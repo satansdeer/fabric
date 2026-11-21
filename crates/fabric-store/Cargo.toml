@@ -3,3 +3,10 @@ name = "fabric-store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+fabric-domain.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

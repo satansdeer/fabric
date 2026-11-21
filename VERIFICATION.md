@@ -20,3 +20,11 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed typed-ID validation, pure state-transition graphs and policy validation/deserialization.
 - Independently ran `cargo test --offline -p fabric-domain --test domain`: all 8 tests passed, including illegal transitions, immutable READY states and invalid/overflowing limits.
 - Implementer supplied observed RED evidence and passing fmt/clippy/workspace checks (13 tests).
+
+## FAB-03
+
+- Reviewed schema constraints, transactional migration/publication, reciprocal ownership foreign keys and compare-and-set transitions.
+- Independently ran `cargo test --offline -p fabric-store`: 10 passed; doctor integration tests: 5 passed.
+- Verified checks exercise concurrent creation/migration, rollback, immutable READY records and persistence across reopen.
+- Authorized a prerequisite test-only fix: wall-clock/PID temporary names collided under parallel macOS doctor tests; implementer added a uniqueness counter.
+- Implementer supplied RED evidence and passing fmt/clippy/workspace checks (23 tests).

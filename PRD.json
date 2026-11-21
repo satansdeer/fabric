@@ -50,7 +50,7 @@
       "acceptance_tests": [
         "AT-12"
       ],
-      "status": "todo"
+      "status": "verified"
     },
     {
       "id": "FAB-04",
