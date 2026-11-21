@@ -10,3 +10,13 @@
 - Scope: seven specified workspace packages, three direct external dependencies (clap, serde, serde_json), lockfile, structured domain errors, doctor implementation, integration tests and README. Other package boundaries intentionally contain no later-story behavior. No supplied requirement documents or PRD status changed; no commit made.
 - Risks: executable discovery is not a launch/version compatibility probe. Non-macOS platforms are reported unsupported and were not verified. No paid/real OMP call occurred. The outer verifier owns clean-checkout verification and completion status.
 - Status: READY_FOR_VERIFICATION.
+
+## FAB-02 — Domain IDs, state transitions, and policy validation
+
+- Behavioral claim: seven distinct validated ID types, pure idempotent Run/Workspace/PreparedState transition graphs, immutable terminal READY status, typed shared errors, specification policy defaults, and fail-closed policy deserialization/validation require no I/O.
+- RED: `cargo test --offline -p fabric-domain --test domain` exited 101 before production changes: missing domain types and `InvalidId`/`InvalidTransition`/`InvalidPolicy` variants.
+- GREEN: all 8 domain tests passed, covering ID bounds and wire round-trips, exhaustive legal/illegal transition pairs with unchanged state on error, terminal/READY protection, wire state names, defaults, positive/combined byte limits, overflow-safe retention duration, unknown fields and invalid untrusted config.
+- Full checks: `cargo fmt --check`, `cargo clippy --offline --workspace --all-targets -- -D warnings`, and `cargo test --offline --workspace` passed (13 tests, including the 5 unchanged doctor regression tests). Formatting findings were corrected via targeted edits before the final checks.
+- Scope: domain modules/tests, serde_json dev dependency and lockfile, README. Existing CLI/error conventions preserved; LSP reports no configured servers, so existing error callers were read directly. No PRD/spec/override edits, DB/reconciliation implementation, paid OMP calls or commit.
+- Risks: lifecycle status transitions are not deletion authorization or filesystem immutability; later I/O layers must enforce leases, ownership and verified capture. Direct edits to public policy fields require `validate()`. IDs are caller-supplied, not randomly generated. Run transitions intentionally follow the specification's exact graph.
+- Status: READY_FOR_VERIFICATION.

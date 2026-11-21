@@ -1,14 +1,25 @@
-//! I/O-free error contract shared by Fabric's packages.
+//! I/O-free IDs, lifecycle transitions, policy validation, and shared errors.
 
 use std::fmt;
 
 use serde::Serialize;
 
-#[derive(Debug, Serialize)]
+mod ids;
+mod policy;
+mod state;
+
+pub use ids::*;
+pub use policy::{RetentionMode, RetentionPolicy, StoragePolicy};
+pub use state::{PreparedStateStatus, RunState, WorkspaceState};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     InvalidArguments,
     Output,
+    InvalidId,
+    InvalidTransition,
+    InvalidPolicy,
 }
 
 #[derive(Debug, Serialize)]
