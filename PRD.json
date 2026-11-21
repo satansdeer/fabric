@@ -1,0 +1,365 @@
+{
+  "project": "Fabric PoC",
+  "version": "0.1",
+  "spec": "FABRIC_POC_SPEC.md",
+  "workflow": "one-story-per-fresh-context",
+  "completion_authority": "external-verifier",
+  "stories": [
+    {
+      "id": "FAB-01",
+      "title": "Rust workspace and doctor command",
+      "depends_on": [],
+      "objective": "Create the Cargo workspace, binary entrypoint, structured errors, and a `fabric doctor --json` command reporting platform and tool discovery without network calls.",
+      "acceptance": [
+        "`cargo test --workspace` passes from a clean checkout",
+        "`fabric doctor --json` yields parseable JSON and explicit Linux support status"
+      ],
+      "acceptance_tests": [
+        "AT-14"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-02",
+      "title": "Domain IDs, state transitions, and policy validation",
+      "depends_on": [
+        "FAB-01"
+      ],
+      "objective": "Implement typed IDs, Run/Workspace/PreparedState state machines, and validation for storage and retention policy.",
+      "acceptance": [
+        "Illegal transitions fail with typed errors",
+        "No I/O required to test state transitions"
+      ],
+      "acceptance_tests": [
+        "AT-12"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-03",
+      "title": "SQLite store and migrations",
+      "depends_on": [
+        "FAB-02"
+      ],
+      "objective": "Implement SQLite schema, idempotent migrations, transactions and atomic creation/transitions of run, project, state and workspace rows.",
+      "acceptance": [
+        "Foreign keys prevent orphan records",
+        "Concurrent creation does not duplicate IDs",
+        "Restart reopens persisted rows"
+      ],
+      "acceptance_tests": [
+        "AT-12"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-04",
+      "title": "Git source resolver and project registration",
+      "depends_on": [
+        "FAB-03"
+      ],
+      "objective": "Register local Git repo and resolve pinned HEAD SHA without importing uncommitted source edits.",
+      "acceptance": [
+        "Dirty checkout gets warning and commit remains pinned",
+        "Non-Git path yields actionable error",
+        "`project status --json` reports source SHA"
+      ],
+      "acceptance_tests": [
+        "AT-14"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-05",
+      "title": "Preparation recipe parser and fingerprint",
+      "depends_on": [
+        "FAB-04"
+      ],
+      "objective": "Parse trusted TOML recipe, validate argv and limits, compute deterministic preparation digest from commit and declared recipe/environment.",
+      "acceptance": [
+        "Equivalent inputs same digest",
+        "Changing recipe or commit changes digest",
+        "Invalid recipe rejected before command start"
+      ],
+      "acceptance_tests": [
+        "AT-01"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-06",
+      "title": "Prepare local project snapshot",
+      "depends_on": [
+        "FAB-05"
+      ],
+      "objective": "Clone pinned source into Fabric staging directory, run preparation commands in clone, register immutable READY prepared state on successful completion.",
+      "acceptance": [
+        "Recipe creates ignored `.deps/ready` marker",
+        "Preparation failure does not publish READY",
+        "Developer original repo remains unchanged"
+      ],
+      "acceptance_tests": [
+        "AT-02"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-07",
+      "title": "Preparation cache reuse and invalidation",
+      "depends_on": [
+        "FAB-06"
+      ],
+      "objective": "Reuse READY prepared state for unchanged key, serialize concurrent preparation requests, handle incomplete stage recovery.",
+      "acceptance": [
+        "Recipe counter increments only once for duplicate requests",
+        "New commit or changed recipe creates separate state",
+        "Interrupted staging never appears READY"
+      ],
+      "acceptance_tests": [
+        "AT-01"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-08",
+      "title": "Managed workspace fork backend",
+      "depends_on": [
+        "FAB-07"
+      ],
+      "objective": "Implement isolated forks of entire prepared tree, including ignored dependencies, with reflink when available and size-admitted copy fallback.",
+      "acceptance": [
+        "Fork retains ignored prepared dependencies",
+        "Fork does not rerun setup",
+        "Writable files are never hardlinked to base"
+      ],
+      "acceptance_tests": [
+        "AT-02",
+        "AT-03"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-09",
+      "title": "Workspace isolation and ownership registration",
+      "depends_on": [
+        "FAB-08"
+      ],
+      "objective": "Persist workspace ownership before use, attach Run ID, validate managed paths and ensure private writes do not affect siblings.",
+      "acceptance": [
+        "Two forks write same relative path differently",
+        "Prepared base remains unchanged",
+        "Every workspace has exactly one owner"
+      ],
+      "acceptance_tests": [
+        "AT-03"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-10",
+      "title": "Fake harness and one-worker foreground supervisor",
+      "depends_on": [
+        "FAB-09"
+      ],
+      "objective": "Implement HarnessAdapter abstraction, deterministic fake binary, foreground runner capturing result and exit status.",
+      "acceptance": [
+        "Run lifecycle transitions recorded",
+        "Nonzero exit becomes FAILED",
+        "Run provenance includes input digests and source SHA"
+      ],
+      "acceptance_tests": [
+        "AT-05"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-11",
+      "title": "OMP headless harness adapter",
+      "depends_on": [
+        "FAB-10"
+      ],
+      "objective": "Probe OMP and launch `omp -p --mode json` safely from a private workspace, parse bounded JSONL events and record version.",
+      "acceptance": [
+        "Argument vector passes prompt verbatim",
+        "Mocked OMP stdout JSONL parsed",
+        "Missing OMP has clear diagnostic"
+      ],
+      "acceptance_tests": [
+        "AT-15"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-12",
+      "title": "Bounded stdout stderr and event capture",
+      "depends_on": [
+        "FAB-11"
+      ],
+      "objective": "Add capped log files, truncation markers, structured event persistence and checksums.",
+      "acceptance": [
+        "100 MiB fake output does not exceed 10 MiB configured log cap",
+        "Truncation reported in run metadata",
+        "Capture does not deadlock on full pipes"
+      ],
+      "acceptance_tests": [
+        "AT-13"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-13",
+      "title": "Concurrency-limited run-many",
+      "depends_on": [
+        "FAB-12"
+      ],
+      "objective": "Run task manifest with bounded parallelism, independent Run IDs, batch result and per-worker workspace.",
+      "acceptance": [
+        "Four tasks with cap 2 have max 2 active",
+        "All tasks retain separate run results",
+        "Batch overall status reports any failures"
+      ],
+      "acceptance_tests": [
+        "AT-04"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-14",
+      "title": "Process groups, timeout, and cancel",
+      "depends_on": [
+        "FAB-13"
+      ],
+      "objective": "Use Linux process-group supervision to terminate worker and descendants on timeout/cancel; record outcome.",
+      "acceptance": [
+        "Fake parent spawning child is fully stopped",
+        "Timeout marks run appropriately",
+        "Cancellation is idempotent"
+      ],
+      "acceptance_tests": [
+        "AT-08"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-15",
+      "title": "Tracked source change artifacts",
+      "depends_on": [
+        "FAB-14"
+      ],
+      "objective": "Capture `git diff HEAD --binary`, stdout/stderr manifest, SHA256 checksums and provenance before marking work cleanup-eligible.",
+      "acceptance": [
+        "Tracked edits survive post-run",
+        "Manifest references exact base SHA, prompt digest, harness version",
+        "Capture failure prevents reclaim"
+      ],
+      "acceptance_tests": [
+        "AT-05",
+        "AT-06",
+        "AT-07"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-16",
+      "title": "Untracked artifact collection and safe failure",
+      "depends_on": [
+        "FAB-15"
+      ],
+      "objective": "Capture size-bounded non-ignored untracked files without following external symlinks, and safely retain workspace if capture fails.",
+      "acceptance": [
+        "Non-ignored untracked files restored accurately",
+        "Oversize capture moves workspace to RECOVERY_REQUIRED",
+        "Outside symlink target is not read"
+      ],
+      "acceptance_tests": [
+        "AT-06",
+        "AT-07"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-17",
+      "title": "Path-safe idempotent garbage collection",
+      "depends_on": [
+        "FAB-16"
+      ],
+      "objective": "Implement lease-aware cleanup, root/path marker validation, symlink refusal, dry-run and interruption recovery.",
+      "acceptance": [
+        "Symlink substitution refuses deletion",
+        "Interrupted cleanup resumes safely",
+        "Unique source changes never deleted before verified capture"
+      ],
+      "acceptance_tests": [
+        "AT-09",
+        "AT-11"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-18",
+      "title": "Storage budgets and admission control",
+      "depends_on": [
+        "FAB-17"
+      ],
+      "objective": "Implement injected storage meter, free-space reserve, managed root budget, workspace usage checks and cleanup before admission.",
+      "acceptance": [
+        "Simulated low free space rejects launch before starting process",
+        "Reported cache/workspace usage exposes retention reasons",
+        "Oversize workspaces stop with clear outcome"
+      ],
+      "acceptance_tests": [
+        "AT-10"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-19",
+      "title": "Lease reconciliation and crash recovery",
+      "depends_on": [
+        "FAB-18"
+      ],
+      "objective": "Persist lease owner and expiry; reconcile interrupted runs fail-closed without killing unverifiable processes or deleting unique data.",
+      "acceptance": [
+        "Expired lease does not equal permission to delete",
+        "Interrupted run goes NEEDS_ATTENTION or safe terminal state",
+        "Reconciliation is repeatable"
+      ],
+      "acceptance_tests": [
+        "AT-12"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "FAB-20",
+      "title": "CLI inspection and end-to-end acceptance",
+      "depends_on": [
+        "FAB-19"
+      ],
+      "objective": "Implement project/runs/storage show and GC dry-run JSON commands, smoke-test complete prepare/fork/run/artifact/reclaim fixture workflow, write operator guide.",
+      "acceptance": [
+        "Project, run, storage and GC commands are inspectable",
+        "AT-01 through AT-14 pass in CI",
+        "`cargo fmt`, `cargo clippy -D warnings`, and full tests pass",
+        "Manual OMP smoke instructions documented; execution separately verified"
+      ],
+      "acceptance_tests": [
+        "AT-01",
+        "AT-02",
+        "AT-03",
+        "AT-04",
+        "AT-05",
+        "AT-06",
+        "AT-07",
+        "AT-08",
+        "AT-09",
+        "AT-10",
+        "AT-11",
+        "AT-12",
+        "AT-13",
+        "AT-14",
+        "AT-15"
+      ],
+      "status": "todo"
+    }
+  ]
+}
