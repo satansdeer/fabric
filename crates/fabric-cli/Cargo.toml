@@ -1,0 +1,16 @@
+[package]
+name = "fabric-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fabric"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+fabric-domain.workspace = true
+fabric-core.workspace = true
