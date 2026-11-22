@@ -23,4 +23,5 @@ fabric-runner = { path = "../fabric-runner" }
 
 [dev-dependencies]
 fabric-store = { path = "../fabric-store" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"

@@ -130,7 +130,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -156,7 +156,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     drop(store);
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch("DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN capture_metadata; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=1;")
+        .execute_batch("DROP TRIGGER immutable_artifact_update; DROP TRIGGER immutable_artifact_delete; DROP TRIGGER immutable_manifest; DROP TABLE artifacts; DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN capture_metadata; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=1;")
         .unwrap();
     drop(connection);
     let reopened = Store::open(&path).unwrap();
@@ -170,7 +170,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn v2_database_upgrades_without_losing_run_ownership() {
     drop(store);
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch(
-        "DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=2;",
+        "DROP TRIGGER immutable_artifact_update; DROP TRIGGER immutable_artifact_delete; DROP TRIGGER immutable_manifest; DROP TABLE artifacts; DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=2;",
     ).unwrap();
     drop(connection);
     let reopened = Store::open(&path).unwrap();
@@ -191,6 +191,29 @@ fn v2_database_upgrades_without_losing_run_ownership() {
         reopened.workspace(&workspace.workspace_id).unwrap(),
         Some(workspace)
     );
+}
+
+#[test]
+fn v4_database_upgrades_without_rewriting_previous_run_evidence() {
+    let (root, mut store) = fixture();
+    let (run, workspace) = pair(1);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    drop(store);
+    let path = root.path().join("fabric.sqlite3");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "DROP TRIGGER immutable_artifact_update; DROP TRIGGER immutable_artifact_delete;
+        DROP TRIGGER immutable_manifest; DROP TABLE artifacts; PRAGMA user_version=4;",
+    )
+    .unwrap();
+    drop(db);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.run(&run.run_id).unwrap(), Some(run.clone()));
+    assert_eq!(
+        reopened.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+    assert!(reopened.artifacts(&run.run_id).unwrap().is_empty());
 }
 
 #[test]

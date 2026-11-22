@@ -169,6 +169,18 @@ pub fn create_workspace(
 /// Reopen the configured root and re-read both owners and the private marker.
 /// Unknown, incomplete, failed, relocated or tampered workspaces are refused.
 pub fn runner_workspace(root: &Path, id: &RunId) -> Result<RunnerWorkspace, FabricError> {
+    owned_workspace(root, id, true)
+}
+
+pub(super) fn capture_workspace(root: &Path, id: &RunId) -> Result<RunnerWorkspace, FabricError> {
+    owned_workspace(root, id, false)
+}
+
+fn owned_workspace(
+    root: &Path,
+    id: &RunId,
+    launching: bool,
+) -> Result<RunnerWorkspace, FabricError> {
     let (root, store) = open_store(root)?;
     let run = store
         .run(id)
@@ -179,14 +191,20 @@ pub fn runner_workspace(root: &Path, id: &RunId) -> Result<RunnerWorkspace, Fabr
         .map_err(storage_error)?
         .ok_or_else(|| storage_error("Missing workspace ownership record."))?;
     let now = timestamp(run.created_at)?;
-    if run.state != RunState::Preparing
+    if run.state
+        != if launching {
+            RunState::Preparing
+        } else {
+            RunState::Finalizing
+        }
         || workspace.state != WorkspaceState::Active
         || workspace.run_id != run.run_id
         || workspace.state_id != run.prepared_state_id
         || workspace.retention_reason.is_some()
-        || workspace
-            .lease_expires_at
-            .is_none_or(|expiry| expiry <= now)
+        || (launching
+            && workspace
+                .lease_expires_at
+                .is_none_or(|expiry| expiry <= now))
     {
         return Err(storage_error("Workspace ownership is not runner-ready."));
     }
@@ -275,7 +293,7 @@ pub(super) fn open_store(root: &Path) -> Result<(PathBuf, Store), FabricError> {
     Ok((root, store))
 }
 
-fn private_directory(path: &Path) -> Result<(), FabricError> {
+pub(super) fn private_directory(path: &Path) -> Result<(), FabricError> {
     let meta = fs::symlink_metadata(path).map_err(storage_error)?;
     // SAFETY: geteuid has no preconditions.
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
@@ -286,7 +304,7 @@ fn private_directory(path: &Path) -> Result<(), FabricError> {
     Ok(())
 }
 
-fn private_file(path: &Path) -> Result<fs::Metadata, FabricError> {
+pub(super) fn private_file(path: &Path) -> Result<fs::Metadata, FabricError> {
     let meta = fs::symlink_metadata(path).map_err(storage_error)?;
     // SAFETY: geteuid has no preconditions.
     if !meta.is_file()

@@ -134,6 +134,15 @@ pub struct BatchTask {
     pub error: Option<String>,
 }
 
+/// Verified immutable files, relative to the canonical Fabric root.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Artifact {
+    pub kind: String,
+    pub relative_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 impl Store {
     /// Opens a file-backed WAL database. The parent directory must already exist.
     /// New database files are owner-only on Unix; callers own storage-root validation.
@@ -167,7 +176,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=4 => {}
+            1..=5 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -206,6 +215,33 @@ impl Store {
         if version < 4 {
             transaction.execute_batch("ALTER TABLE runs ADD COLUMN exit_signal INTEGER;")?;
             transaction.pragma_update(None, "user_version", 4)?;
+        }
+        if version < 5 {
+            transaction.execute_batch(
+                "CREATE TABLE artifacts (
+                    run_id TEXT NOT NULL REFERENCES runs(run_id),
+                    kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+                    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+                    PRIMARY KEY(run_id, kind)
+                 );
+                 CREATE TRIGGER immutable_artifact_update BEFORE UPDATE ON artifacts
+                 BEGIN SELECT RAISE(ABORT, 'artifacts are immutable'); END;
+                 CREATE TRIGGER immutable_artifact_delete BEFORE DELETE ON artifacts
+                 BEGIN SELECT RAISE(ABORT, 'artifacts are immutable'); END;
+                 CREATE TRIGGER immutable_manifest BEFORE UPDATE OF artifact_manifest_id ON runs
+                 WHEN (OLD.artifact_manifest_id IS NOT NULL
+                    AND NEW.artifact_manifest_id IS NOT OLD.artifact_manifest_id)
+                   OR (OLD.artifact_manifest_id IS NULL AND NEW.artifact_manifest_id IS NOT NULL
+                       AND (OLD.state != 'FINALIZING'
+                           OR NEW.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+                           OR NOT EXISTS (SELECT 1 FROM artifacts
+                               WHERE run_id = NEW.run_id AND kind = 'manifest'
+                                 AND relative_path = 'artifacts/' || NEW.artifact_manifest_id || '/manifest.json')))
+                 BEGIN SELECT RAISE(ABORT, 'manifest association is immutable'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 5)?;
         }
         transaction.commit()?;
         Ok(Self { connection })
@@ -470,28 +506,87 @@ impl Store {
         Ok(())
     }
 
-    /// Publish synced capture metadata atomically with terminal completion.
-    /// No source manifest or cleanup eligibility is invented.
-    pub fn finish_run(&mut self, id: &RunId, capture: &CaptureMetadata, now: i64) -> Result<()> {
+    /// The bounded output files have already been synced by the runner.
+    pub fn record_capture(&self, id: &RunId, capture: &CaptureMetadata) -> Result<()> {
+        let encoded = serde_json::to_string(capture)
+            .map_err(|_| StoreError::InvalidRecord("Cannot encode capture metadata"))?;
+        if self.connection.execute(
+            "UPDATE runs SET capture_metadata = ?1 WHERE run_id = ?2
+             AND state = 'FINALIZING' AND capture_metadata IS NULL",
+            params![encoded, id.as_str()],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+    /// Register verified promoted files and terminal completion in one transaction.
+    /// Tracked capture alone never authorizes workspace cleanup.
+    pub fn finish_run(
+        &mut self,
+        id: &RunId,
+        capture: &CaptureMetadata,
+        manifest: &ArtifactManifestId,
+        artifacts: &[Artifact],
+        now: i64,
+    ) -> Result<()> {
+        let prefix = format!("artifacts/{manifest}/");
+        if ![
+            "stdout",
+            "stderr",
+            "events",
+            "tracked_patch",
+            "prompt",
+            "manifest",
+        ]
+        .iter()
+        .all(|kind| artifacts.iter().filter(|file| file.kind == *kind).count() == 1)
+            || artifacts.iter().any(|file| {
+                file.sha256.len() != 64
+                    || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || !file.relative_path.starts_with(&prefix)
+                    || Path::new(&file.relative_path)
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            })
+        {
+            return Err(StoreError::InvalidRecord(
+                "Incomplete or invalid artifact manifest",
+            ));
+        }
         let encoded = serde_json::to_string(capture)
             .map_err(|_| StoreError::InvalidRecord("Cannot encode capture metadata"))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for file in artifacts {
+            transaction.execute(
+                "INSERT INTO artifacts (run_id, kind, relative_path, sha256, size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id.as_str(),
+                    file.kind,
+                    file.relative_path,
+                    file.sha256,
+                    file.size_bytes
+                ],
+            )?;
+        }
         let count = transaction.execute(
             "UPDATE runs SET state = CASE WHEN error_kind = 'cancelled' THEN 'CANCELLED'
              WHEN error_kind = 'timeout' THEN 'FAILED'
              WHEN exit_code = 0 THEN 'SUCCEEDED' ELSE 'FAILED' END,
-             updated_at = ?1, finished_at = ?1, capture_metadata = ?3
-             WHERE run_id = ?2 AND state = 'FINALIZING' AND ?1 >= updated_at",
-            params![now, id.as_str(), encoded],
+             updated_at = ?1, finished_at = ?1, capture_metadata = ?3, artifact_manifest_id = ?4
+             WHERE run_id = ?2 AND state = 'FINALIZING' AND ?1 >= updated_at
+               AND artifact_manifest_id IS NULL",
+            params![now, id.as_str(), encoded, manifest.as_str()],
         )?;
         if count != 1 {
             return Err(StoreError::Conflict);
         }
         let count = transaction.execute(
             "UPDATE workspaces SET state = 'RETAINED', lease_expires_at = NULL,
-             retention_reason = 'Source capture not implemented; workspace and raw output retained'
+             retention_reason = 'Tracked capture verified; untracked capture pending; no cleanup authority'
              WHERE run_id = ?1 AND state = 'ACTIVE'",
             [id.as_str()],
         )?;
@@ -500,6 +595,23 @@ impl Store {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn artifacts(&self, id: &RunId) -> Result<Vec<Artifact>> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, relative_path, sha256, size_bytes FROM artifacts
+             WHERE run_id = ?1 ORDER BY kind",
+        )?;
+        Ok(statement
+            .query_map([id.as_str()], |row| {
+                Ok(Artifact {
+                    kind: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    sha256: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?)
     }
 
     /// Setup/launch/supervision errors are uncertain, never invented process exits.
@@ -525,6 +637,7 @@ impl Store {
              updated_at = ?2, finished_at = ?2,
              error_kind = CASE WHEN state = 'PREPARING' AND ?4 THEN 'cancelled'
                WHEN error_kind IN ('timeout', 'cancelled') THEN error_kind
+               WHEN capture_metadata IS NOT NULL THEN 'artifact_capture'
                ELSE 'harness_execution' END
              WHERE run_id = ?3 AND state IN ('PREPARING', 'FINALIZING')
              AND ?2 >= updated_at",
@@ -592,6 +705,7 @@ impl Store {
             || workspace.state != WorkspaceState::Active
             || run.capture.is_some()
             || run.exit_signal.is_some()
+            || run.artifact_manifest_id.is_some()
         {
             return Err(StoreError::InvalidRecord(
                 "new run/workspace must be QUEUED/ACTIVE without capture metadata",

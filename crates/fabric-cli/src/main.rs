@@ -72,6 +72,10 @@ struct WorkerArgs {
     #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
         value_parser = clap::value_parser!(u64).range(fabric_runner::capture::TRUNCATION_MARKER.len() as u64..))]
     max_log_bytes: u64,
+    /// Total durable artifacts, including prompt, patch, copied logs and manifest.
+    #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().max_artifact_bytes_per_run,
+        value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+    max_artifact_bytes: u64,
     /// Per-worker wall-clock limit, enforced by Fabric (not a spending quota).
     #[arg(long, default_value = "3600")]
     timeout_seconds: std::num::NonZeroU64,
@@ -201,6 +205,7 @@ fn run_options(
     fabric_core::run::RunOptions {
         copy_limit_bytes: args.copy_limit_bytes,
         max_log_bytes: args.max_log_bytes,
+        max_artifact_bytes: args.max_artifact_bytes,
         limits: fabric_runner::ExecutionLimits {
             timeout: std::time::Duration::from_secs(args.timeout_seconds.get()),
             ..fabric_runner::ExecutionLimits::default()

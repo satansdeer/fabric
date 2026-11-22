@@ -196,6 +196,7 @@ dependencies = [
  "fabric-project",
  "fabric-runner",
  "fabric-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -257,6 +258,7 @@ version = "0.1.0"
 dependencies = [
  "fabric-domain",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

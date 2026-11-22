@@ -103,3 +103,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed macOS owned/unreaped process-group identity, TERM/grace/KILL escalation, cancellation and bounded pipe draining.
 - Independently ran three timeout and two cancellation regressions: passed. Tests include TERM-ignoring descendants, heartbeat cessation, Ctrl-C and preserved observed outcomes.
 - Implementer final fmt/clippy/workspace gates passed (93 tests). No stale persisted PID is adopted for signalling; model cost controls remain best effort.
+
+## FAB-15
+
+- Reviewed pinned-base binary tracked diff, private synced artifact staging, no-replace publication, checksums and atomic terminal registration.
+- Independently passed binary staged/unstaged patch round-trip and capture-failure retention regressions. Failed publication/registration, bounded capture and tampered output cannot claim terminal success.
+- Implementer final fmt/clippy/workspace gates passed (96 tests). Workspaces remain retained: untracked archive and deletion authority are not yet implemented.

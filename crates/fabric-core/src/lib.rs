@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+mod artifacts;
 pub mod run;
 pub mod workspace;
 

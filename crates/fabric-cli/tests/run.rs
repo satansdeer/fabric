@@ -94,6 +94,15 @@ impl Fixture {
             .output()
             .unwrap()
     }
+    fn script_fake(&self, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = self.0.join("fake-script");
+        fs::write(&executable, format!(
+            "#!/bin/sh\nset -eu\numask 077\nif [ \"$1\" = --version ]; then printf 'fabric-fake-harness 1\\n'; exit 0; fi\n{body}\n"
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -158,9 +167,53 @@ fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() 
     assert_eq!(run.error_kind.as_deref(), Some("timeout"));
     assert_eq!(run.exit_code, None);
     assert_eq!(
+        verified_manifest(&fixture, &report)["stop_reason"],
+        "timeout"
+    );
+    assert_eq!(
         run.exit_signal,
         report["exit_signal"].as_i64().map(|signal| signal as i32)
     );
+}
+
+fn verified_manifest(fixture: &Fixture, report: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = fixture.0.join("storage");
+    let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+    let id = report["run_id"].as_str().unwrap().parse().unwrap();
+    let run = store.run(&id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&run.artifact_manifest_id).unwrap(),
+        report["artifact_manifest_id"]
+    );
+    let files = store.artifacts(&id).unwrap();
+    assert_eq!(files.len(), 7);
+    let mut manifest = None;
+    for file in files {
+        let path = root.join(&file.relative_path);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, file.size_bytes);
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), file.sha256);
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+        assert_eq!(metadata.nlink(), 1);
+        if file.kind == "manifest" {
+            manifest = Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+        }
+    }
+    let manifest = manifest.unwrap();
+    assert_eq!(manifest["run_id"], report["run_id"]);
+    assert_eq!(manifest["workspace_id"], report["workspace_id"]);
+    assert_eq!(manifest["base_commit_sha"], report["base_commit_sha"]);
+    assert_eq!(manifest["prompt_digest"], report["prompt_digest"]);
+    assert_eq!(manifest["harness_version"], report["harness_version"]);
+    assert_eq!(manifest["exit_code"], report["exit_code"]);
+    assert_eq!(manifest["exit_signal"], report["exit_signal"]);
+    assert_eq!(manifest["capture"], report["capture"]);
+    assert_eq!(manifest["source_scope"], "tracked_only");
+    assert_eq!(manifest["recipe_digest"].as_str().unwrap().len(), 64);
+    manifest
 }
 
 fn assert_tree_stopped(workspace: &Path) {
@@ -236,6 +289,10 @@ fn ctrl_c_cancels_live_worker_and_preserves_observed_exit() {
     assert_eq!(report["error_kind"], "cancelled");
     assert_eq!(report["exit_signal"], 15);
     assert!(report["exit_code"].is_null());
+    assert_eq!(
+        verified_manifest(&fixture, &report)["stop_reason"],
+        "cancelled"
+    );
     assert_tree_stopped(&tree);
     let run = fabric_store::Store::open(fixture.0.join("storage/fabric.db"))
         .unwrap()
@@ -289,6 +346,10 @@ fn api_cancellation_is_idempotent_and_escalates_term_ignoring_child() {
     assert_eq!(report.state, fabric_domain::RunState::Cancelled);
     assert_eq!(report.error_kind.as_deref(), Some("cancelled"));
     assert_eq!(report.exit_signal, Some(15));
+    assert_eq!(
+        verified_manifest(&fixture, &serde_json::to_value(&report).unwrap())["stop_reason"],
+        "cancelled"
+    );
     assert_tree_stopped(Path::new(&report.workspace_path));
 }
 
@@ -302,9 +363,10 @@ fn natural_leader_exit_cleans_background_descendant_and_does_not_claim_timeout()
         r#"{"process_tree":{"ignore_child_term":true,"leader_exits":true}}"#,
     )
     .unwrap();
-    let start = std::time::Instant::now();
     let out = fixture
         .cli()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .args(["run", "test", "--harness", "fake", "--prompt-file"])
         .arg(prompt)
         .args([
@@ -314,14 +376,26 @@ fn natural_leader_exit_cleans_background_descendant_and_does_not_claim_timeout()
             "--copy-limit-bytes",
             "10485760",
         ])
-        .output()
+        .spawn()
         .unwrap();
+    let tree = wait_for_tree(&fixture);
+    // Bound actual child cleanup, not the subsequent durable fsync/publication work.
+    let start = std::time::Instant::now();
+    loop {
+        let before = fs::read(tree.join("child.heartbeat")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        if fs::read(tree.join("child.heartbeat")).unwrap() == before {
+            break;
+        }
+    }
+    let out = out.wait_with_output().unwrap();
     let report = json(&out);
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
     assert_eq!(report["state"], "SUCCEEDED");
     assert_eq!(report["exit_code"], 0);
     assert!(report["exit_signal"].is_null());
     assert!(report["error_kind"].is_null());
+    assert!(verified_manifest(&fixture, &report)["stop_reason"].is_null());
     assert_tree_stopped(Path::new(report["workspace_path"].as_str().unwrap()));
 }
 
@@ -503,7 +577,8 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
         assert!(run.finished_at.unwrap() <= run.updated_at);
         assert_eq!(run.prompt_digest, report["prompt_digest"]);
         assert_eq!(run.prompt_digest.len(), 64);
-        assert!(run.artifact_manifest_id.is_none());
+        assert!(run.artifact_manifest_id.is_some());
+        verified_manifest(&fixture, &report);
         let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
         assert_eq!(workspace.state, WorkspaceState::Retained);
         assert!(
@@ -550,6 +625,24 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
             fs::read_to_string(tree.join(".deps/ready")).unwrap(),
             "ready"
         );
+        let patch = fixture
+            .0
+            .join("storage/artifacts")
+            .join(run.artifact_manifest_id.as_ref().unwrap().as_str())
+            .join("tracked.patch");
+        assert!(
+            fs::read_to_string(&patch)
+                .unwrap()
+                .contains("worker tracked")
+        );
+        assert!(
+            !fs::read_to_string(&patch)
+                .unwrap()
+                .contains("worker untracked")
+        );
+        // Promoted copies survive loss/corruption of the original output evidence.
+        fs::write(container.join("stdout.log"), "changed after capture").unwrap();
+        verified_manifest(&fixture, &report);
     }
     assert_eq!(
         fs::read_to_string(repo.join("tracked")).unwrap(),
@@ -781,6 +874,10 @@ wait
     assert_eq!(capture["limit_bytes"], 10 * 1024 * 1024);
     assert_eq!(capture["persisted_bytes"], total);
     assert_eq!(capture["truncated"], true);
+    assert_eq!(
+        verified_manifest(&fixture, &report)["capture"]["truncated"],
+        true
+    );
     assert!(capture["stdout_bytes_seen"].as_u64().unwrap() >= 50 * 1024 * 1024);
     assert_eq!(capture["stderr_bytes_seen"], 50 * 1024 * 1024);
     assert_eq!(report["events"]["parsed"], 2);
@@ -931,6 +1028,7 @@ rmdir "$lock"
     for (i, task) in report["tasks"].as_array().unwrap().iter().enumerate() {
         assert_eq!(task["id"], format!("task-{i}"));
         let result = &task["result"];
+        verified_manifest(&fixture, result);
         let run_id =
             fabric_domain::RunId::try_from(task["run_id"].as_str().unwrap().to_owned()).unwrap();
         assert!(runs.insert(run_id.clone()));
@@ -1050,12 +1148,189 @@ fn run_many_preserves_mixed_exit_and_prelaunch_failure_and_rejects_invalid_input
         assert_eq!(saved.run_id.as_str(), task["run_id"]);
         assert_eq!(saved.task_id, task["id"]);
         if task["error"].is_null() {
+            verified_manifest(&fixture, &task["result"]);
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&saved.result.unwrap()).unwrap(),
                 task["result"]
             );
         } else {
             assert_eq!(saved.error.as_deref(), task["error"].as_str());
+        }
+    }
+}
+
+#[test]
+fn tracked_binary_patch_round_trips_staged_and_unstaged_changes() {
+    let fixture = Fixture::new();
+    let (repo, _) = fixture.setup();
+    fs::write(repo.join("binary"), b"\0original binary\xff").unwrap();
+    fixture.git(&repo, &["add", "binary"]);
+    fixture.git(&repo, &["commit", "--quiet", "-m", "binary baseline"]);
+    fixture.prepare();
+    let executable = fixture.script_fake(
+        r#"
+printf '\000staged\377' > binary
+/usr/bin/git add binary
+printf '\000unstaged final\376' > binary
+printf '\000staged addition\375' > staged.bin
+/usr/bin/git add staged.bin
+printf 'unstaged text' > tracked
+printf 'not captured' > untracked.txt
+printf '{"captured":true}\n'
+"#,
+    );
+    let prompt = fixture.0.join("binary-prompt");
+    fs::write(&prompt, "exact prompt\n").unwrap();
+    let report = json(
+        &fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(executable)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap(),
+    );
+    verified_manifest(&fixture, &report);
+    let patch = fixture
+        .0
+        .join("storage/artifacts")
+        .join(report["artifact_manifest_id"].as_str().unwrap())
+        .join("tracked.patch");
+    let bytes = fs::read(&patch).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("GIT binary patch"));
+    assert!(!String::from_utf8_lossy(&bytes).contains("untracked.txt"));
+    let restored = fixture.0.join("restored");
+    fixture.git(
+        &repo,
+        &[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            repo.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ],
+    );
+    fixture.git(&restored, &["apply", "--binary", patch.to_str().unwrap()]);
+    assert_eq!(
+        fs::read(restored.join("binary")).unwrap(),
+        b"\0unstaged final\xfe"
+    );
+    assert_eq!(
+        fs::read(restored.join("staged.bin")).unwrap(),
+        b"\0staged addition\xfd"
+    );
+    assert_eq!(
+        fs::read(restored.join("tracked")).unwrap(),
+        b"unstaged text"
+    );
+    assert_eq!(
+        fs::read(repo.join("binary")).unwrap(),
+        b"\0original binary\xff"
+    );
+    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    assert_eq!(
+        fs::read(tree.join("untracked.txt")).unwrap(),
+        b"not captured"
+    );
+    let root = fixture.0.join("storage");
+    let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
+    assert!(
+        db.execute(
+            "UPDATE runs SET artifact_manifest_id='replacement' WHERE run_id=?1",
+            [report["run_id"].as_str().unwrap()]
+        )
+        .is_err()
+    );
+    assert!(
+        db.execute("UPDATE artifacts SET sha256=?1", ["0".repeat(64)])
+            .is_err()
+    );
+}
+
+#[test]
+fn capture_failures_durably_retain_workspace_and_never_claim_terminal_success() {
+    use fabric_domain::{RunState, WorkspaceState};
+    for failure in ["promotion", "registration", "limit", "tampered_output"] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        let root = fixture.0.join("storage");
+        let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
+        if failure == "registration" {
+            db.execute_batch(
+                "CREATE TRIGGER injected_artifact_failure BEFORE INSERT ON artifacts
+                BEGIN SELECT RAISE(ABORT, 'injected registration failure'); END;",
+            )
+            .unwrap();
+        }
+        let extra = match failure {
+            "promotion" => {
+                r#"
+run=$(/usr/bin/sed -n '3p' ../.fabric-owner)
+/bin/mkdir -p "../../../artifacts/a-$run"
+printf 'existing sentinel' > "../../../artifacts/a-$run/sentinel"
+"#
+            }
+            "tampered_output" => r#"/bin/rm ../stdout.log; /bin/ln -s /etc/passwd ../stdout.log"#,
+            _ => "",
+        };
+        let executable = fixture.script_fake(&format!(
+            "printf 'retained edit' > tracked\nprintf 'uncaptured' > untracked.txt\nprintf '{{\"event\":true}}\\n'\n{extra}"
+        ));
+        let prompt = fixture.0.join("prompt");
+        fs::write(&prompt, "retained exact prompt").unwrap();
+        let mut command = fixture.cli();
+        command
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(executable)
+            .arg("--prompt-file")
+            .arg(&prompt)
+            .args(["--json", "--copy-limit-bytes", "10485760"]);
+        if failure == "limit" {
+            command.args(["--max-artifact-bytes", "32"]);
+        }
+        let out = command.output().unwrap();
+        assert!(!out.status.success(), "{failure}: {out:?}");
+        let id: String = db
+            .query_row("SELECT run_id FROM runs", [], |row| row.get(0))
+            .unwrap();
+        drop(db);
+        let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+        let id = id.parse().unwrap();
+        let run = store.run(&id).unwrap().unwrap();
+        assert_eq!(run.state, RunState::NeedsAttention, "{failure}: {out:?}");
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.exit_signal, None);
+        assert_eq!(run.error_kind.as_deref(), Some("artifact_capture"));
+        assert!(run.finished_at.is_some());
+        assert!(run.artifact_manifest_id.is_none());
+        assert!(run.capture.is_some());
+        assert!(store.artifacts(&id).unwrap().is_empty());
+        let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
+        assert_eq!(workspace.state, WorkspaceState::RecoveryRequired);
+        let tree = Path::new(&workspace.managed_path);
+        assert_eq!(fs::read(tree.join("tracked")).unwrap(), b"retained edit");
+        assert_eq!(fs::read(tree.join("untracked.txt")).unwrap(), b"uncaptured");
+        assert_eq!(
+            fs::read(tree.parent().unwrap().join("prompt.input")).unwrap(),
+            fs::read(&prompt).unwrap()
+        );
+        assert!(tree.parent().unwrap().join("stderr.log").is_file());
+        if failure == "registration" {
+            let manifest = root.join(format!("artifacts/a-{id}/manifest.json"));
+            assert!(
+                manifest.is_file(),
+                "promoted recovery artifact must survive DB rollback"
+            );
+        } else {
+            assert!(root.join(format!("artifact-staging/a-{id}")).is_dir());
+        }
+        if failure == "promotion" {
+            assert_eq!(
+                fs::read(root.join(format!("artifacts/a-{id}/sentinel"))).unwrap(),
+                b"existing sentinel"
+            );
         }
     }
 }

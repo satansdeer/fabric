@@ -625,14 +625,70 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
         events: empty,
         event_counts: fabric_domain::EventCounts::default(),
     };
+    let manifest = "manifest-lifecycle".parse().unwrap();
+    assert!(
+        store
+            .finish_run(&request.run_id, &capture, &manifest, &[], time + 2)
+            .is_err()
+    );
+    assert_eq!(
+        fixture.store().run(&request.run_id).unwrap().unwrap(),
+        finalizing
+    );
+    store.record_capture(&request.run_id, &capture).unwrap();
+    let files: Vec<_> = [
+        "stdout",
+        "stderr",
+        "events",
+        "tracked_patch",
+        "prompt",
+        "manifest",
+    ]
+    .into_iter()
+    .map(|kind| fabric_store::Artifact {
+        kind: kind.into(),
+        relative_path: format!(
+            "artifacts/{manifest}/{}",
+            if kind == "manifest" {
+                "manifest.json"
+            } else {
+                kind
+            }
+        ),
+        sha256: capture.stdout.sha256.clone(),
+        size_bytes: 0,
+    })
+    .collect();
     store
-        .finish_run(&request.run_id, &capture, time + 2)
+        .finish_run(&request.run_id, &capture, &manifest, &files, time + 2)
         .unwrap();
     let done = fixture.store().run(&request.run_id).unwrap().unwrap();
     assert_eq!(done.state, RunState::Failed);
     assert_eq!(done.finished_at, Some(time + 2));
     assert_eq!(done.error_kind.as_deref(), Some("harness_exit"));
-    assert_eq!(done.capture, Some(capture));
+    assert_eq!(done.capture, Some(capture.clone()));
+    assert_eq!(done.artifact_manifest_id.as_ref(), Some(&manifest));
+    assert_eq!(fixture.store().artifacts(&request.run_id).unwrap().len(), 6);
+    let db = rusqlite::Connection::open(fixture.root.join("fabric.db")).unwrap();
+    assert!(
+        db.execute(
+            "UPDATE runs SET artifact_manifest_id = NULL WHERE run_id = ?1",
+            [request.run_id.as_str()]
+        )
+        .is_err()
+    );
+    assert!(
+        db.execute(
+            "DELETE FROM artifacts WHERE run_id = ?1",
+            [request.run_id.as_str()]
+        )
+        .is_err()
+    );
+    assert!(
+        store
+            .finish_run(&request.run_id, &capture, &manifest, &files, time + 3)
+            .is_err()
+    );
     assert!(
         store
             .observe_run_exit(&request.run_id, Some(0), None, None, time + 3)

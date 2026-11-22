@@ -39,11 +39,13 @@ pub struct RunReport {
     pub workspace_path: String,
     pub events: fabric_runner::jsonl::Summary,
     pub capture: fabric_domain::CaptureMetadata,
+    pub artifact_manifest_id: Option<String>,
 }
 
 pub struct RunOptions {
     pub copy_limit_bytes: u64,
     pub max_log_bytes: u64,
+    pub max_artifact_bytes: u64,
     pub limits: fabric_runner::ExecutionLimits,
     pub cancellation: fabric_runner::CancellationToken,
     /// Best-effort OMP request admission only, not an exact spending cap.
@@ -55,6 +57,7 @@ impl Default for RunOptions {
         Self {
             copy_limit_bytes: 0,
             max_log_bytes: fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
+            max_artifact_bytes: fabric_domain::StoragePolicy::default().max_artifact_bytes_per_run,
             limits: fabric_runner::ExecutionLimits::default(),
             cancellation: fabric_runner::CancellationToken::default(),
             max_cost_usd: None,
@@ -66,6 +69,11 @@ impl RunOptions {
     fn validate(&self, harness: &str) -> Result<(), FabricError> {
         self.limits.validate()?;
         validate_capture_limit(self.max_log_bytes)?;
+        if self.max_artifact_bytes == 0 || self.max_artifact_bytes > i64::MAX as u64 {
+            return Err(error(
+                "max_artifact_bytes must be positive and fit SQLite storage.",
+            ));
+        }
         if self
             .max_cost_usd
             .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
@@ -207,7 +215,18 @@ fn foreground_prepared(
             )
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
-        store.finish_run(&run_id, &capture, now()?).map_err(error)?;
+        store.record_capture(&run_id, &capture).map_err(error)?;
+        let (manifest, artifacts) = crate::artifacts::capture(
+            &root,
+            &store,
+            &run_id,
+            state,
+            &capture,
+            options.max_artifact_bytes,
+        )?;
+        store
+            .finish_run(&run_id, &capture, &manifest, &artifacts, now()?)
+            .map_err(error)?;
         Ok::<_, FabricError>(capture)
     })();
     let capture = match execution {
@@ -251,6 +270,7 @@ fn foreground_prepared(
         error_kind: run.error_kind,
         events: capture.event_counts.clone(),
         capture,
+        artifact_manifest_id: run.artifact_manifest_id.map(|id| id.to_string()),
         created_at: run.created_at,
         started_at: run.started_at,
         finished_at: run.finished_at,
