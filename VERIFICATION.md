@@ -145,3 +145,18 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Actual CLI crash: killed only the owned supervisor after observing a unique worker write. Automatic GC reconciliation changed run `r-1795320617074185000-29155-0` to NEEDS_ATTENTION / RECOVERY_REQUIRED, retained exact unique bytes and released its proven-inactive storage reservation. A second pass left the logical database unchanged.
 - The first crash probe killed before the fake worker wrote; its empty interrupted run was also retained and its inactive reservation released. No fabricated work or exit result was recorded.
 - Implementer final fmt, strict clippy and workspace gate passed: 129 tests across 24 suites (`local://169.log`). Legacy/unverifiable owners cannot grant deletion or reservation-release authority.
+
+## Final operator fixture — prepare, four workers, artifacts and reclamation
+
+- Fresh root `/tmp/fabric-operator-demo-tbkuSc/final-data`: project add and two prepares reused exactly one READY state, `s-1795321010248896000-29990-0`. Ignored `.deps/ready` contained recipe-produced `ready`; the prepared tracked file retained committed bytes while the developer's dirty file remained unchanged.
+- Actual `run-many --concurrency 2 --harness fake` completed four tasks successfully. All four workspaces were already RECLAIMED when inspected; subsequent GC dry-run/apply correctly reported `already_reclaimed`, not fresh deletion.
+- Independently read all four durable manifests after workspace deletion: exact SHA-256 and length verified for all 52 published files, prompt digests and pinned prepared/source provenance matched, tracked patches contained only candidate edits, untracked archives contained exactly their candidate result, and ignored dependencies were excluded.
+- Initial fixture assertions incorrectly guessed a SQLite column and a trailing newline in the recipe output; corrected the throwaway checks against actual API output and `printf ready`. No product change or weakened product test was needed.
+
+## FAB-20 — automated acceptance verified; manual OMP gate blocked
+
+- Reviewed read-only project/run/artifact inspection, stable ID ordering, explicit not-found errors and macOS CI configuration. Native private-directory validation and existing safe SQLite read-only opening do not migrate or reconcile state.
+- Parent independently passed both new consumer-level CLI tests: four isolated runs with artifact recovery after reclaim, and live-WAL inspection with unchanged DB/WAL bytes and schema version.
+- Actual final-fixture CLI proof passed: doctor reports supported macOS; project readiness and ordered/stable run JSON are inspectable; all four reclaimed runs remain discoverable. Verified SHA-256/length of all 56 registered artifacts (including four manifests) through `runs artifacts`; missing IDs fail with empty stdout and structured not-found stderr. All inspection commands left the logical database unchanged.
+- Implementer final fmt, strict clippy and workspace gate passed: independently counted 131 tests across 24 suites (`local://175.log`). The workspace includes actual 100 MiB concurrent output against a shared 10 MiB durable cap. AT-01–14 runnable coverage is mapped in README; macOS CI is configured, not remotely executed.
+- **Remaining blocker: AT-15 real OMP execution requires explicit spending approval, not received.** Installed version/help were probed, but no provider/model request was made. Manual procedure is documented; FAB-20 stays blocked rather than falsely verified, and `POC_READY_FOR_REVIEW` is not claimed.

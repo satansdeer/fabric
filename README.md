@@ -2,11 +2,15 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-18
+## Implemented: FAB-01 through FAB-20 (automated scope)
 
 The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground fake/OMP harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
+
+Native prerequisites: macOS, Xcode Command Line Tools (`xcode-select --install`) for Git/linking, and a Rust toolchain with rustfmt/clippy. CI uses Rust 1.91 on `macos-latest`. APFS supports native `clonefile` full-tree forks; other local filesystems require an explicitly admitted ordinary copy. SQLite is bundled. OMP is optional for deterministic tests and must be installed/configured separately for an approved model run. No Linux support or sandbox isolation is claimed.
+
+**AT-15 is NOT EXECUTED.** Automated acceptance is not model-demonstrated acceptance; the project is not declared `POC_READY_FOR_REVIEW`.
 
 ```sh
 cargo build --locked -p fabric-cli
@@ -38,7 +42,7 @@ Successful reports go to stdout with exit status 0. Invalid arguments with `--js
 
 Without `--root`, storage uses an absolute `$XDG_DATA_HOME/fabric`, otherwise `$HOME/.local/share/fabric`. A relative/empty XDG value is ignored; absent absolute HOME requires `--root`. New storage directories are owner-only (0700 on Unix); an existing root with group/other permissions or a symlink root is refused, not silently changed. Choose a dedicated private directory. `doctor` never opens storage, even when a root is supplied.
 
-Registration accepts a working tree or its subdirectory, including detached HEAD, and stores the canonical repository root and full committed HEAD SHA. The existing schema's `default_ref` holds this exact SHA, not a moving branch. Status reads persisted metadata without consulting the checkout; JSON contains `project_id`, `name`, `source_path`, `default_ref`, `source_commit_sha` and `created_at` (Unix seconds). Its SHA stays pinned after HEAD moves or the source directory becomes unavailable. Project names are nonblank strings and unique within one root.
+Registration accepts a working tree or its subdirectory, including detached HEAD, and stores the canonical repository root and full committed HEAD SHA. The existing schema's `default_ref` holds this exact SHA, not a moving branch. Status reads persisted metadata without consulting the checkout; JSON contains `project_id`, `name`, `source_path`, `default_ref`, `source_commit_sha`, `created_at` (Unix seconds), and `prepared_states` with READY/failure status and provenance. The registration SHA stays pinned after HEAD moves or the source directory becomes unavailable; each prepared state records its own source SHA. Project names are nonblank strings and unique within one root.
 
 Tracked, staged or non-ignored untracked edits produce a stderr warning: only committed HEAD is pinned; uncommitted changes are not imported. Ignored files are not imported either. Registration copies no source files, changes no checkout/index, runs no recipe and makes no network request. Git uses argument vectors with inherited Git/config/credential environment removed, fsmonitor disabled, optional index writes disabled and lazy fetching disabled. Source paths must be valid UTF-8 for SQLite storage. Missing/non-Git/bare paths and unborn HEAD fail with actionable errors. `--json` works for add/status and structured failures (`source`, `storage`, `not_found`); successful dirty add still emits its warning on stderr.
 
@@ -104,7 +108,7 @@ The same `fork-staging/<workspace-id>/tree` becomes managed only after successfu
 
 Fork failures atomically retain the stable Run as NEEDS_ATTENTION with `workspace_fork` diagnostics and its Workspace as RECOVERY_REQUIRED. Existing/partial files and reservation leases remain intact; no retry overwrites or adopts them. An interrupted pending record is not runner-ready, even if a complete tree happens to exist. No process states or exit codes are fabricated.
 
-`lease_expires_at` currently means a **startup reservation**, supplied explicitly and persisted before forking. Missing/expired reservations cannot yield a runner-ready workspace. It is not a heartbeat or proof of a live owner. Successful complete capture clears the reservation; a future lease still refuses reclaim. Lease-owner identity/renewal/reconciliation belong to FAB-19, and expiry alone never authorizes cleanup.
+`lease_expires_at` starts as a persisted **startup reservation** before forking. Missing/expired startup reservations cannot yield a runner-ready workspace. Durable worker ownership, renewal and crash reconciliation are implemented separately: neither this timestamp nor PID metadata proves liveness or death. Successful complete capture clears the reservation; a future lease still refuses reclaim. Expiry alone never authorizes cleanup.
 
 `fabric-domain` uses opaque caller-supplied IDs (1–128 ASCII letters, digits, `_` or `-`); it does not generate IDs or perform filesystem operations. State wire names follow the specification. Run transitions follow the queued/preparing/running/finalizing graph, with PREPARING → NEEDS_ATTENTION for fork failures before execution; terminal states cannot be rewritten. Repeating a state is a no-op. Workspace transitions alone never authorize deletion: core additionally verifies ownership, leases, exact managed paths and complete durable recovery artifacts.
 
@@ -226,6 +230,81 @@ The existing foreground runner launches `omp -p --mode json --no-session --no-ti
 
 The process environment is cleared first. OMP receives fixed `LC_ALL=C`, default `PATH=/usr/bin:/bin`, and only explicitly allowlisted ambient `PATH`, `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `TMPDIR` when set. HOME/XDG permit OMP's normal installed config/auth mechanism without reading/copying credentials into Fabric-managed data; arbitrary API keys, secrets, injection variables and `PI_*` overrides are not inherited. Config files and the trusted OMP process itself remain outside Fabric's sandbox guarantees. The fake harness keeps its fixed minimal environment.
 
+#### AT-15: explicit opt-in operator procedure (pending approval)
+
+Do not execute this section without separate approval for real provider/model spending. First run `omp --version` and `omp --help` yourself: confirm the installed interface above, configured model and normal OMP authentication. Do not put credentials in prompts, recipes, task manifests or Fabric flags. `doctor --json` only discovers the executable; it does not prove authentication/model availability.
+
+After approval, choose a dedicated private root and a disposable **committed local Git fixture** containing `tracked.txt` with `original`, and `.gitignore` containing `.deps/`. Prepare it using the recipe contract above with this step: `argv = ["/bin/sh", "-c", "mkdir .deps; printf ready > .deps/ready"]`. Use absolute paths below; the recipe is outside the source checkout.
+
+```sh
+FABRIC=./target/debug/fabric
+ROOT=/private/path/to/approved-fabric
+REPO=/private/path/to/disposable-git-fixture
+$FABRIC --root "$ROOT" project add --name omp-smoke --path "$REPO"
+$FABRIC --root "$ROOT" project prepare omp-smoke --recipe /private/path/to/recipe.toml --json
+cat > /private/path/to/approved-prompt.txt <<'PROMPT'
+Read .deps/ready and require its exact contents to be ready. Change tracked.txt to "model edited" plus a newline. Create model-note.txt containing "model created" plus a newline. Do not change anything else. Report what you actually did.
+PROMPT
+$FABRIC --root "$ROOT" run omp-smoke --harness omp \
+  --prompt-file /private/path/to/approved-prompt.txt \
+  --timeout-seconds 120 --max-cost-usd 0.25 --copy-limit-bytes 104857600 --json
+$FABRIC --root "$ROOT" runs list --json
+# Set RUN_ID to the observed run_id, not a fabricated expected value:
+$FABRIC --root "$ROOT" runs show "$RUN_ID" --json
+$FABRIC --root "$ROOT" runs artifacts "$RUN_ID" --json
+$FABRIC --root "$ROOT" storage status --json
+$FABRIC --root "$ROOT" storage gc --dry-run --json
+```
+
+Require the observed OMP version, zero exit, SUCCEEDED Run, source/recipe/prompt digests, actual parsed JSON records in `events.jsonl`, a nonempty preserved `tracked.patch`, complete checksummed artifacts and reclaimed workspace; inspect any actual failure instead of relabeling it success. Follow recovery below in a separate checkout and verify the two requested file contents and unchanged original/base `.deps/ready`. Save actual command outputs, Run ID, version, provenance, checksums and recovered bytes outside the managed root for review. If approved, repeat with four distinct prompt files in the existing `run-many` manifest format and `--concurrency 2`, verifying independent Run IDs/artifacts. Budget flags are best effort and in-flight requests may overshoot. No command in this procedure has been executed against a model as part of automated acceptance.
+
+### Read-only inspection and recovery
+
+```sh
+./target/debug/fabric --root /private/path/to/fabric runs list --json
+./target/debug/fabric --root /private/path/to/fabric runs show RUN_ID --json
+./target/debug/fabric --root /private/path/to/fabric runs artifacts RUN_ID --json
+./target/debug/fabric --root /private/path/to/fabric storage status --json
+./target/debug/fabric --root /private/path/to/fabric storage gc --dry-run --json
+```
+
+Omit `--json` for pretty metadata. `runs list` is an array ordered by Run ID. `runs show` has `run`, `workspace`, and `prepared_state`: persisted state/times, source/recipe/environment/prompt digests, batch/harness/version, observed process/exit/error/capture metadata, lease expiry and retention reason. A recorded PID is historical metadata, never kill authority. `runs artifacts` has `run_id`, nullable `artifact_manifest_id` and artifacts ordered by kind, with root-relative paths, byte lengths and SHA-256. Empty/unavailable artifacts are not fabricated. Unknown Run IDs return `not_found` on stderr with nonzero exit and empty stdout; unsafe IDs are invalid arguments. Inspection never launches a harness, reads prompt/log contents or prints environment/credentials. Trusted harness output and prompts themselves are not generically redacted.
+
+Project status and run inspection use the existing native read-only SQLite path, including committed live WAL, without migrations, reconciliation or logical writes. SQLite may coordinate locks/shared memory or create validated private WAL/SHM sidecars; read-only means no logical state/data mutation, not zero filesystem coordination. Stable persisted metadata produces stable JSON; live processes and storage/free-space measurements can legitimately change.
+
+Artifacts remain discoverable after workspace reclaim; inspect their registered inventory rather than assuming the old workspace path still exists. Verify each artifact's length and SHA-256 (`shasum -a 256 "$ROOT/relative_path"`) and the manifest's source SHA before recovery. Create a separate trusted checkout of that exact source commit, then apply `tracked.patch` with `git -C /private/path/to/recovery apply --binary /absolute/path/to/tracked.patch` (skip an empty patch), and extract `untracked.tar` using `tar -xpf /absolute/path/to/untracked.tar -C /private/path/to/recovery`. Never restore into the managed prepared base or original repository. The archive restores only nonignored untracked paths; ignored dependencies require the original preparation recipe. Inspect trusted-local artifact inputs before extraction; Fabric is not an untrusted archive sandbox.
+
+Storage figures count best-effort **logical bytes**, not APFS-exclusive allocation or a hard quota. Unknown/unsafe measurements are reported rather than treated as zero. Admission reserves conservatively and monitors workers, but scans race allocations and cannot enforce an exact disk/billing ceiling. Failed/incomplete capture and uncertain ownership retain recovery workspaces; expiration of the policy's 24-hour recovery period alone does **not** delete them. Current GC does not expire recovery data or purge artifact history. `storage gc --apply` reconciles proven inactive ownership and reclaims only validated eligible workspaces with complete durable recovery evidence; it may safely refuse or report unknown paths. It does not repair artifacts or kill recorded PIDs. Back up retained evidence, inspect reasons and resolve actual failures; do not bypass ownership protections or manually edit the database.
+
+### Deterministic acceptance map
+
+All names below refer to permanent tests run by `cargo test --offline --workspace`; no installed OMP, credentials or paid calls are needed. The macOS workflow fetches locked dependencies first, then runs fmt, strict clippy and the complete offline workspace suite.
+
+| Acceptance | Runnable evidence |
+| --- | --- |
+| AT-01 preparation reuse | CLI `prepare::ready_cache_reuses_once_and_commit_recipe_environment_separate_states`, `concurrent_processes_wait_and_reuse_one_ready_publication` |
+| AT-02 prepared dependencies | workspace `fork::admitted_copy_preserves_complete_prepared_tree_without_setup_and_isolates_siblings`; CLI end-to-end below |
+| AT-03 isolation | the same fork test, core `durable_pair_precedes_backend_and_owned_siblings_isolate_same_relative_writes`, CLI end-to-end |
+| AT-04 fan-out | CLI `run::run_many_caps_actual_external_workers_and_durably_associates_results` (four external fake workers, barrier-observed peak two) |
+| AT-05 provenance | CLI `foreground_fake_process_records_provenance_exit_and_recovers_changes_after_reclaim`, end-to-end checksummed manifest verification |
+| AT-06 outputs | CLI `tracked_binary_patch_round_trips_staged_and_unstaged_changes`, `untracked_archive_restores_bytes_modes_links_and_excludes_ignored_dependencies`, end-to-end recovery |
+| AT-07 safe failure | CLI `capture_failures_durably_retain_workspace_and_never_claim_terminal_success` |
+| AT-08 timeout/cancel | CLI `wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason`, `ctrl_c_cancels_live_worker_and_preserves_observed_exit` |
+| AT-09 no unsafe deletion | CLI `gc_refuses_unsafe_ownership_paths_manifests_and_noneligible_states`, `gc_reports_unknown_paths_and_unlinks_internal_links_without_touching_targets` |
+| AT-10 low space | CLI `storage_admission_cli_denies_before_worker_and_reports_usage`, `storage_injected_low_free_and_managed_cap_never_launch` |
+| AT-11 GC interruption | core `interrupted_cleanup_resumes_after_intent_partial_unlink_marker_and_container_removal`, `storage_cache_intent_resumes_and_same_key_rebuilds_after_interruption` |
+| AT-12 expired leases | CLI `reconciliation_preserves_expired_live_workers_then_recovers_crashed_owner`, `reconciliation_protects_orphan_worker_that_closed_inherited_lease_descriptor` |
+| AT-13 output cap | CLI `hundred_mib_concurrent_fake_output_has_one_durable_capture_budget`: actual 50 MiB per pipe, 100 MiB total drained against shared 10 MiB durable cap, truncation marker and checksums |
+| AT-14 JSON inspection | CLI doctor/project suites plus `acceptance_cli_inspects_four_isolated_runs_and_recovery_after_reclaim`, `inspection_reads_live_wal_without_migration_or_logical_writes` |
+| AT-15 real OMP | **NOT EXECUTED**, separate opt-in procedure above; not covered by fake acceptance |
+
+The end-to-end test drives actual CLI processes: unchanged recipe reuse with a once-only ignored setup counter, four fake tasks at concurrency two, dependency-preserving forks, independent tracked/nonignored-untracked edits, durable SHA-256/length-verified artifacts, safe automatic reclaim, read-only inspection afterwards, and restoring each distinct result into a fresh checkout. Source/prepared bytes stay unchanged and staging is empty. The live-WAL test keeps a writer open, verifies WAL-only retention metadata through all inspection surfaces, and proves DB/WAL bytes and schema version unchanged.
+
+```sh
+cargo test --offline -p fabric-cli --test run acceptance_cli_inspects_four_isolated_runs_and_recovery_after_reclaim
+cargo test --offline -p fabric-cli --test run inspection_reads_live_wal_without_migration_or_logical_writes
+```
+
 ### Bounded run capture
 
 Both harness adapters and version probes use the same concurrent stdout/stderr drain. Ordinary runs default to **10 MiB total**, configurable with `--max-log-bytes N` (also an explicit core/runner API parameter). The sum of actual `stdout.log`, `stderr.log` and `events.jsonl` lengths never exceeds this shared budget; it is not a separate allowance per file. All raw bytes, JSON record wrappers/newlines and the truncation marker count. Bounded SQLite capture metadata, the input `prompt.input` snapshot and workspace/source files are outside this output budget.
@@ -258,4 +337,4 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 ```
 
-After dependencies have been cached, add `--offline` to Cargo build/test/clippy commands to prohibit registry access as well. No paid model smoke run is part of these stories. Project/preparation tests use temporary local Git repositories, including dirty and newly committed sources, ignored dependencies, literal argv/environment handling, hook/config suppression, retained failures, process-group/total timeouts, fail-closed managed paths, once-only cache side effects, competing CLI processes, and interrupted-stage reconciliation. Fork tests force admitted ordinary copies, compare every tree entry/content and independent inode, preserve executable/chained symlink behavior, concurrently edit siblings without base leakage, and reject insufficient admission, existing destinations and source/destination tampering.
+After dependencies have been cached, add `--offline` to Cargo build/test/clippy commands to prohibit registry access as well. Paid/model smoke is excluded from automated checks; AT-15 remains pending explicit approval. Project/preparation tests use temporary local Git repositories, including dirty and newly committed sources, ignored dependencies, literal argv/environment handling, hook/config suppression, retained failures, process-group/total timeouts, fail-closed managed paths, once-only cache side effects, competing CLI processes, and interrupted-stage reconciliation. Fork tests force admitted ordinary copies, compare every tree entry/content and independent inode, preserve executable/chained symlink behavior, concurrently edit siblings without base leakage, and reject insufficient admission, existing destinations and source/destination tampering.

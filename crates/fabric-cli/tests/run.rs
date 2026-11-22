@@ -2538,3 +2538,253 @@ fn storage_fast_zero_exit_overlimit_retains_reason_when_capture_exceeds_cap() {
     assert!(status.workspaces[0].usage_bytes.unwrap() > 3 * 1024 * 1024);
     assert!(!status.workspaces[0].retention_reason.is_empty());
 }
+
+#[test]
+fn acceptance_cli_inspects_four_isolated_runs_and_recovery_after_reclaim() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    let (repo, _) = fixture.setup();
+    let recipe = fixture.0.join("acceptance.toml");
+    fs::write(&recipe, "version=1\n[[steps]]\nargv=['/bin/sh','-c','mkdir -p .deps; printf ready > .deps/ready; printf x >> .deps/setup-count']\n").unwrap();
+    let prepare = || {
+        json(
+            &fixture
+                .cli()
+                .args(["project", "prepare", "test", "--recipe"])
+                .arg(&recipe)
+                .args(["--json"])
+                .output()
+                .unwrap(),
+        )
+    };
+    let base = prepare();
+    assert_eq!(prepare(), base);
+    let base_path = Path::new(base["prepared_path"].as_str().unwrap());
+    assert_eq!(fs::read(base_path.join(".deps/setup-count")).unwrap(), b"x");
+    let tasks: Vec<_> = (0..4)
+        .map(|i| {
+            let prompt = format!("acceptance-{i}.json");
+            fs::write(
+                fixture.0.join(&prompt),
+                serde_json::to_vec(&serde_json::json!({
+                    "required_files":[".deps/ready", ".deps/setup-count"],
+                    "writes":[{"path":"tracked","content":format!("tracked-{i}")},
+                              {"path":"new-source","content":format!("new-{i}")}],
+                    "events":[{"type":"acceptance","worker":i}],
+                    "absent_environment":["UNSELECTED_SECRET"]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            serde_json::json!({"id":format!("worker-{i}"),"prompt_file":prompt})
+        })
+        .collect();
+    let manifest = fixture.0.join("acceptance-tasks.json");
+    fs::write(&manifest, serde_json::to_vec(&tasks).unwrap()).unwrap();
+    let report = json(&batch(&fixture, &manifest, "2").output().unwrap());
+    let listed = json(
+        &fixture
+            .cli()
+            .args(["runs", "list", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(listed.as_array().unwrap().len(), 4);
+    for (i, task) in report["tasks"].as_array().unwrap().iter().enumerate() {
+        let id = task["run_id"].as_str().unwrap();
+        let inspect = || {
+            fixture
+                .cli()
+                .args(["runs", "show", id, "--json"])
+                .output()
+                .unwrap()
+        };
+        let first = inspect();
+        let shown = json(&first);
+        assert_eq!(first.stdout, inspect().stdout);
+        assert_eq!(shown["run"]["state"], "SUCCEEDED");
+        assert_eq!(shown["run"]["batch_id"], report["batch_id"]);
+        assert_eq!(shown["workspace"]["state"], "RECLAIMED");
+        assert!(shown["workspace"]["retention_reason"].is_null());
+        assert!(!Path::new(shown["workspace"]["managed_path"].as_str().unwrap()).exists());
+        assert_eq!(
+            shown["prepared_state"]["recipe_digest"],
+            base["recipe_digest"]
+        );
+        assert_eq!(shown["run"]["base_commit_sha"], base["source_commit_sha"]);
+        assert_eq!(shown["run"]["harness_version"], "fabric-fake-harness 1");
+        assert_eq!(shown["run"]["exit_code"], 0);
+        assert!(shown["run"]["pid_metadata"].is_string());
+        assert!(shown["run"]["finished_at"].is_number());
+        let files = json(
+            &fixture
+                .cli()
+                .args(["runs", "artifacts", id, "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(files["run_id"], id);
+        assert_eq!(
+            files["artifact_manifest_id"],
+            shown["run"]["artifact_manifest_id"]
+        );
+        for file in files["artifacts"].as_array().unwrap() {
+            let bytes = fs::read(
+                fixture
+                    .0
+                    .join("storage")
+                    .join(file["relative_path"].as_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(file["size_bytes"], bytes.len() as u64);
+            assert_eq!(file["sha256"], format!("{:x}", Sha256::digest(bytes)));
+        }
+        let recovered = restored_workspace(&fixture, &task["result"]);
+        assert_eq!(
+            fs::read_to_string(recovered.join("tracked")).unwrap(),
+            format!("tracked-{i}")
+        );
+        assert_eq!(
+            fs::read_to_string(recovered.join("new-source")).unwrap(),
+            format!("new-{i}")
+        );
+        assert!(!recovered.join(".deps").exists());
+        verified_manifest(&fixture, &task["result"]);
+        success(&fixture.cli().args(["runs", "show", id]).output().unwrap());
+        success(
+            &fixture
+                .cli()
+                .args(["runs", "artifacts", id])
+                .output()
+                .unwrap(),
+        );
+    }
+    assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"original");
+    assert_eq!(fs::read(base_path.join("tracked")).unwrap(), b"original");
+    assert_eq!(fs::read(base_path.join(".deps/setup-count")).unwrap(), b"x");
+    assert!(!base_path.join("new-source").exists());
+    assert!(
+        fs::read_dir(fixture.0.join("storage/fork-staging"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let project = json(
+        &fixture
+            .cli()
+            .args(["project", "status", "test", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        project["prepared_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|state| state["state_id"] == base["state_id"] && state["status"] == "READY")
+    );
+    for command in [
+        ["runs", "show", "missing", "--json"],
+        ["runs", "artifacts", "missing", "--json"],
+    ] {
+        let out = fixture.cli().args(command).output().unwrap();
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "not_found");
+    }
+    let out = fixture
+        .cli()
+        .args(["runs", "show", "../escape", "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        json(
+            &fixture
+                .cli()
+                .args(["storage", "status", "--json"])
+                .output()
+                .unwrap()
+        )["managed_bytes"]
+            .is_number()
+    );
+    assert_eq!(gc(&fixture, "--dry-run")["mode"], "dry_run");
+    assert_eq!(gc(&fixture, "--apply")["mode"], "apply");
+}
+
+#[test]
+fn inspection_reads_live_wal_without_migration_or_logical_writes() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let report = pending_workspace(&fixture);
+    let id = report["run_id"].as_str().unwrap();
+    let database = fixture.0.join("storage/fabric.db");
+    let wal = fixture.0.join("storage/fabric.db-wal");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let before_db = fs::read(&database).unwrap();
+    db.execute_batch("PRAGMA user_version=7; UPDATE workspaces SET retention_reason='live WAL evidence', lease_expires_at=9223372036854775807;").unwrap();
+    assert_eq!(fs::read(&database).unwrap(), before_db);
+    let before_wal = fs::read(&wal).unwrap();
+    assert!(before_wal.len() > 32);
+    let commands: Vec<Vec<&str>> = vec![
+        vec!["doctor", "--json"],
+        vec!["project", "status", "test", "--json"],
+        vec!["runs", "list", "--json"],
+        vec!["runs", "show", id, "--json"],
+        vec!["runs", "artifacts", id, "--json"],
+        vec!["storage", "status", "--json"],
+        vec!["storage", "gc", "--dry-run", "--json"],
+    ];
+    for command in commands {
+        let first = fixture.cli().args(&command).output().unwrap();
+        let value = json(&first);
+        let second = fixture.cli().args(&command).output().unwrap();
+        let repeated = json(&second);
+        if command[..2] != ["storage", "status"] {
+            assert_eq!(first.stdout, second.stdout, "{command:?}");
+        } else {
+            // Native free-space measurements can change independently of Fabric.
+            assert_eq!(value["workspaces"], repeated["workspaces"]);
+            assert_eq!(value["policy"], repeated["policy"]);
+        }
+        if command[..2] == ["runs", "show"] {
+            assert_eq!(value["workspace"]["retention_reason"], "live WAL evidence");
+            assert_eq!(value["workspace"]["lease_expires_at"], i64::MAX);
+        }
+        assert!(
+            !String::from_utf8(first.stdout)
+                .unwrap()
+                .contains("must-not-leak")
+        );
+    }
+    for command in ["show", "artifacts"] {
+        let out = fixture
+            .cli()
+            .args(["runs", command, "unknown", "--json"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+    }
+    assert_eq!(fs::read(&database).unwrap(), before_db);
+    assert_eq!(fs::read(&wal).unwrap(), before_wal);
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM cleanup_intents", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    assert_eq!(fs::read(tree.join("tracked")).unwrap(), b"worker tracked");
+    assert_eq!(
+        fs::read(tree.join("new source ; literal")).unwrap(),
+        b"worker untracked"
+    );
+}

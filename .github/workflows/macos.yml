@@ -1,0 +1,25 @@
+name: macOS acceptance
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt, clippy
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Strict lint
+        run: cargo clippy --offline --locked --workspace --all-targets -- -D warnings
+      - name: AT-01 through AT-14 (local fake harnesses only)
+        run: cargo test --offline --locked --workspace

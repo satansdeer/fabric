@@ -49,7 +49,7 @@ impl From<FabricError> for StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Project {
     pub project_id: ProjectId,
     pub name: String,
@@ -59,7 +59,7 @@ pub struct Project {
     pub created_at: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct PreparedState {
     pub state_id: PreparedStateId,
     pub project_id: ProjectId,
@@ -74,7 +74,7 @@ pub struct PreparedState {
     pub size_bytes: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Run {
     pub run_id: RunId,
     pub batch_id: Option<BatchId>,
@@ -99,7 +99,7 @@ pub struct Run {
     pub capture: Option<CaptureMetadata>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Workspace {
     pub workspace_id: WorkspaceId,
     pub run_id: RunId,
@@ -418,6 +418,15 @@ impl Store {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
+    }
+
+    pub fn run_ids(&self) -> Result<Vec<RunId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT run_id FROM runs ORDER BY run_id")?;
+        Ok(statement
+            .query_map([], |row| read_id(row, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn workspace_ids(&self) -> Result<Vec<WorkspaceId>> {

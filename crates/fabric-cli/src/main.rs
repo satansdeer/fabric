@@ -35,6 +35,13 @@ enum Commands {
     Run(RunArgs),
     /// Execute a task manifest through a bounded foreground worker pool.
     RunMany(RunManyArgs),
+    /// Inspect durable run and artifact metadata, including reclaimed workspaces.
+    Runs {
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: RunsCommands,
+    },
     /// Inspect storage or reclaim fully captured private workspaces.
     Storage {
         #[arg(long, global = true)]
@@ -143,6 +150,16 @@ enum ProjectCommands {
 }
 
 #[derive(Subcommand)]
+enum RunsCommands {
+    /// List persisted runs in stable Run ID order.
+    List,
+    /// Show run, workspace, process, retention and preparation provenance.
+    Show { id: fabric_domain::RunId },
+    /// List registered artifact paths, lengths and SHA-256 checksums.
+    Artifacts { id: fabric_domain::RunId },
+}
+
+#[derive(Subcommand)]
 enum StorageCommands {
     /// Best-effort logical usage, headroom, reservations and retention reasons.
     Status {
@@ -212,6 +229,7 @@ fn main() -> ExitCode {
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run(args) => (args.options.json, write_run(cli.root, args)),
         Commands::RunMany(args) => (args.options.json, write_run_many(cli.root, args)),
+        Commands::Runs { command, json } => (json, write_runs(cli.root, command, json)),
         Commands::Storage { command, json } => (json, write_storage(cli.root, command, json)),
     };
     match result {
@@ -408,7 +426,9 @@ fn write_project(
             }
             registration.project
         }
-        ProjectCommands::Status { name } => fabric_project::status(&root, &name)?,
+        ProjectCommands::Status { name } => {
+            return write_inspection(&fabric_core::inspect::project(&root, &name)?, json);
+        }
         ProjectCommands::Prepare { .. } => unreachable!("preparation handled above"),
     };
     let report = ProjectReport {
@@ -431,6 +451,30 @@ fn write_project(
         )
         .map_err(output_error)?;
     }
+    stdout.flush().map_err(output_error)
+}
+
+fn write_runs(root: Option<PathBuf>, command: RunsCommands, json: bool) -> Result<(), FabricError> {
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    match command {
+        RunsCommands::List => write_inspection(&fabric_core::inspect::list(&root)?, json),
+        RunsCommands::Show { id } => {
+            write_inspection(&fabric_core::inspect::show(&root, &id)?, json)
+        }
+        RunsCommands::Artifacts { id } => {
+            write_inspection(&fabric_core::inspect::artifacts(&root, &id)?, json)
+        }
+    }
+}
+
+fn write_inspection(report: &impl Serialize, json: bool) -> Result<(), FabricError> {
+    let mut stdout = io::stdout().lock();
+    if json {
+        serde_json::to_writer(&mut stdout, report).map_err(output_error)?;
+    } else {
+        serde_json::to_writer_pretty(&mut stdout, report).map_err(output_error)?;
+    }
+    writeln!(stdout).map_err(output_error)?;
     stdout.flush().map_err(output_error)
 }
 
