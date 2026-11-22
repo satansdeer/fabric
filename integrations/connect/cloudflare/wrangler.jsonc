@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "fabric-connect",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-07-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "send_metrics": false,
+  // Values are private bindings provisioned with wrangler secret put, never source.
+  // No GitHub token is hosted.
+  "secrets": {
+    "required": ["FABRIC_CONNECT_WEBHOOK_SECRET", "FABRIC_CONNECT_WORKER_TOKEN_SHA256", "FABRIC_CONNECT_WORKER_ID"]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "CONNECT_INBOX", "class_name": "ConnectInbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ConnectInbox"] }]
+}

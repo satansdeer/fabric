@@ -790,6 +790,7 @@ pub fn serve(
     });
     let (_, store) = open_store(&manager.root)?;
     let batches = store.async_unfinished_batches().map_err(error)?;
+    drop(store);
     for batch in &batches {
         manager.recover_batch(batch, None)?;
     }

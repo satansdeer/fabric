@@ -24,6 +24,10 @@ The C05 installed OMP 19.1.0 proof used real tools and separate fake workers, bu
 
 See [control surfaces](docs/CONTROL_SURFACES.md), [product boundary](docs/PRODUCT_BOUNDARY.md), [removals and compatibility](docs/REMOVALS.md), and the explicitly opt-in [live smoke guide](docs/LIVE_SMOKES.md).
 
+Issue-driven development: [local approval and worker workflow](docs/ISSUE_WORKFLOW.md), [roadmap #1](https://github.com/satansdeer/fabric/issues/1), and [bootstrap #16](https://github.com/satansdeer/fabric/issues/16). The first loop uses the existing local runtime; hosted Connect and plugin migration are not prerequisites. Provider-free checks do not prove model-backed dogfooding.
+
+Hosted GitHub intake: [Connect deployment and supervised consumer](docs/CONNECT.md), tracked in [#18](https://github.com/satansdeer/fabric/issues/18). Implementation passes provider-free end-to-end checks; launch is blocked by exhausted Netlify credits and missing `polyglo.tv` registration/delegation. A signed webhook queues work but cannot authorize execution or model spending.
+
 **Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v12 records immutable capture context; older runs lacking sufficient evidence remain retained.
 
 ```sh

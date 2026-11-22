@@ -1456,13 +1456,29 @@ fn assert_tree_stopped(fixture: &Fixture, report: &serde_json::Value) {
     }
 }
 
+fn tree_ready(tree: &Path) -> bool {
+    ["parent.heartbeat", "child.heartbeat"].iter().all(|name| {
+        let Ok(contents) = fs::read_to_string(tree.join(name)) else {
+            return false;
+        };
+        let Some((record, _)) = contents.split_once('\n') else {
+            return false;
+        };
+        (*name == "parent.heartbeat" && record == "leader exited")
+            || record
+                .strip_prefix("pid=")
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| pid > 0)
+    })
+}
+
 fn wait_for_tree(fixture: &Fixture) -> PathBuf {
     let start = std::time::Instant::now();
     loop {
         if let Ok(entries) = fs::read_dir(fixture.0.join("storage/fork-staging")) {
             for entry in entries {
                 let tree = entry.unwrap().path().join("tree");
-                if fs::metadata(tree.join("parent.heartbeat")).is_ok_and(|meta| meta.len() > 0) {
+                if tree_ready(&tree) {
                     return tree;
                 }
             }
@@ -1473,6 +1489,27 @@ fn wait_for_tree(fixture: &Fixture) -> PathBuf {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+#[test]
+fn tree_readiness_requires_complete_parent_and_child_records() {
+    let fixture = Fixture::new();
+    let parent = fixture.0.join("parent.heartbeat");
+    let child = fixture.0.join("child.heartbeat");
+    fs::write(&child, "pid=456\n.").unwrap();
+    for partial in ["", "pid=", "pid=123", "pid=\n", "pid=0\n"] {
+        fs::write(&parent, partial).unwrap();
+        assert!(!tree_ready(&fixture.0), "accepted parent {partial:?}");
+    }
+    fs::write(&parent, "pid=123\n.").unwrap();
+    assert!(tree_ready(&fixture.0));
+    fs::write(&child, "pid=456").unwrap();
+    assert!(!tree_ready(&fixture.0));
+    fs::write(&child, "pid=456\n.").unwrap();
+    fs::write(&parent, "leader exited").unwrap();
+    assert!(!tree_ready(&fixture.0));
+    fs::write(&parent, "leader exited\n").unwrap();
+    assert!(tree_ready(&fixture.0));
 }
 
 #[test]
