@@ -33,15 +33,35 @@ enum Commands {
     },
     /// Execute one harness worker in a private prepared-tree fork.
     Run(RunArgs),
+    /// Execute a task manifest through a bounded foreground worker pool.
+    RunMany(RunManyArgs),
 }
 
 #[derive(clap::Args)]
 struct RunArgs {
     name: String,
-    #[arg(long, value_parser = ["fake", "omp"])]
-    harness: String,
     #[arg(long)]
     prompt_file: PathBuf,
+    #[command(flatten)]
+    options: WorkerArgs,
+}
+
+#[derive(clap::Args)]
+struct RunManyArgs {
+    name: String,
+    /// JSON list of {id, prompt_file}; relative prompts resolve against its parent.
+    #[arg(long)]
+    tasks: PathBuf,
+    #[arg(long)]
+    concurrency: std::num::NonZeroUsize,
+    #[command(flatten)]
+    options: WorkerArgs,
+}
+
+#[derive(clap::Args)]
+struct WorkerArgs {
+    #[arg(long, value_parser = ["fake", "omp"])]
+    harness: String,
     /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
     #[arg(long)]
     fake_binary: Option<PathBuf>,
@@ -127,7 +147,8 @@ fn main() -> ExitCode {
     let (json, result) = match cli.command {
         Commands::Doctor { json } => (json, write_doctor(json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
-        Commands::Run(args) => (args.json, write_run(cli.root, args)),
+        Commands::Run(args) => (args.options.json, write_run(cli.root, args)),
+        Commands::RunMany(args) => (args.options.json, write_run_many(cli.root, args)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -139,51 +160,19 @@ fn main() -> ExitCode {
 }
 
 fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
-    let RunArgs {
-        name,
-        prompt_file,
-        harness: harness_name,
-        fake_binary,
-        copy_limit_bytes,
-        max_log_bytes,
-        json,
-    } = args;
-    let root = match root {
-        Some(root) => root,
-        None => fabric_project::default_root()?,
-    };
-    let run = |harness: &dyn fabric_runner::HarnessAdapter| {
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let report = with_harness(&args.options, |harness| {
         fabric_core::run::foreground(
             &root,
-            &name,
-            &prompt_file,
+            &args.name,
+            &args.prompt_file,
             harness,
-            copy_limit_bytes,
-            max_log_bytes,
+            args.options.copy_limit_bytes,
+            args.options.max_log_bytes,
         )
-    };
-    let report = match harness_name.as_str() {
-        "omp" => {
-            if fake_binary.is_some() {
-                return Err(FabricError {
-                    kind: ErrorKind::InvalidArguments,
-                    message: "--fake-binary is only valid with --harness fake.".into(),
-                });
-            }
-            run(&fabric_runner::OmpHarness::discover()?)?
-        }
-        _ => {
-            let binary = match fake_binary {
-                Some(binary) => binary,
-                None => std::env::current_exe()
-                    .map_err(output_error)?
-                    .with_file_name("fabric-fake-harness"),
-            };
-            run(&fabric_runner::FakeHarness::new(binary)?)?
-        }
-    };
+    })?;
     let mut stdout = io::stdout().lock();
-    if json {
+    if args.options.json {
         serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
         writeln!(stdout).map_err(output_error)?;
     } else {
@@ -199,6 +188,80 @@ fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
         return Err(output_error(format!(
             "Run {} failed (exit {:?}); workspace retained.",
             report.run_id, report.exit_code
+        )));
+    }
+    Ok(())
+}
+
+fn with_harness<T>(
+    options: &WorkerArgs,
+    run: impl FnOnce(&(dyn fabric_runner::HarnessAdapter + Sync)) -> Result<T, FabricError>,
+) -> Result<T, FabricError> {
+    match options.harness.as_str() {
+        "omp" => {
+            if options.fake_binary.is_some() {
+                return Err(FabricError {
+                    kind: ErrorKind::InvalidArguments,
+                    message: "--fake-binary is only valid with --harness fake.".into(),
+                });
+            }
+            run(&fabric_runner::OmpHarness::discover()?)
+        }
+        _ => {
+            let binary = match &options.fake_binary {
+                Some(binary) => binary.clone(),
+                None => std::env::current_exe()
+                    .map_err(output_error)?
+                    .with_file_name("fabric-fake-harness"),
+            };
+            run(&fabric_runner::FakeHarness::new(binary)?)
+        }
+    }
+}
+
+fn write_run_many(root: Option<PathBuf>, args: RunManyArgs) -> Result<(), FabricError> {
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let report = with_harness(&args.options, |harness| {
+        fabric_core::run::run_many(
+            &root,
+            &args.name,
+            &args.tasks,
+            args.concurrency.get(),
+            harness,
+            args.options.copy_limit_bytes,
+            args.options.max_log_bytes,
+        )
+    })?;
+    let mut stdout = io::stdout().lock();
+    if args.options.json {
+        serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
+        writeln!(stdout).map_err(output_error)?;
+    } else {
+        writeln!(
+            stdout,
+            "Batch: {}\nSucceeded: {}",
+            report.batch_id, report.succeeded
+        )
+        .map_err(output_error)?;
+        for task in &report.tasks {
+            writeln!(
+                stdout,
+                "Task {}: Run {} — {}",
+                task.id,
+                task.run_id,
+                match &task.result {
+                    Some(run) => format!("{:?} (exit {:?})", run.state, run.exit_code),
+                    None => task.error.as_deref().unwrap_or("incomplete").to_owned(),
+                }
+            )
+            .map_err(output_error)?;
+        }
+    }
+    stdout.flush().map_err(output_error)?;
+    if !report.succeeded {
+        return Err(output_error(format!(
+            "Batch {} failed; individual results are preserved.",
+            report.batch_id
         )));
     }
     Ok(())

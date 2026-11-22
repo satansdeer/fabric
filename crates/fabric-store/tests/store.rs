@@ -36,7 +36,7 @@ fn prepared() -> PreparedState {
 fn pair(index: usize) -> (Run, Workspace) {
     let run = Run {
         run_id: format!("run-{index}").parse().unwrap(),
-        batch_id: Some("batch-1".parse().unwrap()),
+        batch_id: None,
         project_id: project().project_id,
         prepared_state_id: prepared().state_id,
         base_commit_sha: prepared().source_commit_sha,
@@ -129,7 +129,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -155,7 +155,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     drop(store);
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch("ALTER TABLE runs DROP COLUMN capture_metadata; PRAGMA user_version=1;")
+        .execute_batch("DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN capture_metadata; PRAGMA user_version=1;")
         .unwrap();
     drop(connection);
     let reopened = Store::open(&path).unwrap();
@@ -169,7 +169,91 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
+}
+
+#[test]
+fn v2_database_upgrades_without_losing_run_ownership() {
+    let (root, mut store) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = pair(1);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(
+        "DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; PRAGMA user_version=2;",
+    ).unwrap();
+    drop(connection);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.run(&run.run_id).unwrap(), Some(run));
+    assert_eq!(
+        reopened.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+}
+
+#[test]
+fn batch_registration_and_results_are_atomic_and_one_shot() {
+    use fabric_store::BatchTask;
+    let (root, mut store) = fixture();
+    let id = "batch-1".parse().unwrap();
+    let tasks = vec![
+        BatchTask {
+            task_id: "first".into(),
+            run_id: "run-1".parse().unwrap(),
+            prompt_file: "/first".into(),
+            result: None,
+            error: None,
+        },
+        BatchTask {
+            task_id: "first".into(),
+            run_id: "run-2".parse().unwrap(),
+            prompt_file: "/second".into(),
+            result: None,
+            error: None,
+        },
+    ];
+    assert!(
+        store
+            .create_batch(&id, &prepared().state_id, &tasks)
+            .is_err()
+    );
+    assert!(store.batch_tasks(&id).unwrap().is_empty());
+    let mut tasks = tasks;
+    tasks[1].task_id = "second".into();
+    store
+        .create_batch(&id, &prepared().state_id, &tasks)
+        .unwrap();
+    assert_eq!(store.batch_succeeded(&id).unwrap(), None);
+    assert!(store.finish_batch(&id, true).is_err());
+    let (mut run, workspace) = pair(1);
+    run.batch_id = Some(id.clone());
+    store.create_run_workspace(&run, &workspace).unwrap();
+    let (mut unregistered, workspace) = pair(3);
+    unregistered.batch_id = Some(id.clone());
+    assert!(
+        store
+            .create_run_workspace(&unregistered, &workspace)
+            .is_err()
+    );
+    store
+        .finish_batch_task(&tasks[0].run_id, Ok("{\"exit_code\":0}"))
+        .unwrap();
+    assert!(
+        store
+            .finish_batch_task(&tasks[0].run_id, Err("overwrite"))
+            .is_err()
+    );
+    store
+        .finish_batch_task(&tasks[1].run_id, Err("prelaunch failure"))
+        .unwrap();
+    store.finish_batch(&id, false).unwrap();
+    drop(store);
+    let reopened = Store::open(root.path().join("fabric.sqlite3")).unwrap();
+    assert_eq!(reopened.batch_succeeded(&id).unwrap(), Some(false));
+    let saved = reopened.batch_tasks(&id).unwrap();
+    assert_eq!(saved[0].result.as_deref(), Some("{\"exit_code\":0}"));
+    assert_eq!(saved[1].error.as_deref(), Some("prelaunch failure"));
 }
 
 #[test]

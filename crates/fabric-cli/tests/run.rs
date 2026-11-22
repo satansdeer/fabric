@@ -458,3 +458,247 @@ wait
         *capture
     );
 }
+
+fn batch(fixture: &Fixture, manifest: &Path, concurrency: &str) -> Command {
+    let mut command = fixture.cli();
+    command
+        .args(["run-many", "test", "--harness", "fake", "--tasks"])
+        .arg(manifest)
+        .args([
+            "--concurrency",
+            concurrency,
+            "--copy-limit-bytes",
+            "10485760",
+            "--json",
+        ]);
+    command
+}
+
+#[test]
+fn run_many_caps_actual_external_workers_and_durably_associates_results() {
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let (repo, base) = fixture.setup();
+    let bin = fixture.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("omp");
+    let journal = fixture.0.join("activity");
+    fs::write(
+        &executable,
+        format!(
+            r#"#!/bin/sh
+set -eu
+lock='{}/lock'
+journal='{}'
+if [ "$1" = --version ]; then
+  printf 'probe\n' >> "$journal.probes"; printf 'omp/fixture\n'; exit 0
+fi
+test "$(cat .deps/ready)" = ready
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+printf 'start %s\n' "$$" >> "$journal"
+rmdir "$lock"
+i=0
+while [ "$(grep -c '^start ' "$journal")" -lt 2 ]; do
+  i=$((i+1)); test "$i" -lt 500; sleep 0.01
+done
+sleep 0.1
+printf '%s' "$7" > tracked
+printf '{{"result":"%s"}}\n' "$7"
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+printf 'end %s\n' "$$" >> "$journal"
+rmdir "$lock"
+"#,
+            fixture.0.display(),
+            journal.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let prompts = fixture.0.join("manifests");
+    fs::create_dir(&prompts).unwrap();
+    let tasks: Vec<_> = (0..4)
+        .map(|i| {
+            fs::write(prompts.join(format!("{i}.txt")), format!("task-{i}")).unwrap();
+            serde_json::json!({"id":format!("task-{i}"), "prompt_file":format!("{i}.txt")})
+        })
+        .collect();
+    let manifest = prompts.join("tasks.json");
+    fs::write(&manifest, serde_json::to_vec(&tasks).unwrap()).unwrap();
+    let out = fixture
+        .cli()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["run-many", "test", "--harness", "omp", "--tasks"])
+        .arg(&manifest)
+        .args([
+            "--concurrency",
+            "2",
+            "--copy-limit-bytes",
+            "10485760",
+            "--json",
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(journal.with_extension("probes")).unwrap(),
+        "probe\n"
+    );
+    let report = json(&out);
+    assert_eq!(report["succeeded"], true);
+    let mut active = HashSet::new();
+    let mut peak = 0;
+    let mut starts = 0;
+    for line in fs::read_to_string(journal).unwrap().lines() {
+        let (event, pid) = line.split_once(' ').unwrap();
+        if event == "start" {
+            assert!(active.insert(pid.to_owned()));
+            starts += 1;
+            peak = peak.max(active.len());
+        } else {
+            assert!(active.remove(pid));
+        }
+        assert!(active.len() <= 2);
+    }
+    assert_eq!(starts, 4);
+    assert_eq!(peak, 2);
+    assert!(active.is_empty());
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let batch_id =
+        fabric_domain::BatchId::try_from(report["batch_id"].as_str().unwrap().to_owned()).unwrap();
+    let durable = store.batch_tasks(&batch_id).unwrap();
+    assert_eq!(store.batch_succeeded(&batch_id).unwrap(), Some(true));
+    assert_eq!(durable.len(), 4);
+    let mut runs = HashSet::new();
+    let mut workspaces = HashSet::new();
+    for (i, task) in report["tasks"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(task["id"], format!("task-{i}"));
+        let result = &task["result"];
+        let run_id =
+            fabric_domain::RunId::try_from(task["run_id"].as_str().unwrap().to_owned()).unwrap();
+        assert!(runs.insert(run_id.clone()));
+        assert_eq!(result["run_id"], task["run_id"]);
+        let run = store.run(&run_id).unwrap().unwrap();
+        assert_eq!(run.batch_id.as_ref(), Some(&batch_id));
+        assert_eq!(run.prepared_state_id.as_str(), base["state_id"]);
+        assert_eq!(run.state, fabric_domain::RunState::Succeeded);
+        assert!(workspaces.insert(run.workspace_id.clone()));
+        let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(Path::new(&workspace.managed_path).join("tracked")).unwrap(),
+            format!("task-{i}")
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&workspace.managed_path).join(".deps/ready")).unwrap(),
+            "ready"
+        );
+        assert_eq!(durable[i].task_id, task["id"]);
+        assert_eq!(durable[i].run_id, run_id);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(durable[i].result.as_ref().unwrap()).unwrap(),
+            *result
+        );
+        assert!(durable[i].error.is_none());
+    }
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(base["prepared_path"].as_str().unwrap()).join("tracked"))
+            .unwrap(),
+        "original"
+    );
+    assert_eq!(fixture.prepare()["state_id"], base["state_id"]);
+}
+
+#[test]
+fn run_many_preserves_mixed_exit_and_prelaunch_failure_and_rejects_invalid_input() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    let manifest = fixture.0.join("tasks.json");
+    for exit in [0, 7] {
+        fs::write(
+            fixture.0.join(format!("{exit}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "required_files":[".deps/ready"], "exit_code":exit,
+                "writes":[{"path":"tracked","content":format!("exit-{exit}")}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let probe_marker = fixture.0.join("unexpected-probe");
+    let probe = fixture.0.join("probe");
+    fs::write(
+        &probe,
+        format!("#!/bin/sh\ntouch '{}'\nexit 99\n", probe_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+    for (input, concurrency) in [
+        ("[]", "2"),
+        ("not json", "2"),
+        (
+            r#"[{"id":"a","prompt_file":"0.json"},{"id":"a","prompt_file":"7.json"}]"#,
+            "2",
+        ),
+        (r#"[{"id":"","prompt_file":"0.json"}]"#, "2"),
+        (r#"[{"id":" ","prompt_file":"0.json"}]"#, "2"),
+        (r#"[{"id":"a","prompt_file":""}]"#, "2"),
+        (r#"[{"prompt_file":"0.json"}]"#, "2"),
+        (r#"[{"id":"a","prompt_file":7}]"#, "2"),
+        (
+            r#"[{"id":"a","prompt_file":"0.json","unexpected":true}]"#,
+            "2",
+        ),
+        (r#"[{"id":"a","prompt_file":"0.json"}]"#, "0"),
+        (r#"[{"id":"a","prompt_file":"0.json"}]"#, "-1"),
+    ] {
+        fs::write(&manifest, input).unwrap();
+        let out = batch(&fixture, &manifest, concurrency)
+            .arg("--fake-binary")
+            .arg(&probe)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(!fixture.0.join("storage/fork-staging").exists());
+        assert!(
+            !probe_marker.exists(),
+            "invalid input launched an external probe"
+        );
+    }
+    fs::write(&manifest, r#"[{"id":"ok","prompt_file":"0.json"},{"id":"nonzero","prompt_file":"7.json"},{"id":"missing","prompt_file":"missing.json"}]"#).unwrap();
+    let out = batch(&fixture, &manifest, "2").output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["succeeded"], false);
+    let tasks = report["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks[0]["result"]["exit_code"], 0);
+    assert_eq!(tasks[0]["result"]["state"], "SUCCEEDED");
+    assert_eq!(tasks[1]["result"]["exit_code"], 7);
+    assert_eq!(tasks[1]["result"]["state"], "FAILED");
+    assert!(tasks[2]["result"].is_null());
+    assert!(tasks[2]["error"].as_str().unwrap().contains("missing.json"));
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let batch_id =
+        fabric_domain::BatchId::try_from(report["batch_id"].as_str().unwrap().to_owned()).unwrap();
+    let durable = store.batch_tasks(&batch_id).unwrap();
+    assert_eq!(store.batch_succeeded(&batch_id).unwrap(), Some(false));
+    assert_eq!(durable.len(), 3);
+    assert!(store.run(&durable[2].run_id).unwrap().is_none());
+    for (task, saved) in tasks.iter().zip(durable) {
+        assert_eq!(saved.run_id.as_str(), task["run_id"]);
+        assert_eq!(saved.task_id, task["id"]);
+        if task["error"].is_null() {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&saved.result.unwrap()).unwrap(),
+                task["result"]
+            );
+        } else {
+            assert_eq!(saved.error.as_deref(), task["error"].as_str());
+        }
+    }
+}

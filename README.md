@@ -2,7 +2,7 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-12
+## Implemented: FAB-01 through FAB-13
 
 The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground fake/OMP harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Durable artifact capture and cleanup commands are not implemented yet.
 
@@ -134,6 +134,27 @@ The core persists PREPARING before fork work, RUNNING with the actual child PID/
 
 **No source artifacts are claimed.** Tracked/untracked edits, exact `prompt.input`, capped raw logs and `events.jsonl` remain in the owner-only workspace/container with an explicit capture-pending retention reason; artifact-manifest ID stays null. FAB-14 adds cancellation/timeouts and FAB-15–17 durable source artifacts/cleanup. No GC or deletion path exists; startup reservations are not renewed execution leases and expiry never authorizes deleting retained work. Use finite trusted workloads: capped output does not bound run duration, workspace writes or model spending.
 
+### Run a bounded task batch
+
+```sh
+./target/debug/fabric --root /private/path/to/fabric run-many my-project \
+  --harness fake --tasks ./batch/tasks.json --concurrency 2 --json
+```
+
+The manifest is a nonempty JSON array with exactly `id` and `prompt_file` fields per task:
+
+```json
+[{"id":"first","prompt_file":"first.json"},{"id":"second","prompt_file":"second.json"}]
+```
+
+IDs must be nonempty and unique within the batch. Prompt paths are resolved against the **manifest's parent directory**, not the project, worker cwd or CLI cwd; absolute prompt paths stay absolute. For the example above, `first.json` means `./batch/first.json`. Malformed/empty manifests, duplicate/blank IDs, empty prompt paths, unknown fields and nonpositive concurrency are rejected before any worker or version probe launches. `--concurrency N` is required and positive.
+
+A pool of at most `min(N, task_count)` threads admits external workers through the same foreground execution path as `run`, with no per-task thread creation. One READY full prepared tree and one probed harness version are pinned for the entire batch; every task gets its own stable Run ID and isolated full-tree workspace, including ignored dependencies. Preparation is reused, not rerun per task. Harness, copy-admission and capture options are the same as `run`; capture limits are **per run**, not a total batch disk quota. Real OMP execution still requires explicit spending approval.
+
+Before admission, SQLite schema v3 records the Batch ID, pinned prepared-state ID, ordered task IDs, resolved prompt paths and assigned Run IDs. Each task durably records its ordinary Run report or a prelaunch error; launched Runs also carry their Batch ID and separate Workspace ID. A missing/unreadable prompt remains a reported task error with its assigned Run ID even though no workspace was created. One task's failure does not stop independent tasks. JSON stdout contains ordered `tasks` with `id`, `run_id`, `result` or `error`, plus `batch_id` and `succeeded`; it remains available when the command exits nonzero. Completed aggregate success/failure is also persisted. A zero CLI exit requires every task to succeed. Infrastructure errors can leave durable pending task records; this story does not resume or reconcile interrupted batches.
+
+Cancellation and execution timeouts remain FAB-14. Batches do not authorize deletion, artifact capture or GC; all existing retention and startup-reservation limitations still apply.
+
 ### Installed OMP adapter (manual execution requires spending approval)
 
 After explicit approval for model spending, the corresponding command is:
@@ -143,7 +164,7 @@ After explicit approval for model spending, the corresponding command is:
   --harness omp --prompt-file ./prompt.md --copy-limit-bytes 104857600 --json
 ```
 
-OMP discovery reuses doctor's executable PATH lookup, resolving relative entries before changing cwd. Missing OMP fails with installation/PATH guidance before creating a run or workspace. Every run probes the selected executable using `--version`; the exact returned version line (minus CR/LF) is persisted, not a configured version. The installed macOS binary was observed on 2026-11-22 as `omp/19.1.0`; its actual `--help` documents print mode, JSON mode, positional messages, `--no-session` and `--no-title`. Only version/help probes were executed; **AT-15 actual model smoke is not complete**.
+OMP discovery reuses doctor's executable PATH lookup, resolving relative entries before changing cwd. Missing OMP fails with installation/PATH guidance before creating a run or workspace. Each single run or batch probes the selected executable once using `--version`; the exact returned version line (minus CR/LF) is persisted, not a configured version. The installed macOS binary was observed on 2026-11-22 as `omp/19.1.0`; its actual `--help` documents print mode, JSON mode, positional messages, `--no-session` and `--no-title`. Only version/help probes were executed; **AT-15 actual model smoke is not complete**.
 
 The existing foreground runner launches `omp -p --mode json --no-session --no-title -- PROMPT` in the freshly validated private fork. UTF-8 prompt snapshot contents are one argv value, verbatim including leading flags, newlines, quotes, shell characters and empty input. NUL/non-UTF-8 inputs fail clearly; operating-system argv size limits still apply. There is no shell interpolation or Fabric prompt-file expansion. OMP may interpret its own message syntax (for example leading `@` file references); argv fidelity is not a promise to disable OMP's message semantics.
 
@@ -157,7 +178,7 @@ The runner reserves enough space for `\n[FABRIC CAPTURE TRUNCATED]\n` up front (
 
 Stdout is decoded concurrently with a 64 KiB maximum line buffer and serde_json's recursion limit, retaining only one decoded value and one reused bounded serialized record buffer. Oversized lines drain without accumulating; parsing resumes at the next newline. Malformed JSON/UTF-8 does not fail an otherwise successful harness. CRLF and final unterminated lines work. Each persisted event is a complete JSONL record with `line_number` (one-based), `line_bytes` (excluding LF, including any CR), `status` (`parsed`, `invalid` or `oversized`) and `value` only for parsed JSON. Invalid/oversized records store no raw line contents. Report/metadata counts cover the **entire drained stdout**, including events omitted after truncation; the structured file may consequently contain fewer records than those counts.
 
-`capture` in JSON reports and reopened Run records contains the configured limit, actual combined persisted bytes, truncation flag, both streams' full observed byte counts, event counts, and per-file length/SHA-256. Checksums are computed incrementally over exactly the persisted bytes (including the marker), and all three files are synced before terminal metadata is committed atomically in SQLite. Database schema v1 upgrades to v2 without changing prior run ownership. Capture failure retains the workspace and records NEEDS_ATTENTION, preserving an already observed child exit; truncation itself does not change the harness exit result. These output checksums are not source artifact manifests or deletion authority.
+`capture` in JSON reports and reopened Run records contains the configured limit, actual combined persisted bytes, truncation flag, both streams' full observed byte counts, event counts, and per-file length/SHA-256. Checksums are computed incrementally over exactly the persisted bytes (including the marker), and all three files are synced before terminal metadata is committed atomically in SQLite. Database schemas v1/v2 upgrade transactionally to v3 without changing prior run ownership (v2 adds capture metadata; v3 adds batches). Capture failure retains the workspace and records NEEDS_ATTENTION, preserving an already observed child exit; truncation itself does not change the harness exit result. These output checksums are not source artifact manifests or deletion authority.
 
 Environment selection remains the explicit allowlist above; Fabric does not discover credentials or generically redact arbitrary trusted-harness output. Avoid prompts or tool output containing secrets.
 

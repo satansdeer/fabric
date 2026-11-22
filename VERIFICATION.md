@@ -91,3 +91,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed shared capture budget, reserved truncation marker, concurrent stream draining, bounded event serialization and streamed checksums.
 - Independently ran all five CLI worker tests: passed. The 100 MiB concurrent-output regression verifies combined persisted logs/events stay within 10 MiB and reopened metadata/checksums.
 - Implementer fmt/clippy/workspace gates passed (79 tests). Output limits do not claim workspace quotas or artifact completion.
+
+## FAB-13
+
+- Reviewed fixed-size worker pool, once-per-batch prepared-state/version selection and durable ordered task results.
+- Independently ran both batch CLI regressions: passed. Four external workers demonstrate peak two with cap two; mixed exit/prelaunch failures preserve individual outcomes and make batch unsuccessful.
+- Implementer final fmt/clippy/workspace gates passed (83 tests).

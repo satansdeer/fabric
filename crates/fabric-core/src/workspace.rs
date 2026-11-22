@@ -66,7 +66,9 @@ pub fn create_workspace(
     let path = fork_path(&root, &request.workspace_id);
     let run = Run {
         run_id: request.run_id.clone(),
-        batch_id: None,
+        batch_id: store
+            .batch_for_run(&request.run_id)
+            .map_err(storage_error)?,
         project_id: state.project_id.clone(),
         prepared_state_id: state.state_id.clone(),
         base_commit_sha: state.source_commit_sha.clone(),

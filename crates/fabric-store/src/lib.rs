@@ -124,6 +124,15 @@ pub struct Store {
     connection: Connection,
 }
 
+#[derive(Debug)]
+pub struct BatchTask {
+    pub task_id: String,
+    pub run_id: RunId,
+    pub prompt_file: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
 impl Store {
     /// Opens a file-backed WAL database. The parent directory must already exist.
     /// New database files are owner-only on Unix; callers own storage-root validation.
@@ -157,15 +166,152 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1 | 2 => {}
+            1..=3 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
             transaction.execute_batch("ALTER TABLE runs ADD COLUMN capture_metadata TEXT;")?;
             transaction.pragma_update(None, "user_version", 2)?;
         }
+        if version < 3 {
+            transaction.execute_batch(
+                "CREATE TABLE batches (
+                    batch_id TEXT PRIMARY KEY NOT NULL,
+                    prepared_state_id TEXT NOT NULL REFERENCES prepared_states(state_id),
+                    succeeded INTEGER CHECK(succeeded IN (0, 1))
+                 );
+                 CREATE TABLE batch_tasks (
+                    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+                    position INTEGER NOT NULL CHECK(position >= 0),
+                    task_id TEXT NOT NULL CHECK(length(task_id) > 0),
+                    run_id TEXT NOT NULL UNIQUE,
+                    prompt_file TEXT NOT NULL CHECK(length(prompt_file) > 0),
+                    result TEXT,
+                    error TEXT,
+                    PRIMARY KEY(batch_id, task_id),
+                    UNIQUE(batch_id, position),
+                    CHECK(result IS NULL OR error IS NULL)
+                 );
+                 CREATE TRIGGER run_requires_batch_task BEFORE INSERT ON runs
+                 WHEN NEW.batch_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM batch_tasks t JOIN batches b ON b.batch_id = t.batch_id
+                    WHERE t.run_id = NEW.run_id AND t.batch_id = NEW.batch_id
+                      AND b.prepared_state_id = NEW.prepared_state_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'run requires matching batch task and prepared state'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 3)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
+    }
+
+    /// Register every task and stable Run ID before admitting any worker.
+    /// Run IDs intentionally have no foreign key: prelaunch errors may have no workspace.
+    pub fn create_batch(
+        &mut self,
+        id: &BatchId,
+        state: &PreparedStateId,
+        tasks: &[BatchTask],
+    ) -> Result<()> {
+        if tasks.is_empty() {
+            return Err(StoreError::InvalidRecord("batch requires tasks"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO batches (batch_id, prepared_state_id) VALUES (?1, ?2)",
+            params![id.as_str(), state.as_str()],
+        )?;
+        for (position, task) in tasks.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO batch_tasks (batch_id, position, task_id, run_id, prompt_file)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id.as_str(),
+                    position as i64,
+                    task.task_id,
+                    task.run_id.as_str(),
+                    task.prompt_file
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_batch_task(
+        &self,
+        run: &RunId,
+        outcome: std::result::Result<&str, &str>,
+    ) -> Result<()> {
+        let (result, error) = match outcome {
+            Ok(value) => (Some(value), None),
+            Err(value) => (None, Some(value)),
+        };
+        if self.connection.execute(
+            "UPDATE batch_tasks SET result = ?1, error = ?2
+             WHERE run_id = ?3 AND result IS NULL AND error IS NULL",
+            params![result, error, run.as_str()],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub fn batch_tasks(&self, id: &BatchId) -> Result<Vec<BatchTask>> {
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, run_id, prompt_file, result, error FROM batch_tasks
+             WHERE batch_id = ?1 ORDER BY position",
+        )?;
+        Ok(statement
+            .query_map([id.as_str()], |row| {
+                Ok(BatchTask {
+                    task_id: row.get(0)?,
+                    run_id: read_id(row, 1)?,
+                    prompt_file: row.get(2)?,
+                    result: row.get(3)?,
+                    error: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn batch_for_run(&self, run: &RunId) -> Result<Option<BatchId>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT batch_id FROM batch_tasks WHERE run_id = ?1",
+                [run.as_str()],
+                |row| read_id(row, 0),
+            )
+            .optional()?)
+    }
+
+    pub fn finish_batch(&self, id: &BatchId, succeeded: bool) -> Result<()> {
+        if self.connection.execute(
+            "UPDATE batches SET succeeded = ?1 WHERE batch_id = ?2 AND succeeded IS NULL
+             AND NOT EXISTS (SELECT 1 FROM batch_tasks WHERE batch_id = ?2
+                             AND result IS NULL AND error IS NULL)",
+            params![succeeded, id.as_str()],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub fn batch_succeeded(&self, id: &BatchId) -> Result<Option<bool>> {
+        self.connection
+            .query_row(
+                "SELECT succeeded FROM batches WHERE batch_id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
     }
 
     pub fn create_project(&self, project: &Project) -> Result<()> {
