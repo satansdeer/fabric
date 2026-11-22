@@ -23,6 +23,18 @@ const METADATA_CAP: usize = 64 * 1024;
 /// Parse first, snapshot declared environment once, then resolve current HEAD once.
 /// The registration's persisted SHA is historical identity and is never rewritten.
 pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedState, FabricError> {
+    prepare_with_admission(root, name, recipe_path, || Ok(()))
+}
+
+/// Reuse follows the same locked identity/provenance validation as ordinary preparation.
+/// Admission runs only for a fresh tree, under its key lock and before durable allocation.
+/// Callers coordinating root-wide eviction must acquire the root lease before calling.
+pub fn prepare_with_admission(
+    root: &Path,
+    name: &str,
+    recipe_path: &Path,
+    admit_fresh: impl FnOnce() -> Result<(), FabricError>,
+) -> Result<PreparedState, FabricError> {
     let recipe = Recipe::parse(&fs::read_to_string(recipe_path).map_err(storage_error)?)?;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(recipe.max_duration_seconds()))
@@ -121,6 +133,7 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
         verify_ready(&root, &state, deadline)?;
         return Ok(state);
     }
+    admit_fresh()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(storage_error)?;
@@ -359,7 +372,26 @@ fn verify_ready(root: &Path, state: &PreparedState, deadline: Instant) -> Result
     Ok(())
 }
 
-fn preparation_lock(root: &Path, key: &str, deadline: Instant) -> Result<File, FabricError> {
+pub struct PreparationLease(File);
+impl Drop for PreparationLease {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Coordinates cache deletion with direct library preparation/reuse of the same key.
+pub fn lock_prepared(root: &Path, key: &str) -> Result<PreparationLease, FabricError> {
+    if key.is_empty() || key.contains('/') || key == "." || key == ".." {
+        return Err(storage_error("Invalid preparation lock key"));
+    }
+    preparation_lock(root, key, Instant::now() + Duration::from_secs(5))
+}
+
+fn preparation_lock(
+    root: &Path,
+    key: &str,
+    deadline: Instant,
+) -> Result<PreparationLease, FabricError> {
     let directory = root.join("preparation-locks");
     ensure_private_directory(&directory)?;
     let file = OpenOptions::new()
@@ -386,7 +418,7 @@ fn preparation_lock(root: &Path, key: &str, deadline: Instant) -> Result<File, F
         check_deadline(deadline)?;
         // SAFETY: file owns this descriptor for the entire lock lifetime.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
+            return Ok(PreparationLease(file));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::WouldBlock

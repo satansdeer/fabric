@@ -201,7 +201,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=6 => {}
+            1..=7 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -315,6 +315,23 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 6)?;
         }
+        if version < 7 {
+            transaction.execute_batch(
+                "CREATE TABLE storage_reservations (
+                    token TEXT PRIMARY KEY NOT NULL,
+                    state_id TEXT REFERENCES prepared_states(state_id),
+                    bytes INTEGER NOT NULL CHECK(bytes > 0)
+                 );
+                 CREATE TABLE cache_evictions (
+                    state_id TEXT PRIMARY KEY NOT NULL,
+                    container_name TEXT NOT NULL UNIQUE,
+                    authority TEXT NOT NULL
+                 );
+                 CREATE TRIGGER immutable_cache_eviction_update BEFORE UPDATE ON cache_evictions
+                 BEGIN SELECT RAISE(ABORT, 'cache eviction intent is immutable'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 7)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -387,7 +404,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=6) {
+        if !matches!(version, 5..=7) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -662,6 +679,133 @@ impl Store {
             .optional()?)
     }
 
+    pub fn prepared_states(&self) -> Result<Vec<PreparedState>> {
+        let mut statement = self.connection.prepare(
+            "SELECT state_id, project_id, preparation_key, source_commit_sha, recipe_digest,
+             harness_environment_digest, prepared_path, status, created_at, verified_at, size_bytes
+             FROM prepared_states ORDER BY verified_at, state_id",
+        )?;
+        Ok(statement
+            .query_map([], read_prepared_state)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Historical provenance and pinned batches are never disposable caches.
+    pub fn cache_retention(&self, id: &PreparedStateId) -> Result<Option<String>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let reserved = version >= 7
+            && self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM storage_reservations WHERE state_id = ?1)",
+                [id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+        Ok(self.connection.query_row(
+            "SELECT CASE
+             WHEN status != 'READY' THEN 'not_ready'
+             WHEN EXISTS (SELECT 1 FROM runs WHERE prepared_state_id = ?1)
+               OR EXISTS (SELECT 1 FROM batches WHERE prepared_state_id = ?1)
+               OR EXISTS (SELECT 1 FROM workspaces WHERE state_id = ?1) THEN 'historical_reference'
+             WHEN ?2 THEN 'admitted_worker'
+             WHEN NOT EXISTS (SELECT 1 FROM prepared_states newer
+               WHERE newer.project_id = prepared_states.project_id AND newer.status = 'READY'
+                 AND newer.source_commit_sha = prepared_states.source_commit_sha
+                 AND (newer.verified_at > prepared_states.verified_at
+                   OR (newer.verified_at = prepared_states.verified_at AND newer.state_id > prepared_states.state_id)))
+               THEN 'selected_state' ELSE NULL END
+             FROM prepared_states WHERE state_id = ?1", params![id.as_str(), reserved], |row| row.get(0))?)
+    }
+
+    pub fn reserved_storage_bytes(&self) -> Result<u64> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 7 {
+            return Ok(0);
+        }
+        Ok(self.connection.query_row(
+            "SELECT COALESCE(sum(bytes), 0) FROM storage_reservations",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn reserve_storage(
+        &self,
+        token: &str,
+        state: Option<&PreparedStateId>,
+        bytes: u64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO storage_reservations VALUES (?1, ?2, ?3)",
+            params![token, state.map(PreparedStateId::as_str), bytes],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_storage(&self, token: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM storage_reservations WHERE token = ?1", [token])?;
+        Ok(())
+    }
+
+    /// Root cleanup lease must cover validation, metadata cutover and physical deletion.
+    /// Delete only an unreferenced row; a same-key preparation can then be rebuilt.
+    pub fn begin_cache_eviction(
+        &mut self,
+        state: &PreparedState,
+        name: &str,
+        authority: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT status, prepared_path FROM prepared_states WHERE state_id=?1",
+                [state.state_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if current != Some(("READY".into(), state.prepared_path.clone())) {
+            return Err(StoreError::Conflict);
+        }
+        transaction.execute(
+            "INSERT INTO cache_evictions VALUES (?1, ?2, ?3)",
+            params![state.state_id.as_str(), name, authority],
+        )?;
+        if transaction.execute(
+            "DELETE FROM prepared_states WHERE state_id=?1 AND NOT EXISTS
+             (SELECT 1 FROM storage_reservations WHERE state_id=?1)",
+            [state.state_id.as_str()],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cache_evictions(&self) -> Result<Vec<(String, String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT state_id, container_name, authority FROM cache_evictions ORDER BY state_id",
+        )?;
+        Ok(statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn finish_cache_eviction(&self, id: &str, authority: &str) -> Result<()> {
+        if self.connection.execute(
+            "DELETE FROM cache_evictions WHERE state_id=?1 AND authority=?2",
+            params![id, authority],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
     pub fn create_prepared_state(&self, state: &PreparedState) -> Result<()> {
         if state.status != PreparedStateStatus::Preparing || state.verified_at.is_some() {
             return Err(StoreError::InvalidRecord(
@@ -758,7 +902,16 @@ impl Store {
         reason: Option<&str>,
         now: i64,
     ) -> Result<()> {
-        if !matches!(reason, None | Some("timeout" | "cancelled")) {
+        if !matches!(
+            reason,
+            None | Some(
+                "timeout"
+                    | "cancelled"
+                    | "workspace_limit"
+                    | "storage_pressure"
+                    | "storage_meter_failed"
+            )
+        ) {
             return Err(StoreError::InvalidRecord("Invalid supervision reason"));
         }
         let count = self.connection.execute(
@@ -843,7 +996,7 @@ impl Store {
         }
         let count = transaction.execute(
             "UPDATE runs SET state = CASE WHEN error_kind = 'cancelled' THEN 'CANCELLED'
-             WHEN error_kind = 'timeout' THEN 'FAILED'
+             WHEN error_kind IS NOT NULL THEN 'FAILED'
              WHEN exit_code = 0 THEN 'SUCCEEDED' ELSE 'FAILED' END,
              updated_at = ?1, finished_at = ?1, capture_metadata = ?3, artifact_manifest_id = ?4
              WHERE run_id = ?2 AND state = 'FINALIZING' AND ?1 >= updated_at
@@ -905,7 +1058,7 @@ impl Store {
              ELSE 'NEEDS_ATTENTION' END, harness_version = ?1,
              updated_at = ?2, finished_at = ?2,
              error_kind = CASE WHEN state = 'PREPARING' AND ?4 THEN 'cancelled'
-               WHEN error_kind IN ('timeout', 'cancelled') THEN error_kind
+               WHEN error_kind IN ('timeout', 'cancelled', 'workspace_limit', 'storage_pressure', 'storage_meter_failed') THEN error_kind
                WHEN capture_metadata IS NOT NULL THEN 'artifact_capture'
                ELSE 'harness_execution' END
              WHERE run_id = ?3 AND state IN ('PREPARING', 'FINALIZING')

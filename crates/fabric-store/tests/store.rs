@@ -98,7 +98,9 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
 fn remove_cleanup_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER immutable_cleanup_intent_insert;
+            "DROP TABLE IF EXISTS storage_reservations;
+             DROP TABLE IF EXISTS cache_evictions;
+             DROP TRIGGER immutable_cleanup_intent_insert;
              DROP TRIGGER immutable_cleanup_intent_update;
              DROP TRIGGER immutable_cleanup_intent_delete;
              DROP TRIGGER cleanup_workspace_update;
@@ -206,7 +208,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -247,7 +249,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -958,7 +960,7 @@ fn cleanup_requires_terminal_capture_and_expiry_alone_does_not_authorize_it() {
 }
 
 #[test]
-fn read_only_inspection_neither_creates_migrates_nor_writes_v5_or_v6() {
+fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let (root, mut store) = fixture();
     let path = root.path().join("fabric.sqlite3");
     let (run, workspace) = finalized_pair(&mut store, 1);
@@ -978,8 +980,11 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_or_v6() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [6, 5] {
+    for version in [7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 6 {
+            db.execute_batch("DROP TABLE storage_reservations; DROP TABLE cache_evictions; PRAGMA user_version=6;").unwrap();
+        }
         if version == 5 {
             remove_cleanup_schema(&db);
             db.pragma_update(None, "user_version", 5).unwrap();

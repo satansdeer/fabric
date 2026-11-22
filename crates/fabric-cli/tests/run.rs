@@ -1901,3 +1901,460 @@ printf 'existing sentinel' > "../../../artifacts/a-$run/sentinel"
         }
     }
 }
+
+#[test]
+fn storage_admission_cli_denies_before_worker_and_reports_usage() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let launched = fixture.0.join("launched");
+    let fake = fixture.script_fake(&format!("touch '{}'", launched.display()));
+    let prompt = fixture.0.join("storage-prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let output = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--fake-binary"])
+        .arg(fake)
+        .arg("--prompt-file")
+        .arg(prompt)
+        .args(["--min-free-bytes", "18446744073709551615", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage_admission"),
+        "{failure}"
+    );
+    assert!(!launched.exists());
+    assert!(!fixture.0.join("storage/fork-staging").exists());
+    let status = json(
+        &fixture
+            .cli()
+            .args(["storage", "status", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        status["accounting"],
+        "logical_bytes_best_effort_not_exclusive"
+    );
+    assert!(status["managed_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(status["caches"][0]["retention_reason"], "selected_state");
+    let manifest = fixture.0.join("tasks.json");
+    fs::write(&manifest, r#"[{"id":"one","prompt_file":"storage-prompt"},{"id":"two","prompt_file":"storage-prompt"}]"#).unwrap();
+    let output = batch(&fixture, &manifest, "2")
+        .arg("--fake-binary")
+        .arg(fixture.0.join("fake-script"))
+        .args([
+            "--max-managed-bytes",
+            "3145728",
+            "--min-free-bytes",
+            "1",
+            "--max-workspace-bytes",
+            "1048576",
+            "--max-log-bytes",
+            "1048576",
+            "--max-artifact-bytes",
+            "1048576",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("storage_admission"))),
+        "{report}"
+    );
+    assert!(!launched.exists());
+    let recipe = fixture.0.join("denied-recipe.toml");
+    fs::write(
+        &recipe,
+        format!(
+            "version=1\n[[steps]]\nargv=['/bin/sh','-c',\"touch '{}'\"]\n",
+            launched.display()
+        ),
+    )
+    .unwrap();
+    let output = fixture
+        .cli()
+        .args(["project", "prepare", "test", "--recipe"])
+        .arg(&recipe)
+        .args(["--min-free-bytes", "18446744073709551615", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage_admission")
+    );
+    assert!(!launched.exists());
+}
+
+struct FixedDisk(u64);
+impl fabric_core::workspace::storage::DiskMeter for FixedDisk {
+    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_domain::FabricError> {
+        Ok(self.0)
+    }
+}
+
+fn storage_options() -> fabric_core::run::RunOptions {
+    let mut options = fabric_core::run::RunOptions {
+        copy_limit_bytes: 10 * 1024 * 1024,
+        max_log_bytes: 1024 * 1024,
+        max_artifact_bytes: 1024 * 1024,
+        ..Default::default()
+    };
+    options.storage.policy.max_workspace_bytes = 128 * 1024;
+    options.storage.policy.min_free_bytes = 1;
+    options.storage.meter = std::sync::Arc::new(FixedDisk(u64::MAX));
+    options
+}
+
+#[test]
+fn storage_injected_low_free_and_managed_cap_never_launch() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let marker = fixture.0.join("launched");
+    let harness = fabric_runner::FakeHarness::new(
+        fixture.script_fake(&format!("touch '{}'", marker.display())),
+    )
+    .unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let mut options = storage_options();
+    options.storage.meter = std::sync::Arc::new(FixedDisk(0));
+    let denied = fabric_core::run::foreground(
+        &fixture.0.join("storage"),
+        "test",
+        &prompt,
+        &harness,
+        &options,
+    )
+    .err()
+    .unwrap();
+    assert!(denied.message.contains("storage_admission"), "{denied}");
+    let recipe = fixture.0.join("denied-prepare.toml");
+    fs::write(
+        &recipe,
+        format!(
+            "version=1\n[[steps]]\nargv=['/bin/sh','-c',\"touch '{}'\"]\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let denied = fabric_core::workspace::storage::prepare(
+        &fixture.0.join("storage"),
+        "test",
+        &recipe,
+        &options.storage,
+    )
+    .unwrap_err();
+    assert!(denied.message.contains("storage_admission"));
+    options.storage.meter = std::sync::Arc::new(FixedDisk(u64::MAX));
+    options.storage.policy.max_managed_bytes = options.storage.policy.max_workspace_bytes
+        + options.max_log_bytes
+        + options.max_artifact_bytes;
+    let denied = fabric_core::run::foreground(
+        &fixture.0.join("storage"),
+        "test",
+        &prompt,
+        &harness,
+        &options,
+    )
+    .err()
+    .unwrap();
+    assert!(denied.message.contains("storage_admission"), "{denied}");
+    assert!(!marker.exists());
+    assert!(
+        fabric_core::workspace::storage::status(&fixture.0.join("storage"), &options.storage)
+            .unwrap()
+            .workspaces
+            .is_empty()
+    );
+}
+
+#[test]
+fn storage_concurrent_workers_share_atomic_admission() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let root = fixture.0.join("storage");
+    let marker = fixture.0.join("launched");
+    let harness = fabric_runner::FakeHarness::new(
+        fixture.script_fake(&format!("echo launched >> '{}'; sleep 1", marker.display())),
+    )
+    .unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let mut options = storage_options();
+    let reservation = options.storage.policy.max_workspace_bytes
+        + options.max_log_bytes
+        + options.max_artifact_bytes;
+    options.storage.policy.max_managed_bytes =
+        fabric_core::workspace::storage::usage(&root).unwrap() + reservation + 512 * 1024;
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    fabric_core::run::foreground(&root, "test", &prompt, &harness, &options)
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| e.message.contains("storage_admission"))
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap().lines().count(), 1);
+    assert_eq!(
+        fabric_core::workspace::storage::status(&root, &options.storage)
+            .unwrap()
+            .reserved_bytes,
+        0
+    );
+}
+
+#[test]
+fn storage_evicts_only_unreferenced_cache_and_same_key_rebuilds() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let root = fixture.0.join("storage");
+    let recipe = fixture.0.join("large-recipe.toml");
+    fs::write(&recipe, "version=1\n[[steps]]\nargv=['/bin/sh','-c','dd if=/dev/zero of=cache bs=1048576 count=2 2>/dev/null']\n").unwrap();
+    let old = fabric_core::workspace::storage::prepare(&root, "test", &recipe, &Default::default())
+        .unwrap();
+    // A new recipe for the same committed tree becomes the selected state.
+    fs::write(
+        &recipe,
+        "version=1\n[[steps]]\nargv=['/bin/sh','-c','printf selected > selected']\n",
+    )
+    .unwrap();
+    let selected =
+        fabric_core::workspace::storage::prepare(&root, "test", &recipe, &Default::default())
+            .unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let harness = fabric_runner::FakeHarness::new(fixture.script_fake("exit 0")).unwrap();
+    let mut options = storage_options();
+    let reservation = options.storage.policy.max_workspace_bytes
+        + options.max_log_bytes
+        + options.max_artifact_bytes;
+    options.storage.policy.max_managed_bytes =
+        fabric_core::workspace::storage::usage(&root).unwrap() + reservation - 1024 * 1024;
+    let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
+    assert_eq!(report.state, fabric_domain::RunState::Succeeded);
+    assert!(!Path::new(&old.prepared_path).exists());
+    let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+    assert!(store.prepared_state(&old.state_id).unwrap().is_none());
+    assert!(Path::new(&selected.prepared_path).exists());
+    assert_eq!(
+        store
+            .cache_retention(&selected.state_id)
+            .unwrap()
+            .as_deref(),
+        Some("historical_reference")
+    );
+    fs::write(&recipe, "version=1\n[[steps]]\nargv=['/bin/sh','-c','dd if=/dev/zero of=cache bs=1048576 count=2 2>/dev/null']\n").unwrap();
+    let rebuilt =
+        fabric_core::workspace::storage::prepare(&root, "test", &recipe, &Default::default())
+            .unwrap();
+    assert_eq!(rebuilt.preparation_key, old.preparation_key);
+    assert_ne!(rebuilt.state_id, old.state_id);
+    fabric_project::prepare::validate_ready(&root, &rebuilt).unwrap();
+    options.storage.policy.max_managed_bytes = reservation;
+    assert!(fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).is_err());
+    assert!(Path::new(&rebuilt.prepared_path).exists());
+    assert!(Path::new(&selected.prepared_path).exists());
+}
+
+#[test]
+fn storage_prepare_reuses_validated_ready_identity_without_fresh_admission() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::new();
+    fixture.setup();
+    let root = fixture.0.join("storage");
+    let recipe = fixture.0.join("counted-recipe.toml");
+    let counter = fixture.0.join("setup-count");
+    fs::write(
+        &recipe,
+        format!(
+            "version=1\n[[steps]]\nargv=['/bin/sh','-c',\"printf x >> '{}'; printf cached > cached\"]\n",
+            counter.display()
+        ),
+    )
+    .unwrap();
+    let original =
+        fabric_core::workspace::storage::prepare(&root, "test", &recipe, &Default::default())
+            .unwrap();
+    // A different selection makes the requested cache otherwise eligible for eviction.
+    let selection = fixture.0.join("selection.toml");
+    fs::write(
+        &selection,
+        "version=1\n[[steps]]\nargv=['/bin/sh','-c','printf selected > selected']\n",
+    )
+    .unwrap();
+    fabric_core::workspace::storage::prepare(&root, "test", &selection, &Default::default())
+        .unwrap();
+    let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+    assert_eq!(store.cache_retention(&original.state_id).unwrap(), None);
+    let identity = fs::metadata(&original.prepared_path).unwrap();
+    for free in [0, u64::MAX] {
+        let mut options = fabric_core::workspace::storage::StorageOptions {
+            meter: std::sync::Arc::new(FixedDisk(free)),
+            ..Default::default()
+        };
+        options.policy.max_managed_bytes =
+            fabric_core::workspace::storage::usage(&root).unwrap() + 4096;
+        options.policy.max_workspace_bytes = options.policy.max_managed_bytes - 2;
+        options.policy.max_log_bytes_per_run = 1;
+        options.policy.max_artifact_bytes_per_run = 1;
+        let reused =
+            fabric_core::workspace::storage::prepare(&root, "test", &recipe, &options).unwrap();
+        assert_eq!(reused.state_id, original.state_id);
+        assert_eq!(reused.prepared_path, original.prepared_path);
+        let current = fs::metadata(&reused.prepared_path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (identity.dev(), identity.ino())
+        );
+        assert_eq!(fs::read(&counter).unwrap(), b"x");
+        fabric_project::prepare::validate_ready(&root, &reused).unwrap();
+    }
+}
+
+#[test]
+fn storage_workspace_monitor_terminates_owned_group_and_zero_exit_is_failure() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let root = fixture.0.join("storage");
+    let child_pid = fixture.0.join("child-pid");
+    let binary = fixture.script_fake(&format!("trap 'exit 0' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\ndd if=/dev/zero of=oversized bs=1048576 count=3 2>/dev/null\nwhile :; do sleep 1; done", child_pid.display()));
+    let harness = fabric_runner::FakeHarness::new(binary).unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let mut options = storage_options();
+    options.storage.policy.max_workspace_bytes = 1024 * 1024;
+    options.max_artifact_bytes = 8 * 1024 * 1024;
+    let started = std::time::Instant::now();
+    let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(report.state, fabric_domain::RunState::Failed);
+    assert_eq!(report.error_kind.as_deref(), Some("workspace_limit"));
+    assert_eq!(report.exit_code, Some(0));
+    assert!(!options.cancellation.is_cancelled());
+    let run = fabric_store::Store::open(root.join("fabric.db"))
+        .unwrap()
+        .run(&report.run_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(run.artifact_manifest_id.is_some());
+    assert_eq!(run.error_kind.as_deref(), Some("workspace_limit"));
+    let pid = fs::read_to_string(child_pid).unwrap();
+    let state = Command::new("/bin/ps")
+        .args(["-p", &pid, "-o", "stat="])
+        .output()
+        .unwrap();
+    let state = String::from_utf8(state.stdout).unwrap();
+    assert!(
+        state.trim().is_empty() || state.trim().starts_with('Z'),
+        "owned descendant survived: {state}"
+    );
+}
+
+struct PressureDisk(PathBuf);
+impl fabric_core::workspace::storage::DiskMeter for PressureDisk {
+    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_domain::FabricError> {
+        Ok(if self.0.exists() { 0 } else { u64::MAX })
+    }
+}
+
+#[test]
+fn storage_pressure_keeps_its_reason_and_captures_evidence() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let pressure = fixture.0.join("pressure");
+    let harness = fabric_runner::FakeHarness::new(fixture.script_fake(&format!(
+        "trap 'exit 0' TERM\nprintf evidence > tracked\ntouch '{}'\nwhile :; do sleep 1; done",
+        pressure.display()
+    )))
+    .unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let mut options = storage_options();
+    options.storage.meter = std::sync::Arc::new(PressureDisk(pressure));
+    let report = fabric_core::run::foreground(
+        &fixture.0.join("storage"),
+        "test",
+        &prompt,
+        &harness,
+        &options,
+    )
+    .unwrap();
+    assert_eq!(report.state, fabric_domain::RunState::Failed);
+    assert_eq!(report.error_kind.as_deref(), Some("storage_pressure"));
+    assert_eq!(report.exit_code, Some(0));
+    assert!(!options.cancellation.is_cancelled());
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    assert!(
+        store
+            .run(&report.run_id.parse().unwrap())
+            .unwrap()
+            .unwrap()
+            .artifact_manifest_id
+            .is_some()
+    );
+}
+
+#[test]
+fn storage_fast_zero_exit_overlimit_retains_reason_when_capture_exceeds_cap() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let root = fixture.0.join("storage");
+    let harness = fabric_runner::FakeHarness::new(fixture.script_fake(
+        "printf 'unique recovery bytes' > tracked\ndd if=/dev/zero of=oversized bs=1048576 count=3 2>/dev/null\nexit 0"
+    )).unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let mut options = storage_options();
+    options.storage.policy.max_workspace_bytes = 1024 * 1024;
+    assert!(fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).is_err());
+    let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+    let id = store.workspace_ids().unwrap().pop().unwrap();
+    let workspace = store.workspace(&id).unwrap().unwrap();
+    let run = store.run(&workspace.run_id).unwrap().unwrap();
+    assert_eq!(run.state, fabric_domain::RunState::NeedsAttention);
+    assert_eq!(run.error_kind.as_deref(), Some("workspace_limit"));
+    assert_eq!(run.exit_code, Some(0));
+    assert_eq!(
+        workspace.state,
+        fabric_domain::WorkspaceState::RecoveryRequired
+    );
+    assert_eq!(
+        fs::read(Path::new(&workspace.managed_path).join("tracked")).unwrap(),
+        b"unique recovery bytes"
+    );
+    let status = fabric_core::workspace::storage::status(&root, &options.storage).unwrap();
+    assert!(status.workspaces[0].usage_bytes.unwrap() > 3 * 1024 * 1024);
+    assert!(!status.workspaces[0].retention_reason.is_empty());
+}

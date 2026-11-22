@@ -12,6 +12,9 @@ use fabric_domain::{
 use fabric_store::{Run, RunWorkspaceTransition, Store, Workspace};
 use fabric_workspace::{WorkspaceBackend, fork_path};
 
+#[path = "storage.rs"]
+pub mod storage;
+
 /// IDs belong to the caller and remain stable even when a fork fails.
 #[derive(Debug)]
 pub struct WorkspaceRequest {
@@ -623,8 +626,23 @@ fn open_cleanup(
     workspace: &Workspace,
     prior: Option<&CleanupAuthority>,
 ) -> Result<OpenCleanup, FabricError> {
+    open_owned_cleanup(
+        root,
+        c"fork-staging",
+        &std::ffi::CString::new(workspace.workspace_id.as_str()).map_err(storage_error)?,
+        &marker_contents(root, workspace),
+        prior,
+    )
+}
+
+fn open_owned_cleanup(
+    root: &Path,
+    staging_name: &std::ffi::CStr,
+    name: &std::ffi::CStr,
+    expected_marker: &str,
+    prior: Option<&CleanupAuthority>,
+) -> Result<OpenCleanup, FabricError> {
     use crate::artifacts::{open_at, stat, stat_at};
-    use std::ffi::CString;
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
@@ -632,7 +650,7 @@ fn open_cleanup(
         .map_err(storage_error)?;
     let root_meta = stat(&directory)?;
     cleanup_directory(&root_meta)?;
-    let staging = open_at(&directory, c"fork-staging", libc::O_DIRECTORY)?;
+    let staging = open_at(&directory, staging_name, libc::O_DIRECTORY)?;
     let staging_meta = stat(&staging)?;
     cleanup_directory(&staging_meta)?;
     if let Some(saved) = prior {
@@ -643,8 +661,7 @@ fn open_cleanup(
             return Err(storage_error("Cleanup root identity changed"));
         }
     }
-    let name = CString::new(workspace.workspace_id.as_str()).map_err(storage_error)?;
-    if missing_at(&staging, &name)? {
+    if missing_at(&staging, name)? {
         return prior
             .map(|authority| OpenCleanup {
                 authority: CleanupAuthority {
@@ -661,7 +678,7 @@ fn open_cleanup(
             })
             .ok_or_else(|| storage_error("Missing container without durable cleanup intent"));
     }
-    let container = open_at(&staging, &name, libc::O_DIRECTORY)?;
+    let container = open_at(&staging, name, libc::O_DIRECTORY)?;
     let container_meta = stat(&container)?;
     cleanup_directory(&container_meta)?;
     if root_meta.st_dev != staging_meta.st_dev || root_meta.st_dev != container_meta.st_dev {
@@ -694,7 +711,7 @@ fn open_cleanup(
         let recorded = stat_at(&container, c".fabric-owner")?;
         let mut marker = open_at(&container, c".fabric-owner", libc::O_NONBLOCK)?;
         let meta = stat(&marker)?;
-        let expected = marker_contents(root, workspace);
+        let expected = expected_marker;
         if Identity::of(&recorded) != Identity::of(&meta)
             || meta.st_mode & libc::S_IFMT != libc::S_IFREG
             || meta.st_uid != unsafe { libc::geteuid() }
@@ -780,11 +797,25 @@ impl OpenCleanup {
         id: &WorkspaceId,
         hook: &mut impl FnMut(CleanupStep) -> Result<(), FabricError>,
     ) -> Result<(), FabricError> {
+        self.delete_named(
+            &std::ffi::CString::new(id.as_str()).map_err(storage_error)?,
+            hook,
+        )
+    }
+
+    fn delete_named(
+        self,
+        name: &std::ffi::CStr,
+        hook: &mut impl FnMut(CleanupStep) -> Result<(), FabricError>,
+    ) -> Result<(), FabricError> {
         use crate::artifacts::{stat, stat_at};
-        use std::ffi::CString;
         if let Some(container) = &self.container {
-            let name = CString::new(id.as_str()).map_err(storage_error)?;
-            check_identity(&stat_at(&self.staging, &name)?, &self.authority.container)?;
+            check_identity(&stat_at(&self.staging, name)?, &self.authority.container)?;
+            // Prepared containers are sealed read-only. Authority is already durable.
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::fchmod(container.as_raw_fd(), 0o700) } != 0 {
+                return Err(storage_error(std::io::Error::last_os_error()));
+            }
             if let Some(tree) = &self.tree {
                 check_identity(&stat_at(container, c"tree")?, &self.authority.tree)?;
                 delete_contents(tree, self.authority.root.device, hook)?;
@@ -795,14 +826,11 @@ impl OpenCleanup {
             // The marker is removed last, but durable intent also authorizes a restart
             // after its unlink. Any replacement container/tree is still refused.
             delete_contents(container, self.authority.root.device, hook)?;
-            check_identity(&stat_at(&self.staging, &name)?, &self.authority.container)?;
-            unlink_at(&self.staging, &name, true)?;
+            check_identity(&stat_at(&self.staging, name)?, &self.authority.container)?;
+            unlink_at(&self.staging, name, true)?;
             hook(CleanupStep::Unlinked)?;
         }
-        if !missing_at(
-            &self.staging,
-            &CString::new(id.as_str()).map_err(storage_error)?,
-        )? {
+        if !missing_at(&self.staging, name)? {
             return Err(storage_error(
                 "Cleanup container reappeared during deletion",
             ));
@@ -1192,5 +1220,65 @@ mod cleanup_tests {
             garbage_collect(&fixture.root, true).unwrap().items[0].reason,
             "already_reclaimed"
         );
+    }
+    #[test]
+    fn storage_cache_intent_resumes_and_same_key_rebuilds_after_interruption() {
+        for stage in 0..3 {
+            let fixture = Fixture::captured();
+            let recipe = fixture.temp.path().join("evicted.toml");
+            fs::write(
+                &recipe,
+                "version=1\n[[steps]]\nargv=['/bin/sh','-c','printf cache > disposable']\n",
+            )
+            .unwrap();
+            let old =
+                storage::prepare(&fixture.root, "fixture", &recipe, &Default::default()).unwrap();
+            let newer = fixture.temp.path().join("selected.toml");
+            fs::write(
+                &newer,
+                "version=1\n[[steps]]\nargv=['/bin/sh','-c','printf newest > selected']\n",
+            )
+            .unwrap();
+            storage::prepare(&fixture.root, "fixture", &newer, &Default::default()).unwrap();
+            let (_, mut store, lease) = cleanup_store(&fixture.root, true, false).unwrap();
+            assert_eq!(store.cache_retention(&old.state_id).unwrap(), None);
+            let name = format!("{}-{}", old.project_id, old.preparation_key);
+            let component = std::ffi::CString::new(name.as_str()).unwrap();
+            let opened = open_owned_cleanup(
+                &fixture.root,
+                c"prepared",
+                &component,
+                old.state_id.as_str(),
+                None,
+            )
+            .unwrap();
+            let authority = serde_json::to_string(&opened.authority).unwrap();
+            store.begin_cache_eviction(&old, &name, &authority).unwrap();
+            assert!(store.prepared_state(&old.state_id).unwrap().is_none());
+            if stage > 0 {
+                let result = opened.delete_named(&component, &mut |_| {
+                    if stage == 1 {
+                        Err(storage_error("injected eviction interruption"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if stage == 1 {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                }
+            }
+            drop(store);
+            drop(lease);
+            let rebuilt =
+                storage::prepare(&fixture.root, "fixture", &recipe, &Default::default()).unwrap();
+            assert_eq!(rebuilt.preparation_key, old.preparation_key);
+            assert_ne!(rebuilt.state_id, old.state_id);
+            fabric_project::prepare::validate_ready(&fixture.root, &rebuilt).unwrap();
+            let (_, store) = open_store(&fixture.root).unwrap();
+            assert!(store.cache_evictions().unwrap().is_empty());
+            assert!(store.prepared_state(&old.state_id).unwrap().is_none());
+        }
     }
 }

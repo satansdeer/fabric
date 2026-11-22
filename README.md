@@ -2,7 +2,7 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-17
+## Implemented: FAB-01 through FAB-18
 
 The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground fake/OMP harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup.
 
@@ -92,7 +92,7 @@ Failures retain staging and mark the state FAILED, never READY. After acquiring 
 
 Every request freshly validates the persisted READY record, its exact managed source path/owner marker, read-only ownership/permissions, private Git, recorded HEAD/size and internal relative symlink chains. It copies the **entire** tree, including `.git`, ignored dependencies and empty directories, into a newly created owner-only `fork-staging/<workspace-id>/tree`. Existing destinations, symlink/permissive directory surprises, foreign ownership, hardlinked/special source files and absolute/escaping/dangling/cyclic links are refused. Regular files receive independent inodes and owner read/write permissions; owner executability is preserved, directories become 0700, and links are reproduced without following or chmodding their targets. READY permissions/content are never changed.
 
-Ordinary copy requires explicit admission of the **whole measured logical tree size**, before creating a forced-copy destination or writing a clone fallback. Clone fallback is allowed only for unsupported/cross-filesystem clone operations, not arbitrary I/O errors. A zero allowance disables copying; CoW may still succeed. This allowance is not a free-space check or hard quota; policy-based admission/monitoring belongs to the later storage story. Copy is the deterministic correctness-test path; no instant-fork performance claim is made on arbitrary filesystems.
+Ordinary copy requires explicit admission of the **whole measured logical tree size**, before creating a forced-copy destination or writing a clone fallback. Clone fallback is allowed only for unsupported/cross-filesystem clone operations, not arbitrary I/O errors. A zero allowance disables copying; CoW may still succeed. This low-level copy allowance is not a free-space check or hard quota; managed CLI/core execution additionally applies the storage admission and monitoring below. Copy is the deterministic correctness-test path; no instant-fork performance claim is made on arbitrary filesystems.
 
 Calling this low-level backend directly produces **unregistered staging forks**, not runnable managed workspaces. Failed or partial destinations remain as evidence and are never overwritten or deleted; their IDs cannot be retried. Use the ownership orchestration below before any future worker launch. Directory existence, a returned `PreparedFork`, and a caller-supplied workspace ID never authorize execution or deletion.
 
@@ -148,6 +148,28 @@ Choose exactly one mode. Reports are sorted by workspace ID, with `action`, stab
 Under an exclusive kernel cleanup lease, GC rereads SQLite and requires a terminal Run, CLEANUP_PENDING without retention or a live lease, exact canonical managed ownership, private real containers/tree, and a complete checksummed registered manifest matching provenance. Outside/nonexact recorded paths, missing/mismatched markers, symlink containers/tree, missing/corrupt artifacts and active/recovery/retained workspaces are explicit refusals. A durable immutable SQLite intent binds directory and marker identities before deletion. Descriptor-relative no-follow traversal unlinks internal symlinks without following targets; it refuses foreign ownership and mounted filesystems. Interrupted cleanup can resume with partial trees, a missing marker or a missing container only against that saved authority; substitutions fail closed. Ownership records and intents remain after deletion. No PID is deletion authority. READY-cache eviction and expired-lease worker reconciliation remain FAB-18/FAB-19.
 
 Cleanup leases explicitly unlock on scope exit, so unrelated forked helpers cannot prolong a completed cleanup by retaining an inherited descriptor.
+
+### Storage budgets and usage
+
+```sh
+fabric --root /private/path/to/fabric storage status --json
+fabric --root /private/path/to/fabric project prepare my-project --recipe ./fabric.prepare.toml \
+  --max-managed-bytes 21474836480 --min-free-bytes 5368709120 --max-workspace-bytes 2147483648
+fabric --root /private/path/to/fabric run my-project --harness fake --prompt-file ./task.json \
+  --max-managed-bytes 21474836480 --min-free-bytes 5368709120 --max-workspace-bytes 2147483648 --json
+```
+
+`project prepare`, `run`, `run-many` and `storage status` accept these three byte flags with the defaults shown. Worker log/artifact caps retain their existing flags. Overrides are per invocation, not persisted configuration. Status is a read-only inspection with the same native SQLite coordination-sidecar caveat as GC dry-run; its JSON includes policy, free space, managed logical usage, outstanding admission reservations and per-cache/workspace usage, retention reasons and measurement diagnostics. A missing or unsafe retained path reports unknown usage (`null`), not invented zero; safely reclaimed workspaces report zero with artifacts preserved.
+
+Before fresh preparation or worker admission, Fabric takes the existing root cleanup lock, meters available filesystem space and logical managed bytes, resumes durable cache eviction intents, and attempts verified eligible workspace cleanup and safe cache eviction before rejecting with `storage_admission`. Repeated preparation resolves the same recipe/environment/commit identity and validates an existing READY cache under its key lock before any fresh-tree admission: reuse keeps its state/tree identity without rerunning setup or demanding another workspace's headroom. Worker admission reserves the whole workspace cap plus log and artifact caps atomically across concurrent workers/processes; fresh preparation reserves a workspace-sized estimate while holding the root lock. Existing reservations are conservatively deducted from free headroom and added to current root usage even as workers materialize files. This may reject earlier than physical space requires. A second check immediately before process launch rejects newly observed pressure without starting the worker.
+
+Cache eviction preserves every historical Run/Batch/Workspace reference, admitted worker and latest READY selection for each project/commit. Only freshly validated unreferenced older READY caches can be removed. Under the root cleanup lock and the existing per-key preparation lock, an immutable descriptor-identity intent and transactional removal of READY metadata precede deletion. Interruption resumes against that authority; an evicted identical key can subsequently be prepared again. Unknown paths, substitutions, invalid caches and recoverable/uncaptured workspaces are never adopted or deleted. Lease expiration alone grants no deletion permission.
+
+Each worker has a bounded no-follow workspace/root scan, polled at 100 ms between scans, with a warning near its workspace limit. Scans stop at 200,000 entries, depth 64 or two seconds per tree; an unreadable/unbounded measurement fails closed as `storage_meter_failed`. Concurrently vanished entries are skipped rather than mistaken for unsafe reads. Workspace overflow stops only that worker's owned process group as `workspace_limit`; root/free-space pressure uses `storage_pressure`. Existing TERM/grace/KILL supervision and capture are reused. These reasons mean FAILED even for cooperative zero exits, never user cancellation; capture failure retains the reason and original workspace as NEEDS_ATTENTION/RECOVERY_REQUIRED. Final measurement also catches fast zero-exit oversize workers.
+
+Accounting uses logical file lengths including ignored dependencies and link text without following links, not APFS-exclusive allocated bytes. Free space uses native `statvfs` available blocks. These are **best-effort admission/monitoring, not hard quotas**: trusted code can allocate between samples or outside the root, and preparation output may exceed its estimate. Crashed reservation owners remain conservatively reserved pending FAB-19 reconciliation; expiry does not release capacity or authorize deletion.
+
+Library callers set `RunOptions.storage` or use `fabric_core::workspace::storage::prepare` for managed preparation; `StorageOptions.meter: Arc<dyn DiskMeter>` permits deterministic injected free-space measurements. Calling the lower-level project preparation/fork APIs directly does not provide budget admission.
 
 ### Run a bounded task batch
 

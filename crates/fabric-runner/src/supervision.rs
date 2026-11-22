@@ -14,8 +14,38 @@ use crate::execution_error;
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
     foreground_generation: u64,
+    storage_stop: Arc<std::sync::atomic::AtomicU8>,
 }
 impl CancellationToken {
+    /// Shares user cancellation but keeps storage termination private to one worker.
+    pub fn worker_token(&self) -> Self {
+        Self {
+            cancelled: Arc::clone(&self.cancelled),
+            foreground_generation: self.foreground_generation,
+            storage_stop: Arc::default(),
+        }
+    }
+
+    pub fn stop_for_storage(&self, reason: StopReason) {
+        let value = match reason {
+            StopReason::WorkspaceLimit => 1,
+            StopReason::StoragePressure => 2,
+            StopReason::StorageMeterFailed => 3,
+            _ => return,
+        };
+        let _ = self
+            .storage_stop
+            .compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    pub fn storage_reason(&self) -> Option<StopReason> {
+        match self.storage_stop.load(Ordering::Acquire) {
+            1 => Some(StopReason::WorkspaceLimit),
+            2 => Some(StopReason::StoragePressure),
+            3 => Some(StopReason::StorageMeterFailed),
+            _ => None,
+        }
+    }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -63,12 +93,18 @@ impl ExecutionLimits {
 pub enum StopReason {
     Timeout,
     Cancelled,
+    WorkspaceLimit,
+    StoragePressure,
+    StorageMeterFailed,
 }
 impl StopReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
+            Self::WorkspaceLimit => "workspace_limit",
+            Self::StoragePressure => "storage_pressure",
+            Self::StorageMeterFailed => "storage_meter_failed",
         }
     }
 }
@@ -199,6 +235,9 @@ impl ProcessGroup {
     ) -> Result<(ExitStatus, Option<StopReason>), FabricError> {
         let start = self.launched;
         let reason = loop {
+            if let Some(reason) = cancellation.storage_reason() {
+                break Some(reason);
+            }
             if self.exited().map_err(execution_error)? {
                 break None;
             }

@@ -51,6 +51,7 @@ pub struct RunOptions {
     pub max_artifact_bytes: u64,
     pub limits: fabric_runner::ExecutionLimits,
     pub cancellation: fabric_runner::CancellationToken,
+    pub storage: crate::workspace::storage::StorageOptions,
     /// Best-effort OMP request admission only, not an exact spending cap.
     pub max_cost_usd: Option<f64>,
 }
@@ -63,6 +64,7 @@ impl Default for RunOptions {
             max_artifact_bytes: fabric_domain::StoragePolicy::default().max_artifact_bytes_per_run,
             limits: fabric_runner::ExecutionLimits::default(),
             cancellation: fabric_runner::CancellationToken::default(),
+            storage: crate::workspace::storage::StorageOptions::default(),
             max_cost_usd: None,
         }
     }
@@ -146,6 +148,10 @@ fn foreground_prepared(
     if options.cancellation.is_cancelled() {
         return Err(error("Cancelled before launch; task was not started."));
     }
+    let mut storage = options.storage.clone();
+    storage.policy.max_log_bytes_per_run = options.max_log_bytes;
+    storage.policy.max_artifact_bytes_per_run = options.max_artifact_bytes;
+    let _reservation = crate::workspace::storage::admit(root, &storage, state, run_id.as_str())?;
     // Snapshot once: digest and child input cannot disagree after this point.
     let prompt = std::fs::read(prompt_file)
         .map_err(|failure| error(format!("Prompt {}: {failure}", prompt_file.display())))?;
@@ -196,18 +202,38 @@ fn foreground_prepared(
         })?;
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
-        let result = fabric_runner::execute(
-            &command,
-            fresh.path(),
-            capture,
-            &options.limits,
-            &options.cancellation,
-            |pid| {
-                store
-                    .start_run(&run_id, harness_version, pid, now()?)
-                    .map_err(error)
-            },
-        )?;
+        crate::workspace::storage::check_launch(&root, &storage)?;
+        let token = options.cancellation.worker_token();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let mut result = std::thread::scope(|scope| {
+            let monitor = scope.spawn(|| {
+                crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done);
+            });
+            let result = fabric_runner::execute(
+                &command,
+                fresh.path(),
+                capture,
+                &options.limits,
+                &token,
+                |pid| {
+                    store
+                        .start_run(&run_id, harness_version, pid, now()?)
+                        .map_err(error)
+                },
+            );
+            done.store(true, std::sync::atomic::Ordering::Release);
+            monitor.thread().unpark();
+            monitor
+                .join()
+                .map_err(|_| error("Storage monitor panicked"))?;
+            result
+        })?;
+        // A fast zero-exit worker must not hide an oversized final workspace.
+        if result.stop_reason.is_none() {
+            result.stop_reason = token
+                .storage_reason()
+                .or_else(|| crate::workspace::storage::violation(&root, fresh.path(), &storage));
+        }
         store
             .observe_run_exit(
                 &run_id,

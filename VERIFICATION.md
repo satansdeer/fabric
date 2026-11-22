@@ -129,3 +129,11 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independent checks: four CLI GC regressions; two read-only store regressions; four cleanup/crash-resume regressions; four concurrent store regressions all passed.
 - Parent caught inherited-flock leakage under concurrent forks. Explicit guard unlock and a live inherited-descriptor child regression fix it; busy cleaner refusal remains enforced. The final gate also exposed initial WAL-transition contention; bounded retry applies only to that idempotent transition.
 - Implementer final fmt, strict clippy and workspace gate passed: 111 tests across 24 suites (`local://133.log`). Operator plan/apply evidence above independently proves artifacts survive actual workspace deletion.
+
+## FAB-18 — bounded storage admission and owned-worker monitoring
+
+- Reviewed native free-space metering, bounded descriptor-rooted logical scans, serialized admission/reservations, reference-preserving cache eviction and crash-resumable same-key rebuild.
+- Independent checks passed: seven storage CLI regressions, cache-eviction crash/rebuild regression, and pressure-time READY reuse regression preserving setup count and tree identity.
+- Parent review found admission preceded no-allocation READY reuse; fixed by using the existing locked identity/provenance path before fresh-tree admission.
+- Actual CLI: storage JSON reports logical accounting/retention and zero leaked reservations; an impossible free-space reserve rejects before allocating any run.
+- Implementer final fmt, strict clippy and workspace gate passed: 120 tests across 24 suites (`local://154.log`). Accounting remains best effort, not an APFS physical quota; stale crash reservations await FAB-19 reconciliation.

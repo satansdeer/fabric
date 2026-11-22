@@ -35,7 +35,7 @@ enum Commands {
     Run(RunArgs),
     /// Execute a task manifest through a bounded foreground worker pool.
     RunMany(RunManyArgs),
-    /// Inspect or reclaim fully captured private workspaces (not READY caches).
+    /// Inspect storage or reclaim fully captured private workspaces.
     Storage {
         #[arg(long, global = true)]
         json: bool,
@@ -67,6 +67,8 @@ struct RunManyArgs {
 
 #[derive(clap::Args)]
 struct WorkerArgs {
+    #[command(flatten)]
+    storage: StorageArgs,
     #[arg(long, value_parser = ["fake", "omp"])]
     harness: String,
     /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
@@ -93,6 +95,32 @@ struct WorkerArgs {
     json: bool,
 }
 
+#[derive(clap::Args)]
+struct StorageArgs {
+    /// Best-effort logical managed-root cap, not an APFS hard quota.
+    #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().max_managed_bytes)]
+    max_managed_bytes: u64,
+    #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().min_free_bytes)]
+    min_free_bytes: u64,
+    /// Periodically enforced workspace tree limit.
+    #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().max_workspace_bytes)]
+    max_workspace_bytes: u64,
+}
+
+impl StorageArgs {
+    fn options(&self) -> fabric_core::workspace::storage::StorageOptions {
+        fabric_core::workspace::storage::StorageOptions {
+            policy: fabric_domain::StoragePolicy {
+                max_managed_bytes: self.max_managed_bytes,
+                min_free_bytes: self.min_free_bytes,
+                max_workspace_bytes: self.max_workspace_bytes,
+                ..fabric_domain::StoragePolicy::default()
+            },
+            ..fabric_core::workspace::storage::StorageOptions::default()
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ProjectCommands {
     /// Pin the current committed HEAD without importing local edits.
@@ -109,11 +137,18 @@ enum ProjectCommands {
         name: String,
         #[arg(long)]
         recipe: PathBuf,
+        #[command(flatten)]
+        storage: StorageArgs,
     },
 }
 
 #[derive(Subcommand)]
 enum StorageCommands {
+    /// Best-effort logical usage, headroom, reservations and retention reasons.
+    Status {
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
     /// Verify all deletion prerequisites; apply only with an explicit flag.
     Gc {
         #[arg(long, required_unless_present = "apply", conflicts_with = "apply")]
@@ -238,6 +273,7 @@ fn run_options(
         },
         cancellation,
         max_cost_usd: args.max_cost_usd,
+        storage: args.storage.options(),
     }
 }
 
@@ -325,8 +361,14 @@ fn write_project(
         Some(root) => root,
         None => fabric_project::default_root()?,
     };
-    if let ProjectCommands::Prepare { name, recipe } = command {
-        let state = fabric_project::prepare::prepare(&root, &name, &recipe)?;
+    if let ProjectCommands::Prepare {
+        name,
+        recipe,
+        storage,
+    } = command
+    {
+        let state =
+            fabric_core::workspace::storage::prepare(&root, &name, &recipe, &storage.options())?;
         let report = PreparationReport {
             state_id: state.state_id.as_str(),
             project_id: state.project_id.as_str(),
@@ -398,7 +440,32 @@ fn write_storage(
     json: bool,
 ) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
-    let StorageCommands::Gc { apply, .. } = command;
+    if let StorageCommands::Status { storage } = command {
+        let report = fabric_core::workspace::storage::status(&root, &storage.options())?;
+        let mut stdout = io::stdout().lock();
+        if json {
+            serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
+            writeln!(stdout).map_err(output_error)?;
+        } else {
+            writeln!(stdout, "Storage: {} logical bytes (best effort; not exclusive APFS bytes)\nAvailable: {} bytes\nReserved: {} bytes",
+                report.managed_bytes, report.free_bytes, report.reserved_bytes).map_err(output_error)?;
+            for item in report.caches.iter().chain(&report.workspaces) {
+                writeln!(
+                    stdout,
+                    "{}: {:?} bytes ({}){}",
+                    item.id,
+                    item.usage_bytes,
+                    item.retention_reason,
+                    item.diagnostic.as_deref().unwrap_or("")
+                )
+                .map_err(output_error)?;
+            }
+        }
+        return stdout.flush().map_err(output_error);
+    }
+    let StorageCommands::Gc { apply, .. } = command else {
+        unreachable!()
+    };
     let report = fabric_core::workspace::garbage_collect(&root, apply)?;
     let mut stdout = io::stdout().lock();
     if json {
