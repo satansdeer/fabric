@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::api::{BatchRequest, Options};
-use crate::run::{BatchHarnesses, RunReport, TaskInput};
+use crate::api::{BatchRequest, Options, WorkerBatchRequest};
+use crate::run::{BatchHarnesses, ExecutionBatch, RunReport};
 use crate::workspace::open_store;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -31,6 +31,11 @@ const MAX_CLIENTS: usize = 64;
 pub enum Request {
     Submit {
         request: BatchRequest,
+        fake_binary: Option<PathBuf>,
+        idempotency_key: Option<String>,
+    },
+    Spawn {
+        request: WorkerBatchRequest,
         fake_binary: Option<PathBuf>,
         idempotency_key: Option<String>,
     },
@@ -134,6 +139,20 @@ impl Endpoint {
 
 /// The first submit starts a detached copy of this executable, not a foreground child worker.
 pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
+    if let Request::Spawn {
+        request,
+        fake_binary,
+        ..
+    } = &request
+    {
+        crate::api::preflight_workers(
+            root,
+            request,
+            &RegistryOptions {
+                fake_binary: fake_binary.clone(),
+            },
+        )?;
+    }
     let endpoint = Endpoint::new(root)?;
     let wait = match &request {
         Request::Wait {
@@ -188,19 +207,8 @@ pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
     )?;
     let response: Value = read_frame(&mut stream)?;
     if let Some(failure) = response.get("error") {
-        return Err(FabricError {
-            kind: match failure["kind"].as_str() {
-                Some("authorization_required") => ErrorKind::AuthorizationRequired,
-                Some("unsupported_capability") => ErrorKind::UnsupportedCapability,
-                Some("not_found") => ErrorKind::NotFound,
-                Some("storage") => ErrorKind::Storage,
-                _ => ErrorKind::InvalidArguments,
-            },
-            message: failure["message"]
-                .as_str()
-                .unwrap_or("Local manager request failed.")
-                .to_owned(),
-        });
+        return Err(serde_json::from_value::<FabricError>(failure.clone())
+            .map_err(|_| error("Invalid typed local manager error."))?);
     }
     response
         .get("ok")
@@ -279,7 +287,20 @@ impl Manager {
                 request,
                 fake_binary,
                 idempotency_key,
-            } => self.submit(request, fake_binary, idempotency_key),
+            } => {
+                let digest = request_digest(&request, &fake_binary)?;
+                let batch = crate::api::translate_v1(request, CancellationToken::default())?;
+                self.submit(batch, fake_binary, idempotency_key, digest, false)
+            }
+            Request::Spawn {
+                request,
+                fake_binary,
+                idempotency_key,
+            } => {
+                let digest = request_digest(&request, &fake_binary)?;
+                let batch = crate::api::translate_workers(request)?;
+                self.submit(batch, fake_binary, idempotency_key, digest, true)
+            }
             Request::Status { id, after } => self.status(&id, after),
             Request::Results { id } => self.results(&id),
             Request::Cancel { id } => self.cancel(&id),
@@ -304,11 +325,12 @@ impl Manager {
 
     fn submit(
         self: &Arc<Self>,
-        request: BatchRequest,
+        request: ExecutionBatch,
         fake_binary: Option<PathBuf>,
         key: Option<String>,
+        digest: String,
+        generic: bool,
     ) -> Result<Value, FabricError> {
-        crate::api::validate_request(&request)?;
         if key
             .as_ref()
             .is_some_and(|key| key.trim().is_empty() || key.len() > 256)
@@ -318,10 +340,6 @@ impl Manager {
         if fake_binary.as_ref().is_some_and(|path| !path.is_absolute()) {
             return Err(invalid("Async --fake-binary must be an absolute path."));
         }
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(&request, &fake_binary)).map_err(error)?)
-        );
         let (_, mut store) = open_store(&self.root)?;
         if let Some(prior) = key
             .as_deref()
@@ -336,56 +354,41 @@ impl Manager {
                 ));
             }
             self.schedule(prior.batch_id.clone())?;
-            return accepted(&store, &prior.batch_id);
+            return accepted(&store, &prior.batch_id, generic);
         }
-        let options = crate::api::run_options(&request.options, CancellationToken::default())?;
         let registry = HarnessRegistry::default();
         let registry_options = RegistryOptions {
             fake_binary: fake_binary.clone(),
         };
-        let inputs = request
-            .tasks
-            .iter()
-            .map(|task| TaskInput {
-                id: task.id.clone(),
-                prompt_file: PathBuf::from("durable-input"),
-                harness: task.harness.clone(),
-                request: task.request.clone(),
-            })
-            .collect();
+        let concurrency = request.concurrency.min(crate::api::MAX_TASKS);
         let prepared = crate::run::prepare_batch(
             &self.root,
-            &request.project,
-            inputs,
-            request.concurrency,
+            request,
             &BatchHarnesses {
                 registry: &registry,
                 options: &registry_options,
-                default: request.default_harness.as_ref(),
+                default: None,
             },
-            &options,
         )?;
         let mut tasks = Vec::with_capacity(prepared.tasks.len());
         for ((task, (harness, (plan, stamp))), input) in prepared
             .tasks
             .into_iter()
             .zip(prepared.plans)
-            .zip(request.tasks.iter())
+            .zip(prepared.inputs)
         {
-            if plan.request.profile.as_ref().is_some_and(|profile| {
-                profile
-                    .connection_refs
-                    .iter()
-                    .any(|reference| reference.kind == "env")
-            }) {
-                return Err(FabricError { kind: ErrorKind::UnsupportedCapability,
-                    message: "Async native environment connections are not restart-safe; use a durable native connection or the foreground API.".into() });
-            }
+            crate::run::validate_durable_plan(&plan)?;
             tasks.push(NewAsyncTask {
                 task,
-                prompt: input.prompt.as_bytes().to_vec(),
+                prompt: input
+                    .prompt
+                    .ok_or_else(|| invalid("Durable tasks require inline prompts."))?,
                 harness: harness.to_string(),
-                plan_json: serde_json::to_string(&plan).map_err(error)?,
+                plan_json: serde_json::to_string(&AcceptedPlan {
+                    plan,
+                    limits: Some(Options::from_run(&input.options)),
+                })
+                .map_err(error)?,
                 consent_stamp: stamp,
             });
         }
@@ -393,8 +396,8 @@ impl Manager {
             batch_id: BatchId::try_from(format!("b-{}", crate::run::new_run_id()?))?,
             prepared_state_id: prepared.state.state_id,
             request_digest: digest,
-            concurrency: request.concurrency.min(crate::api::MAX_TASKS),
-            options_json: serde_json::to_string(&request.options).map_err(error)?,
+            concurrency,
+            options_json: serde_json::to_string(&Options::default()).map_err(error)?,
             fake_binary: fake_binary
                 .map(|path| {
                     path.into_os_string()
@@ -420,7 +423,7 @@ impl Manager {
         Self::enqueue(&mut control, id.clone());
         self.changed.notify_all();
         drop(control);
-        accepted(&store, &id)
+        accepted(&store, &id, generic)
     }
 
     fn enqueue(control: &mut Control, batch: BatchId) {
@@ -494,7 +497,9 @@ impl Manager {
             let _ownership = OwnedTask { manager: self, run };
             let outcome = (|| {
                 let task = store.async_task(run).map_err(error)?;
-                let plan: HarnessPlan = serde_json::from_str(&task.plan_json).map_err(error)?;
+                let accepted: AcceptedPlan =
+                    serde_json::from_str(&task.plan_json).map_err(error)?;
+                let plan = accepted.plan;
                 let registry = HarnessRegistry::default();
                 let adapter = registry.resolve(
                     &HarnessId::try_from(task.harness)?,
@@ -507,7 +512,10 @@ impl Manager {
                         "Accepted harness version changed; task was not launched.",
                     ));
                 }
-                let options = crate::api::run_options(&options, token.clone())?;
+                let options = crate::api::run_options(
+                    accepted.limits.as_ref().unwrap_or(&options),
+                    token.clone(),
+                )?;
                 crate::run::execute_prepared(
                     &self.root,
                     &state,
@@ -878,14 +886,44 @@ fn selection(
     Ok((batch, run, tasks))
 }
 
-fn accepted(store: &Store, id: &BatchId) -> Result<Value, FabricError> {
-    let runs = store
-        .async_tasks(id)
-        .map_err(error)?
-        .into_iter()
-        .map(|task| task.run_id)
-        .collect::<Vec<_>>();
-    Ok(json!({"batch_id":id,"run_ids":runs,"accepted":true}))
+fn accepted(store: &Store, id: &BatchId, generic: bool) -> Result<Value, FabricError> {
+    let tasks = store.async_tasks(id).map_err(error)?;
+    if generic {
+        let tasks = tasks
+            .into_iter()
+            .map(|task| {
+                json!({
+                    "task_id":task.task_id,"run_id":task.run_id,"status":"queued"
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"accepted":true,"batch_id":id,"tasks":tasks}))
+    } else {
+        let runs = tasks
+            .into_iter()
+            .map(|task| task.run_id)
+            .collect::<Vec<_>>();
+        Ok(json!({"batch_id":id,"run_ids":runs,"accepted":true}))
+    }
+}
+
+// Flattening retains the v10 plan representation; old records use batch-level limits.
+#[derive(Serialize, Deserialize)]
+struct AcceptedPlan {
+    #[serde(flatten)]
+    plan: HarnessPlan,
+    #[serde(default)]
+    limits: Option<Options>,
+}
+
+fn request_digest(
+    request: &impl Serialize,
+    fake_binary: &Option<PathBuf>,
+) -> Result<String, FabricError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(request, fake_binary)).map_err(error)?)
+    ))
 }
 
 fn aggregate(tasks: &[AsyncTaskStatus]) -> RunState {

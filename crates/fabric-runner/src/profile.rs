@@ -65,9 +65,6 @@ pub(crate) fn effective_request(
                 "Profile must bind the selected harness and exact supported version.",
             ));
         }
-        if !profile.skills.is_empty() || !profile.plugins.is_empty() || !profile.mcp.is_empty() {
-            return Err(FabricError { kind: ErrorKind::UnsupportedCapability, message: "Requested profile skills, plugins or MCP imports cannot be enforced by this adapter.".into() });
-        }
         if let ModelPolicy::Exact { model } = &profile.model_policy {
             if request
                 .model

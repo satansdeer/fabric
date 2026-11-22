@@ -225,6 +225,29 @@ Batches share the same verified tracked/untracked capture-before-finalization pi
 
 ### Submit durable background workers
 
+Connect the native harnesses first, then write a version-free `workers.json`:
+
+```json
+{
+  "project": "my-project",
+  "max_concurrency": 2,
+  "tasks": [
+    {"task_id": "review", "harness_id": "omp", "prompt": "Review the prepared source."},
+    {"task_id": "check", "harness_id": "codex", "prompt": "Check the same prepared source."}
+  ]
+}
+```
+
+```sh
+fabric --root /private/path/to/fabric workers spawn --request workers.json --json
+```
+
+The response is `{accepted,batch_id,tasks:[{task_id,run_id,status}]}` before worker completion. Use the same `status`, `results`, `wait` and `cancel` commands below with these durable IDs. Omitted models inherit the harness's native default; explicit `model` overrides must be supported by that adapter. Placement defaults to `local`; `remote`, `cloud` and `byoc` fail preflight rather than falling back to local execution.
+
+Each task may set `limits` (`timeout_seconds`, `copy_limit_bytes`, `max_log_bytes`, `max_artifact_bytes`), persisted and enforced independently. The copy limit bounds byte-copy fallback, not successful APFS clones or their logical size. Hard `max_cost_usd` is rejected because no registered adapter enforces a spending cap. Optional `execution_context` selects `{"kind":"native"}` (the default) or an advanced `explicit` context with `harness_version`, `native_config_refs` and `connection_refs`. Skills, plugins and MCP belong to native harness configuration, not this request; nonempty legacy v1 portable lists receive a migration error.
+
+### Version-1 compatibility
+
 `submit` accepts the same strict v1 inline-prompt `spawn_many` request as `api`, but returns `{accepted,batch_id,run_ids}` after atomic durable admission, not worker completion. The existing `api`, `run` and `run-many` remain foreground operations.
 
 ```sh
@@ -412,7 +435,7 @@ Both distinct fixture protocols use the same pool, attempt records, isolated for
 
 ### Explicit profiles
 
-Workers and version probes clear the inherited environment and use private HOME/XDG directories. Real OMP runs require `--profile PATH` (or a task request's `profile`), bound to `omp` / `omp/19.1.0`, with explicit nonsecret connection references. For an already configured environment credential:
+Workers and version probes clear the inherited environment and use private HOME/XDG directories. Connected native harnesses use their explicitly consented configuration without a manual profile. Advanced v1 callers may still select `--profile PATH` (or a task request's `profile`), bound to `omp` / `omp/19.1.0`, with explicit nonsecret connection references. For an already configured environment credential in a foreground invocation:
 
 ```json
 {

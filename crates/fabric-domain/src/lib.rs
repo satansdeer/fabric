@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 mod capture;
 mod harness;
@@ -10,6 +10,7 @@ mod ids;
 mod policy;
 mod profile;
 mod state;
+mod worker;
 
 pub use capture::{AgentEvent, CaptureMetadata, CapturedFile, EventCounts};
 pub use harness::{
@@ -22,8 +23,9 @@ pub use profile::{
     AgentProfile, CredentialConnectionRef, ModelPolicy, NativeConfigRef, ProfileEvidence,
 };
 pub use state::{PreparedStateStatus, RunState, WorkspaceState};
+pub use worker::{ExecutionContext, SourceRef, WorkerLimits, WorkerTask};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     InvalidArguments,
@@ -45,7 +47,7 @@ pub enum ErrorKind {
     AuthorizationRequired,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FabricError {
     pub kind: ErrorKind,
     pub message: String,

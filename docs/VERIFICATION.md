@@ -6,7 +6,7 @@
 
 | Gate | Current status | Evidence |
 |---|---|---|
-| LOCAL_WORKER_API_READY | NOT_VERIFIED | Async lifecycle acceptance passed; generic worker API and immutable source selection (C03–04) remain pending. |
+| LOCAL_WORKER_API_READY | NOT_VERIFIED | Async lifecycle and generic worker API acceptance passed; immutable source selection (C04) remains pending. |
 | PSTACK_LOCAL_SWARM_READY | NOT_VERIFIED | Existing pstack skill routes native tasks; explicit Fabric bridge pending. |
 | LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
 
@@ -124,3 +124,25 @@ cargo test --offline -p fabric-core serialized_queued_plan_keeps_original_grant_
 macOS-specific regression: accepted Unix sockets inherited listener nonblocking mode. A foreground-manager probe showed small status replies succeeded while larger terminal-result replies truncated. Accepted streams now explicitly become blocking before bounded read/write timeouts; the four-worker terminal-result/artifact scenario passed afterward. The owned probe and its completed workspaces were removed.
 
 C-02 final compatibility gate passed: formatting; offline workspace Clippy with warnings denied; all 203 tests across 32 suites (128.95s); offline workspace binary build; and Bun real-CLI/OMP-extension conformance. Both corrected v1/v2 migration fixtures also passed their focused rerun. Combined command completed in 149.71s; raw evidence `local://303.log`. No provider/model calls. Generic worker requests, source selection and native pstack routing remain separate unverified gates.
+
+## C-03 generic workers and v1 compatibility
+
+`TESTED_WITH_FAKE`: version-free `workers spawn` accepts per-task native/explicit execution contexts, optional verified model overrides, and independent persisted limits; returns early task/run handles; shares the durable scheduler with v1. Native models are not guessed or passed as overrides. Remote placement, unverifiable models, hard spending caps and legacy portable skill/plugin/MCP lists reject explicitly before worker admission. Prepared-state/commit source refs remain unsupported until C04.
+
+Eight CLI scenarios cover mixed fake protocols, early acknowledgement, native defaults, literal prompts, typed atomic preflight rejection, serial default concurrency, pinned OMP/Codex executable fixtures without provider calls, independent timeouts/capture limits, and legacy v1 responses/migration errors. Artifacts are size/digest verified after workspace reclaim. Fixtures are not live harness verification.
+
+The first test failed on the missing `workers` command (`local://306.log`). Subsequent gates exposed and fixed manager startup before capability rejection, invalid option error typing, and lost v1 private prompt-file provenance. The existing v1 SIGTERM test now proves real 0600 prompt files under a 0700 parent while running and cleanup after completion.
+
+Final command:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo test --offline -p fabric-cli --test run api_sigterm_cancels_owned_worker_seals_evidence_and_reclaims -- --exact
+cargo fmt --all -- --check
+cargo clippy --offline --workspace --all-targets -- -D warnings
+cargo test --offline --workspace
+cargo build --offline --workspace --bins
+/Users/maksimivanov/.bun/bin/bun integrations/omp/conformance.ts "$PWD/target/debug/fabric"
+```
+
+All passed: focused regression 5.07s; 211 workspace tests/33 suites, 166.57s; combined gate 203.77s. Raw evidence: `local://317.log`. No model/provider calls. `copy_limit_bytes` bounds byte-copy fallback, not successful APFS clones; existing forced-copy backend tests pass, but native runtime fallback end-to-end remains `NOT_VERIFIED` on this APFS host.

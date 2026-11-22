@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use fabric_domain::FabricError;
+use fabric_domain::{ErrorKind, FabricError};
 
 use crate::execution_error;
 
@@ -81,9 +81,10 @@ impl ExecutionLimits {
             || Instant::now().checked_add(self.timeout).is_none()
             || self.term_grace > Duration::from_secs(30)
         {
-            return Err(execution_error(
-                "Timeout must be positive and representable; TERM grace must be at most 30 seconds.",
-            ));
+            return Err(FabricError {
+                kind: ErrorKind::InvalidArguments,
+                message: "Timeout must be positive and representable; TERM grace must be at most 30 seconds.".into(),
+            });
         }
         Ok(())
     }

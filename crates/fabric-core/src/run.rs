@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -53,6 +53,7 @@ pub struct RunReport {
     pub worker_attempts: Vec<WorkerAttempt>,
 }
 
+#[derive(Clone)]
 pub struct RunOptions {
     pub copy_limit_bytes: u64,
     pub max_log_bytes: u64,
@@ -81,13 +82,14 @@ impl Default for RunOptions {
 }
 
 impl RunOptions {
-    fn validate(&self) -> Result<(), FabricError> {
+    pub(crate) fn validate(&self) -> Result<(), FabricError> {
         self.limits.validate()?;
         validate_capture_limit(self.max_log_bytes)?;
         if self.max_artifact_bytes == 0 || self.max_artifact_bytes > i64::MAX as u64 {
-            return Err(error(
-                "max_artifact_bytes must be positive and fit SQLite storage.",
-            ));
+            return Err(FabricError {
+                kind: ErrorKind::InvalidArguments,
+                message: "max_artifact_bytes must be positive and fit SQLite storage.".into(),
+            });
         }
         Ok(())
     }
@@ -462,12 +464,11 @@ pub fn run_many(
     options: &RunOptions,
 ) -> Result<BatchReport, FabricError> {
     let mut inputs: Vec<TaskInput> =
-        serde_json::from_slice(&std::fs::read(manifest).map_err(error)?).map_err(|_| {
-            FabricError {
-                kind: ErrorKind::InvalidArguments,
-                message: "Invalid task manifest; check the supported task and profile fields."
-                    .into(),
-            }
+        serde_json::from_slice(&std::fs::read(manifest).map_err(error)?).map_err(|failure| {
+            crate::api::decode_error(
+                failure,
+                "Invalid task manifest; check the supported task and profile fields.",
+            )
         })?;
     let parent = std::path::absolute(manifest)
         .map_err(error)?
@@ -481,6 +482,57 @@ pub fn run_many(
     }
     spawn_many(root, project_name, inputs, concurrency, harnesses, options)
 }
+pub(crate) struct ExecutionTask {
+    pub id: String,
+    /// Inline bytes, or a legacy prompt file read independently when its worker runs.
+    pub prompt: Option<Vec<u8>>,
+    pub prompt_file: String,
+    pub harness: HarnessId,
+    pub options: RunOptions,
+}
+
+pub(crate) struct ExecutionBatch {
+    pub project: String,
+    pub concurrency: usize,
+    pub tasks: Vec<ExecutionTask>,
+}
+
+struct PromptSpool(PathBuf);
+
+impl PromptSpool {
+    fn write(
+        root: &Path,
+        inputs: &[ExecutionTask],
+        tasks: &mut [BatchTask],
+    ) -> Result<Option<Self>, FabricError> {
+        if !inputs.iter().any(|task| task.prompt.is_some()) {
+            return Ok(None);
+        }
+        let path = root.join(format!("api-prompts-{}", new_run_id()?.as_str()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(error)?;
+        let spool = Self(path);
+        for (index, (input, task)) in inputs.iter().zip(tasks).enumerate() {
+            if let Some(prompt) = &input.prompt {
+                let path = spool.0.join(index.to_string());
+                private_output(&path)?.write_all(prompt).map_err(error)?;
+                task.prompt_file = path
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| error("Prompt paths must be UTF-8."))?;
+            }
+        }
+        Ok(Some(spool))
+    }
+}
+
+impl Drop for PromptSpool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 /// Shared typed batch service; prompt paths are already resolved by the caller.
 pub fn spawn_many(
@@ -491,15 +543,65 @@ pub fn spawn_many(
     harnesses: &BatchHarnesses<'_>,
     options: &RunOptions,
 ) -> Result<BatchReport, FabricError> {
+    let tasks = inputs
+        .into_iter()
+        .map(|task| {
+            let harness = task
+                .harness
+                .or_else(|| harnesses.default.cloned())
+                .ok_or_else(|| FabricError {
+                    kind: ErrorKind::UnknownHarness,
+                    message: format!("Task {} requires a harness or a batch default.", task.id),
+                })?;
+            if task.prompt_file.as_os_str().is_empty() {
+                return Err(error("Task manifest requires nonempty prompt paths."));
+            }
+            let prompt_file = task
+                .prompt_file
+                .into_os_string()
+                .into_string()
+                .map_err(|_| error("Prompt paths must be UTF-8."))?;
+            let mut options = options.clone();
+            if let Some(request) = task.request {
+                options.harness_request = request;
+            }
+            Ok(ExecutionTask {
+                id: task.id,
+                prompt: None,
+                prompt_file,
+                harness,
+                options,
+            })
+        })
+        .collect::<Result<Vec<_>, FabricError>>()?;
+    spawn_execution(
+        root,
+        ExecutionBatch {
+            project: project_name.into(),
+            concurrency,
+            tasks,
+        },
+        harnesses,
+    )
+}
+
+pub(crate) fn spawn_execution(
+    root: &Path,
+    batch: ExecutionBatch,
+    harnesses: &BatchHarnesses<'_>,
+) -> Result<BatchReport, FabricError> {
+    let concurrency = batch.concurrency;
     let PreparedBatch {
         root,
         state,
-        tasks,
+        mut tasks,
         plans,
         adapters,
-    } = prepare_batch(root, project_name, inputs, concurrency, harnesses, options)?;
+        inputs,
+    } = prepare_batch(root, batch, harnesses)?;
     let batch_id = BatchId::try_from(format!("b-{}", new_run_id()?.as_str()))?;
     let (_, mut store) = open_store(&root)?;
+    let _prompt_spool = PromptSpool::write(&root, &inputs, &mut tasks)?;
     store
         .create_batch(&batch_id, &state.state_id, &tasks)
         .map_err(error)?;
@@ -507,15 +609,26 @@ pub fn spawn_many(
         let (_, store) = open_store(&root)?;
         let task = &tasks[index];
         let (harness_id, plan) = &plans[index];
-        let outcome = foreground_prepared(
-            &root,
-            &state,
-            Path::new(&task.prompt_file),
-            adapters[harness_id].0.as_ref(),
-            options,
-            plan,
-            task.run_id.clone(),
-        )
+        let outcome = match &inputs[index].prompt {
+            Some(prompt) => execute_prepared(
+                &root,
+                &state,
+                prompt,
+                adapters[harness_id].0.as_ref(),
+                &inputs[index].options,
+                plan,
+                task.run_id.clone(),
+            ),
+            None => foreground_prepared(
+                &root,
+                &state,
+                Path::new(&task.prompt_file),
+                adapters[harness_id].0.as_ref(),
+                &inputs[index].options,
+                plan,
+                task.run_id.clone(),
+            ),
+        }
         .and_then(|report| serde_json::to_string(&report).map_err(error));
         store
             .finish_batch_task(
@@ -562,79 +675,91 @@ pub(crate) struct PreparedBatch {
     pub state: PreparedState,
     pub tasks: Vec<BatchTask>,
     pub plans: Vec<(HarnessId, (HarnessPlan, Option<String>))>,
-    pub adapters: HashMap<HarnessId, (Box<dyn HarnessAdapter>, fabric_runner::HarnessInfo)>,
+    pub adapters: PlannedAdapters,
+    pub inputs: Vec<ExecutionTask>,
+}
+
+pub(crate) type PlannedAdapters =
+    HashMap<HarnessId, (Box<dyn HarnessAdapter>, fabric_runner::HarnessInfo)>;
+
+pub(crate) fn plan_task(
+    root: &Path,
+    id: &HarnessId,
+    options: &RunOptions,
+    harnesses: &BatchHarnesses<'_>,
+    adapters: &mut PlannedAdapters,
+) -> Result<(HarnessPlan, Option<String>), FabricError> {
+    options.validate()?;
+    let request = options.request()?;
+    let (adapter, probe) = match adapters.entry(id.clone()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let adapter = harnesses.registry.resolve(id, harnesses.options)?;
+            let probe = adapter.probe()?;
+            entry.insert((adapter, probe))
+        }
+    };
+    crate::onboarding::plan(root, adapter.as_ref(), request, probe)
+}
+
+pub(crate) fn validate_durable_plan(plan: &HarnessPlan) -> Result<(), FabricError> {
+    if plan.request.profile.as_ref().is_some_and(|profile| {
+        profile
+            .connection_refs
+            .iter()
+            .any(|reference| reference.kind == "env")
+    }) {
+        return Err(FabricError {
+            kind: ErrorKind::UnsupportedCapability,
+            message: "Async native environment connections are not restart-safe; use a durable native connection or the foreground API.".into(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_batch(
     root: &Path,
-    project_name: &str,
-    inputs: Vec<TaskInput>,
-    concurrency: usize,
+    batch: ExecutionBatch,
     harnesses: &BatchHarnesses<'_>,
-    options: &RunOptions,
 ) -> Result<PreparedBatch, FabricError> {
-    if concurrency == 0 {
+    if batch.concurrency == 0 {
         return Err(error("Concurrency must be positive."));
     }
-    options.validate()?;
+    let inputs = batch.tasks;
     let mut ids = HashSet::with_capacity(inputs.len());
     if inputs.is_empty()
-        || inputs.iter().any(|task| {
-            task.id.trim().is_empty()
-                || task.prompt_file.as_os_str().is_empty()
-                || !ids.insert(&task.id)
-        })
+        || inputs
+            .iter()
+            .any(|task| task.id.trim().is_empty() || !ids.insert(&task.id))
     {
         return Err(error(
-            "Task manifest requires nonempty unique IDs and prompt paths, and at least one task.",
+            "Task manifest requires nonempty unique IDs and at least one task.",
         ));
     }
     let mut adapters = HashMap::new();
     let mut tasks = Vec::with_capacity(inputs.len());
     let mut plans = Vec::with_capacity(inputs.len());
     // Entire batch admission is read-only until every adapter/request has a plan.
-    for task in inputs {
-        let id = task
-            .harness
-            .or_else(|| harnesses.default.cloned())
-            .ok_or_else(|| FabricError {
-                kind: ErrorKind::UnknownHarness,
-                message: format!("Task {} requires a harness or a batch default.", task.id),
-            })?;
-        let request = match task.request {
-            Some(request) => request,
-            None => options.request()?,
-        };
-        request.validate()?;
-        let (adapter, probe) = match adapters.entry(id.clone()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let adapter = harnesses.registry.resolve(&id, harnesses.options)?;
-                let probe = adapter.probe()?;
-                entry.insert((adapter, probe))
-            }
-        };
-        let plan = crate::onboarding::plan(root, adapter.as_ref(), request, probe)?;
+    for task in &inputs {
+        let id = task.harness.clone();
+        let plan = plan_task(root, &id, &task.options, harnesses, &mut adapters)?;
         tasks.push(BatchTask {
-            task_id: task.id,
+            task_id: task.id.clone(),
             run_id: new_run_id()?,
-            prompt_file: task
-                .prompt_file
-                .into_os_string()
-                .into_string()
-                .map_err(|_| error("Prompt paths must be UTF-8."))?,
+            prompt_file: task.prompt_file.clone(),
             result: None,
             error: None,
         });
         plans.push((id, plan));
     }
-    let (root, state) = select_prepared(root, project_name)?;
+    let (root, state) = select_prepared(root, &batch.project)?;
     Ok(PreparedBatch {
         root,
         state,
         tasks,
         plans,
         adapters,
+        inputs,
     })
 }
 
@@ -675,7 +800,10 @@ pub(crate) fn run_pool(
 
 fn validate_capture_limit(max_log_bytes: u64) -> Result<(), FabricError> {
     if max_log_bytes < fabric_runner::capture::TRUNCATION_MARKER.len() as u64 {
-        return Err(error("Capture limit must fit the truncation marker."));
+        return Err(FabricError {
+            kind: ErrorKind::InvalidArguments,
+            message: "Capture limit must fit the truncation marker.".into(),
+        });
     }
     Ok(())
 }

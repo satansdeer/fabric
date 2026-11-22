@@ -83,6 +83,11 @@ enum Commands {
         #[arg(long)]
         idempotency_key: Option<String>,
     },
+    /// Spawn and reconnect to harness-independent durable workers.
+    Workers {
+        #[command(subcommand)]
+        command: WorkersCommands,
+    },
     /// Reconnect to durable batch or run lifecycle events.
     Status {
         id: String,
@@ -129,6 +134,44 @@ enum Commands {
         json: bool,
         #[command(subcommand)]
         command: StorageCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkersCommands {
+    Spawn {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
+        #[arg(long)]
+        fake_binary: Option<PathBuf>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    Show {
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
+    Results {
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    Cancel {
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    Wait {
+        id: String,
+        #[arg(long)]
+        timeout_seconds: u64,
+        #[arg(long, required = true)]
+        json: bool,
     },
 }
 
@@ -392,6 +435,46 @@ fn main() -> ExitCode {
             json,
             write_submit(cli.root, request, fake_binary, idempotency_key),
         ),
+        Commands::Workers { command } => match command {
+            WorkersCommands::Spawn {
+                request,
+                json,
+                fake_binary,
+                idempotency_key,
+            } => (
+                json,
+                write_spawn(cli.root, request, fake_binary, idempotency_key),
+            ),
+            WorkersCommands::Show { id, json, after } => (
+                json,
+                write_worker(
+                    cli.root,
+                    fabric_core::manager::Request::Status { id, after },
+                ),
+            ),
+            WorkersCommands::Results { id, json } => (
+                json,
+                write_worker(cli.root, fabric_core::manager::Request::Results { id }),
+            ),
+            WorkersCommands::Cancel { id, json } => (
+                json,
+                write_worker(cli.root, fabric_core::manager::Request::Cancel { id }),
+            ),
+            WorkersCommands::Wait {
+                id,
+                json,
+                timeout_seconds,
+            } => (
+                json,
+                write_worker(
+                    cli.root,
+                    fabric_core::manager::Request::Wait {
+                        id,
+                        timeout_seconds,
+                    },
+                ),
+            ),
+        },
         Commands::Status { id, json, after } => (
             json,
             write_worker(
@@ -477,6 +560,33 @@ fn write_submit(
     write_worker(
         root,
         fabric_core::manager::Request::Submit {
+            request,
+            fake_binary,
+            idempotency_key,
+        },
+    )
+}
+
+fn write_spawn(
+    root: Option<PathBuf>,
+    path: PathBuf,
+    fake_binary: Option<PathBuf>,
+    idempotency_key: Option<String>,
+) -> Result<(), FabricError> {
+    let file = std::fs::File::open(path).map_err(|_| FabricError {
+        kind: ErrorKind::InvalidArguments,
+        message: "Cannot open worker request JSON file.".into(),
+    })?;
+    if !file.metadata().map_err(output_error)?.is_file() {
+        return Err(FabricError {
+            kind: ErrorKind::InvalidArguments,
+            message: "Worker request must be a regular file.".into(),
+        });
+    }
+    let request = fabric_core::api::read_worker_request(file)?;
+    write_worker(
+        root,
+        fabric_core::manager::Request::Spawn {
             request,
             fake_binary,
             idempotency_key,

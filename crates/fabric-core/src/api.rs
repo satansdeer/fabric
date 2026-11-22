@@ -1,16 +1,17 @@
-//! Versioned foreground control surface; execution and admission remain in `run`.
-use std::fs::{self, OpenOptions};
+//! Generic worker requests and the version-1 compatibility translation.
+use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::Duration;
 
-use fabric_domain::{ErrorKind, FabricError, HarnessId, HarnessRequest};
+use fabric_domain::{
+    AgentProfile, ErrorKind, ExecutionContext, FabricError, HarnessId, HarnessRequest, ModelPolicy,
+    SourceRef, WorkerLimits, WorkerTask,
+};
 use fabric_runner::{CancellationToken, HarnessRegistry, RegistryOptions};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::run::{BatchHarnesses, BatchReport, RunOptions, TaskInput};
+use crate::run::{BatchHarnesses, BatchReport, ExecutionBatch, ExecutionTask, RunOptions};
 
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_TASKS: usize = 128;
@@ -41,13 +42,24 @@ pub struct Task {
     pub request: Option<HarnessRequest>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub timeout_seconds: Option<u64>,
     pub copy_limit_bytes: Option<u64>,
     pub max_log_bytes: Option<u64>,
     pub max_artifact_bytes: Option<u64>,
+}
+
+impl Options {
+    pub(crate) fn from_run(options: &RunOptions) -> Self {
+        Self {
+            timeout_seconds: Some(options.limits.timeout.as_secs()),
+            copy_limit_bytes: Some(options.copy_limit_bytes),
+            max_log_bytes: Some(options.max_log_bytes),
+            max_artifact_bytes: Some(options.max_artifact_bytes),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,8 +69,36 @@ pub struct BatchResponse {
     pub batch: BatchReport,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerBatchRequest {
+    pub project: String,
+    pub tasks: Vec<WorkerTask>,
+    #[serde(default = "default_concurrency")]
+    pub max_concurrency: usize,
+    #[serde(default = "local_placement")]
+    pub placement: String,
+}
+
+fn default_concurrency() -> usize {
+    1
+}
+fn local_placement() -> String {
+    "local".into()
+}
+
 /// Bounded, non-echoing JSON decoding for file/transport consumers.
 pub fn read_request(reader: impl Read) -> Result<BatchRequest, FabricError> {
+    read_json(reader)
+}
+
+pub fn read_worker_request(reader: impl Read) -> Result<WorkerBatchRequest, FabricError> {
+    let request = read_json(reader)?;
+    validate_worker_request(&request)?;
+    Ok(request)
+}
+
+fn read_json<T: DeserializeOwned>(reader: impl Read) -> Result<T, FabricError> {
     let mut bytes = Vec::new();
     reader
         .take(MAX_REQUEST_BYTES as u64 + 1)
@@ -67,12 +107,26 @@ pub fn read_request(reader: impl Read) -> Result<BatchRequest, FabricError> {
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err(invalid("API request exceeds 1 MiB."));
     }
-    serde_json::from_slice(&bytes).map_err(|_| {
-        invalid("Invalid API request JSON; check the supported request and profile fields.")
+    serde_json::from_slice(&bytes).map_err(|failure| {
+        decode_error(
+            failure,
+            "Invalid API request JSON; check the supported request and profile fields.",
+        )
     })
 }
 
-/// Inline prompts are private temporary inputs, never a second execution protocol.
+pub(crate) fn decode_error(failure: serde_json::Error, fallback: &str) -> FabricError {
+    const MIGRATION: &str = "Portable profile.skills/plugins/mcp are no longer supported; configure skills, plugins, and MCP in the native harness instead.";
+    if failure.to_string().starts_with(MIGRATION) {
+        FabricError {
+            kind: ErrorKind::UnsupportedCapability,
+            message: MIGRATION.into(),
+        }
+    } else {
+        invalid(fallback)
+    }
+}
+
 pub fn spawn_many(
     root: &Path,
     request: BatchRequest,
@@ -80,39 +134,14 @@ pub fn spawn_many(
     registry_options: &RegistryOptions,
     cancellation: CancellationToken,
 ) -> Result<BatchResponse, FabricError> {
-    validate_request(&request)?;
-    let options = run_options(&request.options, cancellation)?;
-    let prompts = PromptDirectory::new()?;
-    let mut inputs = Vec::with_capacity(request.tasks.len());
-    for (index, task) in request.tasks.into_iter().enumerate() {
-        let path = prompts.0.join(index.to_string());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|_| invalid("Cannot create private API prompt input."))?;
-        file.write_all(task.prompt.as_bytes())
-            .map_err(|_| invalid("Cannot write private API prompt input."))?;
-        inputs.push(TaskInput {
-            id: task.id,
-            prompt_file: path,
-            harness: task.harness,
-            request: task.request,
-        });
-    }
-    let batch = crate::run::spawn_many(
+    let batch = crate::run::spawn_execution(
         root,
-        &request.project,
-        inputs,
-        request.concurrency,
+        translate_v1(request, cancellation)?,
         &BatchHarnesses {
             registry,
             options: registry_options,
-            default: request.default_harness.as_ref(),
+            default: None,
         },
-        &options,
     )?;
     Ok(BatchResponse {
         version: 1,
@@ -121,26 +150,214 @@ pub fn spawn_many(
     })
 }
 
-pub(crate) fn validate_request(request: &BatchRequest) -> Result<(), FabricError> {
-    if request.version != 1 || request.op != "spawn_many" {
-        return Err(invalid("API requires version 1 and op spawn_many."));
+pub(crate) fn translate_v1(
+    request: BatchRequest,
+    cancellation: CancellationToken,
+) -> Result<ExecutionBatch, FabricError> {
+    validate_request(&request)?;
+    let options = run_options(&request.options, cancellation)?;
+    let tasks = request
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let harness = task
+                .harness
+                .or_else(|| request.default_harness.clone())
+                .ok_or_else(|| FabricError {
+                    kind: ErrorKind::UnknownHarness,
+                    message: format!("Task {} requires a harness or a batch default.", task.id),
+                })?;
+            let mut options = options.clone();
+            if let Some(request) = task.request {
+                options.harness_request = request;
+            }
+            Ok(ExecutionTask {
+                id: task.id,
+                prompt: Some(task.prompt.into_bytes()),
+                prompt_file: "inline-input".into(),
+                harness,
+                options,
+            })
+        })
+        .collect::<Result<Vec<_>, FabricError>>()?;
+    Ok(ExecutionBatch {
+        project: request.project,
+        concurrency: request.concurrency,
+        tasks,
+    })
+}
+
+pub(crate) fn validate_worker_request(request: &WorkerBatchRequest) -> Result<(), FabricError> {
+    if request.placement != "local" {
+        return Err(FabricError {
+            kind: ErrorKind::UnsupportedPlacement,
+            message: "Only local worker placement is supported.".into(),
+        });
     }
-    if request.project.trim().is_empty() || request.concurrency == 0 {
+    validate_size(
+        &request.project,
+        request.max_concurrency,
+        request.tasks.len(),
+        request.tasks.iter().map(|task| task.prompt.len()),
+    )?;
+    serde_json::to_writer(RequestBudget(MAX_REQUEST_BYTES), request)
+        .map_err(|_| invalid("API request exceeds 1 MiB."))?;
+    let mut ids = HashSet::with_capacity(request.tasks.len());
+    if request
+        .tasks
+        .iter()
+        .any(|task| task.task_id.trim().is_empty() || !ids.insert(&task.task_id))
+    {
+        return Err(invalid("Tasks require nonempty unique task_id values."));
+    }
+    for task in &request.tasks {
+        if task
+            .source_ref
+            .as_ref()
+            .is_some_and(|source| !matches!(source, SourceRef::CurrentHead {}))
+        {
+            return Err(FabricError { kind: ErrorKind::UnsupportedCapability,
+                message: "Prepared-state and commit source references are not supported yet; use current-head.".into() });
+        }
+        if task
+            .limits
+            .as_ref()
+            .is_some_and(|limits| limits.max_cost_usd.is_some())
+        {
+            return Err(FabricError { kind: ErrorKind::UnsupportedCapability,
+                message: "No registered adapter enforces a hard max_cost_usd limit; native best-effort budgets are not spending caps.".into() });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn translate_workers(
+    request: WorkerBatchRequest,
+) -> Result<ExecutionBatch, FabricError> {
+    validate_worker_request(&request)?;
+    let tasks = request
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let options = worker_options(
+                &task.harness_id,
+                task.model,
+                task.execution_context,
+                task.limits.unwrap_or_default(),
+            )?;
+            Ok(ExecutionTask {
+                id: task.task_id,
+                prompt: Some(task.prompt.into_bytes()),
+                prompt_file: "inline-input".into(),
+                harness: task.harness_id,
+                options,
+            })
+        })
+        .collect::<Result<Vec<_>, FabricError>>()?;
+    Ok(ExecutionBatch {
+        project: request.project,
+        concurrency: request.max_concurrency,
+        tasks,
+    })
+}
+
+fn worker_options(
+    harness: &HarnessId,
+    model: Option<String>,
+    context: Option<ExecutionContext>,
+    limits: WorkerLimits,
+) -> Result<RunOptions, FabricError> {
+    let mut options = run_options(
+        &Options {
+            timeout_seconds: limits.timeout_seconds,
+            copy_limit_bytes: limits.copy_limit_bytes,
+            max_log_bytes: limits.max_log_bytes,
+            max_artifact_bytes: limits.max_artifact_bytes,
+        },
+        CancellationToken::default(),
+    )?;
+    options.harness_request.model = model;
+    if let Some(ExecutionContext::Explicit {
+        harness_version,
+        native_config_refs,
+        connection_refs,
+    }) = context
+    {
+        options.harness_request.profile = Some(AgentProfile {
+            harness_id: harness.clone(),
+            harness_version,
+            native_config_refs,
+            connection_refs,
+            model_policy: ModelPolicy::NativeDefault {},
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            mcp: Vec::new(),
+        });
+    }
+    Ok(options)
+}
+
+/// The client uses the same read-only adapter negotiation before starting any manager.
+/// The manager repeats it at its trust boundary; prompts are never copied for preflight.
+pub(crate) fn preflight_workers(
+    root: &Path,
+    request: &WorkerBatchRequest,
+    registry_options: &RegistryOptions,
+) -> Result<(), FabricError> {
+    validate_worker_request(request)?;
+    let registry = HarnessRegistry::default();
+    let harnesses = BatchHarnesses {
+        registry: &registry,
+        options: registry_options,
+        default: None,
+    };
+    let mut adapters = crate::run::PlannedAdapters::new();
+    for task in &request.tasks {
+        let options = worker_options(
+            &task.harness_id,
+            task.model.clone(),
+            task.execution_context.clone(),
+            task.limits.clone().unwrap_or_default(),
+        )?;
+        let (plan, _) =
+            crate::run::plan_task(root, &task.harness_id, &options, &harnesses, &mut adapters)?;
+        crate::run::validate_durable_plan(&plan)?;
+    }
+    Ok(())
+}
+
+fn validate_size(
+    project: &str,
+    concurrency: usize,
+    count: usize,
+    prompts: impl Iterator<Item = usize>,
+) -> Result<(), FabricError> {
+    if project.trim().is_empty() || concurrency == 0 {
         return Err(invalid(
             "API requires a nonempty project and positive concurrency.",
         ));
     }
-    if request.tasks.is_empty()
-        || request.tasks.len() > MAX_TASKS
-        || request
-            .tasks
-            .iter()
-            .any(|task| task.prompt.len() > MAX_PROMPT_BYTES)
+    if count == 0
+        || count > MAX_TASKS
+        || prompts.into_iter().any(|length| length > MAX_PROMPT_BYTES)
     {
         return Err(invalid(
             "API requires 1–128 tasks with at most 64 KiB per prompt.",
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_request(request: &BatchRequest) -> Result<(), FabricError> {
+    if request.version != 1 || request.op != "spawn_many" {
+        return Err(invalid("API requires version 1 and op spawn_many."));
+    }
+    validate_size(
+        &request.project,
+        request.concurrency,
+        request.tasks.len(),
+        request.tasks.iter().map(|task| task.prompt.len()),
+    )?;
     // Count without allocating another copy; typed callers obey the transport bound too.
     serde_json::to_writer(RequestBudget(MAX_REQUEST_BYTES), &request)
         .map_err(|_| invalid("API request exceeds 1 MiB."))?;
@@ -167,7 +384,7 @@ pub(crate) fn run_options(
     if let Some(limit) = request.max_artifact_bytes {
         options.max_artifact_bytes = limit;
     }
-    options.limits.validate()?;
+    options.validate()?;
     Ok(options)
 }
 
@@ -182,32 +399,6 @@ impl Write for RequestBudget {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
-    }
-}
-
-struct PromptDirectory(PathBuf);
-impl PromptDirectory {
-    fn new() -> Result<Self, FabricError> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let clock = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| invalid("Cannot create private API prompt directory."))?;
-        let path = std::env::temp_dir().join(format!(
-            "fabric-api-{}-{}-{}",
-            std::process::id(),
-            clock.as_nanos(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|_| invalid("Cannot create private API prompt directory."))?;
-        Ok(Self(path))
-    }
-}
-impl Drop for PromptDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

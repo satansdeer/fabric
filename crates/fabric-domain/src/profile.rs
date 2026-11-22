@@ -60,6 +60,12 @@ pub struct ProfileEvidence {
 
 impl AgentProfile {
     pub fn validate(&self) -> Result<(), FabricError> {
+        if !self.skills.is_empty() || !self.plugins.is_empty() || !self.mcp.is_empty() {
+            return Err(FabricError {
+                kind: ErrorKind::UnsupportedCapability,
+                message: "Portable profile.skills/plugins/mcp are no longer supported; configure skills, plugins, and MCP in the native harness instead.".into(),
+            });
+        }
         let valid = |value: &str| {
             !value.trim().is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
         };
@@ -70,9 +76,6 @@ impl AgentProfile {
         }
         };
         if !valid(&self.harness_version)
-            || [&self.skills, &self.plugins, &self.mcp]
-                .iter()
-                .any(|items| items.len() > 32 || items.iter().any(|value| !valid(value)))
             || self.native_config_refs.len() > 32
             || self.connection_refs.len() > 32
             || self.native_config_refs.iter().any(|reference| {
