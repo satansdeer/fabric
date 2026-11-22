@@ -7,7 +7,7 @@
 | Gate | Current status | Evidence |
 |---|---|---|
 | LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Async/generic API and immutable-source acceptance passed: 220 workspace tests/33 suites and adapter conformance. Recovery/storage follow-up remains C06. |
-| PSTACK_LOCAL_SWARM_READY | NOT_VERIFIED | Existing pstack skill routes native tasks; explicit Fabric bridge pending. |
+| PSTACK_LOCAL_SWARM_READY | TESTED_WITH_FAKE | Pstack `437dd8e`: explicit local-route generator/fail-closed drift tests pass; installed OMP 19.1.0 discovers `/skill:swarm`; native typed tools drive four fake workers, progress/reconnect, independent failure/artifacts/reclaim and cancel. Model-selected routing remains NOT_VERIFIED. |
 | LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
 
 No cloud readiness claim is made. Native installed-host loading and fake workers do not establish authentication/model access or model-driven skill routing.
@@ -165,3 +165,29 @@ cargo build --offline --bins
 ```
 
 All passed: focused regression 14.54 s; 220 workspace tests/33 suites, 156.77 s; combined gate 201.35 s. Raw evidence: `local://330.log`. Separate store-focused migration/contract proof: 27 tests passed, `local://329.log`. No provider calls.
+
+## C-05 typed native OMP and explicit local pstack
+
+- Pstack commit `437dd8e4b2ec579202fce2e81ca0900765b16472`, generated plugin
+  `omp-0.15.46-7a3b678628a7`: five generator tests pass after actual RED (nine
+  missing fail-closed drift subcases). No source/model/provider selection guessed;
+  ordinary native dispatch remains the default. Explicit local routing does not
+  fall back to cloud.
+- Typed acceptance actual RED: missing `fabric_spawn`. Legacy and typed
+  conformance then passed against real CLI/manager/fake worker processes.
+- Actual pinned OMP `omp/19.1.0` initially caught unsupported
+  `pi.zod.discriminatedUnion`, which the in-process proxy did not detect.
+  Supported literal-tagged `union` schemas now pass actual-host positive and
+  negative validation cases. Exposed schema API source:
+  <https://github.com/can1357/oh-my-pi/blob/a7135b8f31826c878734388b648f52bed8da436e/packages/omptype/src/zod.ts>.
+- Final combined provider-free gate passed in 54.70 s:
+  `host-smoke.ts`, `conformance.ts`, `typed-conformance.ts`.
+  Actual installed-host proof uses private HOME and the generated pstack plugin:
+  early four-worker IDs; visible ordinary-context partial progress; controller
+  close/reconnect without cancellation; independent real nonzero fake-worker
+  failure; exact artifact digests and reclaimed workspaces; explicit cancellation;
+  actual `/skill:swarm` discovery. No agent/provider turn.
+- Retained native-host evidence:
+  `/var/folders/1f/387q3rgd0_l041rkswmt1t_r0000gn/T/fabric-omp-host-8mOJ30`.
+  This is native control-plane proof with fake workers, not live authentication,
+  model-selected pstack routing, Codex/OMP live workers or cloud readiness.

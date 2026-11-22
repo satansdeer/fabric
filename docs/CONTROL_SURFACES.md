@@ -1,11 +1,11 @@
-# Fabric control surfaces (HN-06)
+# Fabric control surfaces
 
-Fabric's CLI JSON API and native OMP extension submit one versioned request to
-`fabric_core::api::spawn_many`, which delegates to the existing worker pool.
-The control agent, worker harness and execution backend are separate choices.
-Neither surface replaces v0.1 preparation, durable storage, supervision, capture
-or safe workspace reclaim. Execution is currently foreground, trusted-local,
-macOS-first; this is not a daemon, remote executor or multitenant sandbox.
+The native OMP extension exposes durable generic-worker controls through the
+existing CLI/manager. A submit returns early batch/run handles; the local manager
+owns admitted workers independently of the controller session. The legacy v1
+foreground API remains available for debugging and compatibility.
+Controller, worker harness and execution backend are separate choices.
+Execution is macOS-first trusted-local, not remote/cloud or a security sandbox.
 
 ## Native OMP setup
 
@@ -28,20 +28,39 @@ XDG/home defaults. Relative paths are interpreted from the OMP invocation cwd;
 absolute overrides are recommended. Prepare/register a project before submitting
 workers. These overrides do not select worker profiles or authorize credentials.
 
-The default export registers:
+The default export registers five typed tools:
 
-- Tool **`fabric`**, label **Fabric**, parameters `{ "request": <JSON object> }`.
-  The wrapper deliberately does not duplicate Rust's versioned request schema.
-- Slash **`/fabric <literal JSON request>`**. Arguments are parsed as JSON, not
-  rewritten as a prompt. Both registrations invoke the same helper.
+| Tool | Arguments and behavior |
+| --- | --- |
+| `fabric_spawn` | `project`, inline `tasks`; optional `max_concurrency`, `placement`, `idempotency_key`. Returns early durable batch/run IDs. Only local placement is supported; remote requirements reject without fallback. |
+| `fabric_status` | `batch_id`; current durable states/events. |
+| `fabric_results` | `batch_id`; persisted task results, source provenance, artifacts and actual failures. A successful retrieval does not mean the workers succeeded. |
+| `fabric_cancel` | `batch_id`; explicit cancellation request, not a controller-disconnect side effect. |
+| `fabric_wait` | `batch_id`, integer `timeout_seconds` from 0 through 10; bounded wait, not a full-batch blocking spawn. |
+
+Each task has `task_id`, `harness_id`, and a complete independent `prompt`.
+Omit `execution_context` for the connected native context and `model` for the
+worker harness's own default. Native context requires prior explicit consent;
+these tools never connect, prepare, authorize credentials or guess a model.
+Optional `source_ref` is `{kind:"current-head"}`,
+`{kind:"prepared",state_id:"..."}`, or `{kind:"commit",sha:"..."}`.
+A READY exact base is required; no automatic preparation or dirty-change transfer.
+Optional per-task `limits` carries the generic worker limits documented in README.
+
+The legacy tool `fabric` accepts `{ "request": <v1 JSON object> }`;
+`/fabric <literal JSON request>` parses the same document without rewriting it
+as a prompt. Both remain foreground debugging controls, not the normal swarm route.
 
 The helper creates a fresh mode-0700 temporary directory, writes `request.json`
 mode 0600 with exclusive creation, and removes the directory in `finally` on
-normal completion, rejection, interruption or an exception. It calls exactly:
+normal completion, rejection, interruption or an exception. Legacy v1 calls use:
 
 ```text
 pi.exec(binary, ["--root", root, "api", "--request", privatePath, "--json"], {cwd, signal})
 ```
+
+Typed spawn uses `workers spawn --request privatePath`; the other typed controls
+invoke their corresponding `workers` subcommands without a request file.
 
 The `--root` pair is omitted unless explicitly configured. No shell expansion,
 stdin transport, adapter-specific flags or credentials are added. The tool's
@@ -49,8 +68,10 @@ AbortSignal and context cwd are forwarded. There is **no outer exec timeout**:
 Fabric's per-worker resource limits own deadlines. A killed process or malformed
 response is a transport/protocol error, never a fabricated completed batch. Raw
 stderr and exception text are not displayed; well-formed typed Fabric error JSON
-can be displayed. Accepted failed/partial batches retain their actual response
-and return `isError: true`; successful batches return `isError: false`.
+can be displayed. Legacy foreground failed/partial batches retain their actual
+response and return `isError: true`; successful batches return `isError: false`.
+For typed durable tools, operation failure is separate from worker outcome:
+successfully retrieved failed-worker evidence is not a transport error.
 
 The tool returns JSON text plus the same document in `details`. Slash execution
 uses `pi.sendMessage` with `display: true` and `triggerTurn: false`, without
@@ -58,7 +79,16 @@ uses `pi.sendMessage` with `display: true` and `triggerTurn: false`, without
 slash command without a model call; a model choosing the tool is still an
 ordinary controller model turn.
 
-## Version 1 API
+After an accepted spawn, a managed watcher uses bounded waits and appends changed
+progress plus terminal results as visible ordinary untrusted controller-context
+data. It never uses `deliverAs:"aside"`, starts an idle model turn, or substitutes
+UI-only output for context. An idle controller consumes updates on its next turn.
+Session switch/shutdown aborts watchers/timers only; admitted workers continue.
+Reconnect with `fabric_results` and the saved batch ID; never blindly resubmit
+after an uncertain transport error. Resume observation with a necessary status
+or wait call. Do not hot-poll or loop zero-timeout waits.
+
+## Legacy version 1 foreground API
 
 ```sh
 fabric --root /absolute/storage api --request /private/request.json --json
@@ -185,13 +215,15 @@ unregistered slash command as a nonbilling test: an unknown slash can become a
 model prompt. In RPC mode, first verify `fabric` via `get_available_commands`,
 then require command dispatch with `agentInvoked: false`.
 
-For automated, no-new-dependency conformance, with Bun and both built binaries:
+For automated provider-free checks, with Bun and both built binaries:
 
 ```sh
 bun integrations/omp/conformance.ts "$PWD/target/debug/fabric"
+bun integrations/omp/typed-conformance.ts "$PWD/target/debug/fabric"
+bun integrations/omp/host-smoke.ts "$PWD/target/debug/fabric" /absolute/path/to/omp /absolute/path/to/om-pstack/omp
 ```
 
-This script creates its own disposable Git source, preparation recipe and
+`conformance.ts` creates its own disposable Git source, preparation recipe and
 storage, then uses a tiny fake ExtensionAPI with **real Fabric subprocesses**.
 It submits the identical mixed fake-a/fake-b document directly, through the
 tool and through slash; checks schema, harness/profile identities, attempts,
@@ -205,50 +237,49 @@ wrapper, new package, daemon or provider credential. A fake extension host does
 not prove OMP's actual loader/tool-schema/RPC behavior; that control-plane proof
 is a separate installed-OMP check recorded by the coordinating verification.
 
-## pstack `/swarm` as a generic consumer
+`typed-conformance.ts` checks early durable handles, bounded wait, ordinary
+progress delivery, controller reconnect, independent worker failure/artifacts,
+cancel and fail-closed remote rejection. `host-smoke.ts` drives the installed
+OMP 19.1.0 RPC host with private HOME and real tool registration/schema parsing;
+it proves four-worker handles, progress, reconnect, artifact digests/reclaim and
+cancellation without an agent/provider turn. Passing the generated pstack plugin
+directory also checks actual `/skill:swarm` discovery. This does not prove a model
+chooses the route or that a live worker can authenticate.
 
-A pstack controller can prepare one versioned Fabric document like the example
-above: implement on fake-a with its model/profile, independently review on
-fake-b with another profile, and submit one `fabric` tool call. No worker needs
-a harness-specific launch script; adapters choose their native argv/protocol.
-The incompatible fake-b model/resume case is an explicit preflight failure, not
-a silent fallback. The conformance scenario exercises this generic controller
-boundary, not pstack's native scheduler.
+## Explicit local pstack swarm
 
-There are **no native pstack task-schema, role or `/swarm` implementation
-changes**. Native pstack subagents remain opaque harness-internal work. Fabric
-workers are separate durable runs with their own private workspaces; one native
-subagent is not automatically one Fabric worker.
+The generated [om-pstack OMP plugin](https://github.com/satansdeer/om-pstack)
+keeps ordinary `/skill:swarm` on native OMP `task`. It does not monkeypatch that
+tool, replace the native scheduler or treat a native subagent as a Fabric run.
+Load its generated `omp` directory with OMP's `--plugin-dir` alongside this
+extension. For an already initialized/connected project, explicitly request:
 
-For an opt-in real-harness variation, change the two task harnesses to `omp` and
-`codex`, use ordinary prompt strings, remove fake-a's `model` override, and use
-separate explicit profiles, for example:
-
-```json
-[
-  {"harness_id":"omp","harness_version":"omp/19.1.0","connection_refs":[{"kind":"env","name":"OPENAI_API_KEY"}]},
-  {"harness_id":"codex","harness_version":"codex-cli 0.171.0","connection_refs":[{"kind":"env","name":"CODEX_API_KEY"}]}
-]
+```text
+/skill:swarm --fabric-local --fabric-project demo --fabric-harness omp <brief>
 ```
 
-Assign each complete profile object to its own task's `request.profile`; this
-array is explanatory, not the API document. Values must already be configured
-and explicitly authorized; never paste credentials into JSON or controller
-messages. Native config references are also nonsecret, adapter-specific opt-ins;
-see README's profile rules. Do not infer equivalent models, permissions, native
-subagent isolation or portable config. OMP/Codex worker execution remains
-**NOT_VERIFIED live** here (source/fixture conformance only). Installed OMP
-extension loading/slash verification is control-plane evidence, not provider
-or live-worker validation.
+This real-harness route can incur provider spending and requires separate
+authorization; command discovery alone does not execute or verify it.
+The arguments are interpreted by the skill/controller, not a new executable.
+Select an explicit registered project (or actually discovered single unambiguous
+registration); never infer it from a directory basename. Harness defaults to
+`omp` only when omitted. Missing tools/consent/READY source are blockers, not
+permission for an implicit setup, model substitution or native-task fallback.
 
-Verified on installed OMP 19.1.0: an isolated RPC session loaded this extension,
-enumerated `/fabric`, and completed the mixed fake-a/fake-b request. Its separate
-`prompt_result` frame reported `agentInvoked:false`, `status:completed` and
-`sessionSettled:true`; the initial prompt acknowledgement alone is not completion.
-Both runs succeeded, all 28 registered artifact hashes/sizes matched, and both
-workspaces were reclaimed. No model/provider request was made.
+The controller creates distinct inline tasks, uses `fabric_spawn`, saves early
+IDs, continues independent work, then retrieves/aggregates results through typed
+controls. Coverage/race rules, exact source SHAs, verification methods,
+`PASS`/`ISSUES`/`BLOCKED`, retries and explicit gaps remain the skill's contract.
+Worker self-reports and durable handles alone are not PASS evidence.
+Required remote/cloud placement or credential/security isolation is `BLOCKED`
+before local allocation, never silently downgraded.
 
-## Foreground and cancellation limits
+Provider-free checks verify generation, native skill discovery and typed
+execution with real local fake workers. They do not prove a model selected the
+route, native OMP/Codex authentication, live worker execution or cloud parity.
+Those live gates remain `NOT_VERIFIED`/`BLOCKED` without separate authorization.
+
+## Legacy foreground cancellation limits
 
 The CLI must remain alive until the foreground batch finishes. Fabric handles
 SIGINT/SIGTERM through its existing cancellation token and worker supervision.
@@ -261,6 +292,10 @@ completion of temporary-file `finally` cleanup. Use existing durable run
 inspection, reconciliation and strict reclaim; do not automatically resubmit an
 uncertain batch. There is no background/resume/retry guarantee and no new
 lifecycle owner.
+
+These foreground limits apply to `fabric`/`/fabric`, not accepted typed durable
+submissions. A typed client interruption or controller close does not itself
+cancel admitted workers. Save the early IDs and inspect their durable state.
 
 ## Generic MCP mapping — DESIGN ONLY, not shipped
 

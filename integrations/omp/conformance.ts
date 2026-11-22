@@ -111,10 +111,12 @@ try {
 	let lastArgs: string[] = [];
 	let lastBinary = "";
 	let expectedSignal: AbortSignal | undefined = controller.signal;
-	const schema = { passthrough() { return this; } };
+	type SchemaStub = { (...args: unknown[]): SchemaStub; [key: string]: SchemaStub };
+	const schema = new Proxy(function () { return schema; }, { get: () => schema, apply: () => schema }) as SchemaStub;
 	const host = {
-		zod: { object: () => schema },
-		registerTool(value: FixtureTool) { assert.equal(value.name, "fabric"); tool = value; },
+		zod: schema,
+		on() {},
+		registerTool(value: FixtureTool) { if (value.name === "fabric") tool = value; },
 		registerCommand(name: string, value: FixtureCommand) { assert.equal(name, "fabric"); command = value; },
 		sendMessage(message: FixtureMessage, options: { triggerTurn: boolean }) {
 			assert.equal(message.display, true);

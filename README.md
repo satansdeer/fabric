@@ -483,7 +483,7 @@ Final assistant text, tool lifecycle and token usage are normalized; cost remain
 
 `scripts/smoke-codex.sh` defaults to `NOT_VERIFIED` without invoking a provider. Explicit `--run --profile /absolute/profile.json` enables a potentially billed smoke, requires the exact installed version, and checks output, sealed evidence and cleanup before reporting PASS. No live Codex run has been verified here; deterministic fixture conformance is not provider/authentication validation.
 
-## Shared JSON API and native OMP extension (HN-06)
+## Shared JSON API and native OMP controls
 
 `fabric api --request /private/request.json --json` accepts versioned inline-prompt
 batch requests through `fabric_core::api::spawn_many`, using the existing scheduler,
@@ -491,18 +491,25 @@ profiles, durable evidence and reclaim. Accepted failed batches return one compl
 JSON response with a nonzero exit code; preflight failures return a typed error.
 SIGINT/SIGTERM cancel owned foreground workers.
 
-The native OMP 19.1.0 extension provides the `fabric` tool and `/fabric` command.
+The OMP 19.1.0 extension exposes `fabric_spawn`, `fabric_status`,
+`fabric_results`, `fabric_cancel` and bounded `fabric_wait`. Spawn returns early
+durable IDs; controller disconnect stops observation, not admitted workers.
+The legacy foreground `fabric` tool and `/fabric` command remain for debugging.
 Build the workspace binaries, set `FABRIC_BINARY` and `FABRIC_ROOT`, then load
 `integrations/omp/fabric.ts` with OMP's `-e` option. See
-[control surfaces](docs/CONTROL_SURFACES.md) for setup, the complete request/response
-contract, runnable mixed-harness pstack example, cancellation limits and design-only
-MCP mapping.
+[control surfaces](docs/CONTROL_SURFACES.md) for native-context consent,
+typed tasks, immutable sources, explicit local pstack routing and v1 compatibility.
 
-Run the independent, provider-free extension check with:
+Run the independent, provider-free extension checks with:
 
 ```sh
 bun integrations/omp/conformance.ts "$PWD/target/debug/fabric"
+bun integrations/omp/typed-conformance.ts "$PWD/target/debug/fabric"
+bun integrations/omp/host-smoke.ts "$PWD/target/debug/fabric" /absolute/path/to/omp /absolute/path/to/om-pstack/omp
 ```
 
-Installed OMP control-plane verification completed a mixed fake-worker batch without
-invoking an agent/model. This does not verify live OMP/Codex workers or authorize spending.
+Installed OMP 19.1.0 control-plane verification passed native schemas/tools,
+four independent fake workers, ordinary-context progress, disconnect/reconnect,
+failure evidence, reclamation and cancellation; the actual plugin exposes
+`/skill:swarm`. No agent/model turn ran. Live OMP/Codex workers and model-selected
+pstack routing remain unverified; these checks do not authorize spending.

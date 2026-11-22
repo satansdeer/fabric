@@ -11,8 +11,8 @@ Execution contract: one bounded acceptance criterion at a time, failing behavior
 | C-02 async workers | DONE | Eight async lifecycle scenarios and full compatibility gates passed; schema v10 preserves historical evidence. |
 | C-03 generic request | DONE | Eight generic-worker scenarios, existing v1 SIGTERM/privacy regression, and full compatibility gates passed: 211 tests/33 suites plus Bun conformance. |
 | C-04 immutable sources | DONE | Exact prepared/SHA sources, original-checkout independence, frozen provenance/pins, inline CLI and restart/idempotency acceptance; 220 tests/33 suites plus Bun conformance. |
-| C-05 OMP/pstack | NOT_VERIFIED | Typed tools and explicit local swarm bridge; real installed OMP provider-free four-worker proof. |
-| C-06 recovery/storage | NOT_VERIFIED | Safe recoverable capture/reclaim and protected, actionable retained-workspace reporting. |
+| C-05 OMP/pstack | DONE | Actual REDs fixed; legacy/typed conformance and installed OMP 19.1.0 native schema/tool/four-worker/progress/reconnect/failure/artifact/reclaim/cancel proof pass. Explicit local pstack generator tests and actual skill discovery pass; live/model routing remains unverified. |
+| C-06 recovery/storage | IN_PROGRESS | Real capture-failure acceptance reaches missing `recover` RED; promoted sealed-capture GC regression is being driven before production authorization. |
 | C-07 release gates | NOT_VERIFIED | Exact CI/evidence gates and opt-in live scripts; live provider calls require approval. |
 
 ## C-00
@@ -57,3 +57,19 @@ Focused checks, fmt, warning-denying clippy, all 190 tests across 31 suites, bin
 - Final gate passes (`local://330.log`, 201.35 s): stop/immediate-reconnect regression 14.54 s; formatting; strict offline Clippy; all 220 workspace tests/33 suites (156.77 s); binary build; real CLI adapter conformance with fake OMP host. Store-focused proof also passes all 27 tests (`local://329.log`, 2.56 s total). No model/provider calls.
 - Changed runtime: domain `src/lib.rs`/`src/worker.rs`; core `src/api.rs`/`src/manager.rs`/`src/run.rs`; store `src/lib.rs`/`src/queue.rs`/`src/task_sources.sql`; CLI `src/main.rs`. Acceptance: CLI `tests/workers.rs`, store `tests/store.rs`. README and verification/progress documents record the contract and evidence.
 - C04 complete. Next: C05 typed OMP tools and explicit local pstack route, beginning with independent acceptance REDs. Live model-driven routing remains blocked on spending authorization.
+
+## C-05 acceptance
+
+- C04 committed as `009352cde50d72c8630079be95f89dac2c13d225`. Two independent implementers own Fabric's OMP extension/acceptance and pstack's generator/adapter/acceptance respectively. Shared typed names: `fabric_spawn`, `fabric_status`, `fabric_results`, `fabric_cancel`, `fabric_wait`; raw v1 debug controls remain.
+- First gate is actual RED for typed async controls and explicit local swarm generation. Native ordinary tasks stay native; remote requirements reject rather than silently selecting local. Parent owns generation/checks and actual installed-OMP provider-free proof. Model-driven routing/live harness execution remains blocked on authorization.
+- Typed controls RED (Bun 1.3.5): `typed-conformance.ts` fails `missing typed OMP tool fabric_spawn` before worker allocation; production implementation now authorized. The acceptance uses the actual generic CLI and fake local harnesses with an in-process host; native-host proof remains separate.
+- Pstack actual RED: five tests, nine drift cases fail because invalid model/placement/source migration anchors did not reject generation (`local://333.log`). Fixed source adapter/generator passes all five tests in 2.565s. Temporary generation produced `omp-0.15.46-7a3b678628a7`; four changed generated files and the marketplace version were applied with anchored edits, leaving upstream source/lock unchanged. No provider/model calls.
+- Actual installed OMP 19.1.0 with private HOME and explicit generated plugin directory discovers `skill:swarm` (`source: skill`, 108 available commands). RPC state is settled, non-streaming, zero messages/queued work; EOF exits 0 with no agent/message/tool execution events. This verifies command discovery, not model-selected routing. Pstack changes committed as `437dd8e4b2ec579202fce2e81ca0900765b16472`; Fabric typed native-host execution still pending.
+- C06's runtime and CLI-acceptance owners are preparing independent recovery regressions only; production remains frozen pending actual RED and completion of C05's control-plane gate.
+- C05 runtime checks: legacy and typed provider-free conformance pass with real CLI workers. Native-host RED first caught the helper's incorrect version matcher (`omp/19.1.0`), then actual OMP loading rejected unsupported `pi.zod.discriminatedUnion`. The helper now pins the observed exact version; the implementer replaced that constructor with native supported literal-tagged unions and added actual-host schema validation cases. Native proof is being rerun, not inferred from the in-process proxy.
+- C05 final combined gate PASS (54.70 s): actual installed OMP 19.1.0 native positive/negative schema validation and typed tools, early four-worker handles, visible ordinary-context progress, controller close/reconnect, independent real failure, exact digests/reclaim/cancel, actual `/skill:swarm` discovery; legacy and typed conformance also PASS. Evidence retained in `/var/folders/1f/387q3rgd0_l041rkswmt1t_r0000gn/T/fabric-omp-host-8mOJ30`. No agent/provider turn; live/model-selected routing remains NOT_VERIFIED.
+
+## C-06 acceptance
+
+- Public actual RED: `recover_inspects_captureable_failure_then_seals_and_reclaims_without_inventing_success` reaches a real fake exit 7 and deterministic capture I/O failure, then fails because `recover` is unrecognized (one failed test, 3.04s; `local://348.log`). No durable-evidence/ownership edits or live model calls. Acceptance expansion authorized.
+- Private sealed/promoted-capture GC regression initially exposed three test compilation errors, corrected without production changes; behavioral RED is pending. C05's native gate is now complete.
