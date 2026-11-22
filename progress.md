@@ -243,3 +243,10 @@
 - Added validated extensible harness/version evidence, registry-owned adapter construction/discovery, typed errors, additive v9 worker attempts, immutable provenance/terminal evidence and monotone progress. Existing Run constructors and historical storage remain intact.
 - Parent GREEN: 32 domain/store tests, strict workspace/all-target clippy, 138 workspace tests in 24 suites. Formatting-only anchored corrections followed by a clean fmt check. Evidence: `local://190.log`, `local://191.log`.
 - Status: HN-01 done. No model invocation, remote backend claim, or missing-predecessor acceptance claim.
+
+## HN-02 — externally verified
+
+- Implementers: Hn02Adapters (domain/runner) and Hn02Admission (core/CLI). RED: unsupported OMP version accepted (`local://194.log`); model request rejected only as an unknown CLI flag instead of negotiated `unsupported_capability` (`local://196.log`).
+- Added the exact 13-capability vocabulary, default-deny manifests/plans, validated requests and version pins. Foreground and batch plans reject unsupported model/resume/capabilities/placement/access/budgets before storage/workspace/batch allocation. Invocation evidence uses the negotiated exact version.
+- Parent GREEN: strict workspace/all-target clippy and all 150 workspace tests across 24 suites (`local://203.log`); anchored layout corrections then clean fmt check. Actual CLI list and fake/installed OMP doctors passed (`local://204.log`), observing `omp/19.1.0` without a model request.
+- Status: HN-02 done. Only exact tested fake/OMP versions are accepted; model override, resume and usage remain explicitly unsupported at this stage. Native HOME isolation is the next profile-boundary story, not claimed here.

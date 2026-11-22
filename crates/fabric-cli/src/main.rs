@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fabric_domain::{ErrorKind, FabricError, HarnessId};
+use fabric_domain::{
+    Capability, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId, HarnessRequest,
+};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -23,6 +25,13 @@ enum Commands {
         /// Emit a stable machine-readable report.
         #[arg(long)]
         json: bool,
+    },
+    /// Discover registered adapters and nonbilling version-specific capability evidence.
+    Harnesses {
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: HarnessesCommands,
     },
     /// Register or inspect a local Git source.
     Project {
@@ -81,6 +90,18 @@ struct WorkerArgs {
     /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
     #[arg(long)]
     fake_binary: Option<PathBuf>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long = "require-capability")]
+    required_capabilities: Vec<Capability>,
+    #[arg(long, default_value = "local")]
+    placement: String,
+    #[arg(long, default_value = "edit")]
+    access: String,
+    #[arg(long)]
+    hard_read_only: bool,
+    #[arg(long)]
+    resume: Option<String>,
     /// Explicit whole-tree allowance for ordinary-copy fallback (not a quota).
     #[arg(long, default_value_t = 0)]
     copy_limit_bytes: u64,
@@ -126,6 +147,25 @@ impl StorageArgs {
             ..fabric_core::workspace::storage::StorageOptions::default()
         }
     }
+}
+
+#[derive(Subcommand)]
+enum HarnessesCommands {
+    /// List registered harness IDs without invoking executables.
+    List,
+    /// Probe an installed harness without starting a worker or billing models.
+    Doctor {
+        id: HarnessId,
+        #[arg(long)]
+        fake_binary: Option<PathBuf>,
+    },
+}
+
+#[derive(Serialize)]
+struct HarnessDoctorReport {
+    harness_id: HarnessId,
+    version: String,
+    manifest: HarnessCapabilityManifest,
 }
 
 #[derive(Subcommand)]
@@ -226,6 +266,7 @@ fn main() -> ExitCode {
     };
     let (json, result) = match cli.command {
         Commands::Doctor { json } => (json, write_doctor(json)),
+        Commands::Harnesses { command, json } => (json, write_harnesses(command, json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run(args) => (args.options.json, write_run(cli.root, args)),
         Commands::RunMany(args) => (args.options.json, write_run_many(cli.root, args)),
@@ -292,6 +333,15 @@ fn run_options(
         cancellation,
         max_cost_usd: args.max_cost_usd,
         storage: args.storage.options(),
+        harness_request: HarnessRequest {
+            model: args.model.clone(),
+            required_capabilities: args.required_capabilities.clone(),
+            placement: args.placement.clone(),
+            access: args.access.clone(),
+            hard_read_only: args.hard_read_only,
+            resume: args.resume.clone(),
+            max_cost_usd: None,
+        },
     }
 }
 
@@ -524,6 +574,26 @@ fn write_storage(
         }
     }
     stdout.flush().map_err(output_error)
+}
+
+fn write_harnesses(command: HarnessesCommands, json: bool) -> Result<(), FabricError> {
+    let registry = fabric_runner::HarnessRegistry::default();
+    match command {
+        HarnessesCommands::List => write_inspection(&registry.ids(), json),
+        HarnessesCommands::Doctor { id, fake_binary } => {
+            let harness = registry.resolve(&id, &fabric_runner::RegistryOptions { fake_binary })?;
+            let info = harness.probe()?;
+            let manifest = harness.capabilities(&info)?;
+            write_inspection(
+                &HarnessDoctorReport {
+                    harness_id: id,
+                    version: info.version,
+                    manifest,
+                },
+                json,
+            )
+        }
+    }
 }
 
 fn write_doctor(json: bool) -> Result<(), FabricError> {

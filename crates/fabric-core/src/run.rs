@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fabric_domain::{BatchId, ErrorKind, FabricError, RunId, RunState, WorkspaceId};
+use fabric_domain::{
+    BatchId, ErrorKind, FabricError, HarnessPlan, HarnessRequest, RunId, RunState, WorkspaceId,
+};
 use fabric_runner::{AgentSpec, HarnessAdapter};
 use fabric_store::{BatchTask, PreparedState, WorkerAttempt};
 use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend};
@@ -56,6 +58,7 @@ pub struct RunOptions {
     pub storage: crate::workspace::storage::StorageOptions,
     /// Adapter-specific best-effort request admission, not an exact spending cap.
     pub max_cost_usd: Option<f64>,
+    pub harness_request: HarnessRequest,
 }
 
 impl Default for RunOptions {
@@ -68,6 +71,7 @@ impl Default for RunOptions {
             cancellation: fabric_runner::CancellationToken::default(),
             storage: crate::workspace::storage::StorageOptions::default(),
             max_cost_usd: None,
+            harness_request: HarnessRequest::default(),
         }
     }
 }
@@ -83,6 +87,21 @@ impl RunOptions {
         }
         Ok(())
     }
+
+    fn request(&self) -> Result<HarnessRequest, FabricError> {
+        let mut request = self.harness_request.clone();
+        if let Some(cost) = self.max_cost_usd {
+            if request.max_cost_usd.is_some_and(|other| other != cost) {
+                return Err(FabricError {
+                    kind: ErrorKind::InvalidArguments,
+                    message: "Conflicting max_cost_usd in RunOptions and harness_request.".into(),
+                });
+            }
+            request.max_cost_usd = Some(cost);
+        }
+        request.validate()?;
+        Ok(request)
+    }
 }
 
 pub fn foreground(
@@ -93,6 +112,8 @@ pub fn foreground(
     options: &RunOptions,
 ) -> Result<RunReport, FabricError> {
     options.validate()?;
+    let request = options.request()?;
+    let plan = harness.plan(&request, &harness.probe()?)?;
     let (root, state) = select_prepared(root, project_name)?;
     foreground_prepared(
         &root,
@@ -100,7 +121,7 @@ pub fn foreground(
         prompt_file,
         harness,
         options,
-        &harness.probe()?.version,
+        &plan,
         new_run_id()?,
     )
 }
@@ -135,7 +156,7 @@ fn foreground_prepared(
     prompt_file: &Path,
     harness: &(impl HarnessAdapter + ?Sized),
     options: &RunOptions,
-    harness_version: &str,
+    plan: &HarnessPlan,
     run_id: RunId,
 ) -> Result<RunReport, FabricError> {
     if options.cancellation.is_cancelled() {
@@ -172,9 +193,9 @@ fn foreground_prepared(
         run_id: run_id.clone(),
         harness_requested: harness_id.clone(),
         harness_resolved: harness_id,
-        harness_version: harness_version.to_owned(),
-        model_requested: None,
-        model_resolved: None,
+        harness_version: plan.manifest.exact_version.clone(),
+        model_requested: plan.request.model.clone(),
+        model_resolved: plan.model_resolved.clone(),
         profile_digest: None,
         backend_id: "trusted-local".into(),
         event_cursor: 0,
@@ -211,7 +232,7 @@ fn foreground_prepared(
             .map_err(error)?;
         let command = harness.command(&AgentSpec {
             prompt_file: &prompt_path,
-            max_cost_usd: options.max_cost_usd,
+            max_cost_usd: plan.request.max_cost_usd,
         })?;
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
@@ -236,7 +257,7 @@ fn foreground_prepared(
                     store.record_worker_attempt(&attempt).map_err(error)?;
                     reservation.started(&store, pid)?;
                     store
-                        .start_run(&run_id, harness_version, pid, started_at)
+                        .start_run(&run_id, &plan.manifest.exact_version, pid, started_at)
                         .map_err(error)
                 },
             );
@@ -301,7 +322,7 @@ fn foreground_prepared(
             store
                 .fail_run_execution(
                     &run_id,
-                    harness_version,
+                    &plan.manifest.exact_version,
                     &failure.message,
                     now()?,
                     options.cancellation.is_cancelled(),
@@ -415,6 +436,8 @@ pub fn run_many(
             "Task manifest requires nonempty unique IDs and prompt paths, and at least one task.",
         ));
     }
+    let request = options.request()?;
+    let plan = harness.plan(&request, &harness.probe()?)?;
     let parent = std::path::absolute(manifest)
         .map_err(error)?
         .parent()
@@ -437,7 +460,6 @@ pub fn run_many(
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
     let (root, state) = select_prepared(root, project_name)?;
-    let harness_version = harness.probe()?.version;
     let batch_id = BatchId::try_from(format!("b-{}", new_run_id()?.as_str()))?;
     let (_, mut store) = open_store(&root)?;
     store
@@ -458,7 +480,7 @@ pub fn run_many(
                         Path::new(&task.prompt_file),
                         harness,
                         options,
-                        &harness_version,
+                        &plan,
                         task.run_id.clone(),
                     )
                     .and_then(|report| serde_json::to_string(&report).map_err(error));

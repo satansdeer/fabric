@@ -167,3 +167,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Parent independently passed domain/store tests (32 tests, `local://190.log`), then strict workspace/all-target clippy and all 138 workspace tests across 24 suites (`local://191.log`). Initial fmt check found layout-only issues; anchored corrections passed `cargo fmt --all -- --check`.
 - Registry construction and executable discovery now belong to adapters. Shared core uses extensible IDs, persists immutable invocation provenance and observed process/event evidence, and exposes attempts through read-only inspection. Legacy Run fields and cleanup/capture behavior remain compatible; legacy runs acquire no invented attempts.
 - HN-01/HN-08 automated compatibility is verified. The referenced `FABRIC_PSTACK_UPDATE_SPEC.md` was absent from supplied files and both repositories; its additional AC/RC gates cannot be claimed. Live OMP remains unexecuted without spending authorization.
+
+## HN-02 — version/capability admission
+
+- Independently reviewed request validation, adapter version pins and all-task common-plan admission before mutable core operations. Missing/configuration-required capabilities fail closed; non-finite/nonpositive/conflicting budgets fail before allocation.
+- Implementer RED artifacts: `local://194.log`, `local://196.log`. Parent strict all-target clippy and 150 workspace tests across 24 suites passed (`local://203.log`); initial formatting-only failures were corrected with anchored edits and the subsequent fmt check passed.
+- Actual CLI proof (`local://204.log`): list reports registered IDs, fake doctor returns all 13 capability statuses and exact pin, installed OMP doctor observes `omp/19.1.0`. Probes are bounded version-only invocations; no billing/model request occurred. Unsupported requests retain unchanged run/workspace/batch/attempt counts in permanent CLI coverage.

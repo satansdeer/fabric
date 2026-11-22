@@ -97,6 +97,87 @@ mod unix {
     }
 
     #[test]
+    fn harness_list_and_doctor_are_nonbilling_and_do_not_allocate_storage() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("unallocated");
+        let executable = fixture.0.join("fake");
+        let marker = fixture.0.join("worker-started");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'fabric-fake-harness 1\\n'; exit 0; fi\nprintf launched > '{}'\nexit 91\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let invoke = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_fabric"))
+                .env_clear()
+                .arg("--root")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let output = invoke(&["harnesses", "list", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let ids: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(ids, serde_json::json!(["fake", "omp"]));
+        let output = invoke(&[
+            "harnesses",
+            "doctor",
+            "fake",
+            "--json",
+            "--fake-binary",
+            executable.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["harness_id"], "fake");
+        assert_eq!(report["version"], "fabric-fake-harness 1");
+        assert_eq!(report["manifest"]["harness_id"], "fake");
+        assert_eq!(report["manifest"]["exact_version"], report["version"]);
+        let statuses = report["manifest"]["capabilities"].as_array().unwrap();
+        assert_eq!(statuses.len(), fabric_domain::Capability::ALL.len());
+        for capability in fabric_domain::Capability::ALL {
+            let status = statuses
+                .iter()
+                .find(|status| status["capability"] == capability.as_str())
+                .unwrap();
+            assert!(status["support"].is_string());
+            assert!(!status["reason"]["code"].as_str().unwrap().is_empty());
+            assert!(!status["reason"]["message"].as_str().unwrap().is_empty());
+        }
+        let unknown = invoke(&["harnesses", "doctor", "unregistered-worker", "--json"]);
+        assert!(!unknown.status.success());
+        assert!(unknown.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&unknown.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "unknown_harness");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'fabric-fake-harness 999\\n'\n",
+        )
+        .unwrap();
+        let unsupported = invoke(&[
+            "harnesses",
+            "doctor",
+            "fake",
+            "--json",
+            "--fake-binary",
+            executable.to_str().unwrap(),
+        ]);
+        assert!(!unsupported.status.success());
+        assert!(unsupported.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&unsupported.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "unsupported_version");
+        assert!(!marker.exists());
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn discovery_is_deterministic_read_only_and_never_executes_tools() {
         let fixture = Fixture::new();
         for directory in ["first", "bin", "home", "cwd"] {

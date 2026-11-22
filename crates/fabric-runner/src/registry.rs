@@ -58,6 +58,12 @@ impl HarnessRegistry {
         Ok(adapter)
     }
 
+    pub fn ids(&self) -> Vec<HarnessId> {
+        let mut ids: Vec<_> = self.entries.keys().cloned().collect();
+        ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        ids
+    }
+
     pub fn doctor_executables(&self) -> Vec<&'static str> {
         let mut names: Vec<_> = self
             .entries

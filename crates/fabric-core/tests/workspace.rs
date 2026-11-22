@@ -523,6 +523,37 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
                 version: "tamper-test".into(),
             })
         }
+        fn capabilities(
+            &self,
+            info: &HarnessInfo,
+        ) -> Result<fabric_domain::HarnessCapabilityManifest, FabricError> {
+            use fabric_domain::{
+                Capability, CapabilityReason, CapabilitySupport, HarnessCapabilityManifest,
+            };
+            let mut manifest = HarnessCapabilityManifest::unsupported(
+                self.id(),
+                info.version.clone(),
+                "tamper-test (fixture only)".into(),
+            );
+            for status in &mut manifest.capabilities {
+                if matches!(
+                    status.capability,
+                    Capability::HeadlessRun
+                        | Capability::WorkspaceExternal
+                        | Capability::ExecutionCancel
+                        | Capability::FilesystemPatchCapture
+                ) {
+                    status.support = CapabilitySupport::FabricManaged;
+                    status.reason = CapabilityReason {
+                        code: "fixture_lifecycle".into(),
+                        message: "Fixture uses Fabric's supervised owned-workspace lifecycle."
+                            .into(),
+                    };
+                    status.minimum_version = Some("tamper-test".into());
+                }
+            }
+            Ok(manifest)
+        }
         fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
             let marker = spec.prompt_file.parent().unwrap().join(".fabric-owner");
             let text = fs::read_to_string(&marker).unwrap();

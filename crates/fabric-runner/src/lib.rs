@@ -14,7 +14,10 @@ pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, S
 use supervision::{PipeReader, ProcessGroup};
 
 use capture::Capture;
-use fabric_domain::{ErrorKind, FabricError, HarnessId, HarnessVersion};
+use fabric_domain::{
+    CapabilitySupport, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId, HarnessPlan,
+    HarnessRequest, HarnessVersion,
+};
 
 pub struct Execution {
     pub status: ExitStatus,
@@ -41,6 +44,21 @@ pub struct CommandSpec {
 pub trait HarnessAdapter {
     fn id(&self) -> HarnessId;
     fn probe(&self) -> Result<HarnessInfo, FabricError>;
+    fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
+        HarnessVersion::validate(&info.version)?;
+        Ok(HarnessCapabilityManifest::unsupported(
+            self.id(),
+            info.version.clone(),
+            "none attested".into(),
+        ))
+    }
+    fn plan(
+        &self,
+        request: &HarnessRequest,
+        info: &HarnessInfo,
+    ) -> Result<HarnessPlan, FabricError> {
+        negotiate(request, self.capabilities(info)?, false)
+    }
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError>;
 }
 
@@ -49,6 +67,8 @@ pub struct FakeHarness {
 }
 
 impl FakeHarness {
+    const SUPPORTED_VERSION: &'static str = "fabric-fake-harness 1";
+
     pub fn new(binary: PathBuf) -> Result<Self, FabricError> {
         if !binary.is_absolute() {
             return Err(execution_error(
@@ -66,20 +86,20 @@ impl HarnessAdapter for FakeHarness {
 
     fn probe(&self) -> Result<HarnessInfo, FabricError> {
         let version = probe_version(&self.binary, Vec::new())?;
-        if version != "fabric-fake-harness 1" {
-            return Err(execution_error("Unsupported fake harness version."));
-        }
-        HarnessVersion::validate(&version)?;
+        planning::check_version("fake", &version, Self::SUPPORTED_VERSION)?;
         Ok(HarnessInfo { version })
     }
 
+    fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
+        planning::local_manifest(
+            self.id(),
+            info,
+            Self::SUPPORTED_VERSION,
+            CapabilitySupport::FabricManaged,
+        )
+    }
+
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
-        if spec.max_cost_usd.is_some() {
-            return Err(FabricError {
-                kind: ErrorKind::UnsupportedCapability,
-                message: "Fake harness does not support max cost.".into(),
-            });
-        }
         Ok(CommandSpec {
             program: self.binary.clone(),
             args: vec!["--prompt-file".into(), spec.prompt_file.into()],
@@ -241,3 +261,6 @@ pub mod fake;
 
 mod registry;
 pub use registry::{HarnessRegistration, HarnessRegistry, RegistryOptions};
+
+mod planning;
+pub use planning::negotiate;

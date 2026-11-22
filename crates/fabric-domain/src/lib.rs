@@ -11,7 +11,10 @@ mod policy;
 mod state;
 
 pub use capture::{CaptureMetadata, CapturedFile, EventCounts};
-pub use harness::{HarnessId, HarnessVersion};
+pub use harness::{
+    Capability, CapabilityReason, CapabilityStatus, CapabilitySupport, HarnessCapabilityManifest,
+    HarnessId, HarnessPlan, HarnessRequest, HarnessVersion,
+};
 pub use ids::*;
 pub use policy::{RetentionMode, RetentionPolicy, StoragePolicy};
 pub use state::{PreparedStateStatus, RunState, WorkspaceState};

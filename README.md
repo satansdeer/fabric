@@ -338,3 +338,16 @@ cargo test --locked --workspace
 ```
 
 After dependencies have been cached, add `--offline` to Cargo build/test/clippy commands to prohibit registry access as well. Paid/model smoke is excluded from automated checks; AT-15 remains pending explicit approval. Project/preparation tests use temporary local Git repositories, including dirty and newly committed sources, ignored dependencies, literal argv/environment handling, hook/config suppression, retained failures, process-group/total timeouts, fail-closed managed paths, once-only cache side effects, competing CLI processes, and interrupted-stage reconciliation. Fork tests force admitted ordinary copies, compare every tree entry/content and independent inode, preserve executable/chained symlink behavior, concurrently edit siblings without base leakage, and reject insufficient admission, existing destinations and source/destination tampering.
+
+## Harness-neutral amendment
+
+The supplied v0.2.1 amendment is tracked separately in `PRD_HARNESS_NEUTRAL.json`. HN-01/02 are complete: registry-owned adapters, durable worker-attempt evidence, exact version probes and fail-closed capability planning. Existing v0.1 commands and storage remain compatible.
+
+```sh
+fabric harnesses list --json
+fabric harnesses doctor fake --json
+fabric harnesses doctor omp --json
+```
+
+Doctors are bounded, version-only probes, not provider/authentication or model checks. Supported pins currently are `fabric-fake-harness 1` and `omp/19.1.0`; other versions fail `unsupported_version`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating a worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Missing usage is unknown. No model/resume support or paid live acceptance is implied by a successful doctor.
+

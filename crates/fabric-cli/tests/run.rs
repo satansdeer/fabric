@@ -128,6 +128,171 @@ fn json(out: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn unsupported_harness_requests_fail_before_run_or_batch_allocation() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let prompt = fixture.0.join("request.json");
+    fs::write(&prompt, "{}").unwrap();
+    let manifest = fixture.0.join("requests.json");
+    fs::write(
+        &manifest,
+        r#"[{"id":"first","prompt_file":"request.json"},{"id":"second","prompt_file":"request.json"}]"#,
+    )
+    .unwrap();
+    let inventory = || {
+        let db = rusqlite::Connection::open_with_flags(
+            fixture.0.join("storage/fabric.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let counts: Vec<i64> = [
+            "runs",
+            "workspaces",
+            "batches",
+            "batch_tasks",
+            "worker_attempts",
+        ]
+        .into_iter()
+        .map(|table| {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        })
+        .collect();
+        let mut directories = Vec::new();
+        for name in ["workspaces", "fork-staging"] {
+            let path = fixture.0.join("storage").join(name);
+            if path.exists() {
+                directories.extend(
+                    fs::read_dir(path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            }
+        }
+        directories.sort();
+        (counts, directories)
+    };
+    let before = inventory();
+    for (flags, kind) in [
+        (
+            vec!["--model", "unavailable-model"],
+            "unsupported_capability",
+        ),
+        (vec!["--resume", "native-session"], "unsupported_capability"),
+        (vec!["--placement", "remote"], "unsupported_placement"),
+        (vec!["--hard-read-only"], "unsupported_capability"),
+        (vec!["--access", "inspect"], "unsupported_capability"),
+        (
+            vec!["--require-capability", "usage.report"],
+            "unsupported_capability",
+        ),
+        (vec!["--max-cost-usd", "0.25"], "unsupported_capability"),
+        (vec!["--max-cost-usd", "NaN"], "invalid_arguments"),
+        (vec!["--max-cost-usd", "0"], "invalid_arguments"),
+        (vec!["--placement", "unknown"], "invalid_arguments"),
+        (vec!["--access", "unknown"], "invalid_arguments"),
+        (
+            vec!["--require-capability", "unknown.feature"],
+            "invalid_arguments",
+        ),
+        (
+            vec![
+                "--require-capability",
+                "events.structured",
+                "--require-capability",
+                "session.resume",
+            ],
+            "unsupported_capability",
+        ),
+    ] {
+        for many in [false, true] {
+            let mut command = fixture.cli();
+            if many {
+                command
+                    .args(["run-many", "test", "--tasks"])
+                    .arg(&manifest)
+                    .args(["--concurrency", "2"]);
+            } else {
+                command.args(["run", "test", "--prompt-file"]).arg(&prompt);
+            }
+            let output = command
+                .args(["--harness", "fake", "--json"])
+                .args(&flags)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(failure["error"]["kind"], kind, "{failure}");
+            assert_eq!(inventory(), before, "{flags:?}, batch={many}");
+        }
+    }
+}
+
+#[test]
+fn direct_run_service_validates_budget_before_storage_allocation() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("unallocated");
+    let prompt = fixture.0.join("prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    let manifest = fixture.0.join("tasks.json");
+    fs::write(&manifest, r#"[{"id":"a","prompt_file":"prompt.json"}]"#).unwrap();
+    let harness =
+        fabric_runner::FakeHarness::new(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness")))
+            .unwrap();
+    for (legacy, requested, expected) in [
+        (
+            Some(f64::NAN),
+            None,
+            fabric_domain::ErrorKind::InvalidArguments,
+        ),
+        (
+            None,
+            Some(f64::INFINITY),
+            fabric_domain::ErrorKind::InvalidArguments,
+        ),
+        (Some(-1.0), None, fabric_domain::ErrorKind::InvalidArguments),
+        (None, Some(0.0), fabric_domain::ErrorKind::InvalidArguments),
+        (
+            Some(0.25),
+            Some(0.5),
+            fabric_domain::ErrorKind::InvalidArguments,
+        ),
+        (
+            Some(0.25),
+            Some(0.25),
+            fabric_domain::ErrorKind::UnsupportedCapability,
+        ),
+        (
+            None,
+            Some(0.25),
+            fabric_domain::ErrorKind::UnsupportedCapability,
+        ),
+    ] {
+        let options = fabric_core::run::RunOptions {
+            max_cost_usd: legacy,
+            harness_request: fabric_domain::HarnessRequest {
+                max_cost_usd: requested,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let failure = fabric_core::run::foreground(&root, "missing", &prompt, &harness, &options)
+            .err()
+            .expect("budget must be rejected");
+        assert_eq!(failure.kind, expected, "{failure}");
+        let failure =
+            fabric_core::run::run_many(&root, "missing", &manifest, 2, &harness, &options)
+                .err()
+                .expect("batch budget must be rejected");
+        assert_eq!(failure.kind, expected, "{failure}");
+        assert!(!root.exists());
+    }
+}
+
+#[test]
 fn harness_registry_unknown_id_and_neutral_core_preserve_attempt_evidence() {
     let fixture = Fixture::new();
     let unknown = fixture
@@ -1367,7 +1532,7 @@ test -z "${AWS_SECRET_ACCESS_KEY+x}"
 test -z "${BASH_ENV+x}"
 test -z "${PI_CODING_AGENT_DIR+x}"
 if [ "$#" = 1 ] && [ "$1" = --version ]; then
-    printf 'omp/19.1.0-fixture+exact\n'
+    printf 'omp/19.1.0\n'
     exit 0
 fi
 test "$#" = 8
@@ -1416,7 +1581,7 @@ printf '\n{"type":"finished"}\n{"last":true}'
             .unwrap();
         let report = json(&out);
         assert_eq!(report["harness"], "omp");
-        assert_eq!(report["harness_version"], "omp/19.1.0-fixture+exact");
+        assert_eq!(report["harness_version"], "omp/19.1.0");
         assert_eq!(report["base_commit_sha"], base["source_commit_sha"]);
         assert_eq!(report["state"], "SUCCEEDED");
         assert_eq!(report["events"]["parsed"], 3);
@@ -1466,7 +1631,7 @@ printf '\n{"type":"finished"}\n{"last":true}'
             .run(&report["run_id"].as_str().unwrap().parse().unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(run.harness_version, Some("omp/19.1.0-fixture+exact".into()));
+        assert_eq!(run.harness_version, Some("omp/19.1.0".into()));
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(
             serde_json::to_value(run.capture.unwrap()).unwrap(),
@@ -1623,7 +1788,7 @@ set -eu
 lock='{}/lock'
 journal='{}'
 if [ "$1" = --version ]; then
-  printf 'probe\n' >> "$journal.probes"; printf 'omp/fixture\n'; exit 0
+  printf 'probe\n' >> "$journal.probes"; printf 'omp/19.1.0\n'; exit 0
 fi
 test "$(cat .deps/ready)" = ready
 while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
