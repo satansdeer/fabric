@@ -115,3 +115,17 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed bounded tar writing, no-follow descriptor traversal, ignored exclusion, symlink refusal and complete-capture cleanup eligibility.
 - Independently passed real archive extraction (bytes, modes, links, unusual paths) and capture-failure retention regressions, including outside-link and size-limit cases.
 - Implementer final fmt/clippy/workspace gates passed (98 tests). Complete manifests permit CLEANUP_PENDING; this story performs no deletion.
+
+## Operator smoke — complete capture before reclamation
+
+- Ran the actual CLI against the retained dirty-source fixture with two fake workers, concurrency two, prepared ignored dependencies and distinct same-path edits.
+- Batch `b-r-1795314365266364000-74935-2` succeeded. Independently checked each published manifest, declared file size/SHA-256, tracked patch and restorable unique untracked bytes; sibling results and ignored dependencies are absent from archives. Original developer edit remained unchanged.
+- Actual `storage gc --dry-run` classified both captured forks as reclaimable; `--apply` deleted both containers. Independent post-deletion checks still recovered exact unique archive bytes and verified all declared hashes, tracked patches and logs. The earlier uncaptured workspace was refused; developer checkout remained unchanged.
+- These are offline fake-harness results, not a model-backed OMP demonstration.
+
+## FAB-17 — verified capture precedes lease-protected reclamation
+
+- Inspected descriptor-rooted cleanup, immutable intent authority, artifact revalidation, native read-only WAL inspection and lock release.
+- Independent checks: four CLI GC regressions; two read-only store regressions; four cleanup/crash-resume regressions; four concurrent store regressions all passed.
+- Parent caught inherited-flock leakage under concurrent forks. Explicit guard unlock and a live inherited-descriptor child regression fix it; busy cleaner refusal remains enforced. The final gate also exposed initial WAL-transition contention; bounded retry applies only to that idempotent transition.
+- Implementer final fmt, strict clippy and workspace gate passed: 111 tests across 24 suites (`local://133.log`). Operator plan/apply evidence above independently proves artifacts survive actual workspace deletion.

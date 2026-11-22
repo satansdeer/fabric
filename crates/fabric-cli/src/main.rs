@@ -35,6 +35,13 @@ enum Commands {
     Run(RunArgs),
     /// Execute a task manifest through a bounded foreground worker pool.
     RunMany(RunManyArgs),
+    /// Inspect or reclaim fully captured private workspaces (not READY caches).
+    Storage {
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: StorageCommands,
+    },
 }
 
 #[derive(clap::Args)]
@@ -105,6 +112,17 @@ enum ProjectCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum StorageCommands {
+    /// Verify all deletion prerequisites; apply only with an explicit flag.
+    Gc {
+        #[arg(long, required_unless_present = "apply", conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 #[derive(Serialize)]
 struct ProjectReport<'a> {
     project_id: &'a str,
@@ -159,6 +177,7 @@ fn main() -> ExitCode {
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run(args) => (args.options.json, write_run(cli.root, args)),
         Commands::RunMany(args) => (args.options.json, write_run_many(cli.root, args)),
+        Commands::Storage { command, json } => (json, write_storage(cli.root, command, json)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -183,16 +202,23 @@ fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
     } else {
         writeln!(
             stdout,
-            "Run: {}\nState: {:?}\nExit: {:?}\nRetained workspace: {}",
+            "Run: {}\nState: {:?}\nExit: {:?}\nWorkspace: {}",
             report.run_id, report.state, report.exit_code, report.workspace_path
         )
         .map_err(output_error)?;
+        if let Some(cleanup) = &report.cleanup {
+            writeln!(stdout, "Cleanup: {} ({})", cleanup.action, cleanup.reason)
+                .map_err(output_error)?;
+            if let Some(detail) = &cleanup.detail {
+                writeln!(stdout, "  {detail}").map_err(output_error)?;
+            }
+        }
     }
     stdout.flush().map_err(output_error)?;
     if report.state != fabric_domain::RunState::Succeeded {
         return Err(output_error(format!(
-            "Run {} failed (exit {:?}); workspace retained.",
-            report.run_id, report.exit_code
+            "Run {} failed (exit {:?}); recovery artifacts: {:?}.",
+            report.run_id, report.exit_code, report.artifact_manifest_id
         )));
     }
     Ok(())
@@ -362,6 +388,41 @@ fn write_project(
             report.name, report.source_path, report.source_commit_sha
         )
         .map_err(output_error)?;
+    }
+    stdout.flush().map_err(output_error)
+}
+
+fn write_storage(
+    root: Option<PathBuf>,
+    command: StorageCommands,
+    json: bool,
+) -> Result<(), FabricError> {
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let StorageCommands::Gc { apply, .. } = command;
+    let report = fabric_core::workspace::garbage_collect(&root, apply)?;
+    let mut stdout = io::stdout().lock();
+    if json {
+        serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
+        writeln!(stdout).map_err(output_error)?;
+    } else {
+        writeln!(stdout, "Storage GC ({})", report.mode).map_err(output_error)?;
+        for item in &report.items {
+            writeln!(
+                stdout,
+                "{}: {} ({}){}",
+                item.workspace_id,
+                item.action,
+                item.reason,
+                item.detail
+                    .as_ref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            )
+            .map_err(output_error)?;
+        }
+        for item in &report.unknown_paths {
+            writeln!(stdout, "{}: refused ({})", item.path, item.reason).map_err(output_error)?;
+        }
     }
     stdout.flush().map_err(output_error)
 }

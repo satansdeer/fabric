@@ -127,6 +127,379 @@ fn json(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+fn artifact_container(fixture: &Fixture, report: &serde_json::Value) -> PathBuf {
+    fixture
+        .0
+        .join("storage/artifacts")
+        .join(report["artifact_manifest_id"].as_str().unwrap())
+}
+
+fn restored_workspace(fixture: &Fixture, report: &serde_json::Value) -> PathBuf {
+    let artifacts = artifact_container(fixture, report);
+    let repo = fixture.0.join("repo ; literal");
+    let restored = fixture
+        .0
+        .join(format!("recovered-{}", report["run_id"].as_str().unwrap()));
+    fixture.git(
+        &repo,
+        &[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            repo.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ],
+    );
+    let patch = artifacts.join("tracked.patch");
+    if fs::metadata(&patch).unwrap().len() != 0 {
+        fixture.git(&restored, &["apply", "--binary", patch.to_str().unwrap()]);
+    }
+    success(
+        &Command::new("/usr/bin/tar")
+            .arg("-xpf")
+            .arg(artifacts.join("untracked.tar"))
+            .arg("-C")
+            .arg(&restored)
+            .output()
+            .unwrap(),
+    );
+    restored
+}
+
+fn pending_workspace(fixture: &Fixture) -> serde_json::Value {
+    let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER gc_test_lease AFTER UPDATE OF state ON workspaces
+        WHEN NEW.state='CLEANUP_PENDING' BEGIN
+        UPDATE workspaces SET lease_expires_at=9223372036854775807
+        WHERE workspace_id=NEW.workspace_id; END;",
+    )
+    .unwrap();
+    drop(db);
+    let report = json(&fixture.run(0));
+    assert_eq!(report["cleanup"]["reason"], "worker_lease_valid");
+    let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+    db.execute_batch("DROP TRIGGER gc_test_lease; UPDATE workspaces SET lease_expires_at=NULL;")
+        .unwrap();
+    report
+}
+
+fn gc(fixture: &Fixture, mode: &str) -> serde_json::Value {
+    json(
+        &fixture
+            .cli()
+            .args(["storage", "gc", mode, "--json"])
+            .output()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn gc_dry_run_is_read_only_and_live_lease_is_not_cleanup_permission() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::new();
+    fixture.setup();
+    let report = pending_workspace(&fixture);
+    let db_path = fixture.0.join("storage/fabric.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let committed_database = fs::read(&db_path).unwrap();
+    db.execute(
+        "UPDATE workspaces SET lease_expires_at=9223372036854775807",
+        [],
+    )
+    .unwrap();
+    assert_eq!(fs::read(&db_path).unwrap(), committed_database);
+    let wal_path = fixture.0.join("storage/fabric.db-wal");
+    let committed_wal = fs::read(&wal_path).unwrap();
+    assert!(committed_wal.len() > 32);
+    assert!(fixture.0.join("storage/fabric.db-shm").is_file());
+    let artifacts = artifact_container(&fixture, &report);
+    let artifact_bytes: std::collections::BTreeMap<_, _> = fs::read_dir(&artifacts)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        gc(&fixture, "--dry-run")["items"][0]["reason"],
+        "worker_lease_valid"
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), committed_database);
+    assert_eq!(fs::read(&wal_path).unwrap(), committed_wal);
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM cleanup_intents", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    assert_eq!(fs::read(tree.join("tracked")).unwrap(), b"worker tracked");
+    assert_eq!(
+        fs::read(tree.join("new source ; literal")).unwrap(),
+        b"worker untracked"
+    );
+    for (name, bytes) in &artifact_bytes {
+        assert_eq!(&fs::read(artifacts.join(name)).unwrap(), bytes);
+    }
+    drop(db);
+    assert_eq!(
+        gc(&fixture, "--apply")["items"][0]["reason"],
+        "worker_lease_valid"
+    );
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute("UPDATE workspaces SET lease_expires_at=NULL", [])
+        .unwrap();
+    drop(db);
+    let before = fs::read(&db_path).unwrap();
+    let root_entries: std::collections::BTreeSet<_> = fs::read_dir(fixture.0.join("storage"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let first = gc(&fixture, "--dry-run");
+    assert_eq!(first["items"][0]["action"], "would_reclaim");
+    assert_eq!(first, gc(&fixture, "--dry-run"));
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+    let after_entries: std::collections::BTreeSet<_> = fs::read_dir(fixture.0.join("storage"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(root_entries.is_subset(&after_entries));
+    for added in after_entries.difference(&root_entries) {
+        assert!(added == "fabric.db-wal" || added == "fabric.db-shm");
+        let metadata = fs::symlink_metadata(fixture.0.join("storage").join(added)).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), fs::metadata(&db_path).unwrap().uid());
+        assert_eq!(metadata.mode() & 0o077, 0);
+        assert_eq!(metadata.nlink(), 1);
+    }
+    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    assert_eq!(fs::read(tree.join("tracked")).unwrap(), b"worker tracked");
+    assert_eq!(
+        fs::read(tree.join("new source ; literal")).unwrap(),
+        b"worker untracked"
+    );
+    for (name, bytes) in &artifact_bytes {
+        assert_eq!(&fs::read(artifacts.join(name)).unwrap(), bytes);
+    }
+    assert_eq!(gc(&fixture, "--apply")["items"][0]["action"], "reclaimed");
+    assert!(!tree.parent().unwrap().exists());
+    assert_eq!(
+        fs::read(restored_workspace(&fixture, &report).join("new source ; literal")).unwrap(),
+        b"worker untracked"
+    );
+}
+
+#[test]
+fn gc_refuses_unsafe_ownership_paths_manifests_and_noneligible_states() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for case in [
+        "outside",
+        "marker_missing",
+        "marker_tamper",
+        "container_link",
+        "tree_link",
+        "manifest_missing",
+        "manifest_corrupt",
+        "run_active",
+        "provenance_tamper",
+        "retention_reason",
+        "active",
+        "recovery",
+        "retained",
+    ] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        let report = pending_workspace(&fixture);
+        let tree = PathBuf::from(report["workspace_path"].as_str().unwrap());
+        let container = tree.parent().unwrap();
+        let outside = fixture.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"outside must survive").unwrap();
+        match case {
+            "outside" => {
+                let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+                db.execute(
+                    "UPDATE workspaces SET managed_path=?1",
+                    [outside.to_str().unwrap()],
+                )
+                .unwrap();
+            }
+            "marker_missing" => fs::remove_file(container.join(".fabric-owner")).unwrap(),
+            "marker_tamper" => fs::write(container.join(".fabric-owner"), b"wrong owner").unwrap(),
+            "container_link" => {
+                fs::rename(container, fixture.0.join("saved-container")).unwrap();
+                symlink(&outside, container).unwrap();
+            }
+            "tree_link" => {
+                fs::rename(&tree, container.join("saved-tree")).unwrap();
+                symlink(&outside, &tree).unwrap();
+            }
+            "manifest_missing" | "manifest_corrupt" => {
+                let artifacts = artifact_container(&fixture, &report);
+                fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+                if case == "manifest_missing" {
+                    fs::remove_file(artifacts.join("manifest.json")).unwrap();
+                } else {
+                    fs::set_permissions(
+                        artifacts.join("manifest.json"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    let mut bytes = fs::read(artifacts.join("manifest.json")).unwrap();
+                    bytes[0] = b'X';
+                    fs::write(artifacts.join("manifest.json"), bytes).unwrap();
+                    fs::set_permissions(
+                        artifacts.join("manifest.json"),
+                        fs::Permissions::from_mode(0o400),
+                    )
+                    .unwrap();
+                }
+                fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            "run_active" | "provenance_tamper" | "retention_reason" => {
+                let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+                let sql = match case {
+                    "run_active" => "UPDATE runs SET state='RUNNING'",
+                    "provenance_tamper" => "UPDATE runs SET harness_version='tampered'",
+                    _ => "UPDATE workspaces SET retention_reason='keep for inspection'",
+                };
+                db.execute(sql, []).unwrap();
+            }
+            state => {
+                let state = match state {
+                    "active" => "ACTIVE",
+                    "recovery" => "RECOVERY_REQUIRED",
+                    _ => "RETAINED",
+                };
+                let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+                db.execute("UPDATE workspaces SET state=?1", [state])
+                    .unwrap();
+            }
+        }
+        let dry = gc(&fixture, "--dry-run");
+        let applied = gc(&fixture, "--apply");
+        for item in [&dry["items"][0], &applied["items"][0]] {
+            assert_eq!(item["action"], "refused", "{case}: {item}");
+            assert!(!item["reason"].as_str().unwrap().is_empty());
+        }
+        assert_eq!(
+            fs::read(outside.join("sentinel")).unwrap(),
+            b"outside must survive",
+            "{case}"
+        );
+        let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+        assert!(
+            store
+                .cleanup_intent(&report["workspace_id"].as_str().unwrap().parse().unwrap())
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+        assert!(fs::symlink_metadata(container).is_ok(), "{case}");
+    }
+}
+
+#[test]
+fn gc_reports_unknown_paths_and_unlinks_internal_links_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    fixture.setup();
+    let report = pending_workspace(&fixture);
+    let outside = fixture.0.join("outside-sentinel");
+    fs::write(&outside, b"not a cleanup target").unwrap();
+    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    symlink(&outside, tree.join("post-capture-link")).unwrap();
+    let unknown = fixture.0.join("storage/fork-staging/unknown");
+    fs::create_dir(&unknown).unwrap();
+    fs::write(unknown.join("unknown-bytes"), b"unknown must survive").unwrap();
+    let dry = gc(&fixture, "--dry-run");
+    assert_eq!(dry["unknown_paths"][0]["reason"], "unknown_path");
+    assert!(tree.join("post-capture-link").is_symlink());
+    let applied = gc(&fixture, "--apply");
+    assert_eq!(applied["items"][0]["action"], "reclaimed");
+    assert_eq!(applied["unknown_paths"][0]["reason"], "unknown_path");
+    assert_eq!(fs::read(outside).unwrap(), b"not a cleanup target");
+    assert_eq!(
+        fs::read(unknown.join("unknown-bytes")).unwrap(),
+        b"unknown must survive"
+    );
+}
+
+#[test]
+fn gc_reclaims_only_captured_workspaces_and_preserves_recoverable_bytes() {
+    let fixture = Fixture::new();
+    let (repo, base) = fixture.setup();
+    let report = json(&fixture.run(0));
+    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    assert!(
+        !tree.parent().unwrap().exists(),
+        "captured fork must be reclaimed"
+    );
+    let manifest = verified_manifest(&fixture, &report);
+    let artifacts = fixture
+        .0
+        .join("storage/artifacts")
+        .join(manifest["manifest_id"].as_str().unwrap());
+    let restored = fixture.0.join("recovered");
+    fixture.git(
+        &repo,
+        &[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            repo.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ],
+    );
+    fixture.git(
+        &restored,
+        &[
+            "apply",
+            "--binary",
+            artifacts.join("tracked.patch").to_str().unwrap(),
+        ],
+    );
+    success(
+        &Command::new("/usr/bin/tar")
+            .arg("-xpf")
+            .arg(artifacts.join("untracked.tar"))
+            .arg("-C")
+            .arg(&restored)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read(restored.join("tracked")).unwrap(),
+        b"worker tracked"
+    );
+    assert_eq!(
+        fs::read(restored.join("new source ; literal")).unwrap(),
+        b"worker untracked"
+    );
+    assert!(!fs::read(artifacts.join("stdout.log")).unwrap().is_empty());
+    assert_eq!(
+        fs::read(Path::new(base["prepared_path"].as_str().unwrap()).join(".deps/ready")).unwrap(),
+        b"ready"
+    );
+    let first = fixture
+        .cli()
+        .args(["storage", "gc", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    let second = fixture
+        .cli()
+        .args(["storage", "gc", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(json(&first)["items"][0]["reason"], "already_reclaimed");
+}
+
 #[test]
 fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() {
     use fabric_domain::{RunId, RunState};
@@ -156,8 +529,7 @@ fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() 
     assert!(report["exit_code"].is_null());
     assert!(report["exit_signal"].as_i64().is_some());
     assert!(start.elapsed() < std::time::Duration::from_secs(6));
-    let workspace = Path::new(report["workspace_path"].as_str().unwrap());
-    assert_tree_stopped(workspace);
+    assert_tree_stopped(&fixture, &report);
     let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
     let run = store
         .run(&RunId::try_from(report["run_id"].as_str().unwrap().to_owned()).unwrap())
@@ -189,10 +561,7 @@ fn verified_manifest(fixture: &Fixture, report: &serde_json::Value) -> serde_jso
     );
     let files = store.artifacts(&id).unwrap();
     let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
-    assert_eq!(
-        workspace.state,
-        fabric_domain::WorkspaceState::CleanupPending
-    );
+    assert_eq!(workspace.state, fabric_domain::WorkspaceState::Reclaimed);
     assert!(workspace.lease_expires_at.is_none());
     let total: u64 = files.iter().map(|file| file.size_bytes).sum();
     assert_eq!(files.len(), 14);
@@ -225,20 +594,32 @@ fn verified_manifest(fixture: &Fixture, report: &serde_json::Value) -> serde_jso
     manifest
 }
 
-fn assert_tree_stopped(workspace: &Path) {
-    let paths = [
-        workspace.join("parent.heartbeat"),
-        workspace.join("child.heartbeat"),
-    ];
-    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    assert!(before.iter().all(|bytes| !bytes.is_empty()));
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    for (path, expected) in paths.iter().zip(before) {
-        assert_eq!(
-            fs::read(path).unwrap(),
-            expected,
-            "writer survived: {path:?}"
-        );
+fn assert_tree_stopped(fixture: &Fixture, report: &serde_json::Value) {
+    let workspace = restored_workspace(fixture, report);
+    assert!(
+        !Path::new(report["workspace_path"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .exists()
+    );
+    for name in ["parent.heartbeat", "child.heartbeat"] {
+        let bytes = fs::read(workspace.join(name)).unwrap();
+        assert!(!bytes.is_empty());
+        let pid = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("pid="));
+        if let Some(pid) = pid {
+            let state = Command::new("/bin/ps")
+                .args(["-p", pid, "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8(state.stdout).unwrap();
+            assert!(
+                state.trim().is_empty() || state.trim().starts_with('Z'),
+                "writer {pid} survived cleanup: {state}"
+            );
+        }
     }
 }
 
@@ -282,7 +663,7 @@ fn ctrl_c_cancels_live_worker_and_preserves_observed_exit() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let tree = wait_for_tree(&fixture);
+    wait_for_tree(&fixture);
     for _ in 0..2 {
         success(
             &Command::new("/bin/kill")
@@ -302,7 +683,7 @@ fn ctrl_c_cancels_live_worker_and_preserves_observed_exit() {
         verified_manifest(&fixture, &report)["stop_reason"],
         "cancelled"
     );
-    assert_tree_stopped(&tree);
+    assert_tree_stopped(&fixture, &report);
     let run = fabric_store::Store::open(fixture.0.join("storage/fabric.db"))
         .unwrap()
         .run(&report["run_id"].as_str().unwrap().parse().unwrap())
@@ -359,7 +740,7 @@ fn api_cancellation_is_idempotent_and_escalates_term_ignoring_child() {
         verified_manifest(&fixture, &serde_json::to_value(&report).unwrap())["stop_reason"],
         "cancelled"
     );
-    assert_tree_stopped(Path::new(&report.workspace_path));
+    assert_tree_stopped(&fixture, &serde_json::to_value(&report).unwrap());
 }
 
 #[test]
@@ -405,7 +786,7 @@ fn natural_leader_exit_cleans_background_descendant_and_does_not_claim_timeout()
     assert!(report["exit_signal"].is_null());
     assert!(report["error_kind"].is_null());
     assert!(verified_manifest(&fixture, &report)["stop_reason"].is_null());
-    assert_tree_stopped(Path::new(report["workspace_path"].as_str().unwrap()));
+    assert_tree_stopped(&fixture, &report);
 }
 
 #[test]
@@ -426,7 +807,7 @@ fn batch_ctrl_c_stops_queued_launches_and_keeps_completed_durable_outcomes() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let tree = wait_for_tree(&fixture);
+    wait_for_tree(&fixture);
     success(
         &Command::new("/bin/kill")
             .args(["-INT", &child.id().to_string()])
@@ -439,7 +820,7 @@ fn batch_ctrl_c_stops_queued_launches_and_keeps_completed_durable_outcomes() {
     assert_eq!(report["tasks"][0]["result"]["state"], "SUCCEEDED");
     assert_eq!(report["tasks"][1]["result"]["state"], "CANCELLED");
     assert_eq!(report["succeeded"], false);
-    assert_tree_stopped(&tree);
+    assert_tree_stopped(&fixture, &report["tasks"][1]["result"]);
     let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
     let id = report["batch_id"].as_str().unwrap().parse().unwrap();
     let tasks = store.batch_tasks(&id).unwrap();
@@ -503,7 +884,7 @@ fn batch_api_applies_wall_timeout_per_worker_without_discarding_other_results() 
     let timed = report.tasks[0].result.as_ref().unwrap();
     assert_eq!(timed.state, fabric_domain::RunState::Failed);
     assert_eq!(timed.error_kind.as_deref(), Some("timeout"));
-    assert_tree_stopped(Path::new(&timed.workspace_path));
+    assert_tree_stopped(&fixture, &serde_json::to_value(timed).unwrap());
     assert_eq!(
         report.tasks[1].result.as_ref().unwrap().state,
         fabric_domain::RunState::Succeeded
@@ -552,7 +933,7 @@ fn cooperative_zero_exit_after_timeout_still_persists_timeout_failure() {
 }
 
 #[test]
-fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
+fn foreground_fake_process_records_provenance_exit_and_recovers_changes_after_reclaim() {
     use fabric_domain::{RunId, RunState, WorkspaceState};
     use fabric_store::Store;
     let fixture = Fixture::new();
@@ -589,9 +970,15 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
         assert!(run.artifact_manifest_id.is_some());
         verified_manifest(&fixture, &report);
         let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
-        assert_eq!(workspace.state, WorkspaceState::CleanupPending);
+        assert_eq!(workspace.state, WorkspaceState::Reclaimed);
         assert!(workspace.retention_reason.is_none());
-        let tree = Path::new(&workspace.managed_path);
+        assert!(
+            !Path::new(&workspace.managed_path)
+                .parent()
+                .unwrap()
+                .exists()
+        );
+        let tree = restored_workspace(&fixture, &report);
         assert_eq!(
             fs::read_to_string(tree.join("tracked")).unwrap(),
             "worker tracked"
@@ -601,7 +988,7 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
             "worker untracked"
         );
         assert!(!tree.join("INJECTED").exists());
-        let container = tree.parent().unwrap();
+        let container = artifact_container(&fixture, &report);
         assert_eq!(
             fs::read(container.join("prompt.input")).unwrap(),
             fs::read(fixture.0.join("prompt ; $(touch INJECTED).json")).unwrap()
@@ -624,9 +1011,9 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
         assert_eq!(events[1]["value"], 42);
         assert_eq!(events.last().unwrap()["exit_code"], exit);
         assert!(fs::read(container.join("stderr.log")).unwrap().is_empty());
-        assert_eq!(
-            fs::read_to_string(tree.join(".deps/ready")).unwrap(),
-            "ready"
+        assert!(
+            !tree.join(".deps").exists(),
+            "ignored dependencies are not source artifacts"
         );
         let patch = fixture
             .0
@@ -643,8 +1030,13 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
                 .unwrap()
                 .contains("worker untracked")
         );
-        // Promoted copies survive loss/corruption of the original output evidence.
-        fs::write(container.join("stdout.log"), "changed after capture").unwrap();
+        // Durable evidence remains usable after the entire original container is gone.
+        assert!(
+            !Path::new(&workspace.managed_path)
+                .parent()
+                .unwrap()
+                .exists()
+        );
         verified_manifest(&fixture, &report);
     }
     assert_eq!(
@@ -753,8 +1145,8 @@ printf '\n{"type":"finished"}\n{"last":true}'
         assert_eq!(report["events"]["parsed"], 3);
         assert_eq!(report["events"]["invalid"], 2);
         assert_eq!(report["events"]["oversized"], 1);
-        let tree = Path::new(report["workspace_path"].as_str().unwrap());
-        let container = tree.parent().unwrap();
+        let tree = restored_workspace(&fixture, &report);
+        let container = artifact_container(&fixture, &report);
         let records: Vec<serde_json::Value> = fs::read_to_string(container.join("events.jsonl"))
             .unwrap()
             .lines()
@@ -864,9 +1256,7 @@ wait
             .output()
             .unwrap(),
     );
-    let container = Path::new(report["workspace_path"].as_str().unwrap())
-        .parent()
-        .unwrap();
+    let container = artifact_container(&fixture, &report);
     let total: u64 = ["stdout.log", "stderr.log", "events.jsonl"]
         .iter()
         .filter_map(|name| fs::metadata(container.join(name)).ok())
@@ -1042,14 +1432,14 @@ rmdir "$lock"
         assert_eq!(run.state, fabric_domain::RunState::Succeeded);
         assert!(workspaces.insert(run.workspace_id.clone()));
         let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
+        assert_eq!(workspace.state, fabric_domain::WorkspaceState::Reclaimed);
+        assert!(!Path::new(&workspace.managed_path).exists());
+        let restored = restored_workspace(&fixture, result);
         assert_eq!(
-            fs::read_to_string(Path::new(&workspace.managed_path).join("tracked")).unwrap(),
+            fs::read_to_string(restored.join("tracked")).unwrap(),
             format!("task-{i}")
         );
-        assert_eq!(
-            fs::read_to_string(Path::new(&workspace.managed_path).join(".deps/ready")).unwrap(),
-            "ready"
-        );
+        assert!(!restored.join(".deps").exists());
         assert_eq!(durable[i].task_id, task["id"]);
         assert_eq!(durable[i].run_id, run_id);
         assert_eq!(
@@ -1218,9 +1608,9 @@ printf 'long path bytes' > "$name"
     verified_manifest(&fixture, &report);
     assert_eq!(
         store.workspace(&run.workspace_id).unwrap().unwrap().state,
-        fabric_domain::WorkspaceState::CleanupPending
+        fabric_domain::WorkspaceState::Reclaimed
     );
-    // Restore into a fresh committed checkout, not the still-retained worker.
+    // Restore into a fresh committed checkout after the worker tree was reclaimed.
     let restored = fixture.0.join("restored archive");
     fixture.git(
         &repo,
@@ -1341,7 +1731,7 @@ printf '{"captured":true}\n'
         fs::read(repo.join("binary")).unwrap(),
         b"\0original binary\xff"
     );
-    let tree = Path::new(report["workspace_path"].as_str().unwrap());
+    let tree = restored_workspace(&fixture, &report);
     assert_eq!(
         fs::read(tree.join("untracked.txt")).unwrap(),
         b"not captured"

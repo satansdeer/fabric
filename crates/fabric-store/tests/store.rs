@@ -95,6 +95,82 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
     }
 }
 
+fn remove_cleanup_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER immutable_cleanup_intent_insert;
+             DROP TRIGGER immutable_cleanup_intent_update;
+             DROP TRIGGER immutable_cleanup_intent_delete;
+             DROP TRIGGER cleanup_workspace_update;
+             DROP TRIGGER cleanup_workspace_delete;
+             DROP TRIGGER cleanup_workspace_insert;
+             DROP TRIGGER cleanup_run_update;
+             DROP TRIGGER cleanup_run_delete;
+             DROP TRIGGER cleanup_run_insert;
+             DROP TABLE cleanup_intents;",
+        )
+        .unwrap();
+}
+
+fn finalized_pair(store: &mut Store, index: usize) -> (Run, Workspace) {
+    let (run, workspace) = pair(index);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    store
+        .transition_run_workspace(&run.run_id, change(WorkspaceState::Active))
+        .unwrap();
+    store.start_run(&run.run_id, "1", 123, 202).unwrap();
+    store
+        .observe_run_exit(&run.run_id, Some(0), None, None, 203)
+        .unwrap();
+    let empty = fabric_domain::CapturedFile {
+        size_bytes: 0,
+        sha256: "0".repeat(64),
+    };
+    let capture = fabric_domain::CaptureMetadata {
+        limit_bytes: 100,
+        persisted_bytes: 0,
+        truncated: false,
+        stdout_bytes_seen: 0,
+        stderr_bytes_seen: 0,
+        stdout: empty.clone(),
+        stderr: empty.clone(),
+        events: empty,
+        event_counts: fabric_domain::EventCounts::default(),
+    };
+    let manifest = format!("manifest-{index}").parse().unwrap();
+    let artifacts: Vec<_> = [
+        "stdout",
+        "stderr",
+        "events",
+        "tracked_patch",
+        "untracked_archive",
+        "prompt",
+        "manifest",
+    ]
+    .into_iter()
+    .map(|kind| fabric_store::Artifact {
+        kind: kind.into(),
+        relative_path: format!(
+            "artifacts/{manifest}/{}",
+            if kind == "manifest" {
+                "manifest.json"
+            } else {
+                kind
+            }
+        ),
+        sha256: "0".repeat(64),
+        size_bytes: 0,
+    })
+    .collect();
+    store
+        .finish_run(&run.run_id, &capture, &manifest, &artifacts, 204)
+        .unwrap();
+    (
+        store.run(&run.run_id).unwrap().unwrap(),
+        store.workspace(&workspace.workspace_id).unwrap().unwrap(),
+    )
+}
+
 #[test]
 fn sqlite_store_opens_and_reopens_a_durable_database() {
     let (root, mut store) = fixture();
@@ -130,7 +206,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -155,6 +231,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     store.create_run_workspace(&run, &workspace).unwrap();
     drop(store);
     let connection = Connection::open(&path).unwrap();
+    remove_cleanup_schema(&connection);
     connection
         .execute_batch("DROP TRIGGER immutable_artifact_update; DROP TRIGGER immutable_artifact_delete; DROP TRIGGER immutable_manifest; DROP TABLE artifacts; DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN capture_metadata; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=1;")
         .unwrap();
@@ -170,7 +247,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -181,6 +258,7 @@ fn v2_database_upgrades_without_losing_run_ownership() {
     store.create_run_workspace(&run, &workspace).unwrap();
     drop(store);
     let connection = Connection::open(&path).unwrap();
+    remove_cleanup_schema(&connection);
     connection.execute_batch(
         "DROP TRIGGER immutable_artifact_update; DROP TRIGGER immutable_artifact_delete; DROP TRIGGER immutable_manifest; DROP TABLE artifacts; DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=2;",
     ).unwrap();
@@ -201,6 +279,7 @@ fn v4_database_upgrades_without_rewriting_previous_run_evidence() {
     drop(store);
     let path = root.path().join("fabric.sqlite3");
     let db = Connection::open(&path).unwrap();
+    remove_cleanup_schema(&db);
     db.execute_batch(
         "DROP TRIGGER immutable_artifact_update; DROP TRIGGER immutable_artifact_delete;
         DROP TRIGGER immutable_manifest; DROP TABLE artifacts; PRAGMA user_version=4;",
@@ -495,6 +574,61 @@ fn concurrent_first_open_migrates_once() {
 }
 
 #[test]
+fn concurrent_wal_transition_waits_for_reader_then_migrates_once() {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fabric.sqlite3");
+    let reader = Connection::open(&path).unwrap();
+    reader
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE preserved(value TEXT);
+             INSERT INTO preserved VALUES ('before WAL');
+             BEGIN; SELECT * FROM preserved;",
+        )
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(5));
+    let (finished, receive) = mpsc::channel();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let opened = Store::open(path);
+                finished.send(()).unwrap();
+                opened
+            })
+        })
+        .collect();
+    barrier.wait();
+    let early = receive.recv_timeout(Duration::from_millis(100));
+    reader.execute_batch("COMMIT").unwrap();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(early, Err(RecvTimeoutError::Timeout));
+    for result in results {
+        drop(result.unwrap());
+    }
+    let mode: String = Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    assert_eq!(
+        reader
+            .query_row("SELECT value FROM preserved", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "before WAL"
+    );
+    assert!(Store::open(path).is_ok());
+}
+
+#[test]
 fn concurrent_state_cas_rejects_stale_intent_and_exact_replay_is_idempotent() {
     let (root, mut store) = fixture();
     let (run, workspace) = pair(1);
@@ -631,4 +765,311 @@ fn migrations_fail_closed_and_roll_back_partial_schema() {
         )
         .unwrap();
     assert_eq!(projects, 0);
+}
+
+#[test]
+fn cleanup_intent_freezes_snapshots_and_replays_completion_without_deleting_ownership() {
+    let (root, mut store) = fixture();
+    let (run, workspace) = finalized_pair(&mut store, 2);
+    let (other_run, other_workspace) = pair(1);
+    store
+        .create_run_workspace(&other_run, &other_workspace)
+        .unwrap();
+    assert_eq!(
+        store.workspace_ids().unwrap(),
+        vec![other_workspace.workspace_id, workspace.workspace_id.clone()]
+    );
+    assert_eq!(store.cleanup_intent(&workspace.workspace_id).unwrap(), None);
+    assert!(
+        store
+            .finish_cleanup(&workspace.workspace_id, "verified")
+            .is_err()
+    );
+    assert!(
+        store
+            .record_cleanup_intent(&run, &workspace, "", 300)
+            .is_err()
+    );
+    let mut changed_run = run.clone();
+    changed_run.capture.as_mut().unwrap().stdout.sha256 = "1".repeat(64);
+    assert!(matches!(
+        store.record_cleanup_intent(&changed_run, &workspace, "verified", 300),
+        Err(StoreError::Conflict)
+    ));
+    let mut changed_workspace = workspace.clone();
+    changed_workspace.usage_bytes += 1;
+    assert!(matches!(
+        store.record_cleanup_intent(&run, &changed_workspace, "verified", 300),
+        Err(StoreError::Conflict)
+    ));
+    store
+        .record_cleanup_intent(&run, &workspace, "verified", 300)
+        .unwrap();
+    store
+        .record_cleanup_intent(&run, &workspace, "verified", 300)
+        .unwrap();
+    assert!(matches!(
+        store.record_cleanup_intent(&run, &workspace, "different", 300),
+        Err(StoreError::Conflict)
+    ));
+    let db = Connection::open(root.path().join("fabric.sqlite3")).unwrap();
+    for assignment in [
+        "workspace_id = 'changed'",
+        "run_id = 'changed'",
+        "managed_path = '/changed'",
+        "state_id = 'changed'",
+        "lease_expires_at = 999",
+        "retention_reason = 'changed'",
+        "usage_bytes = 0",
+        "state = 'RETAINED'",
+        "state = 'RECLAIMED'",
+    ] {
+        assert!(
+            db.execute(
+                &format!("UPDATE workspaces SET {assignment} WHERE workspace_id = 'workspace-2'"),
+                [],
+            )
+            .is_err(),
+            "{assignment}"
+        );
+    }
+    for sql in [
+        "UPDATE runs SET prompt_digest = 'changed' WHERE run_id = 'run-2'",
+        "DELETE FROM runs WHERE run_id = 'run-2'",
+        "DELETE FROM workspaces WHERE workspace_id = 'workspace-2'",
+        "UPDATE cleanup_intents SET authority = 'changed'",
+        "DELETE FROM cleanup_intents",
+        "INSERT OR REPLACE INTO cleanup_intents VALUES ('workspace-2', 'changed')",
+        "INSERT OR REPLACE INTO workspaces SELECT * FROM workspaces WHERE workspace_id = 'workspace-2'",
+        "INSERT OR REPLACE INTO runs SELECT * FROM runs WHERE run_id = 'run-2'",
+        "INSERT OR REPLACE INTO workspaces SELECT 'replacement', run_id, managed_path, state_id, state, lease_expires_at, usage_bytes, retention_reason FROM workspaces WHERE workspace_id = 'workspace-2'",
+    ] {
+        assert!(db.execute(sql, []).is_err(), "{sql}");
+    }
+    assert!(
+        store
+            .finish_cleanup(&workspace.workspace_id, "different")
+            .is_err()
+    );
+    drop(store);
+    let mut store = Store::open(root.path().join("fabric.sqlite3")).unwrap();
+    assert_eq!(
+        store
+            .cleanup_intent(&workspace.workspace_id)
+            .unwrap()
+            .as_deref(),
+        Some("verified")
+    );
+    store
+        .finish_cleanup(&workspace.workspace_id, "verified")
+        .unwrap();
+    store
+        .finish_cleanup(&workspace.workspace_id, "verified")
+        .unwrap();
+    let mut reclaimed = workspace;
+    reclaimed.state = WorkspaceState::Reclaimed;
+    reclaimed.usage_bytes = 0;
+    assert_eq!(
+        store.workspace(&reclaimed.workspace_id).unwrap(),
+        Some(reclaimed)
+    );
+    assert_eq!(store.run(&run.run_id).unwrap(), Some(run));
+}
+
+#[test]
+fn cleanup_requires_terminal_capture_and_expiry_alone_does_not_authorize_it() {
+    let (root, mut store) = fixture();
+    let (run, workspace) = finalized_pair(&mut store, 1);
+    let db = Connection::open(root.path().join("fabric.sqlite3")).unwrap();
+    for (run_state, workspace_state, retention, lease) in [
+        ("RUNNING", "CLEANUP_PENDING", None, None),
+        ("NEEDS_ATTENTION", "CLEANUP_PENDING", None, None),
+        ("SUCCEEDED", "ACTIVE", None, Some(0)),
+        ("SUCCEEDED", "RETAINED", None, None),
+        ("SUCCEEDED", "RECOVERY_REQUIRED", None, None),
+        ("SUCCEEDED", "CLEANUP_PENDING", Some("keep"), None),
+        ("SUCCEEDED", "CLEANUP_PENDING", None, Some(301)),
+    ] {
+        db.execute("UPDATE runs SET state = ?1", [run_state])
+            .unwrap();
+        db.execute(
+            "UPDATE workspaces SET state = ?1, retention_reason = ?2, lease_expires_at = ?3",
+            rusqlite::params![workspace_state, retention, lease],
+        )
+        .unwrap();
+        let current_run = store.run(&run.run_id).unwrap().unwrap();
+        let current_workspace = store.workspace(&workspace.workspace_id).unwrap().unwrap();
+        assert!(
+            store
+                .record_cleanup_intent(&current_run, &current_workspace, "verified", 300)
+                .is_err()
+        );
+        assert_eq!(store.cleanup_intent(&workspace.workspace_id).unwrap(), None);
+    }
+    db.execute("UPDATE runs SET state = 'FAILED'", []).unwrap();
+    db.execute(
+        "UPDATE workspaces SET state = 'CLEANUP_PENDING', retention_reason = NULL, lease_expires_at = 300",
+        [],
+    )
+    .unwrap();
+    let current_run = store.run(&run.run_id).unwrap().unwrap();
+    let current_workspace = store.workspace(&workspace.workspace_id).unwrap().unwrap();
+    store
+        .record_cleanup_intent(&current_run, &current_workspace, "verified", 300)
+        .unwrap();
+    let (missing_run, missing_workspace) = pair(3);
+    store
+        .create_run_workspace(&missing_run, &missing_workspace)
+        .unwrap();
+    db.execute(
+        "UPDATE runs SET state = 'CANCELLED' WHERE run_id = 'run-3'",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE workspaces SET state = 'CLEANUP_PENDING', lease_expires_at = NULL WHERE workspace_id = 'workspace-3'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        store
+            .record_cleanup_intent(
+                &store.run(&missing_run.run_id).unwrap().unwrap(),
+                &store
+                    .workspace(&missing_workspace.workspace_id)
+                    .unwrap()
+                    .unwrap(),
+                "verified",
+                300,
+            )
+            .is_err()
+    );
+    let (incomplete_run, incomplete_workspace) = finalized_pair(&mut store, 4);
+    db.execute_batch(
+        "DROP TRIGGER immutable_artifact_delete;
+         DELETE FROM artifacts WHERE run_id = 'run-4' AND kind = 'untracked_archive';",
+    )
+    .unwrap();
+    assert!(
+        store
+            .record_cleanup_intent(&incomplete_run, &incomplete_workspace, "verified", 300)
+            .is_err()
+    );
+}
+
+#[test]
+fn read_only_inspection_neither_creates_migrates_nor_writes_v5_or_v6() {
+    let (root, mut store) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = finalized_pair(&mut store, 1);
+    let wal = path.with_extension("sqlite3-wal");
+    let shm = path.with_extension("sqlite3-shm");
+    let wal_before = std::fs::read(&wal).unwrap();
+    let readonly = Store::open_existing_read_only(&path).unwrap();
+    assert_eq!(readonly.run(&run.run_id).unwrap(), Some(run.clone()));
+    assert_eq!(
+        readonly.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace.clone())
+    );
+    drop(readonly);
+    assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+    assert!(shm.is_file());
+    drop(store);
+    let escaped_path = root.path().join("inspection ?#%.sqlite3");
+    std::fs::rename(&path, &escaped_path).unwrap();
+    let path = escaped_path;
+    for version in [6, 5] {
+        let db = Connection::open(&path).unwrap();
+        if version == 5 {
+            remove_cleanup_schema(&db);
+            db.pragma_update(None, "user_version", 5).unwrap();
+        }
+        db.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(db);
+        let before = std::fs::read(&path).unwrap();
+        let readonly = Store::open_existing_read_only(&path).unwrap();
+        assert_eq!(readonly.run(&run.run_id).unwrap(), Some(run.clone()));
+        assert_eq!(
+            readonly.workspace(&workspace.workspace_id).unwrap(),
+            Some(workspace.clone())
+        );
+        assert_eq!(
+            readonly.cleanup_intent(&workspace.workspace_id).unwrap(),
+            None
+        );
+        assert!(
+            readonly
+                .create_project(&Project {
+                    project_id: "other-project".parse().unwrap(),
+                    name: "other-project".into(),
+                    ..project()
+                })
+                .is_err()
+        );
+        drop(readonly);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("sqlite3-wal").exists());
+        assert!(!path.with_extension("sqlite3-shm").exists());
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            version
+        );
+    }
+    let missing = root.path().join("missing.sqlite3");
+    assert!(Store::open_existing_read_only(&missing).is_err());
+    assert!(!missing.exists());
+    let migrated = Store::open(&path).unwrap();
+    assert_eq!(migrated.run(&run.run_id).unwrap(), Some(run));
+    assert_eq!(
+        migrated.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+}
+
+#[test]
+fn read_only_inspection_refuses_symlink_hardlink_and_public_database_sidecars() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for suffix in ["", "-wal", "-shm"] {
+        for kind in ["symlink", "hardlink", "public"] {
+            let (root, mut store) = fixture();
+            finalized_pair(&mut store, 1);
+            let path = root.path().join("fabric.sqlite3");
+            let component = root.path().join(format!("fabric.sqlite3{suffix}"));
+            let saved = root.path().join("saved");
+            let sentinel = root.path().join("outside");
+            std::fs::write(&sentinel, b"outside sentinel").unwrap();
+            match kind {
+                "symlink" => {
+                    std::fs::rename(&component, &saved).unwrap();
+                    symlink(&sentinel, &component).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(&component, &saved).unwrap(),
+                "public" => {
+                    std::fs::set_permissions(&component, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                Store::open_existing_read_only(&path).is_err(),
+                "accepted {kind} SQLite component {suffix}"
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside sentinel");
+            match kind {
+                "symlink" => {
+                    std::fs::remove_file(&component).unwrap();
+                    std::fs::rename(&saved, &component).unwrap();
+                }
+                "hardlink" => std::fs::remove_file(&saved).unwrap(),
+                "public" => {
+                    std::fs::set_permissions(&component, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
 }

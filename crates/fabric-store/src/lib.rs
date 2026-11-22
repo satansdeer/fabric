@@ -147,6 +147,8 @@ impl Store {
     /// Opens a file-backed WAL database. The parent directory must already exist.
     /// New database files are owner-only on Unix; callers own storage-root validation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        use std::time::Instant;
+
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -163,9 +165,32 @@ impl Store {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        let busy_timeout = Duration::from_secs(5);
+        connection.busy_timeout(busy_timeout)?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        let mode: String = connection.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        // A journal-mode upgrade can return BUSY without invoking SQLite's busy
+        // handler. Retry only this idempotent transition, sharing one deadline.
+        let deadline = Instant::now() + busy_timeout;
+        let mode: String = loop {
+            connection.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
+            match connection.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)) {
+                Ok(mode) => break mode,
+                Err(error)
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
+                {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(error.into());
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                    if Instant::now() >= deadline {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        connection.busy_timeout(busy_timeout)?;
         if mode != "wal" {
             return Err(StoreError::InvalidRecord(
                 "file-backed WAL database required",
@@ -176,7 +201,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=5 => {}
+            1..=6 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -243,8 +268,251 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 5)?;
         }
+        if version < 6 {
+            transaction.execute_batch(
+                "CREATE TABLE cleanup_intents (
+                    workspace_id TEXT PRIMARY KEY NOT NULL REFERENCES workspaces(workspace_id),
+                    authority TEXT NOT NULL CHECK(length(authority) > 0)
+                 );
+                 CREATE TRIGGER immutable_cleanup_intent_insert BEFORE INSERT ON cleanup_intents
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = NEW.workspace_id)
+                 BEGIN SELECT RAISE(ABORT, 'cleanup intent is immutable'); END;
+                 CREATE TRIGGER immutable_cleanup_intent_update BEFORE UPDATE ON cleanup_intents
+                 BEGIN SELECT RAISE(ABORT, 'cleanup intent is immutable'); END;
+                 CREATE TRIGGER immutable_cleanup_intent_delete BEFORE DELETE ON cleanup_intents
+                 BEGIN SELECT RAISE(ABORT, 'cleanup intent is immutable'); END;
+                 CREATE TRIGGER cleanup_workspace_update BEFORE UPDATE ON workspaces
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = OLD.workspace_id)
+                   AND NOT (
+                     NEW.workspace_id IS OLD.workspace_id AND NEW.run_id IS OLD.run_id
+                     AND NEW.managed_path IS OLD.managed_path AND NEW.state_id IS OLD.state_id
+                     AND NEW.lease_expires_at IS OLD.lease_expires_at
+                     AND NEW.retention_reason IS OLD.retention_reason
+                     AND ((NEW.state IS OLD.state AND NEW.usage_bytes IS OLD.usage_bytes)
+                       OR (OLD.state = 'CLEANUP_PENDING' AND NEW.state = 'RECLAIMED'
+                           AND NEW.usage_bytes = 0)))
+                 BEGIN SELECT RAISE(ABORT, 'workspace has cleanup intent'); END;
+                 CREATE TRIGGER cleanup_workspace_delete BEFORE DELETE ON workspaces
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = OLD.workspace_id)
+                 BEGIN SELECT RAISE(ABORT, 'workspace has cleanup intent'); END;
+                 CREATE TRIGGER cleanup_workspace_insert BEFORE INSERT ON workspaces
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents c
+                   JOIN workspaces w ON w.workspace_id = c.workspace_id
+                   WHERE w.workspace_id = NEW.workspace_id OR w.run_id = NEW.run_id
+                     OR w.managed_path = NEW.managed_path)
+                 BEGIN SELECT RAISE(ABORT, 'workspace has cleanup intent'); END;
+                 CREATE TRIGGER cleanup_run_update BEFORE UPDATE ON runs
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = OLD.workspace_id)
+                 BEGIN SELECT RAISE(ABORT, 'run has cleanup intent'); END;
+                 CREATE TRIGGER cleanup_run_delete BEFORE DELETE ON runs
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = OLD.workspace_id)
+                 BEGIN SELECT RAISE(ABORT, 'run has cleanup intent'); END;
+                 CREATE TRIGGER cleanup_run_insert BEFORE INSERT ON runs
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents c
+                   JOIN runs r ON r.workspace_id = c.workspace_id
+                   WHERE r.run_id = NEW.run_id OR r.workspace_id = NEW.workspace_id)
+                 BEGIN SELECT RAISE(ABORT, 'run has cleanup intent'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 6)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
+    }
+
+    /// Inspect an existing database without creating or migrating it.
+    /// SQLite may coordinate locks/shared memory, but database writes are forbidden.
+    /// Ordinary read-only mode includes committed WAL data instead of ignoring it.
+    pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let supplied = path.as_ref();
+        let parent = supplied
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty());
+        let path = parent
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .map_err(StoreError::Io)?
+            .join(supplied.file_name().ok_or(StoreError::InvalidRecord(
+                "read_only_unsafe_database: database file name is missing",
+            ))?);
+        let path = path.as_path();
+        let validate = |path: &Path, required: bool| -> Result<()> {
+            let file = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(StoreError::Io(error)),
+            };
+            let actual = file.metadata().map_err(StoreError::Io)?;
+            let named = std::fs::symlink_metadata(path).map_err(StoreError::Io)?;
+            // SAFETY: geteuid has no preconditions.
+            if !actual.is_file()
+                || actual.uid() != unsafe { libc::geteuid() }
+                || actual.nlink() != 1
+                || actual.mode() & 0o077 != 0
+                || !named.is_file()
+                || (actual.dev(), actual.ino()) != (named.dev(), named.ino())
+            {
+                return Err(StoreError::InvalidRecord(
+                    "read_only_unsafe_database: SQLite files must be private owned regular files",
+                ));
+            }
+            Ok(())
+        };
+        let sidecars = ["-wal", "-shm"].map(|suffix| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        });
+        validate(path, true)?;
+        for sidecar in &sidecars {
+            validate(sidecar, false)?;
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        validate(path, true)?;
+        for sidecar in &sidecars {
+            validate(sidecar, false)?;
+        }
+        if !matches!(version, 5..=6) {
+            return Err(StoreError::UnsupportedSchema(version));
+        }
+        Ok(Self { connection })
+    }
+
+    pub fn workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT workspace_id FROM workspaces ORDER BY workspace_id")?;
+        Ok(statement
+            .query_map([], |row| read_id(row, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn cleanup_intent(&self, id: &WorkspaceId) -> Result<Option<String>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 5 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT authority FROM cleanup_intents WHERE workspace_id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Commit caller-verified filesystem authority against exact durable snapshots.
+    /// An expired lease alone never grants permission to reclaim a workspace.
+    pub fn record_cleanup_intent(
+        &mut self,
+        run: &Run,
+        workspace: &Workspace,
+        authority: &str,
+        now: i64,
+    ) -> Result<()> {
+        if authority.is_empty() {
+            return Err(StoreError::InvalidRecord(
+                "Cleanup authority must not be empty",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::query_run(&transaction, &run.run_id)?.as_ref() != Some(run)
+            || Self::query_workspace(&transaction, &workspace.workspace_id)?.as_ref()
+                != Some(workspace)
+        {
+            return Err(StoreError::Conflict);
+        }
+        if !matches!(
+            run.state,
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled
+        ) || run.workspace_id != workspace.workspace_id
+            || workspace.run_id != run.run_id
+            || workspace.state_id != run.prepared_state_id
+            || workspace.state != WorkspaceState::CleanupPending
+            || workspace.retention_reason.is_some()
+            || workspace
+                .lease_expires_at
+                .is_some_and(|expiry| expiry > now)
+        {
+            return Err(StoreError::InvalidRecord(
+                "Workspace is not cleanup eligible",
+            ));
+        }
+        let manifest = run
+            .artifact_manifest_id
+            .as_ref()
+            .ok_or(StoreError::InvalidRecord(
+                "Cleanup requires an artifact manifest",
+            ))?;
+        let complete: bool = transaction.query_row(
+            "SELECT
+               (SELECT count(*) FROM artifacts WHERE run_id = ?1 AND kind IN
+                 ('stdout', 'stderr', 'events', 'tracked_patch', 'untracked_archive', 'prompt', 'manifest')) = 7
+               AND EXISTS (SELECT 1 FROM artifacts WHERE run_id = ?1 AND kind = 'manifest'
+                 AND relative_path = 'artifacts/' || ?2 || '/manifest.json')",
+            params![run.run_id.as_str(), manifest.as_str()],
+            |row| row.get(0),
+        )?;
+        if !complete {
+            return Err(StoreError::InvalidRecord(
+                "Cleanup requires complete artifacts",
+            ));
+        }
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT authority FROM cleanup_intents WHERE workspace_id = ?1",
+                [workspace.workspace_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing != authority => return Err(StoreError::Conflict),
+            Some(_) => {}
+            None => {
+                transaction.execute(
+                    "INSERT INTO cleanup_intents (workspace_id, authority) VALUES (?1, ?2)",
+                    params![workspace.workspace_id.as_str(), authority],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Preserve ownership records after deletion; matching completion replay is a no-op.
+    pub fn finish_cleanup(&mut self, id: &WorkspaceId, authority: &str) -> Result<()> {
+        if self.connection.execute(
+            "UPDATE workspaces SET state = 'RECLAIMED', usage_bytes = 0
+             WHERE workspace_id = ?1
+               AND (state = 'CLEANUP_PENDING' OR (state = 'RECLAIMED' AND usage_bytes = 0))
+               AND EXISTS (SELECT 1 FROM cleanup_intents
+                           WHERE workspace_id = ?1 AND authority = ?2)",
+            params![id.as_str(), authority],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
     }
 
     /// Register every task and stable Run ID before admitting any worker.
@@ -745,8 +1013,11 @@ impl Store {
     }
 
     pub fn run(&self, id: &RunId) -> Result<Option<Run>> {
-        Ok(self
-            .connection
+        Self::query_run(&self.connection, id)
+    }
+
+    fn query_run(connection: &Connection, id: &RunId) -> Result<Option<Run>> {
+        Ok(connection
             .query_row(
                 "SELECT run_id, batch_id, project_id, prepared_state_id, base_commit_sha, harness,
              harness_version, prompt_digest, state, workspace_id, pid_metadata, exit_code,
@@ -789,8 +1060,11 @@ impl Store {
     }
 
     pub fn workspace(&self, id: &WorkspaceId) -> Result<Option<Workspace>> {
-        Ok(self
-            .connection
+        Self::query_workspace(&self.connection, id)
+    }
+
+    fn query_workspace(connection: &Connection, id: &WorkspaceId) -> Result<Option<Workspace>> {
+        Ok(connection
             .query_row(
                 "SELECT workspace_id, run_id, managed_path, state_id, state, lease_expires_at,
              usage_bytes, retention_reason FROM workspaces WHERE workspace_id = ?1",

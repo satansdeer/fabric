@@ -258,6 +258,7 @@ name = "fabric-store"
 version = "0.1.0"
 dependencies = [
  "fabric-domain",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

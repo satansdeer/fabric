@@ -14,7 +14,7 @@ use fabric_domain::{
 };
 use fabric_runner::{CancellationToken, CommandSpec, ExecutionLimits};
 use fabric_store::{Artifact, PreparedState, Store};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::workspace::{capture_workspace, private_directory, private_file};
@@ -38,6 +38,230 @@ struct Manifest<'a> {
     artifact_limit_bytes: u64,
     source_scope: &'static str,
     files: &'a [Artifact],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredManifest {
+    format_version: u32,
+    manifest_id: String,
+    run_id: String,
+    workspace_id: String,
+    prepared_state_id: String,
+    base_commit_sha: String,
+    recipe_digest: String,
+    prompt_digest: String,
+    harness: String,
+    harness_version: Option<String>,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    stop_reason: Option<String>,
+    capture: RegisteredCapture,
+    artifact_limit_bytes: u64,
+    source_scope: String,
+    files: Vec<RegisteredFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredCapture {
+    limit_bytes: u64,
+    persisted_bytes: u64,
+    truncated: bool,
+    stdout_bytes_seen: u64,
+    stderr_bytes_seen: u64,
+    stdout: RegisteredCapturedFile,
+    stderr: RegisteredCapturedFile,
+    events: RegisteredCapturedFile,
+    event_counts: RegisteredEventCounts,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredCapturedFile {
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredEventCounts {
+    parsed: u64,
+    invalid: u64,
+    oversized: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredFile {
+    kind: String,
+    relative_path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+/// Validate all durable recovery evidence immediately before reclaiming a workspace.
+pub(super) fn verify_registered(
+    root: &Path,
+    store: &Store,
+    run: &fabric_store::Run,
+) -> Result<(), FabricError> {
+    let expected_id = format!("a-{}", run.run_id);
+    if run.artifact_manifest_id.as_ref().map(|id| id.as_str()) != Some(expected_id.as_str()) {
+        return Err(error("Missing or unexpected registered artifact manifest"));
+    }
+    private_directory(root)?;
+    if fs::canonicalize(root).map_err(error)? != root {
+        return Err(error("Artifact root is not canonical"));
+    }
+    let artifacts = root.join("artifacts");
+    let directory = artifacts.join(&expected_id);
+    for path in [&artifacts, &directory] {
+        private_directory(path)?;
+        if fs::canonicalize(path).map_err(error)? != *path {
+            return Err(error("Artifact directory has a symlink ancestor"));
+        }
+    }
+    if fs::symlink_metadata(&directory).map_err(error)?.mode() & 0o222 != 0 {
+        return Err(error("Artifact directory is not sealed"));
+    }
+    let files = store.artifacts(&run.run_id).map_err(error)?;
+    let expected = [
+        ("stdout", "stdout.log"),
+        ("stderr", "stderr.log"),
+        ("events", "events.jsonl"),
+        ("prompt", "prompt.input"),
+        ("tracked_patch", "tracked.patch"),
+        ("capture_diagnostic", "git.stderr"),
+        ("ignored_paths", "ignored.paths"),
+        ("ignored_stderr", "ignored.stderr"),
+        ("untracked_archive", "untracked.tar"),
+        ("untracked_paths", "untracked.paths"),
+        ("untracked_stderr", "untracked.stderr"),
+        ("verified_untracked_paths", "verified.paths"),
+        ("verified_untracked_stderr", "verified.stderr"),
+        ("manifest", "manifest.json"),
+    ];
+    if files.len() != expected.len() {
+        return Err(error("Incomplete registered artifact set"));
+    }
+    let mut total = 0_u64;
+    for (kind, name) in expected {
+        let path = format!("artifacts/{expected_id}/{name}");
+        let mut matching = files.iter().filter(|file| file.kind == kind);
+        let file = matching
+            .next()
+            .ok_or_else(|| error("Missing artifact kind"))?;
+        if matching.next().is_some() || file.relative_path != path {
+            return Err(error("Duplicate kind or unsafe artifact path"));
+        }
+        total = total
+            .checked_add(file.size_bytes)
+            .ok_or_else(|| error("Artifact size overflow"))?;
+        let path = root.join(&file.relative_path);
+        let metadata = private_file(&path)?;
+        if metadata.mode() & 0o222 != 0 || metadata.len() != file.size_bytes {
+            return Err(error("Artifact is writable or has an unexpected size"));
+        }
+        let actual = checksum(&path)?;
+        if actual.size_bytes != file.size_bytes || actual.sha256 != file.sha256 {
+            return Err(error("Registered artifact checksum mismatch"));
+        }
+    }
+    let manifest_file = files
+        .iter()
+        .find(|file| file.kind == "manifest")
+        .ok_or_else(|| error("Missing manifest"))?;
+    let reader = BufReader::new(
+        open(&root.join(&manifest_file.relative_path))?.take(manifest_file.size_bytes),
+    );
+    let manifest: RegisteredManifest = serde_json::from_reader(reader).map_err(error)?;
+    let prepared = store
+        .prepared_state(&run.prepared_state_id)
+        .map_err(error)?
+        .ok_or_else(|| error("Missing prepared state for artifact verification"))?;
+    let capture = run
+        .capture
+        .as_ref()
+        .ok_or_else(|| error("Missing capture metadata"))?;
+    if manifest.format_version != 2
+        || manifest.source_scope != "tracked_and_nonignored_untracked"
+        || manifest.manifest_id != expected_id
+        || manifest.run_id != run.run_id.as_str()
+        || manifest.workspace_id != run.workspace_id.as_str()
+        || manifest.prepared_state_id != run.prepared_state_id.as_str()
+        || manifest.base_commit_sha != run.base_commit_sha
+        || manifest.base_commit_sha != prepared.source_commit_sha
+        || manifest.recipe_digest != prepared.recipe_digest
+        || manifest.prompt_digest != run.prompt_digest
+        || manifest.harness != run.harness
+        || manifest.harness_version != run.harness_version
+        || manifest.exit_code != run.exit_code
+        || manifest.exit_signal != run.exit_signal
+        || manifest.stop_reason.as_deref()
+            != run
+                .error_kind
+                .as_deref()
+                .filter(|reason| matches!(*reason, "timeout" | "cancelled"))
+        || manifest.capture.limit_bytes != capture.limit_bytes
+        || manifest.capture.persisted_bytes != capture.persisted_bytes
+        || manifest.capture.truncated != capture.truncated
+        || manifest.capture.stdout_bytes_seen != capture.stdout_bytes_seen
+        || manifest.capture.stderr_bytes_seen != capture.stderr_bytes_seen
+        || manifest.capture.stdout.size_bytes != capture.stdout.size_bytes
+        || manifest.capture.stdout.sha256 != capture.stdout.sha256
+        || manifest.capture.stderr.size_bytes != capture.stderr.size_bytes
+        || manifest.capture.stderr.sha256 != capture.stderr.sha256
+        || manifest.capture.events.size_bytes != capture.events.size_bytes
+        || manifest.capture.events.sha256 != capture.events.sha256
+        || manifest.capture.event_counts.parsed != capture.event_counts.parsed
+        || manifest.capture.event_counts.invalid != capture.event_counts.invalid
+        || manifest.capture.event_counts.oversized != capture.event_counts.oversized
+        || total > manifest.artifact_limit_bytes
+        || manifest.files.len() != files.len() - 1
+    {
+        return Err(error("Manifest metadata does not match registered run"));
+    }
+    let mut seen = HashSet::new();
+    for entry in &manifest.files {
+        if entry.kind == "manifest"
+            || !seen.insert(entry.kind.as_str())
+            || !files.iter().any(|file| {
+                file.kind == entry.kind
+                    && file.relative_path == entry.relative_path
+                    && file.size_bytes == entry.size_bytes
+                    && file.sha256 == entry.sha256
+            })
+        {
+            return Err(error(
+                "Manifest file entries do not match registered artifacts",
+            ));
+        }
+    }
+    for (kind, expected) in [
+        ("stdout", &capture.stdout),
+        ("stderr", &capture.stderr),
+        ("events", &capture.events),
+    ] {
+        if !files.iter().any(|file| {
+            file.kind == kind
+                && file.size_bytes == expected.size_bytes
+                && file.sha256 == expected.sha256
+        }) {
+            return Err(error("Capture output differs from registered artifacts"));
+        }
+    }
+    if !files
+        .iter()
+        .any(|file| file.kind == "prompt" && file.sha256 == run.prompt_digest)
+    {
+        return Err(error("Prompt artifact differs from registered digest"));
+    }
+    let actual = checksum(&root.join(&manifest_file.relative_path))?;
+    if actual.size_bytes != manifest_file.size_bytes || actual.sha256 != manifest_file.sha256 {
+        return Err(error("Manifest changed during verification"));
+    }
+    Ok(())
 }
 
 pub(super) fn capture(
@@ -646,7 +870,7 @@ fn inspect_directory(
     Ok(())
 }
 
-fn open_at(parent: &File, name: &CStr, flags: i32) -> Result<File, FabricError> {
+pub(super) fn open_at(parent: &File, name: &CStr, flags: i32) -> Result<File, FabricError> {
     // SAFETY: valid descriptor and NUL-terminated component; no symlink is followed.
     let fd = unsafe {
         libc::openat(
@@ -693,7 +917,7 @@ fn entry(root: &File, path: &Path) -> Result<(File, CString, libc::stat), Fabric
     Ok((parent, name, metadata))
 }
 
-fn stat_at(parent: &File, name: &CStr) -> Result<libc::stat, FabricError> {
+pub(super) fn stat_at(parent: &File, name: &CStr) -> Result<libc::stat, FabricError> {
     let mut metadata = std::mem::MaybeUninit::uninit();
     // SAFETY: valid descriptor, component and output storage; final symlinks are not followed.
     if unsafe {
@@ -711,7 +935,7 @@ fn stat_at(parent: &File, name: &CStr) -> Result<libc::stat, FabricError> {
     Ok(unsafe { metadata.assume_init() })
 }
 
-fn stat(file: &File) -> Result<libc::stat, FabricError> {
+pub(super) fn stat(file: &File) -> Result<libc::stat, FabricError> {
     let mut metadata = std::mem::MaybeUninit::uninit();
     // SAFETY: valid descriptor and output storage.
     if unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) } != 0 {

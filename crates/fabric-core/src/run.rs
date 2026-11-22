@@ -1,4 +1,4 @@
-//! Foreground execution shared by single runs and bounded batches; no cleanup.
+//! Foreground execution and verified capture followed by the shared safe reclaim path.
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -40,6 +40,9 @@ pub struct RunReport {
     pub events: fabric_runner::jsonl::Summary,
     pub capture: fabric_domain::CaptureMetadata,
     pub artifact_manifest_id: Option<String>,
+    /// Cleanup refusal never rewrites an already terminal process outcome.
+    #[serde(default)]
+    pub cleanup: Option<crate::workspace::GcItem>,
 }
 
 pub struct RunOptions {
@@ -152,7 +155,7 @@ fn foreground_prepared(
     let workspace_id = WorkspaceId::try_from(format!("w-{}", run_id.as_str()))?;
     let request = WorkspaceRequest {
         run_id: run_id.clone(),
-        workspace_id,
+        workspace_id: workspace_id.clone(),
         prepared_state_id: state.state_id.clone(),
         harness: harness.name().to_owned(),
         prompt_digest,
@@ -252,6 +255,15 @@ fn foreground_prepared(
             )));
         }
     };
+    let cleanup = crate::workspace::reclaim_run(&root, &run_id).unwrap_or_else(|failure| {
+        crate::workspace::GcItem {
+            workspace_id: workspace_id.clone(),
+            run_id: run_id.clone(),
+            action: "refused".into(),
+            reason: "cleanup_unavailable".into(),
+            detail: Some(failure.message),
+        }
+    });
     let run = store
         .run(&run_id)
         .map_err(error)?
@@ -271,6 +283,7 @@ fn foreground_prepared(
         events: capture.event_counts.clone(),
         capture,
         artifact_manifest_id: run.artifact_manifest_id.map(|id| id.to_string()),
+        cleanup: Some(cleanup),
         created_at: run.created_at,
         started_at: run.started_at,
         finished_at: run.finished_at,
