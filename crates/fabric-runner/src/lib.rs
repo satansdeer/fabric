@@ -1,7 +1,9 @@
 //! Literal-argv local harness execution with bounded, checksummed capture.
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -90,6 +92,7 @@ pub fn execute(
     capture: Capture,
     limits: &ExecutionLimits,
     cancellation: &CancellationToken,
+    owner_lease: Option<&File>,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
 ) -> Result<Execution, FabricError> {
     limits.validate()?;
@@ -97,7 +100,8 @@ pub fn execute(
         return Err(execution_error("Cancelled before harness launch."));
     }
     let launched = std::time::Instant::now();
-    let child = Command::new(&spec.program)
+    let mut command = Command::new(&spec.program);
+    command
         .args(&spec.args)
         .current_dir(cwd)
         .env_clear()
@@ -107,14 +111,27 @@ pub fn execute(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| {
-            execution_error(format!(
-                "Cannot start harness {}: {error}",
-                spec.program.display()
-            ))
-        })?;
+        .process_group(0);
+    if let Some(lease) = owner_lease {
+        let fd = lease.as_raw_fd();
+        // Only this worker inherits the lease through exec. The parent's CLOEXEC
+        // remains set, so unrelated probes cannot accidentally keep an owner alive.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = command.spawn().map_err(|error| {
+        execution_error(format!(
+            "Cannot start harness {}: {error}",
+            spec.program.display()
+        ))
+    })?;
     let mut group = ProcessGroup::new(child, launched);
     let stopped = AtomicBool::new(false);
     let stdout = PipeReader::new(group.child.stdout.take().expect("piped stdout"), &stopped)
@@ -176,6 +193,7 @@ fn probe_version(
             ..ExecutionLimits::default()
         },
         &CancellationToken::default(),
+        None,
         |_| Ok(()),
     )?;
     let metadata = result.capture.map_err(execution_error)?;

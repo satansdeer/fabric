@@ -171,12 +171,26 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
 pub(crate) struct Reservation {
     root: PathBuf,
     token: String,
+    owner: super::leases::Owner,
+}
+impl Reservation {
+    pub(crate) fn file(&self) -> &File {
+        self.owner.file()
+    }
+    pub(crate) fn launching(&mut self, store: &Store) -> Result<(), FabricError> {
+        self.owner.launching(store, &self.token)
+    }
+    pub(crate) fn started(&self, store: &Store, pid: u32) -> Result<(), FabricError> {
+        self.owner.started(store, &self.token, pid)
+    }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         // Failure deliberately retains capacity; expiry alone does not release authority.
         if let Ok((_, store)) = open_store(&self.root) {
-            let _ = store.release_storage(&self.token);
+            if self.owner.release(&store, &self.token).is_ok() {
+                let _ = store.release_storage(&self.token);
+            }
         }
     }
 }
@@ -285,13 +299,16 @@ pub(crate) fn admit(
         .and_then(|bytes| bytes.checked_add(options.policy.max_artifact_bytes_per_run))
         .ok_or_else(|| storage_error("Storage estimate overflow"))?;
     let (root, mut store, _lease) = cleanup_store(root, true, true)?;
+    super::leases::reconcile(&root, &mut store)?;
     make_room(&root, &mut store, options, requested, Some(&state.state_id))?;
+    let owner = super::leases::Owner::acquire(&root, &store, token)?;
     store
         .reserve_storage(token, Some(&state.state_id), requested)
         .map_err(storage_error)?;
     Ok(Reservation {
         root,
         token: token.to_owned(),
+        owner,
     })
 }
 
@@ -304,6 +321,7 @@ pub fn prepare(
 ) -> Result<PreparedState, FabricError> {
     options.policy.validate()?;
     let (root, mut store, _lease) = cleanup_store(root, true, true)?;
+    super::leases::reconcile(&root, &mut store)?;
     // Resume deletion before taking the requested key lock: its own interrupted
     // eviction must finish before the shared preparation path resolves READY reuse.
     resume_evictions(&root, &store)?;

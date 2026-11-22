@@ -27,6 +27,7 @@ fn descendants_cannot_keep_capture_pipes_open_after_leader_exit() {
         capture,
         &fabric_runner::ExecutionLimits::default(),
         &fabric_runner::CancellationToken::default(),
+        None,
         |_| Ok(()),
     )
     .unwrap();
@@ -53,6 +54,7 @@ fn persistence_failure_still_drains_concurrent_streams_and_preserves_observed_ex
         capture,
         &fabric_runner::ExecutionLimits::default(),
         &fabric_runner::CancellationToken::default(),
+        None,
         |_| Ok(()),
     )
     .unwrap();
@@ -80,6 +82,7 @@ fn timeout_escalates_a_term_ignoring_leader_and_reaps_its_observed_status() {
             term_grace: Duration::from_millis(50),
         },
         &fabric_runner::CancellationToken::default(),
+        None,
         |_| Ok(()),
     )
     .unwrap();
@@ -112,6 +115,7 @@ fn cancelled_token_never_launches_and_a_failed_start_callback_cannot_hang_drains
             capture,
             &fabric_runner::ExecutionLimits::default(),
             if cancelled { &cancellation } else { &fresh },
+            None,
             |_| {
                 Err(fabric_domain::FabricError {
                     kind: fabric_domain::ErrorKind::Output,

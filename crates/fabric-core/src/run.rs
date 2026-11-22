@@ -151,7 +151,7 @@ fn foreground_prepared(
     let mut storage = options.storage.clone();
     storage.policy.max_log_bytes_per_run = options.max_log_bytes;
     storage.policy.max_artifact_bytes_per_run = options.max_artifact_bytes;
-    let _reservation = crate::workspace::storage::admit(root, &storage, state, run_id.as_str())?;
+    let mut reservation = crate::workspace::storage::admit(root, &storage, state, run_id.as_str())?;
     // Snapshot once: digest and child input cannot disagree after this point.
     let prompt = std::fs::read(prompt_file)
         .map_err(|failure| error(format!("Prompt {}: {failure}", prompt_file.display())))?;
@@ -203,6 +203,7 @@ fn foreground_prepared(
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
         crate::workspace::storage::check_launch(&root, &storage)?;
+        reservation.launching(&store)?;
         let token = options.cancellation.worker_token();
         let done = std::sync::atomic::AtomicBool::new(false);
         let mut result = std::thread::scope(|scope| {
@@ -215,7 +216,9 @@ fn foreground_prepared(
                 capture,
                 &options.limits,
                 &token,
+                Some(reservation.file()),
                 |pid| {
+                    reservation.started(&store, pid)?;
                     store
                         .start_run(&run_id, harness_version, pid, now()?)
                         .map_err(error)
@@ -281,6 +284,7 @@ fn foreground_prepared(
             )));
         }
     };
+    drop(reservation);
     let cleanup = crate::workspace::reclaim_run(&root, &run_id).unwrap_or_else(|failure| {
         crate::workspace::GcItem {
             workspace_id: workspace_id.clone(),

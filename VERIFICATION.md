@@ -137,3 +137,11 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Parent review found admission preceded no-allocation READY reuse; fixed by using the existing locked identity/provenance path before fresh-tree admission.
 - Actual CLI: storage JSON reports logical accounting/retention and zero leaked reservations; an impossible free-space reserve rejects before allocating any run.
 - Implementer final fmt, strict clippy and workspace gate passed: 120 tests across 24 suites (`local://154.log`). Accounting remains best effort, not an APFS physical quota; stale crash reservations await FAB-19 reconciliation.
+
+## FAB-19 — ownership-based crash reconciliation
+
+- Reviewed persisted kernel-lock identity, macOS process start identity/group inspection, inherited worker ownership and atomic reconciliation. Persisted PIDs are inspected, never used as signal authority; unknown ownership remains conservative.
+- Independent checks passed: seven lease unit regressions, expired-live-worker/crashed-owner regression, closed-inherited-descriptor orphan protection and GC live-lease regression.
+- Actual CLI crash: killed only the owned supervisor after observing a unique worker write. Automatic GC reconciliation changed run `r-1795320617074185000-29155-0` to NEEDS_ATTENTION / RECOVERY_REQUIRED, retained exact unique bytes and released its proven-inactive storage reservation. A second pass left the logical database unchanged.
+- The first crash probe killed before the fake worker wrote; its empty interrupted run was also retained and its inactive reservation released. No fabricated work or exit result was recorded.
+- Implementer final fmt, strict clippy and workspace gate passed: 129 tests across 24 suites (`local://169.log`). Legacy/unverifiable owners cannot grant deletion or reservation-release authority.

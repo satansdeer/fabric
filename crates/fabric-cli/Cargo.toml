@@ -25,3 +25,4 @@ fabric-runner = { path = "../fabric-runner" }
 fabric-store = { path = "../fabric-store" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+libc = "0.2"

@@ -99,6 +99,7 @@ fn remove_cleanup_schema(connection: &Connection) {
     connection
         .execute_batch(
             "DROP TABLE IF EXISTS storage_reservations;
+             DROP TABLE IF EXISTS worker_leases;
              DROP TABLE IF EXISTS cache_evictions;
              DROP TRIGGER immutable_cleanup_intent_insert;
              DROP TRIGGER immutable_cleanup_intent_update;
@@ -208,7 +209,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -249,7 +250,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
@@ -980,8 +981,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [7, 6, 5] {
+    for version in [8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 7 {
+            db.execute_batch("DROP TABLE worker_leases; PRAGMA user_version=7;")
+                .unwrap();
+        }
         if version == 6 {
             db.execute_batch("DROP TABLE storage_reservations; DROP TABLE cache_evictions; PRAGMA user_version=6;").unwrap();
         }

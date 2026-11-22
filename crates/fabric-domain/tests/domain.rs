@@ -56,9 +56,9 @@ fn run_transitions_follow_the_spec_and_reject_terminal_rewrites() {
             let allowed = from == to
                 || matches!(
                     (from, to),
-                    (Queued, Preparing)
+                    (Queued, Preparing | NeedsAttention)
                         | (Preparing, Running | Cancelled | NeedsAttention)
-                        | (Running, Finalizing)
+                        | (Running, Finalizing | NeedsAttention)
                         | (Finalizing, Succeeded | Failed | Cancelled | NeedsAttention)
                 );
             let mut state = from;

@@ -12,6 +12,8 @@ use fabric_domain::{
 use fabric_store::{Run, RunWorkspaceTransition, Store, Workspace};
 use fabric_workspace::{WorkspaceBackend, fork_path};
 
+#[path = "leases.rs"]
+mod leases;
 #[path = "storage.rs"]
 pub mod storage;
 
@@ -25,8 +27,7 @@ pub struct WorkspaceRequest {
     pub prompt_digest: String,
     /// Unix seconds, including the startup reservation's expiry below.
     pub created_at: i64,
-    /// A startup reservation, not a heartbeat or proof of a live process.
-    /// FAB-19 owns lease-owner identity, renewal and crash reconciliation.
+    /// Expiry is diagnostic only; kernel/process ownership remains authoritative.
     pub lease_expires_at: i64,
 }
 
@@ -362,9 +363,12 @@ pub struct UnknownCleanupPath {
     pub reason: &'static str,
 }
 
-/// No cache eviction or reconciliation: only already captured private forks qualify.
+/// Apply also reconciles interrupted ownership; only verified captured forks qualify for deletion.
 pub fn garbage_collect(root: &Path, apply: bool) -> Result<GcReport, FabricError> {
     let (root, mut store, _lease) = cleanup_store(root, apply, false)?;
+    if apply {
+        leases::reconcile(&root, &mut store)?;
+    }
     use std::os::unix::ffi::OsStrExt;
     let ids = store.workspace_ids().map_err(storage_error)?;
     let known: std::collections::HashSet<_> = ids.iter().map(WorkspaceId::as_str).collect();
@@ -548,6 +552,12 @@ fn clean_one(
         {
             return Ok(("refused", "worker_lease_valid"));
         }
+        let _owner = match leases::status(root, store, workspace.run_id.as_str())? {
+            leases::Status::Active => return Ok(("refused", "worker_owner_active")),
+            leases::Status::Unknown => return Ok(("refused", "worker_owner_unverifiable")),
+            leases::Status::Inactive(guard) => Some(guard),
+            leases::Status::Legacy => None,
+        };
         if workspace.state != WorkspaceState::CleanupPending || workspace.retention_reason.is_some()
         {
             return Ok(("refused", "workspace_not_cleanup_pending"));
@@ -951,13 +961,13 @@ mod cleanup_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
-    struct Fixture {
-        temp: tempfile::TempDir,
-        root: PathBuf,
-        id: WorkspaceId,
+    pub(super) struct Fixture {
+        pub(super) temp: tempfile::TempDir,
+        pub(super) root: PathBuf,
+        pub(super) id: WorkspaceId,
     }
     impl Fixture {
-        fn captured() -> Self {
+        pub(super) fn captured() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();

@@ -149,6 +149,15 @@ Under an exclusive kernel cleanup lease, GC rereads SQLite and requires a termin
 
 Cleanup leases explicitly unlock on scope exit, so unrelated forked helpers cannot prolong a completed cleanup by retaining an inherited descriptor.
 
+### Interrupted workers and recovery
+
+Schema v8 persists each worker's owner, expiry and private lock-file identity **before** reserving storage, including the pre-Run crash window. Preparation startup, worker admission and GC `--apply` reconcile under the root cleanup lock; read-only status and GC dry-run do not reconcile. Expiry is diagnostic, never death or deletion authority. An inherited kernel lock protects orphaned workers; macOS also compares native PID/start-time identity and inspects the original process group, protecting live workers even after expiry or closing the inherited descriptor. Persisted PIDs are never signalled: only the existing live foreground supervisor may signal its own process group.
+Normal foreground completion durably releases ownership and explicitly unlocks it, so unrelated concurrent forks cannot prolong a finished worker's reservation. Dropping an unreleased owner never explicitly unlocks an orphan worker's inherited descriptor.
+
+When that authority proves the owner and worker inactive, stale reservations are released before admission. Interrupted nonterminal Runs become NEEDS_ATTENTION and their workspaces RECOVERY_REQUIRED, retaining original files, observed exit/capture metadata and registered artifacts without inventing an exit or success. Inspect the retained workspace and Run before deciding how to recover; GC will not delete it. Fully captured terminal Runs keep their recorded outcome and may resume the existing verified cleanup intent. Repeating reconciliation changes neither evidence nor outcomes.
+
+Missing, replaced or unverifiable authority, a crash between launch intent and durable worker identity, unsupported native inspection, and pre-v8 reservations without reliable ownership remain conservatively retained. These require operator recovery rather than hidden PID-based killing or automatic deletion; live/unverifiable workers continue to consume reserved headroom.
+
 ### Storage budgets and usage
 
 ```sh
@@ -167,7 +176,7 @@ Cache eviction preserves every historical Run/Batch/Workspace reference, admitte
 
 Each worker has a bounded no-follow workspace/root scan, polled at 100 ms between scans, with a warning near its workspace limit. Scans stop at 200,000 entries, depth 64 or two seconds per tree; an unreadable/unbounded measurement fails closed as `storage_meter_failed`. Concurrently vanished entries are skipped rather than mistaken for unsafe reads. Workspace overflow stops only that worker's owned process group as `workspace_limit`; root/free-space pressure uses `storage_pressure`. Existing TERM/grace/KILL supervision and capture are reused. These reasons mean FAILED even for cooperative zero exits, never user cancellation; capture failure retains the reason and original workspace as NEEDS_ATTENTION/RECOVERY_REQUIRED. Final measurement also catches fast zero-exit oversize workers.
 
-Accounting uses logical file lengths including ignored dependencies and link text without following links, not APFS-exclusive allocated bytes. Free space uses native `statvfs` available blocks. These are **best-effort admission/monitoring, not hard quotas**: trusted code can allocate between samples or outside the root, and preparation output may exceed its estimate. Crashed reservation owners remain conservatively reserved pending FAB-19 reconciliation; expiry does not release capacity or authorize deletion.
+Accounting uses logical file lengths including ignored dependencies and link text without following links, not APFS-exclusive allocated bytes. Free space uses native `statvfs` available blocks. These are **best-effort admission/monitoring, not hard quotas**: trusted code can allocate between samples or outside the root, and preparation output may exceed its estimate. Crash reconciliation releases only reservations whose persisted ownership is provably inactive; expiry alone releases no capacity and authorizes no deletion.
 
 Library callers set `RunOptions.storage` or use `fabric_core::workspace::storage::prepare` for managed preparation; `StorageOptions.meter: Arc<dyn DiskMeter>` permits deterministic injected free-space measurements. Calling the lower-level project preparation/fork APIs directly does not provide budget admission.
 
@@ -190,7 +199,7 @@ A pool of at most `min(N, task_count)` threads admits external workers through t
 
 Before admission, SQLite schema v3 records the Batch ID, pinned prepared-state ID, ordered task IDs, resolved prompt paths and assigned Run IDs. Each task durably records its ordinary Run report or a prelaunch error; launched Runs also carry their Batch ID and separate Workspace ID. A missing/unreadable prompt remains a reported task error with its assigned Run ID even though no workspace was created. One task's failure does not stop independent tasks. JSON stdout contains ordered `tasks` with `id`, `run_id`, `result` or `error`, plus `batch_id` and `succeeded`; it remains available when the command exits nonzero. Completed aggregate success/failure is also persisted. A zero CLI exit requires every task to succeed. Infrastructure errors can leave durable pending task records; this story does not resume or reconcile interrupted batches.
 
-Batches share the same verified tracked/untracked capture-before-finalization pipeline, lease-aware automatic reclaim and cancellation/timeout controls as single runs, including artifacts for failed exits and stopped workers. Startup-reservation limitations still apply.
+Batches share the same verified tracked/untracked capture-before-finalization pipeline, lease-aware automatic reclaim and cancellation/timeout controls as single runs, including artifacts for failed exits and stopped workers. Crash reconciliation does not invent missing task reports or aggregate batch success.
 
 ### Timeout and cancellation (macOS)
 

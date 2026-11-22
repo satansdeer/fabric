@@ -590,6 +590,7 @@ fn capture_git(
             ..Default::default()
         },
         &CancellationToken::default(),
+        None,
         |_| Ok(()),
     )?;
     let capture = result.capture.map_err(error)?;

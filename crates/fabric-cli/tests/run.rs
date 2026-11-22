@@ -194,6 +194,186 @@ fn gc(fixture: &Fixture, mode: &str) -> serde_json::Value {
     )
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn reconciliation_preserves_expired_live_workers_then_recovers_crashed_owner() {
+    reconcile_crashed_worker(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reconciliation_protects_orphan_worker_that_closed_inherited_lease_descriptor() {
+    reconcile_crashed_worker(true);
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_crashed_worker(close_descriptors: bool) {
+    use std::io::{BufRead, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::process::Stdio;
+
+    let fixture = Fixture::new();
+    fixture.setup();
+    let ready = fixture.0.join("ready");
+    let resume = fixture.0.join("resume");
+    for path in [&ready, &resume] {
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+    let close = if close_descriptors {
+        "fd=3; while [ \"$fd\" -lt 64 ]; do eval \"exec $fd>&-\"; fd=$((fd+1)); done\n"
+    } else {
+        ""
+    };
+    let fake = fixture.script_fake(&format!(
+        "{close}printf unique > interrupted-source\nprintf '%s\\n%s\\n' \"$$\" \"$PWD\" > '{}'\nread -r resume < '{}'\n",
+        ready.display(), resume.display()
+    ));
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, b"{}").unwrap();
+    let mut supervisor = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--fake-binary"])
+        .arg(fake)
+        .arg("--prompt-file")
+        .arg(prompt)
+        .args(["--copy-limit-bytes", "10485760", "--json"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(fs::File::open(ready).unwrap()).lines();
+    let worker: i32 = lines.next().unwrap().unwrap().parse().unwrap();
+    let tree = PathBuf::from(lines.next().unwrap().unwrap());
+    // Register against the observed live child before releasing its FIFO. NOTE_EXIT
+    // is an actual kernel process event, not a sleep/PID-reuse assumption.
+    let queue = unsafe { libc::kqueue() };
+    assert!(queue >= 0);
+    let queue = unsafe { fs::File::from_raw_fd(queue) };
+    let mut event = libc::kevent {
+        ident: worker as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    assert_eq!(
+        unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+    db.execute("UPDATE workspaces SET lease_expires_at=0", [])
+        .unwrap();
+    db.execute("UPDATE worker_leases SET expires_at=0", [])
+        .unwrap();
+    let run_id: String = db
+        .query_row("SELECT run_id FROM runs", [], |r| r.get(0))
+        .unwrap();
+    let snapshot = || {
+        db.query_row(
+            "SELECT state, exit_code, artifact_manifest_id FROM runs WHERE run_id=?1",
+            [&run_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i32>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    // Wait for the durable launch callback, not PID timing or a guessed sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while snapshot().0 != "RUNNING" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "launch callback did not commit"
+        );
+        std::thread::yield_now();
+    }
+    let before = snapshot();
+    gc(&fixture, "--apply");
+    assert_eq!(snapshot(), before);
+    supervisor.kill().unwrap();
+    supervisor.wait().unwrap();
+    let lease = fs::File::open(fixture.0.join("storage/leases").join(&run_id)).unwrap();
+    let locked = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if close_descriptors {
+        assert_eq!(locked, 0, "fixture closed the inherited lock");
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) }, 0);
+    } else {
+        assert_ne!(locked, 0, "orphan still owns the inherited lock");
+    }
+    gc(&fixture, "--apply");
+    assert_eq!(
+        snapshot(),
+        before,
+        "an orphaned live worker is still protected"
+    );
+    assert_eq!(
+        fs::read(tree.join("interrupted-source")).unwrap(),
+        b"unique"
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .open(resume)
+        .unwrap()
+        .write_all(b"finish\n")
+        .unwrap();
+    let deadline = libc::timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                &deadline,
+            )
+        },
+        1
+    );
+    assert_eq!(event.fflags & libc::NOTE_EXIT, libc::NOTE_EXIT);
+    gc(&fixture, "--apply");
+    assert_eq!(snapshot(), ("NEEDS_ATTENTION".into(), None, None));
+    let workspace: (String, String) = db
+        .query_row("SELECT state, retention_reason FROM workspaces", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(workspace.0, "RECOVERY_REQUIRED");
+    assert!(workspace.1.contains("Interrupted"));
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM storage_reservations", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fs::read(tree.join("interrupted-source")).unwrap(),
+        b"unique"
+    );
+    let stable = snapshot();
+    gc(&fixture, "--apply");
+    assert_eq!(snapshot(), stable);
+    assert!(tree.exists());
+}
+
 #[test]
 fn gc_dry_run_is_read_only_and_live_lease_is_not_cleanup_permission() {
     use std::os::unix::fs::MetadataExt;

@@ -201,7 +201,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=7 => {}
+            1..=8 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -332,6 +332,16 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 7)?;
         }
+        if version < 8 {
+            transaction.execute_batch(
+                "CREATE TABLE worker_leases (
+                    token TEXT PRIMARY KEY NOT NULL,
+                    authority TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL
+                 );",
+            )?;
+            transaction.pragma_update(None, "user_version", 8)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -404,7 +414,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=7) {
+        if !matches!(version, 5..=8) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -747,6 +757,81 @@ impl Store {
     pub fn release_storage(&self, token: &str) -> Result<()> {
         self.connection
             .execute("DELETE FROM storage_reservations WHERE token = ?1", [token])?;
+        Ok(())
+    }
+
+    /// The caller holds the root admission/cleanup lock and the recorded owner lock.
+    pub fn create_worker_lease(&self, token: &str, authority: &str, expires: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO worker_leases VALUES (?1, ?2, ?3)",
+            params![token, authority, expires],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_worker_lease(&self, token: &str, authority: &str) -> Result<()> {
+        if self.connection.execute(
+            "UPDATE worker_leases SET authority = ?1 WHERE token = ?2",
+            params![authority, token],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub fn worker_lease(&self, token: &str) -> Result<Option<(String, i64)>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 8 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT authority, expires_at FROM worker_leases WHERE token = ?1",
+                [token],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn worker_lease_tokens(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT token FROM worker_leases ORDER BY token")?;
+        Ok(statement
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// No exit, finish time or artifact is invented. Cleanup intents are immutable.
+    /// Only the caller's verified inactive owner lock permits reservation release.
+    pub fn reconcile_interrupted(&mut self, token: &str, inactive: bool, now: i64) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if inactive {
+            transaction.execute("DELETE FROM storage_reservations WHERE token = ?1", [token])?;
+        }
+        let changed = transaction.execute(
+            "UPDATE runs SET state = 'NEEDS_ATTENTION', error_kind = COALESCE(error_kind, 'interrupted'),
+             updated_at = max(updated_at, ?2)
+             WHERE run_id = ?1 AND state IN ('QUEUED', 'PREPARING', 'RUNNING', 'FINALIZING')
+             AND NOT EXISTS (SELECT 1 FROM cleanup_intents c WHERE c.workspace_id = runs.workspace_id)",
+            params![token, now],
+        )?;
+        if changed != 0 {
+            transaction.execute(
+                "UPDATE workspaces SET state = 'RECOVERY_REQUIRED',
+                 retention_reason = 'Interrupted supervisor; recovery required. Inspect workspace and captured evidence; no process exit or complete capture is assumed.'
+                 WHERE run_id = ?1 AND state != 'RECLAIMED'
+                 AND NOT EXISTS (SELECT 1 FROM cleanup_intents c WHERE c.workspace_id = workspaces.workspace_id)",
+                [token],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
