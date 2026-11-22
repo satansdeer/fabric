@@ -215,7 +215,7 @@ fn owned_workspace(
     validate_owned_workspace(&root, &run, &workspace)
 }
 
-fn validate_owned_workspace(
+pub(super) fn validate_owned_workspace(
     root: &Path,
     run: &Run,
     workspace: &Workspace,

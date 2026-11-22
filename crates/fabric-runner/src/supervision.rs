@@ -246,14 +246,20 @@ impl ProcessGroup {
         &mut self,
         limits: &ExecutionLimits,
         cancellation: &CancellationToken,
+        observed_alive: impl Fn(),
     ) -> Result<(ExitStatus, Option<StopReason>), FabricError> {
         let start = self.launched;
+        let mut next_observation = Duration::ZERO;
         let reason = loop {
             if let Some(reason) = cancellation.storage_reason() {
                 break Some(reason);
             }
             if self.exited().map_err(execution_error)? {
                 break None;
+            }
+            if start.elapsed() >= next_observation {
+                observed_alive();
+                next_observation = start.elapsed() + Duration::from_millis(250);
             }
             if cancellation.is_cancelled() {
                 break Some(StopReason::Cancelled);

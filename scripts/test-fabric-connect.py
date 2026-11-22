@@ -173,6 +173,8 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
 """)
     consumer = Path(__file__).resolve().with_name("fabric-connect.py")
 
+    limits = {"timeout_seconds": 7200, "max_log_bytes": 67108864,
+              "max_artifact_bytes": 134217728, "copy_limit_bytes": 104857600}
     def command(name="once", *, good=True, connection=None, **overrides):
         args = [sys.executable, consumer, name, "--connection", connection or server.connection,
                 "--allow-loopback-http"]
@@ -181,6 +183,7 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
                       "root": f.root, "project": "fabric", "prepared-state": prepared["state_id"],
                       "harness": "fake", "allow-author": "satansdeer", "allow-label": "ready",
                       "gh": f.bin / "gh", "fake-binary": f.fake_wrapper}
+            values.update({name.replace("_", "-"): value for name, value in limits.items()})
             values.update(overrides)
             for key, value in values.items():
                 if value is True:
@@ -206,6 +209,10 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
     require(not server.view()["events"] and f.counts() == initial, "invalid ingress admitted work")
     command(good=False, **{"harness": "omp", "fake-binary": None})
     command(good=False, **{"allow-author": "other"})
+    for name, value in (("timeout-seconds", 0), ("timeout-seconds", 604801),
+                        ("max-log-bytes", 25), ("max-artifact-bytes", 0),
+                        ("copy-limit-bytes", -1)):
+        command(good=False, **{name: value})
     require(server.view()["worker"]["last_seen_at"] is None, "spend/route gate polled before rejecting")
     bad_connection = f.path / "bad-connection.json"
     value = json.loads(server.connection.read_text())
@@ -262,6 +269,11 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
     require(first.get("accepted") is True and first["status"] == "running" and first["event_id"] == event_id,
             "lost evidence retrieval did not preserve actual accepted handles")
     batch, run = first["batch_id"], first["run_id"]
+    require(first["limits"] == limits, "consumer did not report selected limits")
+    mapping = json.loads((f.root / "connect-bridge" / (event_id + ".json")).read_text())
+    intent = json.loads(Path(mapping["bridge_state"]).read_text())
+    require(mapping["configuration"]["limits"] == limits and intent["request"]["tasks"][0]["limits"] == limits,
+            "limits were not part of the durable configuration and request")
     require((f.path / "mapping-before-admission").read_text() == "durable", "event mapping was not saved before Core admission")
     require(f.counts()["async_batches"] == 1 and f.counts()["batch_tasks"] == 1, "once did not admit exactly one real worker")
     remote = next(event for event in server.view()["events"] if event["event_id"] == event_id)
@@ -269,6 +281,9 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
             "accepted admission was incorrectly reported as completion")
     require(not f.comments(), "failed evidence lookup published a misleading comment")
     command(good=False, **{"prepared-state": "different-source"})
+    command(good=False, **{"timeout-seconds": 7201})
+    command(good=False, **{"max-log-bytes": 67108865})
+    require(f.counts()["async_batches"] == 1, "changed limits admitted a duplicate event")
     fixtures.save_json(f.issue_path, closed)
     calls_before = (f.path / "gh-calls.jsonl").read_text().count('"method": "GET"')
     server.stop()

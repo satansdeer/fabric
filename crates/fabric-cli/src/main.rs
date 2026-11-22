@@ -355,6 +355,21 @@ enum RunsCommands {
     Show { id: fabric_domain::RunId },
     /// List registered artifact paths, lengths and SHA-256 checksums.
     Artifacts { id: fabric_domain::RunId },
+    /// Read content-free activity; raw native content requires explicit --raw.
+    Logs {
+        id: fabric_domain::RunId,
+        /// Per-run observation revision, or byte offset for the selected raw stream.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(1..=65536))]
+        limit_bytes: u64,
+        /// Ctrl-C stops this viewer only; use `fabric cancel` to stop work.
+        #[arg(long)]
+        follow: bool,
+        /// SENSITIVE local opt-in: no universal redaction; never upload these logs.
+        #[arg(long, value_parser = ["stdout", "stderr", "events"])]
+        raw: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -905,6 +920,42 @@ fn write_runs(root: Option<PathBuf>, command: RunsCommands, json: bool) -> Resul
         }
         RunsCommands::Artifacts { id } => {
             write_inspection(&fabric_core::inspect::artifacts(&root, &id)?, json)
+        }
+        RunsCommands::Logs {
+            id,
+            after,
+            limit_bytes,
+            follow,
+            raw,
+        } => {
+            let stream = raw.as_deref().map(|stream| match stream {
+                "stdout" => fabric_core::logs::RawStream::Stdout,
+                "stderr" => fabric_core::logs::RawStream::Stderr,
+                _ => fabric_core::logs::RawStream::Events,
+            });
+            if stream.is_some() {
+                eprintln!(
+                    "SENSITIVE LOCAL RAW LOGS: may contain prompts, credentials, reasoning, tool arguments/results and native errors. No universal secret redaction. Do not post/upload to GitHub or Connect."
+                );
+            }
+            let interrupt = fabric_runner::ForegroundInterrupt::install()?;
+            let cancellation = interrupt.token();
+            let mut cursor = after;
+            loop {
+                if cancellation.is_cancelled() {
+                    return Ok(());
+                }
+                let report =
+                    fabric_core::logs::read(&root, &id, cursor, limit_bytes as usize, stream)?;
+                if !follow || report.changed {
+                    write_inspection(&report, json || follow)?;
+                }
+                cursor = report.next_cursor;
+                if !follow || (report.terminal && (stream.is_none() || report.raw_eof)) {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
     }
 }
