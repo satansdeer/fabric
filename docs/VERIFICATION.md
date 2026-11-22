@@ -269,3 +269,39 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
   and actual native-host/pinned-pstack checks passed. No provider/model turn
   was invoked. Live OMP, Codex, mixed-harness and model-selected routing
   remain explicitly BLOCKED/NOT_VERIFIED.
+
+## TypeScript plugin SDK — issue #3
+
+- One Fabric-managed native OMP 19.1.0 worker ran from source
+  `568cc0296b72683506aa6379d93a7933473dc628` as
+  `r-1795384877421260000-42614-0`: `SUCCEEDED`, exit 0, workspace
+  `RECLAIMED`, capture not truncated. The controller verified all fourteen
+  retained artifact lengths and SHA-256 digests before recovering source into
+  a separate review checkout. No second worker or automatic retry was launched.
+- Controller checks on macOS with Node 22.23.2:
+  - `cargo build --offline --locked --bin fabric` passed.
+  - `cd sdk/typescript && npm ci --ignore-scripts` passed.
+  - `FABRIC_PLUGIN_TEST_HOST=/absolute/review/target/debug/fabric npm test`
+    passed typed contracts and all **12 tests, zero skips**. Actual subprocesses
+    exercised all three generated plugin kinds, offline npm-packed scaffolding,
+    watch-mode reruns, bounded malformed input, pin/version rejection and
+    secret-free failures. Real Core installation/check/tamper rejection/upgrade/
+    revoke used an owner-only temporary registry outside every Git checkout.
+  - `cargo fmt --all -- --check` passed.
+  - `FABRIC_PLUGIN_TEST_NODE=/absolute/node cargo test --offline --locked
+    -p fabric-runner --test plugins` passed **7 tests**, including generated
+    TypeScript plugins through the native host and pin checks before execution.
+  - `cargo test --offline --locked -p fabric-core --test workspace
+    external_plugin_reclaim_claim_cannot_bypass_artifacts_or_ownership`
+    passed **1 test** after updating its manifest constructor for optional pins.
+- SDK fixtures are provider-free; the implementation worker was a separately
+  owner-approved model-backed run. These checks do not claim public npm
+  publication, sandbox isolation, real provider-plugin execution or completion
+  of harness/target/connector extraction (#4–#6).
+- Pre-merge review found the push CI run failed in typed OMP conformance with
+  `SQLITE_BUSY` while reading workspace state from the live manager database;
+  the pull-request CI run on the same commit passed. The shared test query
+  connection now sets SQLite's bounded `busy_timeout = 5000` instead of failing
+  immediately during a concurrent manager write. The unchanged typed conformance
+  scenario passed locally after that fix; no provider call or automatic retry
+  was used.

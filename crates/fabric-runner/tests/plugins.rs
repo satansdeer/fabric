@@ -22,6 +22,7 @@ fn manifest(kind: PluginKind, mode: &str, dir: &Path) -> PluginManifest {
             mode.into(),
             dir.join("pid").display().to_string(),
         ],
+        integrity: None,
         capabilities: vec![
             match kind {
                 PluginKind::Harness => "harness.run",
@@ -256,4 +257,129 @@ fn manifest_versions_and_file_inputs_fail_closed() {
     assert!(PluginManifest::load(Path::new("/dev/zero")).is_err());
     std::fs::write(&path, vec![b'x'; MAX_FRAME + 1]).unwrap();
     assert!(PluginManifest::load(&path).is_err());
+}
+
+#[test]
+fn package_integrity_is_checked_before_control_and_harness_launch() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut plugin = manifest(PluginKind::Harness, "ok", dir.path());
+    let source = std::fs::read(&plugin.args[0]).unwrap();
+    let entry = bundle.join("entry.py");
+    std::fs::write(&entry, &source).unwrap();
+    plugin.args[0] = entry.display().to_string();
+    let content = format!("entry.py\0{:x}\n", Sha256::digest(&source));
+    plugin.integrity = Some(PluginIntegrity {
+        root: bundle.canonicalize().unwrap(),
+        sha256: format!("{:x}", Sha256::digest(content)),
+    });
+    PluginRegistry::default()
+        .install(plugin.clone(), false)
+        .unwrap();
+    let adapter = PluginHarness::new(plugin.clone()).unwrap();
+    let info = adapter.probe().unwrap();
+    reaped(dir.path());
+    let plan = adapter.plan(&HarnessRequest::default(), &info).unwrap();
+    std::fs::remove_file(dir.path().join("pid")).unwrap();
+    std::fs::write(&entry, "SECRET_CANARY: tampered").unwrap();
+    let error = PluginHost::default()
+        .harness_info(&plugin, &CancellationToken::default())
+        .err()
+        .unwrap();
+    assert_eq!(error.message, "Plugin: integrity_mismatch.");
+    assert!(!dir.path().join("pid").exists());
+    assert!(
+        PluginRegistry::default()
+            .install(plugin.clone(), false)
+            .is_err()
+    );
+    let prompt = dir.path().join("prompt");
+    let error = match adapter.command(&fabric_runner::AgentSpec {
+        profile: &plan.profile,
+        prompt_file: &prompt,
+        max_cost_usd: None,
+        request: &HarnessRequest::default(),
+    }) {
+        Ok(_) => panic!("tampered package was admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.message, "Plugin: integrity_mismatch.");
+    assert!(!dir.path().join("pid").exists());
+}
+
+#[test]
+fn typescript_scaffolds_use_existing_native_host() {
+    let Some(node) = std::env::var_os("FABRIC_PLUGIN_TEST_NODE") else {
+        eprintln!("TypeScript host smoke skipped: set FABRIC_PLUGIN_TEST_NODE");
+        return;
+    };
+    let node = std::fs::canonicalize(node).unwrap();
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk/typescript/cli.mjs");
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    for kind in [
+        PluginKind::Harness,
+        PluginKind::Target,
+        PluginKind::Connector,
+    ] {
+        let name = match kind {
+            PluginKind::Harness => "harness",
+            PluginKind::Target => "target",
+            PluginKind::Connector => "connector",
+        };
+        let project = dir.join(name);
+        let run = |args: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new(&node)
+                .arg(&cli)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("TMPDIR", &dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            output
+        };
+        run(&["create".as_ref(), name.as_ref(), project.as_os_str()]);
+        run(&["test".as_ref(), project.as_os_str()]);
+        // The content store contains shipped files, not development-only tsconfig.
+        std::fs::remove_file(project.join("tsconfig.json")).unwrap();
+        let pin = run(&["hash".as_ref(), project.as_os_str()]);
+        let pin: serde_json::Value = serde_json::from_slice(&pin.stdout).unwrap();
+        let mut plugin = manifest(kind, "ok", &dir);
+        plugin.id = name.parse().unwrap();
+        plugin.executable = node.clone();
+        plugin.args = vec![project.join("plugin.ts").display().to_string()];
+        plugin.integrity = Some(PluginIntegrity {
+            root: project,
+            sha256: pin["sha256"].as_str().unwrap().into(),
+        });
+        // Same admission boundary, without saving a registry inside a checkout.
+        PluginRegistry::default()
+            .install(plugin.clone(), false)
+            .unwrap();
+        let host = PluginHost::default();
+        let cancel = CancellationToken::default();
+        match kind {
+            PluginKind::Harness => {
+                assert_eq!(
+                    host.harness_info(&plugin, &cancel).unwrap().version,
+                    "1.0.0"
+                );
+            }
+            PluginKind::Target => {
+                assert_eq!(
+                    host.target_plan(&plugin, &cancel).unwrap().placement,
+                    "local"
+                );
+            }
+            PluginKind::Connector => {
+                assert!(!host.connector_evidence(&plugin, &cancel).unwrap().available);
+            }
+        }
+    }
 }

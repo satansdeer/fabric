@@ -12,6 +12,7 @@ use crate::{AgentSpec, CancellationToken, CommandSpec, HarnessAdapter, HarnessIn
 use fabric_domain::{ErrorKind, FabricError, HarnessId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const MAX_FRAME: usize = 65536;
 const MAX_REGISTRY: u64 = 1024 * 1024;
@@ -35,6 +36,14 @@ pub struct ProtocolRange {
     pub min: u32,
     pub max: u32,
 }
+
+/// Optional content pin for SDK packages. Legacy executable manifests remain supported.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginIntegrity {
+    pub root: PathBuf,
+    pub sha256: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
@@ -46,6 +55,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub args: Vec<String>,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<PluginIntegrity>,
 }
 impl PluginManifest {
     pub fn load(path: &Path) -> Result<Self, FabricError> {
@@ -83,6 +94,16 @@ impl PluginManifest {
         {
             return Err(failure("invalid_manifest"));
         }
+        if self.integrity.as_ref().is_some_and(|pin| {
+            !pin.root.is_absolute()
+                || pin.sha256.len() != 64
+                || !pin
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(failure("invalid_integrity"));
+        }
         let allowed = match self.kind {
             PluginKind::Harness => "harness.run",
             PluginKind::Target => "target.plan",
@@ -96,6 +117,119 @@ impl PluginManifest {
     pub fn compatible(&self) -> bool {
         self.protocol.min <= 1 && self.protocol.max >= 1
     }
+    pub fn verify_integrity(&self) -> Result<(), FabricError> {
+        let Some(pin) = &self.integrity else {
+            return Ok(());
+        };
+        let root = &pin.root;
+        let meta = fs::symlink_metadata(root).map_err(|_| failure("integrity_mismatch"))?;
+        if !meta.is_dir()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.permissions().mode() & 0o077 != 0
+            || root
+                .canonicalize()
+                .map_err(|_| failure("integrity_mismatch"))?
+                != *root
+        {
+            return Err(failure("integrity_mismatch"));
+        }
+        let mut files = Vec::new();
+        let mut entries = 0;
+        integrity_files(root, 0, &mut entries, &mut files)?;
+        files.sort();
+        let mut digest = Sha256::new();
+        let mut total = 0usize;
+        let mut buffer = [0u8; 8192];
+        for path in files {
+            let name = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .ok_or_else(|| failure("integrity_mismatch"))?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+                .map_err(|_| failure("integrity_mismatch"))?;
+            if !file
+                .metadata()
+                .map_err(|_| failure("integrity_mismatch"))?
+                .is_file()
+            {
+                return Err(failure("integrity_mismatch"));
+            }
+            let mut content = Sha256::new();
+            loop {
+                let n = file
+                    .read(&mut buffer)
+                    .map_err(|_| failure("integrity_mismatch"))?;
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if total > 32 * 1024 * 1024 {
+                    return Err(failure("integrity_mismatch"));
+                }
+                content.update(&buffer[..n]);
+            }
+            digest.update(name.as_bytes());
+            digest.update(b"\0");
+            digest.update(hex_digest(content.finalize().into()));
+            digest.update(b"\n");
+        }
+        if pin.sha256.as_bytes() != hex_digest(digest.finalize().into()).as_slice() {
+            return Err(failure("integrity_mismatch"));
+        }
+        Ok(())
+    }
+}
+
+fn hex_digest(bytes: [u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = [0; 64];
+    for (i, byte) in bytes.into_iter().enumerate() {
+        hex[i * 2] = HEX[(byte >> 4) as usize];
+        hex[i * 2 + 1] = HEX[(byte & 15) as usize];
+    }
+    hex
+}
+
+fn integrity_files(
+    root: &Path,
+    depth: usize,
+    entries: &mut usize,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), FabricError> {
+    if depth > 16 {
+        return Err(failure("integrity_mismatch"));
+    }
+    for entry in fs::read_dir(root).map_err(|_| failure("integrity_mismatch"))? {
+        let entry = entry.map_err(|_| failure("integrity_mismatch"))?;
+        *entries += 1;
+        if *entries > 512 {
+            return Err(failure("integrity_mismatch"));
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| failure("integrity_mismatch"))?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_@.-".contains(&b))
+        {
+            return Err(failure("integrity_mismatch"));
+        }
+        let kind = entry
+            .file_type()
+            .map_err(|_| failure("integrity_mismatch"))?;
+        if kind.is_dir() {
+            integrity_files(&entry.path(), depth + 1, entries, files)?;
+        } else if kind.is_file() && files.len() < 256 {
+            files.push(entry.path());
+        } else {
+            return Err(failure("integrity_mismatch"));
+        }
+    }
+    Ok(())
 }
 fn valid_version(version: &str) -> bool {
     if version.len() > 64 {
@@ -214,6 +348,7 @@ impl PluginRegistry {
     }
     pub fn install(&mut self, manifest: PluginManifest, upgrade: bool) -> Result<(), FabricError> {
         manifest.validate()?;
+        manifest.verify_integrity()?;
         if builtin(&manifest.id) {
             return Err(failure("duplicate_id"));
         }
@@ -384,6 +519,7 @@ impl PluginHost {
         if !manifest.compatible() {
             return Err(failure("unsupported_protocol"));
         }
+        manifest.verify_integrity()?;
         if cancel.is_cancelled() {
             return Err(failure("cancelled"));
         }
@@ -624,6 +760,7 @@ impl HarnessAdapter for PluginHarness {
         )
     }
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
+        self.manifest.verify_integrity()?;
         crate::profile::revalidate(self, spec, &self.manifest.version)?;
         // No plugin-supplied argv, cwd, environment or deletion request enters Core.
         let mut args: Vec<_> = self
