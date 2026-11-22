@@ -188,15 +188,19 @@ impl Store {
                 "SELECT project_id, name, source_path, default_ref, created_at
              FROM projects WHERE project_id = ?1",
                 [id.as_str()],
-                |r| {
-                    Ok(Project {
-                        project_id: read_id(r, 0)?,
-                        name: r.get(1)?,
-                        source_path: r.get(2)?,
-                        default_ref: r.get(3)?,
-                        created_at: r.get(4)?,
-                    })
-                },
+                read_project,
+            )
+            .optional()?)
+    }
+
+    pub fn project_by_name(&self, name: &str) -> Result<Option<Project>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT project_id, name, source_path, default_ref, created_at
+                 FROM projects WHERE name = ?1",
+                [name],
+                read_project,
             )
             .optional()?)
     }
@@ -489,5 +493,15 @@ fn read_state<T: SqlState>(row: &Row<'_>, index: usize) -> rusqlite::Result<T> {
             index,
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid persisted state"),
         )
+    })
+}
+
+fn read_project(row: &Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        project_id: read_id(row, 0)?,
+        name: row.get(1)?,
+        source_path: row.get(2)?,
+        default_ref: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }

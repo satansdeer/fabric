@@ -149,6 +149,7 @@ dependencies = [
  "clap",
  "fabric-core",
  "fabric-domain",
+ "fabric-project",
  "serde",
  "serde_json",
 ]
@@ -171,6 +172,10 @@ dependencies = [
 [[package]]
 name = "fabric-project"
 version = "0.1.0"
+dependencies = [
+ "fabric-domain",
+ "fabric-store",
+]
 
 [[package]]
 name = "fabric-runner"

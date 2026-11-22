@@ -14,3 +14,4 @@ serde.workspace = true
 serde_json.workspace = true
 fabric-domain.workspace = true
 fabric-core.workspace = true
+fabric-project = { path = "../fabric-project" }

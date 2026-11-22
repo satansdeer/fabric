@@ -20,6 +20,9 @@ pub enum ErrorKind {
     InvalidId,
     InvalidTransition,
     InvalidPolicy,
+    Source,
+    Storage,
+    NotFound,
 }
 
 #[derive(Debug, Serialize)]

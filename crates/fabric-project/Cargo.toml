@@ -3,3 +3,7 @@ name = "fabric-project"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+fabric-domain.workspace = true
+fabric-store = { path = "../fabric-store" }

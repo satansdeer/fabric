@@ -28,3 +28,10 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Verified checks exercise concurrent creation/migration, rollback, immutable READY records and persistence across reopen.
 - Authorized a prerequisite test-only fix: wall-clock/PID temporary names collided under parallel macOS doctor tests; implementer added a uniqueness counter.
 - Implementer supplied RED evidence and passing fmt/clippy/workspace checks (23 tests).
+
+## FAB-04
+
+- Reviewed local-only Git resolution/environment isolation, registration, durable source pin and private-root checks.
+- Independently ran seven project CLI tests: all passed.
+- Actual CLI registered the independently prepared dirty fixture, warned without importing edits, and returned the committed SHA `ed5d65262395a2dc5f95c457ca223c62956c2295` in add/status JSON.
+- Implementer supplied RED evidence and passing fmt/clippy/workspace checks (30 tests).
