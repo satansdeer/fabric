@@ -1,6 +1,6 @@
 # Supervised GitHub Connect bootstrap
 
-Tracked in [#18](https://github.com/satansdeer/fabric/issues/18), stacked on the [local issue bridge](ISSUE_WORKFLOW.md). **The permanent hosted service is not deployed**, but [#20](https://github.com/satansdeer/fabric/issues/20) proves actual signed GitHub delivery through a temporary Cloudflare Quick Tunnel into real Fabric/fake-harness execution. Netlify rejects deployment because account credits are exhausted. The reserved fallback is `https://fabric-connect-polyglo-satansdeer.netlify.app`; the desired custom domain is `fabric-connect.polyglo.tv`, but public DNS returns NXDOMAIN and registry WHOIS returns “No Data Found”. Neither Netlify nor that domain is a prerequisite for development. This is a single owner-provisioned route, not self-service authentication or a multi-tenant service. Full identity, transport and GitHub connector issues remain open.
+Tracked in [#18](https://github.com/satansdeer/fabric/issues/18), stacked on the [local issue bridge](ISSUE_WORKFLOW.md). **The permanent owner-provisioned Cloudflare service is live at `https://fabric-connect.satansdeer.workers.dev`**, backed by a SQLite Durable Object. The owner connection is `~/.config/fabric/connect/cloudflare.json`, outside the checkout. No paid upgrade or DNS changes were needed. Netlify and the custom domain are historical fallbacks, not active prerequisites. This is a single owner-provisioned route, not self-service authentication or a multi-tenant service. Full identity, transport and GitHub connector issues remain open.
 
 ## Trust and execution
 
@@ -15,14 +15,14 @@ The hosted route binds one provisioned worker identity and bearer-token hash. Ro
 The connection file must be an owner-owned, nonsymlink, mode-0600 JSON file:
 
 ```json
-{"schema_version":1,"endpoint":"https://fabric-connect-polyglo-satansdeer.netlify.app","worker_id":"OWNER_PROVISIONED_ID","token":"OWNER_PROVISIONED_TOKEN"}
+{"schema_version":1,"endpoint":"https://fabric-connect.satansdeer.workers.dev","worker_id":"OWNER_PROVISIONED_ID","token":"OWNER_PROVISIONED_TOKEN"}
 ```
 
-The initial owner connection is provisioned at `~/.config/fabric/connect/polyglo.json`, outside the checkout. It is not usable until deployment succeeds. After launch, status does not admit work:
+Use the existing owner-provisioned connection at `~/.config/fabric/connect/cloudflare.json`; do not copy credentials into the checkout. Status does not admit work:
 
 ```sh
 python3 scripts/fabric-connect.py status \
-  --connection "$HOME/.config/fabric/connect/polyglo.json"
+  --connection "$HOME/.config/fabric/connect/cloudflare.json"
 ```
 
 Prepare/register the trusted source using the [local workflow](ISSUE_WORKFLOW.md), then preview the live issue to obtain its approval SHA. Select the same source/project/prepared state when consuming:
@@ -33,7 +33,7 @@ python3 scripts/fabric-issue.py preview \
   --allow-author satansdeer --allow-label ready
 
 python3 scripts/fabric-connect.py once \
-  --connection "$HOME/.config/fabric/connect/polyglo.json" \
+  --connection "$HOME/.config/fabric/connect/cloudflare.json" \
   --issue 18 --approve "$REVIEWED_SHA" \
   --fabric "$PWD/target/debug/fabric" --root "$FABRIC_ROOT" \
   --project fabric --prepared-state "$READY_ID" \
@@ -47,7 +47,7 @@ The fake harness is for deterministic proof, not code generation. For an explici
 
 ## Provider-independent development
 
-The [local issue bridge](ISSUE_WORKFLOW.md) reads GitHub directly and needs no public URL. Use it for explicitly approved issue-driven work while permanent hosting is unavailable.
+The [local issue bridge](ISSUE_WORKFLOW.md) reads GitHub directly and needs no public URL. It remains a fallback for explicitly approved issue-driven work independent of hosted ingress.
 
 For signed-webhook development, a [Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/) forwards a temporary HTTPS address to a loopback receiver without an account or domain. Keep Core private; expose only the bounded, signature-checked Connect handler, with separate disposable webhook and worker credentials. The local file-backed `test-server.mjs` is a single-process integration fixture, not a production service. The address changes on restart and delivery is unavailable when the Mac or tunnel is offline; the local file store does not make ingress always-on.
 
@@ -55,36 +55,24 @@ In [#20](https://github.com/satansdeer/fabric/issues/20), real GitHub opened/rea
 
 The permanent Cloudflare adapter is in [`integrations/connect/cloudflare/`](../integrations/connect/cloudflare/): [Workers on `workers.dev`](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/) forwards the single configured route to one [SQLite-backed Durable Object](https://developers.cloudflare.com/durable-objects/platform/pricing/). Conditional writes use synchronous SQLite transactions; the route's bounded 512 KiB JSON is SQL TEXT, not a single 128 KiB Durable Object KV value. Authentication, leases/replay and explicit local approval/spend gates reuse the existing service. No custom domain, Netlify account or paid-plan upgrade is required.
 
-```sh
-cd integrations/connect/cloudflare
-npm ci
-npm test
-npx wrangler deploy --dry-run --outdir /tmp/fabric-connect-cloudflare
-# Deployment requires authorized access to the intended Cloudflare account:
-npx wrangler login
-npx wrangler secret put FABRIC_CONNECT_WEBHOOK_SECRET
-npx wrangler secret put FABRIC_CONNECT_WORKER_TOKEN_SHA256
-npx wrangler secret put FABRIC_CONNECT_WORKER_ID
-npm run deploy
-```
+## Live deployment evidence
 
-Provision all three bindings privately; upload only the bearer token's SHA-256 digest, never its raw value or a GitHub token. Use the actual deployed `https://fabric-connect.<account-subdomain>.workers.dev` origin for the private local connection and append the existing ingress path for the GitHub webhook. Keep credentials outside the checkout.
+Controller-supplied production observations for [#21](https://github.com/satansdeer/fabric/issues/21):
 
-The real local workerd/Miniflare SQLite check and Wrangler deployment dry-run passed. The check covers unauthorized requests, signed admission, competing conditional writes/leases, replay-safe completion, and lifecycle-generated state larger than 128 KiB surviving disposal/restart against the same disk. **No Worker has been deployed.** Saved Workers authorization is expired and the local browser relay is unavailable; renewing Cloudflare authorization is the remaining deployment gate. Hosted health/authentication, real queued GitHub delivery while the local consumer is offline, redeploy persistence and the subsequent local Core run remain required by [#21](https://github.com/satansdeer/fabric/issues/21).
+- Workers and SQLite Durable Object deployment succeeded without a paid upgrade or DNS changes.
+- Public `GET /health` returned 200; unsigned ingress and unauthenticated worker access each returned 401.
+- Repository webhook `715419509` is active, issues-only, with SSL verification enabled, at `https://fabric-connect.satansdeer.workers.dev/v1/projects/satansdeer/fabric/automations/issues/github`.
+- A real signed ready-label delivery for #21 queued while the local consumer was offline, survived production redeploy, and was subsequently consumed through real Core/fake-harness execution.
 
-## Deployment
+This proves permanent ingress/redeploy durability and provider-free consumption, not model-backed implementation. [#23](https://github.com/satansdeer/fabric/issues/23) and [#25](https://github.com/satansdeer/fabric/issues/25) separately supply native-worker evidence. Ingress queues unattended; execution remains supervised and outbound-only through the existing `status`/`once` consumer, not a new daemon.
 
-The isolated Netlify site is `fabric-connect-polyglo-satansdeer` (ID `6400a187-1d3a-49a4-aef1-0e4510571f1c`), reserved but not deployed. Its `netlify.app` hostname is the fallback public address after deployment allowance is restored. The unavailable custom domain is detached; no new DNS record remains. The two original `polyglo.tv` DNS records and unrelated sites/DNS, especially `usemont.com`, remain unchanged. Deployment is manual; no repository build hook or untrusted preview receives credentials.
+The deployed route uses the privately provisioned `FABRIC_CONNECT_WEBHOOK_SECRET`, `FABRIC_CONNECT_WORKER_TOKEN_SHA256` and `FABRIC_CONNECT_WORKER_ID` bindings. Only the bearer token's SHA-256 digest belongs on the server. Keep the raw token and owner connection outside the checkout. Public health and authenticated `/status`, `/poll` and `/events/<id>/ack` remain scoped to the fixed route; status payloads contain neither raw issue content nor tokens.
 
-After the owner restores deployment allowance, run `npm ci` then `npx netlify-cli deploy --no-build --prod --site 6400a187-1d3a-49a4-aef1-0e4510571f1c` from `integrations/connect` with an authenticated Netlify CLI. Do not put credentials in command arguments or source. The modern function uses site-wide Netlify Blobs, strong reads and conditional writes to preserve data across redeploys; this still needs production verification. Production environment variables:
+## Historical Netlify/domain fallback
 
-- `FABRIC_CONNECT_WEBHOOK_SECRET`: random shared GitHub HMAC secret.
-- `FABRIC_CONNECT_WORKER_TOKEN_SHA256`: SHA-256 of the private local bearer token, never the raw token.
-- `FABRIC_CONNECT_WORKER_ID`: the explicitly provisioned worker identity.
+The reserved Netlify site `fabric-connect-polyglo-satansdeer` (ID `6400a187-1d3a-49a4-aef1-0e4510571f1c`) was blocked by exhausted account credits and is not deployed. Its fallback address is `https://fabric-connect-polyglo-satansdeer.netlify.app`; no webhook was created against that undeployed endpoint. The proposed `fabric-connect.polyglo.tv` domain returned NXDOMAIN and registry WHOIS “No Data Found” and was detached. Existing DNS and unrelated sites were left unchanged.
 
-Variables are site-specific and production-context only. The current plan does not support function-only scopes or Netlify secret-value flags; account administrators can read these values. No paid-plan upgrade, credit purchase or domain registration was performed. No GitHub token is stored on Netlify.
-
-After health succeeds, create the GitHub repository webhook at `https://fabric-connect-polyglo-satansdeer.netlify.app/v1/projects/satansdeer/fabric/automations/issues/github`, content type JSON, SSL verification enabled, only `issues` events. Configure the shared secret privately. **No webhook has been created against the undeployed endpoint.** Public `GET /health` checks the service; authenticated `/status`, `/poll` and `/events/<id>/ack` are scoped to that fixed route. No status payload includes raw issue content or tokens.
+These limitations do not gate the live Cloudflare path. The Netlify adapter uses site-wide Blobs, strong reads and conditional writes, but still lacks production/redeploy verification. Revisit only if the owner explicitly selects that fallback; no credit purchase, domain registration or authorization renewal is required to use the current Cloudflare connection.
 
 ## Bounds and recovery
 
@@ -105,6 +93,6 @@ node --test integrations/connect/service.test.mjs
 python3 scripts/test-fabric-connect.py --fabric "$PWD/target/debug/fabric"
 ```
 
-These checks use signed fixture events, a durable local test-server store and real Fabric/fake-harness processes. All 19 ingress tests and the outbound real-Core/fake-harness check passed locally, including 14 verified artifacts, restart recovery and duplicate-admission prevention. `netlify functions:build --src netlify/functions --functions .netlify/functions` also successfully bundled the Netlify adapter. Actual signed GitHub delivery is separately proven by #20, not by those fixtures. Neither proof establishes permanent hosted-runtime/redeploy durability or model-backed issue-to-PR dogfooding.
+These checks use signed fixture events, a durable local test-server store and real Fabric/fake-harness processes. All 19 ingress tests and the outbound real-Core/fake-harness check passed locally, including 14 verified artifacts, restart recovery and duplicate-admission prevention. `netlify functions:build --src netlify/functions --functions .netlify/functions` also successfully bundled the Netlify adapter. Those fixture checks and the temporary tunnel proof in #20 do not themselves establish permanent hosting or model-backed execution; the separate production and native-worker evidence is listed above.
 
-The observed [SIGTERM CI failure](https://github.com/satansdeer/fabric/actions/runs/45035376872) was a partial heartbeat PID record (#22); shared tree readiness now requires complete parent/child records. A later [typed-conformance CI failure](https://github.com/satansdeer/fabric/actions/runs/45036747038) exposed a manager startup SQLite handle retained across shutdown (#24); that startup-only handle now closes before readiness. The deterministic readiness regression, actual SIGTERM lifecycle test, binary build and actual typed conformance all passed locally after these fixes. The conformance fixture owns/reaps the foreground manager and prints PASS only after successful resource cleanup. This is not a claim that remote CI is green. Launch blockers remain in #18; #15 remains the real model-backed issue-to-PR acceptance gate.
+The observed [SIGTERM CI failure](https://github.com/satansdeer/fabric/actions/runs/45035376872) was a partial heartbeat PID record (#22); shared tree readiness now requires complete parent/child records. A later [typed-conformance CI failure](https://github.com/satansdeer/fabric/actions/runs/45036747038) exposed a manager startup SQLite handle retained across shutdown (#24); that startup-only handle now closes before readiness. The deterministic readiness regression, actual SIGTERM lifecycle test, binary build and actual typed conformance passed locally after these fixes. The conformance fixture owns/reaps the foreground manager and prints PASS only after successful resource cleanup. Controller-supplied GitHub macOS CI runs [45039604770](https://github.com/satansdeer/fabric/actions/runs/45039604770) and [45039529438](https://github.com/satansdeer/fabric/actions/runs/45039529438) at `c6583cb` completed successfully. These are recorded observations, not checks rerun here; #15 retains the real model-backed issue-to-reviewed-PR acceptance gate.
