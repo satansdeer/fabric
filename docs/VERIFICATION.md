@@ -245,7 +245,7 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
   `recover RUN_ID` displayed inspection-only `already_reclaimed`.
 - Updated macOS workflow YAML parsed successfully. It retains locked offline
   Rust gates and adds both Bun protocols plus checksum-verified native OMP and
-  pinned real pstack plugin discovery. Remote execution is not yet verified.
+  pinned real pstack plugin discovery. Remote execution passed; see below.
 - The initial workspace run passed the C06 twenty-worker recovery scenario,
   then reported 42 passing CLI run checks and four failures: a legacy-profile
   fixture still had schema12 capture context, two total-CLI timing assertions
@@ -262,3 +262,10 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
 - Ten live-guide shell blocks and embedded Python parsed successfully without
   execution. The guide's `sh scripts/smoke-codex.sh` default returned
   `NOT_VERIFIED`; no live provider recipe was executed.
+- Remote [macOS CI 45029533204](https://github.com/satansdeer/fabric/actions/runs/45029533204)
+  passed in 5m0s on implementation commit `f86ac3c330`. Rust 1.91 formatting,
+  strict lint, complete workspace acceptance and binary builds all passed;
+  both Bun protocols passed; native OMP 19.1.0 download checksum verification
+  and actual native-host/pinned-pstack checks passed. No provider/model turn
+  was invoked. Live OMP, Codex, mixed-harness and model-selected routing
+  remain explicitly BLOCKED/NOT_VERIFIED.
