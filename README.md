@@ -2,9 +2,9 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-10
+## Implemented: FAB-01 through FAB-11
 
-The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and one foreground fake-harness worker. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. OMP execution, artifact capture and cleanup commands are not implemented yet.
+The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground fake/OMP harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Durable artifact capture and cleanup commands are not implemented yet.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 
@@ -132,7 +132,24 @@ The fake harness is an actual separate `fabric-fake-harness` executable beside `
 
 The core persists PREPARING before fork work, RUNNING with the actual child PID/version/start time after spawn, FINALIZING with the observed exit, and finally SUCCEEDED or FAILED with a completion timestamp. Prompt identity is SHA-256 of the exact copied input bytes. JSON stdout reports IDs, source SHA, prompt digest, harness version, terminal state, exit and times; nonzero child exit also makes the CLI fail. Launch/supervision uncertainty instead records NEEDS_ATTENTION and retains recovery evidence without inventing exit metadata. Child processes have a private process group; remaining group descendants are killed and the leader reaped when their leader exits. There is no execution timeout or cancellation API yet.
 
-**No source artifacts are claimed.** Tracked/untracked edits, exact `prompt.input`, `stdout.log` and `stderr.log` remain in the owner-only workspace/container with an explicit capture-pending retention reason; artifact-manifest ID stays null. Child output writes directly to files, never undrained pipes. These raw logs are currently unbounded; FAB-12 adds caps/event capture, FAB-14 cancellation, and FAB-15–17 durable artifacts/cleanup. Run only trusted bounded fixture workloads until those controls land. No GC or deletion path exists; startup reservations are not renewed execution leases and expiry never authorizes deleting retained work.
+**No source artifacts are claimed.** Tracked/untracked edits, exact `prompt.input`, `stdout.log` and `stderr.log` remain in the owner-only workspace/container with an explicit capture-pending retention reason; artifact-manifest ID stays null. Child output writes directly to files, never undrained pipes. These raw logs are currently unbounded; FAB-12 adds total byte caps and durable structured event capture, FAB-14 cancellation, and FAB-15–17 durable source artifacts/cleanup. Run only trusted bounded fixture workloads until those controls land. No GC or deletion path exists; startup reservations are not renewed execution leases and expiry never authorizes deleting retained work.
+
+### Installed OMP adapter (manual execution requires spending approval)
+
+After explicit approval for model spending, the corresponding command is:
+
+```sh
+./target/debug/fabric --root /private/path/to/fabric run my-project \
+  --harness omp --prompt-file ./prompt.md --copy-limit-bytes 104857600 --json
+```
+
+OMP discovery reuses doctor's executable PATH lookup, resolving relative entries before changing cwd. Missing OMP fails with installation/PATH guidance before creating a run or workspace. Every run probes the selected executable using `--version`; the exact returned version line (minus CR/LF) is persisted, not a configured version. The installed macOS binary was observed on 2026-11-22 as `omp/19.1.0`; its actual `--help` documents print mode, JSON mode, positional messages, `--no-session` and `--no-title`. Only version/help probes were executed; **AT-15 actual model smoke is not complete**.
+
+The existing foreground runner launches `omp -p --mode json --no-session --no-title -- PROMPT` in the freshly validated private fork. UTF-8 prompt snapshot contents are one argv value, verbatim including leading flags, newlines, quotes, shell characters and empty input. NUL/non-UTF-8 inputs fail clearly; operating-system argv size limits still apply. There is no shell interpolation or Fabric prompt-file expansion. OMP may interpret its own message syntax (for example leading `@` file references); argv fidelity is not a promise to disable OMP's message semantics.
+
+The process environment is cleared first. OMP receives fixed `LC_ALL=C`, default `PATH=/usr/bin:/bin`, and only explicitly allowlisted ambient `PATH`, `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `TMPDIR` when set. HOME/XDG permit OMP's normal installed config/auth mechanism without reading/copying credentials into Fabric-managed data; arbitrary API keys, secrets, injection variables and `PI_*` overrides are not inherited. Config files and the trusted OMP process itself remain outside Fabric's sandbox guarantees. The fake harness keeps its fixed minimal environment.
+
+After exit, stdout is decoded incrementally using a 64 KiB maximum line/event buffer and serde_json's recursion limit. Oversized lines drain without accumulating and parsing resumes at the next newline; malformed JSON/UTF-8 is counted without failing an otherwise successful harness. CRLF and final unterminated lines work. JSON run reports include `events.parsed`, `events.invalid` and `events.oversized`; the library iterator yields individual decoded JSON values without accumulating them. Raw stdout/stderr remain available. This story bounds decoder memory, **not total disk output**: combined log caps, truncation metadata and checksummed structured event persistence remain FAB-12.
 
 ## Checks
 
@@ -148,6 +165,7 @@ cargo test --locked -p fabric-cli --test prepare
 cargo test --locked -p fabric-workspace --test fork
 cargo test --locked -p fabric-core --test workspace
 cargo test --locked -p fabric-cli --test run
+cargo test --locked -p fabric-runner
 cargo fmt --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace

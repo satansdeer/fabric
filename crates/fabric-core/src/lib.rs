@@ -1,7 +1,7 @@
 //! Local diagnostics and durable workspace ownership orchestration.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
 
@@ -39,37 +39,9 @@ pub fn doctor() -> DoctorReport {
         },
         tools: ["git", "omp"].map(|name| ToolReport {
             name,
-            path: path.as_ref().and_then(|path| {
-                env::split_paths(path).find_map(|directory| {
-                    let candidate = directory.join(name);
-                    if !is_executable(&candidate) {
-                        return None;
-                    }
-                    if candidate.is_absolute() {
-                        Some(candidate)
-                    } else {
-                        env::current_dir().ok().map(|cwd| cwd.join(candidate))
-                    }
-                })
-            }),
+            path: path
+                .as_ref()
+                .and_then(|path| fabric_runner::discover_executable(name, path)),
         }),
-    }
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        false
     }
 }

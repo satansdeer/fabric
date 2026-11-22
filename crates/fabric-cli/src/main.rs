@@ -31,10 +31,10 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
-    /// Execute one fake harness worker in a private prepared-tree fork.
+    /// Execute one harness worker in a private prepared-tree fork.
     Run {
         name: String,
-        #[arg(long, value_parser = ["fake"])]
+        #[arg(long, value_parser = ["fake", "omp"])]
         harness: String,
         #[arg(long)]
         prompt_file: PathBuf,
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run {
             name,
-            harness: _,
+            harness,
             prompt_file,
             fake_binary,
             copy_limit_bytes,
@@ -133,6 +133,7 @@ fn main() -> ExitCode {
                 cli.root,
                 &name,
                 &prompt_file,
+                &harness,
                 fake_binary,
                 copy_limit_bytes,
                 json,
@@ -152,6 +153,7 @@ fn write_run(
     root: Option<PathBuf>,
     name: &str,
     prompt_file: &std::path::Path,
+    harness_name: &str,
     fake_binary: Option<PathBuf>,
     copy_limit_bytes: u64,
     json: bool,
@@ -160,15 +162,29 @@ fn write_run(
         Some(root) => root,
         None => fabric_project::default_root()?,
     };
-    let binary = match fake_binary {
-        Some(binary) => binary,
-        None => std::env::current_exe()
-            .map_err(output_error)?
-            .with_file_name("fabric-fake-harness"),
+    let run = |harness: &dyn fabric_runner::HarnessAdapter| {
+        fabric_core::run::foreground(&root, name, prompt_file, harness, copy_limit_bytes)
     };
-    let harness = fabric_runner::FakeHarness::new(binary)?;
-    let report =
-        fabric_core::run::foreground(&root, name, prompt_file, &harness, copy_limit_bytes)?;
+    let report = match harness_name {
+        "omp" => {
+            if fake_binary.is_some() {
+                return Err(FabricError {
+                    kind: ErrorKind::InvalidArguments,
+                    message: "--fake-binary is only valid with --harness fake.".into(),
+                });
+            }
+            run(&fabric_runner::OmpHarness::discover()?)?
+        }
+        _ => {
+            let binary = match fake_binary {
+                Some(binary) => binary,
+                None => std::env::current_exe()
+                    .map_err(output_error)?
+                    .with_file_name("fabric-fake-harness"),
+            };
+            run(&fabric_runner::FakeHarness::new(binary)?)?
+        }
+    };
     let mut stdout = io::stdout().lock();
     if json {
         serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;

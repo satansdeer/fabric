@@ -538,6 +538,7 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
                         .join("MUST_NOT_RUN")
                         .into_os_string(),
                 ],
+                environment: Vec::new(),
             })
         }
     }

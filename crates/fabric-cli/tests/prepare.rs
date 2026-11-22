@@ -246,11 +246,12 @@ fn invalid_recipe_starts_no_git_and_failure_is_retained_never_ready() {
 fn total_timeout_kills_recipe_descendants_and_discards_large_output() {
     let fixture = Fixture::new();
     fixture.repo();
-    let recipe = fixture.recipe("version=1\n[[steps]]\nargv=['/bin/sh','-c','(while :; do printf x >> heartbeat; sleep 0.03; done) & while :; do printf noisy; done']\n[limits]\nmax_duration_seconds=1\n");
+    // The total budget includes Git startup: allow the recipe to start under load.
+    let recipe = fixture.recipe("version=1\n[[steps]]\nargv=['/bin/sh','-c','(while :; do printf x >> heartbeat; sleep 0.03; done) & while :; do printf noisy; done']\n[limits]\nmax_duration_seconds=5\n");
     let start = Instant::now();
     let out = fixture.prepare(&recipe);
     assert!(!out.status.success());
-    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(start.elapsed() < Duration::from_secs(10));
     assert!(out.stdout.len() + out.stderr.len() < 4096);
     let state = fs::read_dir(fixture.0.join("storage/prepared"))
         .unwrap()

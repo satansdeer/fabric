@@ -78,3 +78,10 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independently ran both CLI worker regression tests: passed, including nonzero exit and unprepared-HEAD refusal.
 - Actual operator fixture CLI launched external fake worker, read ignored `.deps/ready`, returned SUCCEEDED/exit 0 and exact committed SHA. Run: `r-1795309396406779000-25375-0`.
 - Implementer final fmt/clippy/workspace gates passed (67 tests). No cleanup eligibility or artifact claim yet.
+
+## FAB-11
+
+- Reviewed OMP discovery/version validation, literal argv prompt boundary and explicit environment allowlist.
+- Independently ran both OMP CLI regressions: passed, including offline JSONL/argv fixture and missing-executable refusal before allocation. Initial nonexistent `omp` test-target selection was corrected to the existing `run` target.
+- Implementer final gates passed (73 tests), after disclosed test-only startup-budget and unique-fixture corrections.
+- Real OMP help/version only; paid model smoke AT-15 remains unverified.

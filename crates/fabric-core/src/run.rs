@@ -1,6 +1,6 @@
-//! One foreground worker; no batch scheduling, OMP adapter, artifacts or cleanup.
+//! One foreground worker; no batch scheduling, durable artifacts or cleanup.
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,13 +31,14 @@ pub struct RunReport {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub workspace_path: String,
+    pub events: fabric_runner::jsonl::Summary,
 }
 
 pub fn foreground(
     root: &Path,
     project_name: &str,
     prompt_file: &Path,
-    harness: &impl HarnessAdapter,
+    harness: &(impl HarnessAdapter + ?Sized),
     copy_limit_bytes: u64,
 ) -> Result<RunReport, FabricError> {
     // Snapshot the exact prompt once: digest and child input cannot disagree if
@@ -116,22 +117,31 @@ pub fn foreground(
         store
             .observe_run_exit(&run_id, status.code(), now()?)
             .map_err(error)?;
-        store.finish_run(&run_id, now()?).map_err(error)
+        let events = fabric_runner::jsonl::Events::new(BufReader::new(
+            File::open(container.join("stdout.log")).map_err(error)?,
+        ))
+        .summarize()
+        .map_err(error)?;
+        store.finish_run(&run_id, now()?).map_err(error)?;
+        Ok::<_, FabricError>(events)
     })();
-    if let Err(failure) = execution {
-        store
-            .fail_run_execution(&run_id, &info.version, &failure.message, now()?)
-            .map_err(|persist| {
-                error(format!(
-                    "{}; could not persist run failure: {persist}",
-                    failure.message
-                ))
-            })?;
-        return Err(error(format!(
-            "Run {run_id}: {} (workspace retained)",
-            failure.message
-        )));
-    }
+    let events = match execution {
+        Ok(events) => events,
+        Err(failure) => {
+            store
+                .fail_run_execution(&run_id, &info.version, &failure.message, now()?)
+                .map_err(|persist| {
+                    error(format!(
+                        "{}; could not persist run failure: {persist}",
+                        failure.message
+                    ))
+                })?;
+            return Err(error(format!(
+                "Run {run_id}: {} (workspace retained)",
+                failure.message
+            )));
+        }
+    };
     let run = store
         .run(&run_id)
         .map_err(error)?
@@ -146,6 +156,7 @@ pub fn foreground(
         harness_version: run.harness_version,
         state: run.state,
         exit_code: run.exit_code,
+        events,
         created_at: run.created_at,
         started_at: run.started_at,
         finished_at: run.finished_at,

@@ -1,17 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "fabric-run-{}-{}",
+            "fabric-run-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
@@ -227,4 +231,122 @@ fn run_selects_prepared_current_head_and_refuses_unprepared_head() {
         fs::read_to_string(repo.join("tracked")).unwrap(),
         "dirty not imported"
     );
+}
+
+#[test]
+fn omp_mock_receives_literal_prompt_parses_bounded_jsonl_and_records_observed_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let (repo, base) = fixture.setup();
+    let bin = fixture.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("omp");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+set -eu
+test -n "$HOME"
+test -z "${UNSELECTED_SECRET+x}"
+test -z "${OPENAI_API_KEY+x}"
+test -z "${AWS_SECRET_ACCESS_KEY+x}"
+test -z "${BASH_ENV+x}"
+test -z "${PI_CODING_AGENT_DIR+x}"
+if [ "$#" = 1 ] && [ "$1" = --version ]; then
+    printf 'omp/19.1.0-fixture+exact\n'
+    exit 0
+fi
+test "$#" = 7
+test "$1" = -p
+test "$2" = --mode
+test "$3" = json
+test "$4" = --no-session
+test "$5" = --no-title
+test "$6" = --
+test "$(cat .deps/ready)" = ready
+printf '%s' "$7" > received.prompt
+printf 'mock tracked change' > tracked
+printf '{"type":"started","value":42}\r\nnot-json\n\377\n'
+head -c 262144 /dev/zero | tr '\000' x
+printf '\n{"type":"finished"}\n{"last":true}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    for prompt in [
+        "--model evil ; $(touch INJECTED) 'quoted' \"double\" \\\nsecond line\n",
+        "@literal-file-not-an-option",
+        "",
+    ] {
+        let prompt_path = fixture.0.join("omp.prompt");
+        fs::write(&prompt_path, prompt).unwrap();
+        let out = fixture
+            .cli()
+            .env("PATH", &path)
+            .env("OPENAI_API_KEY", "must-not-leak")
+            .env("AWS_SECRET_ACCESS_KEY", "must-not-leak")
+            .env("BASH_ENV", "/must/not/load")
+            .env("PI_CODING_AGENT_DIR", "/must/not/load")
+            .args(["run", "test", "--harness", "omp", "--prompt-file"])
+            .arg(prompt_path)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap();
+        let report = json(&out);
+        assert_eq!(report["harness"], "omp");
+        assert_eq!(report["harness_version"], "omp/19.1.0-fixture+exact");
+        assert_eq!(report["base_commit_sha"], base["source_commit_sha"]);
+        assert_eq!(report["state"], "SUCCEEDED");
+        assert_eq!(report["events"]["parsed"], 3);
+        assert_eq!(report["events"]["invalid"], 2);
+        assert_eq!(report["events"]["oversized"], 1);
+        let tree = Path::new(report["workspace_path"].as_str().unwrap());
+        assert_eq!(
+            fs::read(tree.join("received.prompt")).unwrap(),
+            prompt.as_bytes()
+        );
+        assert!(!tree.join("INJECTED").exists());
+        assert_eq!(
+            fs::read_to_string(tree.join("tracked")).unwrap(),
+            "mock tracked change"
+        );
+        let run = fabric_store::Store::open(fixture.0.join("storage/fabric.db"))
+            .unwrap()
+            .run(&report["run_id"].as_str().unwrap().parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.harness_version, Some("omp/19.1.0-fixture+exact".into()));
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked")).unwrap(),
+            "original"
+        );
+    }
+}
+
+#[test]
+fn missing_omp_is_actionable_and_does_not_allocate_a_run() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let prompt = fixture.0.join("omp.prompt");
+    fs::write(&prompt, "no model call").unwrap();
+    let bin = fixture.0.join("empty-bin");
+    fs::create_dir(&bin).unwrap();
+    let out = fixture
+        .cli()
+        .env("PATH", bin)
+        .args(["run", "test", "--harness", "omp", "--prompt-file"])
+        .arg(prompt)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let diagnostic: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert!(
+        diagnostic["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("OMP executable not found on PATH")
+    );
+    assert!(!fixture.0.join("storage/fork-staging").exists());
 }
