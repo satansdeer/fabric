@@ -94,6 +94,12 @@ Offline workers leave events queued. Run `status` after reconnect, then explicit
 
 ## Provider-free verification
 
+The consumer sends `User-Agent: Fabric-Connect (+https://github.com/satansdeer/fabric)`. Check actual GET/POST headers, Bearer authorization and JSON content type with disposable loopback HTTP and fake credentials only:
+
+```sh
+python3 scripts/test-fabric-connect-request.py -v
+```
+
 ```sh
 node --test integrations/connect/service.test.mjs
 python3 scripts/test-fabric-connect.py --fabric "$PWD/target/debug/fabric"

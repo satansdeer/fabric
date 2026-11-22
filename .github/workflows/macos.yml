@@ -47,6 +47,8 @@ jobs:
           npm ci
           npm test
           npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/fabric-connect-cloudflare"
+      - name: Connect application request headers (provider-free)
+        run: python3 scripts/test-fabric-connect-request.py -v
       - name: Connect outbound local worker (provider-free)
         timeout-minutes: 5
         run: python3 scripts/test-fabric-connect.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"

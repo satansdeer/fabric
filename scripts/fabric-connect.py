@@ -78,7 +78,8 @@ class Client:
         data = None if payload is None else bridge.canonical({"worker_id": self.worker_id, **payload}).encode()
         request = urllib.request.Request(
             self.endpoint + PREFIX + suffix, data=data,
-            headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"},
+            headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json",
+                     "User-Agent": "Fabric-Connect (+https://github.com/satansdeer/fabric)"},
             method="GET" if payload is None else "POST")
         try:
             with self.opener.open(request, timeout=15) as response:

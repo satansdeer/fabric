@@ -81,3 +81,17 @@ python3 scripts/test-fabric-issue.py --fabric "$PWD/target/debug/fabric"
 This check uses a disposable Git source, fake GitHub transport, a real Fabric manager and separate fake harness subprocesses. It requires neither GitHub authentication/network nor native harness consent/provider spending. It exercises approved issue admission, rejected input, durable idempotency, actual captured mutations/evidence and safe cleanup. It is not a real-agent or hosted-trigger proof.
 
 Observed bootstrap proof: [provider-free acceptance evidence](https://github.com/satansdeer/fabric/issues/16#issuecomment-7080579649). The gate passed with real manager admission, stable retry handles, 14 verified artifacts, immutable source trees, reclaimed workspace and stopped owned manager. Live GitHub issue preview also passed. This does not verify a native/model-backed worker, automatic issue delivery or a hosted callback URL.
+
+## First supervised native OMP run
+
+[Issue #23](https://github.com/satansdeer/fabric/issues/23) was explicitly selected for one real OMP worker, using the installed `omp/19.1.0` and reviewed native default `openai-codex/gpt-6.1-sol`. Native event records confirm that provider/model and nonzero usage. A 600-second deadline bounded execution, not monetary cost; the worker had no authority to publish or merge.
+
+- Approved issue SHA-256: `d83a7f60243979838495ad2cb59baeba63e2fd912e1577818d63cbe5d9b519e5`.
+- Immutable input commit: `f3f10599f6e0b76d670f5dd99f17ee7e608de43a`; READY state: `s-1795361263364685000-64158-0`.
+- Batch: `b-r-1795361399343796000-64879-1`; run: `r-1795361399304738000-64879-0`; manifest: `a-r-1795361399304738000-64879-0`.
+- Observed `SUCCEEDED`, exit 0, no native failure; workspace `RECLAIMED` and absent afterward. READY source bytes, detached source SHA and read-only permissions remained unchanged.
+- All 14 retained artifact paths, sizes and SHA-256 digests were checked, then verified again in a private persistent evidence copy. Logs hit the configured 1 MiB capture bound and are truncated; the tracked patch and untracked archive were preserved.
+- Changes were restored in an independent checkout of the recorded commit. Restored tracked files match the patch's exact Git blob identities, and the added test matches the safe regular-file archive entry. The controller's actual GET/POST loopback header check passed there with fake credentials and no provider calls.
+- Repeating the approved dispatch reused the same batch/run and updated the same GitHub comment without another admission. The controller explicitly stopped its foreground manager afterward; the process exited 0.
+
+This is direct, supervised GitHub issue → Fabric → native OMP execution, not permanent webhook deployment. The controller publishes the reviewed changes and run evidence in a stacked PR; issue #23 and #15 record the PR/review gate. No automatic merge or worker-created PR is involved.
