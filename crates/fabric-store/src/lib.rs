@@ -11,7 +11,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 mod queue;
 use queue::insert_task_source;
-pub use queue::{AsyncBatch, AsyncEvent, AsyncTask, AsyncTaskStatus, NewAsyncTask};
+pub use queue::{
+    AsyncBatch, AsyncEvent, AsyncLogIdentity, AsyncTask, AsyncTaskStatus, NewAsyncTask,
+};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -235,7 +237,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=12 => {}
+            1..=13 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -474,6 +476,17 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 12)?;
         }
+        if version < 13 {
+            transaction.execute_batch(
+                "CREATE TABLE run_observations (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB)) <= 8192)
+                      CHECK(json_valid(metadata))
+                 );",
+            )?;
+            transaction.pragma_update(None, "user_version", 13)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -546,10 +559,40 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=12) {
+        if !matches!(version, 5..=13) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
+    }
+
+    /// One bounded metadata snapshot per run, independent of raw capture retention.
+    pub fn record_observation(&self, run: &RunId, metadata: &str) -> Result<()> {
+        if metadata.len() > 8192 {
+            return Err(StoreError::InvalidRecord("observation exceeds 8 KiB"));
+        }
+        self.connection.execute(
+            "INSERT INTO run_observations(run_id,revision,metadata) VALUES(?1,1,?2)
+             ON CONFLICT(run_id) DO UPDATE SET revision=revision+1,metadata=excluded.metadata",
+            params![run.as_str(), metadata],
+        )?;
+        Ok(())
+    }
+
+    pub fn observation(&self, run: &RunId) -> Result<Option<(u64, String)>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 13 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT revision,metadata FROM run_observations WHERE run_id=?1",
+                [run.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// Insert observed invocation evidence or monotonically advance an existing attempt.
@@ -1937,7 +1980,8 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_capture_contexts;
+            "DROP TABLE run_observations;
+             DROP TABLE run_capture_contexts;
              DROP TRIGGER immutable_manifest;
              CREATE TRIGGER immutable_manifest BEFORE UPDATE OF artifact_manifest_id ON runs
              WHEN (OLD.artifact_manifest_id IS NOT NULL

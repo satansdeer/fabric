@@ -9,6 +9,7 @@ use serde::Serialize;
 pub mod api;
 mod artifacts;
 pub mod inspect;
+pub mod logs;
 pub mod onboarding;
 pub mod run;
 pub mod workspace;

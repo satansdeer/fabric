@@ -167,6 +167,7 @@ def subprocess_environment(client):
 
 
 def configuration(args, client):
+    limits = bridge.selected_limits(args)  # Validate before polling or claiming a delivery.
     require(args.harness == "fake" or args.allow_model_spend,
             "Native workers require --allow-model-spend and prior Fabric native consent.")
     require(args.fake_binary is None or args.harness == "fake", "Fake executable requires the fake harness.")
@@ -183,7 +184,7 @@ def configuration(args, client):
             "approval_sha256": args.approve, "root": args.root, "fabric": args.fabric,
             "project": args.project, "source": {"kind": "prepared", "state_id": args.prepared_state},
             "harness": args.harness, "fake_binary": args.fake_binary,
-            "allow_author": args.allow_author, "allow_label": args.allow_label}
+            "allow_author": args.allow_author, "allow_label": args.allow_label, "limits": limits}
 
 
 # Only explicit live-issue validation failures can reject an unadmitted delivery.
@@ -226,7 +227,7 @@ def mapped_state(mapping, config):
             and snapshot.get("author") == config["allow_author"]
             and state.get("root") == config["root"] and state.get("fake_binary") == config["fake_binary"]
             and state.get("request") == bridge.worker_request(snapshot, config["project"],
-                                                               config["source"]["state_id"], config["harness"])
+                                                               config["source"]["state_id"], config["harness"], config["limits"])
             and bridge.identity(snapshot, state["request"], config["fake_binary"]) == key
             and state.get("idempotency_key") == key, "Saved bridge provenance mismatch.")
     return path, state
@@ -245,6 +246,7 @@ def save_handles(mapping, path, state, output):
 
 def once(args, client, output):
     config = configuration(args, client)  # Spend gate before even polling.
+    output["limits"] = config["limits"]
     response = client.request("/poll", {"issue_number": args.issue})
     worker_record(response.get("worker"), client)
     require("event" in response, "Invalid remote poll response.")
@@ -261,12 +263,17 @@ def once(args, client, output):
     with bridge.locked(directory / "route.json"), subprocess_environment(client):
         if path.exists():
             mapping = bridge.read_state(path)
+            # Version-1 mappings predate configurable limits; their request used these defaults.
+            saved_config = mapping.get("configuration")
+            if isinstance(saved_config, dict) and "limits" not in saved_config:
+                saved_config["limits"] = {name: bounds[0] for name, bounds in bridge.LIMITS.items()}
+                bridge.save_state(path, mapping)
             require(mapping.get("configuration") == config and mapping.get("event") == provenance,
                     "Saved event configuration differs; repeat the original command to reconnect.")
         else:
             require(event["status"] != "running", "Remote running event has no local mapping; recover original private state, do not resubmit.")
             snapshot = approved_snapshot(args, client, event, output, can_reject=True)
-            request = bridge.worker_request(snapshot, args.project, args.prepared_state, args.harness)
+            request = bridge.worker_request(snapshot, args.project, args.prepared_state, args.harness, config["limits"])
             key = bridge.identity(snapshot, request, args.fake_binary)
             mapping = {"schema_version": 1, "configuration": config, "event": provenance,
                        "idempotency_key": key, "bridge_state": str(Path(args.root) / "issue-bridge" / (key + ".json")),
@@ -277,7 +284,7 @@ def once(args, client, output):
             require(event["status"] != "running", "Remote accepted handles lack local confirmation; do not resubmit.")
             # A saved intent may represent a lost admission response: never mark it failed.
             snapshot = approved_snapshot(args, client, event, output, can_reject=state is None)
-            request = bridge.worker_request(snapshot, args.project, args.prepared_state, args.harness)
+            request = bridge.worker_request(snapshot, args.project, args.prepared_state, args.harness, config["limits"])
             require(bridge.identity(snapshot, request, args.fake_binary) == mapping["idempotency_key"],
                     "Saved approval identity changed; do not resubmit.")
             output["admission"] = "uncertain"
@@ -337,6 +344,7 @@ def parse_args():
             command.add_argument("--fake-binary")
             command.add_argument("--allow-model-spend", action="store_true")
             command.add_argument("--post", action="store_true")
+            bridge.add_limit_arguments(command)
     return parser.parse_args()
 
 

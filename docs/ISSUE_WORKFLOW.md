@@ -37,9 +37,9 @@ python3 scripts/fabric-connect.py once \
   --allow-author satansdeer --allow-label ready
 ```
 
-`status` does not admit work. `once` selects only that issue, uses the existing bridge/Core admission, and observes for at most 30 seconds; the worker deadline is 600 seconds, not a dollar cap. Native OMP must already have consent and connection. `--post` is optional controller-side opt-in to sanitized evidence comments, not worker GitHub authority.
+`status` does not admit work. `once` selects only that issue, uses the existing bridge/Core admission, and observes for at most 30 seconds; this viewer window is not the worker timeout. Both bridges default to a 600-second worker deadline and accept the explicit resource flags below. Native OMP must already have consent and connection. `--post` is optional controller-side opt-in to sanitized evidence comments, not worker GitHub authority.
 
-After disconnect, run `status` and repeat the **identical `once` command**, including connection, root, source ID, harness and approval, to reconcile the saved event/admission. Preserve the private journals and accepted handles; never change IDs or delete state to force another run. Accepted work can be observed even if the issue has since changed; that does not approve new work. Admission is not completion.
+After disconnect, run `status` and repeat the **identical `once` command**, including connection, root, source ID, harness, approval and resource limits, to reconcile the saved event/admission. Preserve the private journals and accepted handles; never change IDs or delete state to force another run. Accepted work can be observed even if the issue has since changed; that does not approve new work. Admission is not completion.
 
 The worker cannot publish or merge. The controller reviews actual terminal state, checks and retained artifacts, restores and inspects changes, then creates the PR; a human merges. Current open PRs remain a human integration gate. An explicitly selected independent stacked task may proceed on its reviewed READY source without treating those PRs as merged; dependent work must wait or explicitly include and review the required source.
 
@@ -76,6 +76,19 @@ python3 scripts/fabric-issue.py dispatch \
 ```
 
 The controller selects one local task, concurrency one, the explicit prepared state and the harness's native model/configuration; it does not guess model names or copy auth stores. The worker has a finite wall-clock deadline and capture limits. **A deadline is not a dollar-spending cap.** Native trust, GitHub labels and creation of these issues do not replace explicit model-spending consent.
+
+For an explicitly approved long-running worker, append these same flags to either `dispatch` or Connect `once`:
+
+```sh
+  --timeout-seconds 7200 --max-log-bytes 67108864 \
+  --max-artifact-bytes 134217728 --copy-limit-bytes 104857600
+```
+
+Defaults remain 600 seconds, 1 MiB combined stdout/stderr/events, 10 MiB total artifacts and 100 MiB copy fallback. Timeout accepts 1–604800 seconds; raw/event capture accepts 26–9223372036854775807 bytes (must fit its truncation marker), artifacts 1–9223372036854775807 bytes, copy fallback 0–9223372036854775807 bytes. Zero copy fallback disables copying; it does not impose a workspace quota. Core storage admission may reject budgets that cannot fit its policy/free-space reserve. Invalid bounds are rejected before admission (Connect rejects them before polling).
+
+Selected limits are reported locally and enter the saved request/idempotency identity before admission. A changed limit is a different direct dispatch; Connect refuses changed configuration for an already bound event rather than admitting a duplicate. Repeat the original flags to reconnect. Pre-limit Connect journals reconnect with the original defaults. No changes to author/label routing, approval, native consent or spending gates.
+
+Use [local watch/inspect/cancel](../README.md#watch-a-running-worker-locally) while RUNNING and after capture/reclaim. A healthy worker may exceed ten minutes and exhaust raw capture while metadata still updates. Inspect twice and compare observed bytes/tool timestamps, process-observation freshness and actual task evidence; silence alone is not a stuck verdict. Stop only with an informed explicit `fabric --root "$FABRIC_ROOT" cancel "$RUN_ID" --json`. The hard deadline is an emergency wall-clock ceiling, not an inactivity detector; neither bridge restarts quiet work. Ctrl-C in `runs logs --follow` only stops the viewer. Raw logs are sensitive local opt-in and must never be posted/uploaded to GitHub or Connect.
 
 The private state file records the approved snapshot, deterministic request/key and actual batch/run IDs. Repeat the identical approved command to reconnect to the same admission; changed source, harness or request is a different dispatch. After a transport failure, inspect state/manager evidence and repeat only deliberately with the same key—never invent a completion or submit a replacement blindly. State belongs under the selected private Fabric root, not the Git checkout.
 

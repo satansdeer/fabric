@@ -45,6 +45,10 @@ The fake harness is for deterministic proof, not code generation. For an explici
 
 `once` polls only the selected issue, journals the immutable event-to-local-request mapping before admission, acknowledges accepted Core handles, then observes for at most 30 seconds. Repeat the identical command to reconcile unfinished work. Accepted work is observed without requiring the issue still to be eligible. Uncertain admission is retained for reconciliation, never silently declared complete or blindly replaced. Replays use the existing bridge/Core identity instead of creating a second run. A terminal hosted status requires an observed local terminal outcome.
 
+Worker resource flags are shared with direct issue dispatch: `--timeout-seconds 7200 --max-log-bytes 67108864 --max-artifact-bytes 134217728 --copy-limit-bytes 104857600` explicitly selects a two-hour emergency deadline, 64 MiB combined raw/events, 128 MiB artifacts and 100 MiB copy fallback. Defaults, bounds and approval requirements are in the [operator workflow](ISSUE_WORKFLOW.md#dispatch-one-bounded-worker). Limits are validated before polling, reported locally, and persisted in the event configuration and request/idempotency identity before admission. Reconnect with identical limits; changing them on a bound event is refused, not a new run. The 30-second consumer observation window never replaces the selected worker deadline.
+
+Watch the actual worker using [local metadata or opt-in raw logs](../README.md#watch-a-running-worker-locally); live and retained reads stay on the Mac. Connect receives only existing sanitized handles/state, never raw harness logs or the new activity payload. Two inspections can inform an explicit existing `cancel`; there is no inactivity kill or automatic restart. Trusted-local native execution and environment fidelity are unchanged, not a sandbox claim.
+
 ## Provider-independent development
 
 The [local issue bridge](ISSUE_WORKFLOW.md) reads GitHub directly and needs no public URL. It remains a fallback for explicitly approved issue-driven work independent of hosted ingress.

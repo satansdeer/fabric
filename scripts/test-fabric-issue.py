@@ -263,9 +263,14 @@ def check(fixture, report):
     require(all(count == 0 for count in initial_counts.values()), "fixture already has worker admissions")
     source_args = ["--root", f.root, "--project", "fixture", "--prepared-state", prepared["state_id"]]
 
-    def dispatch(*, harness="fake", approve=approval, source=None, fabric=None, good=True, post=False):
+    limits = {"timeout_seconds": 7200, "max_log_bytes": 67108864,
+              "max_artifact_bytes": 134217728, "copy_limit_bytes": 104857600}
+
+    def dispatch(*, harness="fake", approve=approval, source=None, fabric=None, good=True, post=False, selected=None):
         args = [*f.issue_args(), "--approve", approve, "--fabric", fabric or f.fabric,
                 *(source or source_args), "--harness", harness]
+        for name, value in (limits if selected is None else selected).items():
+            args += ["--" + name.replace("_", "-"), str(value)]
         if harness == "fake":
             args += ["--fake-binary", f.fake_wrapper]
         if post:
@@ -293,6 +298,11 @@ def check(fixture, report):
     dispatch(source=["--root", f.root, "--project", "fixture", "--prepared-state", "missing-ready-state"], good=False)
     require(f.counts() == initial_counts, "invalid source or missing spend admitted work")
     require(not f.comments(), "rejected work posted a comment")
+    for name, value in (("timeout_seconds", 0), ("timeout_seconds", 604801),
+                        ("max_log_bytes", 25), ("max_artifact_bytes", 0),
+                        ("copy_limit_bytes", -1), ("max_log_bytes", 9223372036854775808)):
+        dispatch(good=False, fabric=f.bin / "fabric", selected={**limits, name: value})
+    require(not (f.path / "forbidden-fabric-call").exists(), "invalid limits invoked Fabric")
     report["checks"].append("authorization_digest_spend_and_source_rejected_before_admission")
 
     (f.path / "fail-post").touch()
@@ -307,6 +317,8 @@ def check(fixture, report):
     require(stat.S_IMODE(state.stat().st_mode) == 0o600, "state mode is not 0600")
     require(stat.S_IMODE(state.parent.stat().st_mode) == 0o700, "state directory mode is not 0700")
     saved = json.loads(state.read_text())
+    require(accepted["limits"] == limits and saved["request"]["tasks"][0]["limits"] == limits,
+            "configured limits were not accurately reported and persisted")
     require(isinstance(saved, dict) and TOKEN not in state.read_text(), "state contains credential sentinel")
     require(isinstance(saved.get("schema_version", saved.get("version")), int), "state lacks explicit schema version")
     for reference in (approval, BODY, str(f.root), prepared["state_id"], batch, run, accepted["idempotency_key"]):

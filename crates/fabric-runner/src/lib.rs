@@ -225,7 +225,8 @@ pub fn execute(
     let (status, events) = std::thread::scope(|scope| {
         let out = scope.spawn(|| capture.stdout(stdout));
         let err = scope.spawn(|| capture.stderr(stderr));
-        let status = started(group.child.id()).and_then(|()| group.supervise(limits, cancellation));
+        let status = started(group.child.id())
+            .and_then(|()| group.supervise(limits, cancellation, || capture.observe_alive()));
         // Stop the owned group before joining drains, including on persistence errors.
         drop(group);
         stopped.store(true, Ordering::Release);
@@ -325,6 +326,7 @@ pub fn discover_executable(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf
     })
 }
 
+pub mod activity;
 pub mod capture;
 pub mod jsonl;
 pub mod omp;

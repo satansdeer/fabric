@@ -47,6 +47,7 @@ impl<'a> Capture<'a> {
                 truncated: false,
                 seen: [0, 0],
                 error: None,
+                activity: None,
                 normalized_event_count: 0,
                 native_failure: None,
             }),
@@ -55,6 +56,11 @@ impl<'a> Capture<'a> {
 
     pub fn with_harness(mut self, harness: &'a dyn HarnessAdapter) -> Self {
         self.harness = Some(harness);
+        self
+    }
+
+    pub fn with_activity(self, activity: crate::activity::SharedActivity) -> Self {
+        self.state.lock().unwrap().activity = Some(activity);
         self
     }
 
@@ -79,6 +85,13 @@ impl<'a> Capture<'a> {
                 exit_signal,
                 success,
             });
+        }
+    }
+
+    pub(crate) fn observe_alive(&self) {
+        if let Some(activity) = &self.state.lock().unwrap().activity {
+            activity.lock().unwrap().process_alive_observed_at_ms =
+                Some(crate::activity::timestamp_ms());
         }
     }
 
@@ -126,6 +139,9 @@ impl<'a> Capture<'a> {
                 Event::Invalid | Event::Oversized => None,
             });
             let mut state = self.state.lock().unwrap();
+            if let Some(activity) = &state.activity {
+                activity.lock().unwrap().frames += 1;
+            }
             let sequence = normalized.as_ref().map(|event| state.observe(event));
             if state.truncated || state.error.is_some() {
                 continue;
@@ -145,6 +161,7 @@ impl<'a> Capture<'a> {
             )?;
             encoded.push(b'\n');
             state.persist(2, &encoded, true);
+            state.publish();
         }
         Ok(counts)
     }
@@ -175,6 +192,7 @@ impl<'a> Capture<'a> {
                 file.sync_all()?;
             }
         }
+        state.publish();
         let [stdout, stderr, events] = state.files.map(Sink::metadata);
         Ok(CaptureMetadata {
             limit_bytes: state.limit_bytes,
@@ -217,7 +235,13 @@ impl<R: Read> Read for RawReader<'_, '_, R> {
         let length = self.pipe.read(buffer)?;
         let mut state = self.capture.state.lock().unwrap();
         state.seen[self.stream] += length as u64;
+        if length > 0 {
+            if let Some(activity) = &state.activity {
+                activity.lock().unwrap().last_output_at_ms = Some(crate::activity::timestamp_ms());
+            }
+        }
         state.persist(self.stream, &buffer[..length], false);
+        state.publish();
         Ok(length)
     }
 }
@@ -231,10 +255,14 @@ struct State {
     error: Option<io::Error>,
     normalized_event_count: u64,
     native_failure: Option<String>,
+    activity: Option<crate::activity::SharedActivity>,
 }
 impl State {
     fn observe(&mut self, event: &AgentEvent) -> u64 {
         self.normalized_event_count += 1;
+        if let Some(activity) = &self.activity {
+            activity.lock().unwrap().event(event);
+        }
         if let AgentEvent::Failure { code, .. } = event {
             if self.native_failure.is_none() {
                 self.native_failure = Some(code.clone());
@@ -243,6 +271,15 @@ impl State {
         self.normalized_event_count
     }
 
+    fn publish(&self) {
+        if let Some(activity) = &self.activity {
+            let mut activity = activity.lock().unwrap();
+            activity.stdout_bytes = self.seen[0];
+            activity.stderr_bytes = self.seen[1];
+            activity.persisted_bytes = self.persisted_bytes;
+            activity.capture_truncated = self.truncated;
+        }
+    }
     fn normalized(&mut self, event: &AgentEvent) {
         let sequence = self.observe(event);
         if self.truncated || self.error.is_some() {
@@ -264,6 +301,7 @@ impl State {
             }
             Err(error) => self.error = Some(io::Error::other(error)),
         }
+        self.publish();
     }
     fn persist(&mut self, stream: usize, bytes: &[u8], whole_record: bool) {
         if bytes.is_empty() || self.truncated || self.error.is_some() {
@@ -432,5 +470,40 @@ mod tests {
         );
         assert_eq!(metadata.normalized_event_count, 3);
         assert!(metadata.native_failure.is_none());
+    }
+
+    #[test]
+    fn metadata_continues_after_raw_truncation_without_native_content() {
+        let harness = crate::FakeBHarness::new("/unused".into()).unwrap();
+        let activity = crate::activity::SharedActivity::default();
+        let capture = Capture::new(
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            Some(tempfile::tempfile().unwrap()),
+            TRUNCATION_MARKER.len() as u64,
+        )
+        .unwrap()
+        .with_harness(&harness)
+        .with_activity(activity.clone());
+        capture
+            .stdout(&b"TOOL start private-tool-name\n"[..])
+            .unwrap();
+        let first = *activity.lock().unwrap();
+        assert!(first.capture_truncated);
+        capture
+            .stdout(&b"OUTPUT private-model-content\nTOOL end private-tool-name\n"[..])
+            .unwrap();
+        capture.stderr(&b"private-native-error"[..]).unwrap();
+        let last = *activity.lock().unwrap();
+        assert!(last.stdout_bytes > first.stdout_bytes);
+        assert!(last.stderr_bytes > first.stderr_bytes);
+        assert_eq!(last.normalized_events, 3);
+        assert_eq!((last.tool_starts, last.tool_ends), (1, 1));
+        assert!(last.current_tool.is_none());
+        assert!(last.last_tool_activity_at_ms.is_some());
+        assert!(last.persisted_bytes <= TRUNCATION_MARKER.len() as u64);
+        let json = serde_json::to_string(&last).unwrap();
+        assert!(json.contains("\"other\""));
+        assert!(!json.contains("private-"));
     }
 }
