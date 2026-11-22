@@ -1,0 +1,16 @@
+{
+  "name": "fabric-connect-cloudflare",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12" },
+  "scripts": {
+    "test": "node --test adapter.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "miniflare": "4.20260722.0",
+    "wrangler": "4.114.0"
+  }
+}
