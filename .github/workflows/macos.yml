@@ -32,6 +32,9 @@ jobs:
         run: cargo test --offline --locked --workspace
       - name: Build actual Fabric binaries
         run: cargo build --offline --locked --bins
+      - name: Issue-controlled local worker (provider-free)
+        timeout-minutes: 5
+        run: python3 scripts/test-fabric-issue.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
       - name: OMP v1 conformance (fake workers, provider-free)
         timeout-minutes: 5
         run: bun integrations/omp/conformance.ts "$GITHUB_WORKSPACE/target/debug/fabric"
