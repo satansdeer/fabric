@@ -151,6 +151,7 @@ impl Fixture {
             .unwrap_or_else(|| panic!("CLI timed out: {:?}", fs::read_to_string(&process.stderr)))
     }
 
+    #[track_caller]
     fn query(&self, verb: &str, id: &str) -> Value {
         let mut command = self.cli();
         command.args([verb, id, "--json"]);
@@ -175,6 +176,8 @@ esac
 case "$prompt" in
   *\"content\":\"first* ) id=first;;
   *\"content\":\"second* ) id=second;;
+  *\"content\":\"third* ) id=third;;
+  *\"content\":\"fourth* ) id=fourth;;
   *) exit 90;;
 esac
 root='{root}'
@@ -281,7 +284,7 @@ impl Drop for Fixture {
             }
         }
         let start = Instant::now();
-        while ["first", "second"].iter().any(|id| {
+        while ["first", "second", "third", "fourth"].iter().any(|id| {
             self.path.join(format!("started.{id}")).exists()
                 && !self.path.join(format!("stopped.{id}")).exists()
         }) {
@@ -305,10 +308,12 @@ impl Drop for Fixture {
     }
 }
 
+#[track_caller]
 fn checked(output: &Output) {
     assert!(output.status.success(), "{output:?}");
 }
 
+#[track_caller]
 fn parsed(output: &Output) -> Value {
     checked(output);
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| panic!("{error}: {output:?}"))
@@ -454,6 +459,7 @@ impl Fixture {
             "async_batches",
             "async_tasks",
             "async_events",
+            "batch_task_sources",
             "storage_reservations",
             "worker_leases",
             "cleanup_intents",
@@ -576,6 +582,165 @@ printf '%s\n' "$@" > '{root}/native-{harness}.argv'
             .push(accepted["batch_id"].as_str().unwrap().to_owned());
         accepted
     }
+
+    fn prepare_current(&self) -> Value {
+        let mut prepare = self.cli();
+        prepare
+            .args(["project", "prepare", "test", "--json", "--recipe"])
+            .arg(self.path.join("recipe.toml"));
+        parsed(&self.run(prepare))
+    }
+
+    fn commit_tracked(&self, contents: &str) {
+        fs::write(self.repo.join("tracked"), contents).unwrap();
+        self.git(&["add", "tracked"]);
+        self.git(&["commit", "--quiet", "-m", contents]);
+    }
+
+    fn storage_pressure(&self) {
+        let recipe = self.path.join("pressure.toml");
+        fs::write(
+            &recipe,
+            "version=1\n[[steps]]\nargv=['/bin/sh','-c','printf pressure > pressure']\n",
+        )
+        .unwrap();
+        let mut options = fabric_core::workspace::storage::StorageOptions::default();
+        options.policy.min_free_bytes = u64::MAX;
+        let error = fabric_core::workspace::storage::prepare(
+            &self.path.join("storage"),
+            "test",
+            &recipe,
+            &options,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, fabric_domain::ErrorKind::Storage);
+        assert!(error.message.contains("storage_admission"), "{error}");
+    }
+
+    fn start_manager(&self) -> Process {
+        let mut command = self.cli();
+        command.args(["manager", "serve", "--json"]);
+        let mut manager = self.spawn(command);
+        eventually(|| {
+            assert!(
+                manager.child.try_wait().unwrap().is_none(),
+                "manager exited: {:?}",
+                fs::read_to_string(&manager.stderr)
+            );
+            fs::read_to_string(&manager.stdout)
+                .unwrap()
+                .lines()
+                .next()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                .is_some_and(|ready| ready["manager_ready"] == true)
+        });
+        manager
+    }
+}
+
+#[test]
+fn explicit_prepared_and_exact_sha_capture_after_checkout_disappears() {
+    let mut fixture = Fixture::new();
+    let a = fixture.base.clone();
+    fs::write(fixture.repo.join("tracked"), "commit B\n").unwrap();
+    fixture.git(&["add", "tracked"]);
+    fixture.git(&["commit", "--quiet", "-m", "B"]);
+    let mut prepare = fixture.cli();
+    prepare
+        .args(["project", "prepare", "test", "--json", "--recipe"])
+        .arg(fixture.path.join("recipe.toml"));
+    let b = parsed(&fixture.run(prepare));
+    assert_ne!(a["source_commit_sha"], b["source_commit_sha"]);
+    fs::write(fixture.path.join("release-all"), "").unwrap();
+    for (source, base, old_contents) in [
+        (json!({"kind":"current-head"}), &b, "commit B"),
+        (
+            json!({"kind":"prepared","state_id":a["state_id"]}),
+            &a,
+            "original",
+        ),
+        (
+            json!({"kind":"commit","sha":a["source_commit_sha"]}),
+            &a,
+            "original",
+        ),
+    ] {
+        if source["kind"] == "prepared" {
+            fs::rename(&fixture.repo, fixture.path.join("renamed-checkout")).unwrap();
+        } else if source["kind"] == "commit" {
+            fs::remove_dir_all(fixture.path.join("renamed-checkout")).unwrap();
+        }
+        let mut task = fixture.task("first", "fake-a");
+        task["source_ref"] = source;
+        let accepted = fixture.accept(&json!({"project":"test","tasks":[task]}));
+        let batch = accepted["batch_id"].as_str().unwrap();
+        fixture.terminal(batch);
+        let results = fixture.query("results", batch);
+        assert_eq!(results["succeeded"], true, "{results}");
+        let run = &results["tasks"][0]["result"];
+        assert_eq!(run["prepared_state_id"], base["state_id"]);
+        assert_eq!(run["base_commit_sha"], base["source_commit_sha"]);
+        let id = results["tasks"][0]["run_id"].as_str().unwrap();
+        let mut show = fixture.cli();
+        show.args(["runs", "show", id, "--json"]);
+        let shown = parsed(&fixture.run(show));
+        assert_eq!(shown["workspace"]["state"], "RECLAIMED");
+        assert!(!Path::new(shown["workspace"]["managed_path"].as_str().unwrap()).exists());
+        let mut artifacts = fixture.cli();
+        artifacts.args(["runs", "artifacts", id, "--json"]);
+        let files = parsed(&fixture.run(artifacts));
+        let mut patch_found = false;
+        let mut untracked_found = false;
+        for artifact in files["artifacts"].as_array().unwrap() {
+            let path = artifact["relative_path"].as_str().unwrap();
+            let bytes = fs::read(fixture.path.join("storage").join(path)).unwrap();
+            assert_eq!(artifact["size_bytes"], bytes.len() as u64);
+            assert_eq!(artifact["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+            if path.ends_with("tracked.patch") {
+                let patch = String::from_utf8(bytes).unwrap();
+                assert!(patch.contains(&format!("-{old_contents}")), "{patch}");
+                assert!(patch.contains("+first ; $(touch INJECTED)"), "{patch}");
+                patch_found = true;
+            } else if artifact["kind"] == "untracked_archive" {
+                let restored = fixture
+                    .path
+                    .join(format!("restored-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+                fs::create_dir(&restored).unwrap();
+                checked(
+                    &Command::new("/usr/bin/tar")
+                        .arg("-xpf")
+                        .arg(fixture.path.join("storage").join(path))
+                        .arg("-C")
+                        .arg(&restored)
+                        .output()
+                        .unwrap(),
+                );
+                assert_eq!(fs::read(restored.join("new-source")).unwrap(), b"new-first");
+                untracked_found = true;
+            }
+        }
+        assert!(patch_found, "tracked patch missing: {files}");
+        assert!(untracked_found, "untracked artifact missing: {files}");
+        for (base, contents) in [(&a, b"original".as_slice()), (&b, b"commit B\n".as_slice())] {
+            assert_eq!(
+                fs::read(Path::new(base["prepared_path"].as_str().unwrap()).join("tracked"))
+                    .unwrap(),
+                contents
+            );
+            assert!(
+                !Path::new(base["prepared_path"].as_str().unwrap())
+                    .join("new-source")
+                    .exists()
+            );
+        }
+        assert!(!fixture.path.join("INJECTED").exists());
+    }
+    let before = fixture.inventory();
+    fixture.reject(
+        &json!({"project":"test","tasks":[fixture.task("first","fake-a")]}),
+        "source",
+    );
+    assert_eq!(fixture.inventory(), before);
 }
 
 #[test]
@@ -612,12 +777,12 @@ fn unsupported_placement_and_late_task_preflight_allocate_nothing() {
         (
             "source_ref",
             json!({"kind":"prepared","state_id":"ps-not-supported"}),
-            "unsupported_capability",
+            "source",
         ),
         (
             "source_ref",
             json!({"kind":"commit","sha":"a".repeat(40)}),
-            "unsupported_capability",
+            "source",
         ),
         ("resume", json!("previous-session"), "invalid_arguments"),
         ("skills", json!(["portable"]), "invalid_arguments"),
@@ -940,5 +1105,586 @@ fn v1_submit_keeps_its_response_and_nonempty_portable_profiles_require_native_mi
             "{error}"
         );
         assert_eq!(fixture.inventory(), before);
+    }
+}
+
+#[test]
+fn source_ownership_readiness_exact_sha_and_missing_head_reject_before_admission() {
+    let fixture = Fixture::new();
+    let mut add = fixture.cli();
+    add.args(["project", "add", "--name", "other", "--path"])
+        .arg(&fixture.repo);
+    checked(&fixture.run(add));
+    let db = rusqlite::Connection::open(fixture.path.join("storage/fabric.db")).unwrap();
+    db.execute(
+        "INSERT INTO prepared_states
+         SELECT 'ps-not-ready', project_id, preparation_key || '-pending',
+         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', recipe_digest, harness_environment_digest,
+         prepared_path || '-pending', 'PREPARING', created_at, NULL, size_bytes
+         FROM prepared_states WHERE state_id = ?1",
+        [fixture.base["state_id"].as_str().unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let before = fixture.inventory();
+    for (project, source, kind) in [
+        (
+            "test",
+            json!({"kind":"prepared","state_id":"ps-unknown"}),
+            "source",
+        ),
+        (
+            "other",
+            json!({"kind":"prepared","state_id":fixture.base["state_id"]}),
+            "source",
+        ),
+        (
+            "test",
+            json!({"kind":"prepared","state_id":"ps-not-ready"}),
+            "source",
+        ),
+        (
+            "test",
+            json!({"kind":"commit","sha":"a".repeat(40)}),
+            "source",
+        ),
+        (
+            "test",
+            json!({"kind":"commit","sha":"b".repeat(40)}),
+            "source",
+        ),
+        (
+            "test",
+            json!({"kind":"commit","sha":fixture.base["source_commit_sha"].as_str().unwrap()[..12]}),
+            "invalid_arguments",
+        ),
+        (
+            "test",
+            json!({"kind":"commit","sha":"z".repeat(40)}),
+            "invalid_arguments",
+        ),
+        (
+            "test",
+            json!({"kind":"prepared","state_id":fixture.repo}),
+            "invalid_id",
+        ),
+        (
+            "test",
+            json!({"kind":"path","path":fixture.repo}),
+            "invalid_arguments",
+        ),
+    ] {
+        let mut task = fixture.task("second", "fake-b");
+        task["source_ref"] = source;
+        fixture.reject(&json!({"project":project,"tasks":[task]}), kind);
+        assert_eq!(fixture.inventory(), before);
+    }
+    fixture.commit_tracked("unprepared C\n");
+    fixture.reject(
+        &json!({"project":"test","tasks":[fixture.task("first","fake-a")]}),
+        "source",
+    );
+    let mut exact_c = fixture.task("first", "fake-a");
+    let output = Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&fixture.repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    checked(&output);
+    exact_c["source_ref"] =
+        json!({"kind":"commit","sha":String::from_utf8(output.stdout).unwrap().trim()});
+    fixture.reject(&json!({"project":"test","tasks":[exact_c]}), "source");
+    assert_eq!(fixture.inventory(), before);
+    fs::rename(&fixture.repo, fixture.path.join("missing-checkout")).unwrap();
+    fixture.reject(
+        &json!({"project":"test","tasks":[fixture.task("first","fake-a")]}),
+        "source",
+    );
+    assert_eq!(fixture.inventory(), before);
+    let container = Path::new(fixture.base["prepared_path"].as_str().unwrap())
+        .parent()
+        .unwrap();
+    fs::set_permissions(container, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(container, fixture.path.join("missing-prepared-base")).unwrap();
+    for source in [
+        json!({"kind":"prepared","state_id":fixture.base["state_id"]}),
+        json!({"kind":"commit","sha":fixture.base["source_commit_sha"]}),
+    ] {
+        let mut task = fixture.task("first", "fake-a");
+        task["source_ref"] = source;
+        fixture.reject(&json!({"project":"test","tasks":[task]}), "source");
+        assert_eq!(fixture.inventory(), before);
+    }
+    assert!(!fixture.path.join("storage/manager.lock").exists());
+    assert!(!fixture.path.join("started.first").exists());
+    assert!(!fixture.path.join("started.second").exists());
+    for directory in [
+        "workspaces",
+        "fork-staging",
+        "artifacts",
+        "artifact-staging",
+    ] {
+        let path = fixture.path.join("storage").join(directory);
+        assert!(!path.exists() || fs::read_dir(path).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn dirty_checkout_is_reported_excluded_and_preserved_with_durable_source_provenance() {
+    let mut fixture = Fixture::new();
+    fs::write(fixture.repo.join("tracked"), "PRIVATE dirty tracked\n").unwrap();
+    fs::write(
+        fixture.repo.join("private-untracked"),
+        "PRIVATE untracked\n",
+    )
+    .unwrap();
+    let path = fixture.request(&json!({"project":"test","tasks":[fixture.task("first","fake-a")]}));
+    fixture.submitted = true;
+    let output = fixture.run(fixture.spawn_command(&path));
+    let accepted = parsed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("dirty"),
+        "{output:?}"
+    );
+    let batch = accepted["batch_id"].as_str().unwrap();
+    fixture.batches.push(batch.to_owned());
+    eventually(|| fixture.path.join("started.first").exists());
+    fs::write(fixture.path.join("release.first"), "").unwrap();
+    fixture.terminal(batch);
+    let results = fixture.query("results", batch);
+    assert_eq!(results["succeeded"], true, "{results}");
+    let run = &results["tasks"][0]["result"];
+    assert_eq!(
+        run["source"],
+        json!({
+            "source_ref":{"kind":"current-head"},
+            "prepared_state_id":fixture.base["state_id"],
+            "base_commit_sha":fixture.base["source_commit_sha"],
+            "checkout_dirty":true,"dirty_changes_excluded":true
+        })
+    );
+    let artifacts = fixture
+        .path
+        .join("storage/artifacts")
+        .join(run["artifact_manifest_id"].as_str().unwrap());
+    let patch = fs::read_to_string(artifacts.join("tracked.patch")).unwrap();
+    assert!(patch.contains("-original"), "{patch}");
+    assert!(!patch.contains("PRIVATE"), "{patch}");
+    let listing = Command::new("/usr/bin/tar")
+        .arg("-tf")
+        .arg(artifacts.join("untracked.tar"))
+        .output()
+        .unwrap();
+    checked(&listing);
+    assert!(!String::from_utf8_lossy(&listing.stdout).contains("private-untracked"));
+    assert_eq!(
+        fs::read(fixture.repo.join("tracked")).unwrap(),
+        b"PRIVATE dirty tracked\n"
+    );
+    assert_eq!(
+        fs::read(fixture.repo.join("private-untracked")).unwrap(),
+        b"PRIVATE untracked\n"
+    );
+    assert_eq!(
+        fs::read(Path::new(fixture.base["prepared_path"].as_str().unwrap()).join("tracked"))
+            .unwrap(),
+        b"original"
+    );
+    let mut stop = fixture.cli();
+    stop.args(["manager", "stop", "--json"]);
+    checked(&fixture.run(stop));
+    assert_eq!(fixture.query("results", batch), results);
+}
+
+#[test]
+fn inline_native_prompt_and_source_flags_preserve_literal_bytes_and_defaults() {
+    let mut fixture = Fixture::new();
+    fixture.native_fixtures();
+    fixture.connect("codex");
+    let prompt = "literal ; $(touch INLINE_INJECTED) 'quoted' \"double\"\nsecond line\n";
+    for selector in [None, Some("--prepared-state"), Some("--commit")] {
+        let mut command = fixture.native_cli();
+        command.args([
+            "workers",
+            "spawn",
+            "--project",
+            "test",
+            "--harness",
+            "codex",
+            "--prompt",
+            prompt,
+            "--json",
+        ]);
+        if let Some(selector) = selector {
+            let value = if selector == "--prepared-state" {
+                &fixture.base["state_id"]
+            } else {
+                &fixture.base["source_commit_sha"]
+            };
+            command.args([
+                selector,
+                value.as_str().unwrap(),
+                "--task-id",
+                "inline-literal",
+            ]);
+        }
+        fixture.submitted = true;
+        let accepted = parsed(&fixture.run(command));
+        let batch = accepted["batch_id"].as_str().unwrap();
+        fixture.batches.push(batch.to_owned());
+        assert_eq!(accepted["accepted"], true);
+        assert_eq!(accepted["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            accepted["tasks"][0]["task_id"],
+            if selector.is_none() {
+                "task"
+            } else {
+                "inline-literal"
+            }
+        );
+        fixture.terminal(batch);
+        let results = fixture.query("results", batch);
+        assert_eq!(results["succeeded"], true, "{results}");
+        let result = &results["tasks"][0]["result"];
+        assert_eq!(result["prepared_state_id"], fixture.base["state_id"]);
+        assert!(result["worker_attempts"][0]["model_requested"].is_null());
+        assert!(result["worker_attempts"][0]["model_resolved"].is_null());
+        assert_eq!(result["profile"]["portable"], false);
+        let argv = fs::read_to_string(fixture.path.join("native-codex.argv")).unwrap();
+        assert!(argv.contains(prompt), "{argv}");
+        assert!(!Path::new(result["workspace_path"].as_str().unwrap()).exists());
+    }
+    assert!(!fixture.path.join("INLINE_INJECTED").exists());
+    assert!(!fixture.repo.join("INLINE_INJECTED").exists());
+    assert!(
+        !Path::new(fixture.base["prepared_path"].as_str().unwrap())
+            .join("INLINE_INJECTED")
+            .exists()
+    );
+}
+
+#[test]
+fn inline_request_source_and_remote_conflicts_allocate_nothing() {
+    let fixture = Fixture::new();
+    fixture.native_fixtures();
+    fixture.connect("codex");
+    let path = fixture.request(&json!({"project":"test","tasks":[{"task_id":"native","harness_id":"codex","prompt":"fixture"}]}));
+    let before = fixture.inventory();
+    for inline_field in [
+        vec!["--project", "test"],
+        vec!["--harness", "codex"],
+        vec!["--prompt", "literal"],
+        vec!["--task-id", "task"],
+        vec!["--model", "literal"],
+        vec![
+            "--prepared-state",
+            fixture.base["state_id"].as_str().unwrap(),
+        ],
+        vec![
+            "--commit",
+            fixture.base["source_commit_sha"].as_str().unwrap(),
+        ],
+    ] {
+        let mut command = fixture.native_cli();
+        command
+            .args(["workers", "spawn", "--request"])
+            .arg(&path)
+            .args(inline_field)
+            .arg("--json");
+        let output = fixture.run(command);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(fixture.inventory(), before);
+    }
+    for extra in [
+        vec![
+            "--prepared-state",
+            fixture.base["state_id"].as_str().unwrap(),
+            "--commit",
+            fixture.base["source_commit_sha"].as_str().unwrap(),
+        ],
+        vec!["--placement", "remote"],
+    ] {
+        let mut command = fixture.native_cli();
+        command
+            .args([
+                "workers",
+                "spawn",
+                "--project",
+                "test",
+                "--harness",
+                "codex",
+                "--prompt",
+                "literal",
+                "--json",
+            ])
+            .args(extra);
+        let output = fixture.run(command);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(fixture.inventory(), before);
+    }
+    assert!(!fixture.path.join("storage/manager.lock").exists());
+    assert!(!fixture.path.join("native-codex.argv").exists());
+}
+
+#[test]
+fn mixed_queued_sources_are_frozen_and_all_pins_survive_restart_and_eviction() {
+    let mut fixture = Fixture::new();
+    let mut a_candidates = vec![fixture.base.clone()];
+    for marker in ["A2", "A3"] {
+        fs::write(fixture.path.join("recipe.toml"), format!("version=1\n[[steps]]\nargv=['/bin/sh','-c','mkdir .deps; printf ready > .deps/ready; printf {marker} > .deps/marker']\n")).unwrap();
+        a_candidates.push(fixture.prepare_current());
+    }
+    fixture.commit_tracked("commit B\n");
+    let mut b_candidates = vec![fixture.prepare_current()];
+    fs::write(fixture.path.join("recipe.toml"), "version=1\n[[steps]]\nargv=['/bin/sh','-c','mkdir .deps; printf ready > .deps/ready; printf B2 > .deps/marker']\n").unwrap();
+    b_candidates.push(fixture.prepare_current());
+    let root = fixture.path.join("storage");
+    let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+    let mut unselected = a_candidates.into_iter().filter(|state| {
+        store
+            .cache_retention(&state["state_id"].as_str().unwrap().parse().unwrap())
+            .unwrap()
+            .is_none()
+    });
+    let a = unselected.next().unwrap();
+    let disposable = unselected.next().unwrap();
+    let b = b_candidates
+        .into_iter()
+        .find(|state| {
+            store
+                .cache_retention(&state["state_id"].as_str().unwrap().parse().unwrap())
+                .unwrap()
+                .is_none()
+        })
+        .unwrap();
+    drop(store);
+    let mut manager = fixture.start_manager();
+    let mut tasks = [
+        fixture.task("first", "fake-a"),
+        fixture.task("second", "fake-b"),
+        fixture.task("third", "fake-a"),
+        fixture.task("fourth", "fake-b"),
+    ];
+    tasks[0]["source_ref"] = json!({"kind":"prepared","state_id":a["state_id"]});
+    tasks[1]["source_ref"] = json!({"kind":"prepared","state_id":b["state_id"]});
+    tasks[2]["source_ref"] = json!({"kind":"current-head"});
+    tasks[3]["source_ref"] = json!({"kind":"commit","sha":a["source_commit_sha"]});
+    let accepted = fixture.accept(&json!({"project":"test","max_concurrency":1,"tasks":tasks}));
+    let batch = accepted["batch_id"].as_str().unwrap();
+    eventually(|| fixture.path.join("started.first").exists());
+    let (current_a, current_b) = {
+        let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+        for base in [&a, &b] {
+            assert_eq!(
+                store
+                    .cache_retention(&base["state_id"].as_str().unwrap().parse().unwrap())
+                    .unwrap()
+                    .as_deref(),
+                Some("historical_reference")
+            );
+        }
+        let project = b["project_id"].as_str().unwrap().parse().unwrap();
+        (
+            store
+                .ready_state_for_commit(&project, a["source_commit_sha"].as_str().unwrap())
+                .unwrap()
+                .unwrap(),
+            store
+                .ready_state_for_commit(&project, b["source_commit_sha"].as_str().unwrap())
+                .unwrap()
+                .unwrap(),
+        )
+    };
+    let pins = {
+        let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
+        let mut statement = db
+            .prepare(
+                "SELECT s.prepared_state_id, s.provenance_json FROM batch_task_sources s
+             JOIN batch_tasks t USING(run_id) WHERE t.batch_id = ?1 ORDER BY t.position",
+            )
+            .unwrap();
+        let pins = statement
+            .query_map([batch], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            pins.iter()
+                .map(|(state, _)| state.as_str())
+                .collect::<Vec<_>>(),
+            [
+                a["state_id"].as_str().unwrap(),
+                b["state_id"].as_str().unwrap(),
+                current_b.state_id.as_str(),
+                current_a.state_id.as_str(),
+            ],
+        );
+        for (state, source) in &pins {
+            assert_eq!(
+                serde_json::from_str::<Value>(source).unwrap()["prepared_state_id"],
+                *state
+            );
+        }
+        assert!(
+            db.execute(
+                "UPDATE batch_task_sources SET prepared_state_id = prepared_state_id
+             WHERE run_id IN (SELECT run_id FROM batch_tasks WHERE batch_id = ?1)",
+                [batch],
+            )
+            .is_err()
+        );
+        assert!(
+            db.execute(
+                "DELETE FROM batch_task_sources
+             WHERE run_id IN (SELECT run_id FROM batch_tasks WHERE batch_id = ?1)",
+                [batch],
+            )
+            .is_err()
+        );
+        pins
+    };
+    assert!(!fixture.path.join("started.second").exists());
+    manager.child.kill().unwrap();
+    manager.child.wait().unwrap();
+    fixture.commit_tracked("unprepared C\n");
+    fs::write(fixture.repo.join("tracked"), "dirty after admission\n").unwrap();
+    fixture.storage_pressure();
+    assert!(
+        !Path::new(disposable["prepared_path"].as_str().unwrap()).exists(),
+        "pressure did not exercise cache eviction"
+    );
+    for base in [&a, &b] {
+        assert!(Path::new(base["prepared_path"].as_str().unwrap()).exists());
+        let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+        assert_eq!(
+            store
+                .cache_retention(&base["state_id"].as_str().unwrap().parse().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("historical_reference")
+        );
+    }
+    manager = fixture.start_manager();
+    eventually(|| fixture.path.join("started.second").exists());
+    fixture.storage_pressure();
+    for base in [&a, &b] {
+        assert!(Path::new(base["prepared_path"].as_str().unwrap()).exists());
+    }
+    fs::write(fixture.path.join("release-all"), "").unwrap();
+    fixture.terminal(batch);
+    let results = fixture.query("results", batch);
+    assert_eq!(results["tasks"][0]["state"], "NEEDS_ATTENTION");
+    let current_a_id = json!(current_a.state_id);
+    let current_b_id = json!(current_b.state_id);
+    for (index, (state_id, sha, old_contents)) in [
+        (&b["state_id"], &b["source_commit_sha"], "commit B"),
+        (&current_b_id, &b["source_commit_sha"], "commit B"),
+        (&current_a_id, &a["source_commit_sha"], "original"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let task = &results["tasks"][index + 1];
+        assert_eq!(task["state"], "SUCCEEDED", "{results}");
+        let run = &task["result"];
+        assert_eq!(
+            run["source"],
+            serde_json::from_str::<Value>(&pins[index + 1].1).unwrap()
+        );
+        assert_eq!(&run["prepared_state_id"], state_id);
+        assert_eq!(&run["base_commit_sha"], sha);
+        assert_eq!(
+            run["source"]["checkout_dirty"],
+            if index == 1 {
+                json!(false)
+            } else {
+                Value::Null
+            }
+        );
+        let artifacts = root
+            .join("artifacts")
+            .join(run["artifact_manifest_id"].as_str().unwrap());
+        let patch = fs::read_to_string(artifacts.join("tracked.patch")).unwrap();
+        assert!(patch.contains(&format!("-{old_contents}")), "{patch}");
+        assert!(!patch.contains("dirty after admission"));
+        assert!(!Path::new(run["workspace_path"].as_str().unwrap()).exists());
+    }
+    eventually(|| fixture.path.join("stopped.first").exists());
+    assert_eq!(
+        fs::read(fixture.repo.join("tracked")).unwrap(),
+        b"dirty after admission\n"
+    );
+    let mut stop = fixture.cli();
+    stop.args(["manager", "stop", "--json"]);
+    checked(&fixture.run(stop));
+    assert!(manager.output(DEADLINE).is_some());
+    assert_eq!(fixture.query("results", batch), results);
+}
+
+#[test]
+fn idempotent_source_submission_reconnects_after_checkout_disappears() {
+    let mut fixture = Fixture::new();
+    let path = fixture.request(&json!({
+        "project":"test","tasks":[fixture.task("first","fake-a")]
+    }));
+    let mut submit = fixture.spawn_command(&path);
+    submit.args(["--idempotency-key", "frozen-source"]);
+    fixture.submitted = true;
+    let accepted = parsed(&fixture.run(submit));
+    let batch = accepted["batch_id"].as_str().unwrap();
+    fixture.batches.push(batch.to_owned());
+    fs::write(fixture.path.join("release-all"), "").unwrap();
+    fixture.terminal(batch);
+    fs::rename(&fixture.repo, fixture.path.join("missing-checkout")).unwrap();
+    for restart in [false, true] {
+        if restart {
+            let mut stop = fixture.cli();
+            stop.args(["manager", "stop", "--json"]);
+            checked(&fixture.run(stop));
+        }
+        let mut retry = fixture.spawn_command(&path);
+        retry.args(["--idempotency-key", "frozen-source"]);
+        let original = parsed(&fixture.run(retry));
+        assert_eq!(original["batch_id"], accepted["batch_id"]);
+        assert_eq!(
+            original["tasks"][0]["run_id"],
+            accepted["tasks"][0]["run_id"]
+        );
+        assert_eq!(fixture.query("results", batch)["succeeded"], true);
+    }
+}
+
+#[test]
+fn manager_stop_acknowledges_release_before_immediate_reconnect() {
+    let mut fixture = Fixture::new();
+    let path = fixture.request(&json!({
+        "project":"test","tasks":[fixture.task("first","fake-a")]
+    }));
+    fs::write(fixture.path.join("release-all"), "").unwrap();
+    fixture.submitted = true;
+    let accepted = parsed(&fixture.run(fixture.spawn_command(&path)));
+    let batch = accepted["batch_id"].as_str().unwrap();
+    fixture.batches.push(batch.to_owned());
+    fixture.terminal(batch);
+    let expected = fixture.query("results", batch);
+    assert_eq!(expected["succeeded"], true);
+    for cycle in 0..20 {
+        let mut stop = fixture.cli();
+        stop.args(["manager", "stop", "--json"]);
+        let output = fixture.run(stop);
+        assert!(output.status.success(), "stop cycle {cycle}: {output:?}");
+        let mut reconnect = fixture.cli();
+        reconnect.args(["results", batch, "--json"]);
+        let output = fixture.run(reconnect);
+        assert!(
+            output.status.success(),
+            "results after stop cycle {cycle}: {output:?}"
+        );
+        assert_eq!(parsed(&output), expected, "cycle {cycle}");
     }
 }

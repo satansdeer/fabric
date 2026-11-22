@@ -96,7 +96,24 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
     }
 }
 
+fn remove_task_source_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS batch_task_sources;
+         DROP TRIGGER IF EXISTS run_requires_batch_task;
+         CREATE TRIGGER run_requires_batch_task BEFORE INSERT ON runs
+         WHEN NEW.batch_id IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM batch_tasks t JOIN batches b USING(batch_id)
+             WHERE t.run_id = NEW.run_id AND t.batch_id = NEW.batch_id
+               AND b.prepared_state_id = NEW.prepared_state_id
+         )
+         BEGIN SELECT RAISE(ABORT, 'run requires matching batch task and prepared state'); END;",
+        )
+        .unwrap();
+}
+
 fn remove_async_schema(connection: &Connection) {
+    remove_task_source_schema(connection);
     connection
         .execute_batch(
             "DROP TRIGGER IF EXISTS async_task_accepted;
@@ -230,7 +247,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -286,7 +303,7 @@ fn v8_database_adds_attempt_storage_without_rewriting_legacy_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        10,
+        11,
         "C-02 must preserve earlier additive migrations"
     );
     let attempts: i64 = db
@@ -325,7 +342,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -396,14 +413,14 @@ fn batch_registration_and_results_are_atomic_and_one_shot() {
     ];
     assert!(
         store
-            .create_batch(&id, &prepared().state_id, &tasks)
+            .create_batch_with_sources(&id, &prepared().state_id, &tasks, &[])
             .is_err()
     );
     assert!(store.batch_tasks(&id).unwrap().is_empty());
     let mut tasks = tasks;
     tasks[1].task_id = "second".into();
     store
-        .create_batch(&id, &prepared().state_id, &tasks)
+        .create_batch_with_sources(&id, &prepared().state_id, &tasks, &[])
         .unwrap();
     assert_eq!(store.batch_succeeded(&id).unwrap(), None);
     assert!(store.finish_batch(&id, true).is_err());
@@ -459,6 +476,7 @@ fn async_admission() -> (fabric_store::AsyncBatch, Vec<fabric_store::NewAsyncTas
             harness: "fake".into(),
             plan_json: format!("frozen plan {index}"),
             consent_stamp: Some(format!("frozen consent {index}")),
+            source: None,
         })
         .collect();
     (batch, tasks)
@@ -589,7 +607,80 @@ fn v9_migration_adds_queue_without_rewriting_completed_run_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        10
+        11
+    );
+}
+
+#[test]
+fn v10_migration_retains_accepted_plans_prompts_order_and_completed_evidence() {
+    let (root, mut store) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = finalized_pair(&mut store, 1);
+    let artifacts = store.artifacts(&run.run_id).unwrap();
+    let (batch, tasks) = async_admission();
+    store
+        .accept_async_batch(&batch, Some("v10-admission"), &tasks, 300)
+        .unwrap();
+    let states = store.async_tasks(&batch.batch_id).unwrap();
+    drop(store);
+    let db = Connection::open(&path).unwrap();
+    remove_task_source_schema(&db);
+    db.pragma_update(None, "user_version", 10).unwrap();
+    drop(db);
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.run(&run.run_id).unwrap(), Some(run.clone()));
+    assert_eq!(
+        store.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+    assert_eq!(store.artifacts(&run.run_id).unwrap(), artifacts);
+    let accepted = store.async_idempotency("v10-admission").unwrap().unwrap();
+    assert_eq!(accepted.batch_id, batch.batch_id);
+    assert_eq!(accepted.prepared_state_id, batch.prepared_state_id);
+    assert_eq!(accepted.options_json, batch.options_json);
+    assert_eq!(accepted.fake_binary, batch.fake_binary);
+    assert_eq!(accepted.request_digest, batch.request_digest);
+    assert_eq!(accepted.concurrency, batch.concurrency);
+    let migrated = store.async_tasks(&batch.batch_id).unwrap();
+    assert_eq!(migrated.len(), states.len());
+    for (index, task) in tasks.iter().enumerate() {
+        assert_eq!(migrated[index].run_id, states[index].run_id);
+        assert_eq!(migrated[index].task_id, states[index].task_id);
+        assert_eq!(migrated[index].queue_state, states[index].queue_state);
+        assert_eq!(migrated[index].state, states[index].state);
+        assert_eq!(migrated[index].result, states[index].result);
+        assert_eq!(migrated[index].error, states[index].error);
+        let frozen = store.async_task(&task.task.run_id).unwrap();
+        assert_eq!(frozen.prompt, task.prompt);
+        assert_eq!(frozen.harness, task.harness);
+        assert_eq!(frozen.plan_json, task.plan_json);
+        assert_eq!(frozen.consent_stamp, task.consent_stamp);
+    }
+    let db = Connection::open(&path).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT s.prepared_state_id, s.provenance_json FROM batch_task_sources s
+         JOIN batch_tasks t USING(run_id) WHERE t.batch_id = ?1 ORDER BY t.position",
+        )
+        .unwrap();
+    let sources = statement
+        .query_map([batch.batch_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        sources,
+        vec![(batch.prepared_state_id.to_string(), None); 2]
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
     );
 }
 
@@ -1212,8 +1303,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [10, 9, 8, 7, 6, 5] {
+    for version in [11, 10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 10 {
+            remove_task_source_schema(&db);
+            db.pragma_update(None, "user_version", 10).unwrap();
+        }
         if version == 9 {
             remove_async_schema(&db);
             db.pragma_update(None, "user_version", 9).unwrap();

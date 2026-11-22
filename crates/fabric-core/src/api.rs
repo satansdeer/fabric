@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use fabric_domain::{
     AgentProfile, ErrorKind, ExecutionContext, FabricError, HarnessId, HarnessRequest, ModelPolicy,
-    SourceRef, WorkerLimits, WorkerTask,
+    WorkerLimits, WorkerTask,
 };
 use fabric_runner::{CancellationToken, HarnessRegistry, RegistryOptions};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -177,6 +177,7 @@ pub(crate) fn translate_v1(
                 prompt_file: "inline-input".into(),
                 harness,
                 options,
+                source_ref: None,
             })
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
@@ -212,14 +213,6 @@ pub(crate) fn validate_worker_request(request: &WorkerBatchRequest) -> Result<()
     }
     for task in &request.tasks {
         if task
-            .source_ref
-            .as_ref()
-            .is_some_and(|source| !matches!(source, SourceRef::CurrentHead {}))
-        {
-            return Err(FabricError { kind: ErrorKind::UnsupportedCapability,
-                message: "Prepared-state and commit source references are not supported yet; use current-head.".into() });
-        }
-        if task
             .limits
             .as_ref()
             .is_some_and(|limits| limits.max_cost_usd.is_some())
@@ -251,6 +244,7 @@ pub(crate) fn translate_workers(
                 prompt_file: "inline-input".into(),
                 harness: task.harness_id,
                 options,
+                source_ref: task.source_ref,
             })
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
@@ -305,6 +299,11 @@ pub(crate) fn preflight_workers(
     registry_options: &RegistryOptions,
 ) -> Result<(), FabricError> {
     validate_worker_request(request)?;
+    crate::run::preflight_sources(
+        root,
+        &request.project,
+        request.tasks.iter().map(|task| task.source_ref.as_ref()),
+    )?;
     let registry = HarnessRegistry::default();
     let harnesses = BatchHarnesses {
         registry: &registry,

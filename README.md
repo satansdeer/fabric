@@ -246,6 +246,20 @@ The response is `{accepted,batch_id,tasks:[{task_id,run_id,status}]}` before wor
 
 Each task may set `limits` (`timeout_seconds`, `copy_limit_bytes`, `max_log_bytes`, `max_artifact_bytes`), persisted and enforced independently. The copy limit bounds byte-copy fallback, not successful APFS clones or their logical size. Hard `max_cost_usd` is rejected because no registered adapter enforces a spending cap. Optional `execution_context` selects `{"kind":"native"}` (the default) or an advanced `explicit` context with `harness_version`, `native_config_refs` and `connection_refs`. Skills, plugins and MCP belong to native harness configuration, not this request; nonempty legacy v1 portable lists receive a migration error.
 
+### Select an immutable prepared source
+
+For one native-context worker, no request file is needed:
+
+```sh
+fabric --root /absolute/fabric-root workers spawn \
+  --project my-project --harness omp --prompt 'Review this prepared source.' \
+  --prepared-state "$PREPARED_STATE_ID" --json
+```
+
+Use the `state_id` returned by project preparation, or replace `--prepared-state` with `--commit "$COMMIT_SHA"` for an exact full commit SHA. Explicit refs select a READY state owned by the project; they remain usable after the original checkout is moved or deleted. No source flag means exactly the current checkout HEAD at admission, never an older cached fallback; an unavailable checkout or unprepared HEAD fails without admitting workers.
+
+JSON tasks may independently select `source_ref: {"kind":"prepared","state_id":"..."}`, `{"kind":"commit","sha":"..."}` or `{"kind":"current-head"}`. Every admitted source is frozen and pinned through queued execution and manager restart. Workers use immutable prepared bytes, not dirty checkout changes; source evidence records the selected state/base and whether checkout dirtiness was observed. An unavailable or uninspected checkout has unknown dirtiness, not a fabricated clean status. `--request` cannot be combined with inline task flags, and `--prepared-state` and `--commit` are mutually exclusive.
+
 ### Version-1 compatibility
 
 `submit` accepts the same strict v1 inline-prompt `spawn_many` request as `api`, but returns `{accepted,batch_id,run_ids}` after atomic durable admission, not worker completion. The existing `api`, `run` and `run-many` remain foreground operations.
@@ -263,9 +277,9 @@ fabric --root /private/path/to/fabric cancel BATCH_ID --json
 fabric --root /private/path/to/fabric manager stop --json
 ```
 
-The first client starts a detached owner-only Unix-socket manager. Exiting the submitter does not cancel accepted work. One batch at a time uses the bounded pool; later accepted batches wait durably. `manager serve --json` runs an owned foreground manager for supervision/debugging. Stop refuses active or queued work.
+The first client starts a detached owner-only Unix-socket manager. Exiting the submitter does not cancel accepted work. One batch at a time uses the bounded pool; later accepted batches wait durably. `manager serve --json` runs an owned foreground manager for supervision/debugging. Stop refuses active or queued work; a successful stop reply means the endpoint and ownership lock have been released, so an immediate reconnect can start a fresh manager.
 
-Prompts, exact plans, consent stamps, source IDs and task IDs are persisted together in schema v10. Reusing an idempotency key with the same logical request returns the original handles; changing that request is an error. A failed reply is not automatically retried because admission may already have committed.
+Prompts, exact plans, consent stamps, source IDs and task IDs are persisted together in schema v11; accepted v10 records retain their evidence and gain per-task source pins. Reusing an idempotency key with the same logical request returns the original handles; changing that request is an error. A failed reply is not automatically retried because admission may already have committed.
 
 Fresh clients can read retained results and artifacts after workspace reclamation. Status events are cursor-ordered and bounded (256 per reply; 1,024 recent events per batch). `wait` uses manager notifications and a bounded timeout, not controller hot-polling. Cancellation only signals live manager-owned workers; queued cancellation never launches a worker. After manager failure, only unclaimed queued work resumes. Claimed work becomes `NEEDS_ATTENTION`, remains protected, and cannot be cancelled using persisted PIDs.
 

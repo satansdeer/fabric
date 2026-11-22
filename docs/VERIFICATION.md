@@ -6,7 +6,7 @@
 
 | Gate | Current status | Evidence |
 |---|---|---|
-| LOCAL_WORKER_API_READY | NOT_VERIFIED | Async lifecycle and generic worker API acceptance passed; immutable source selection (C04) remains pending. |
+| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Async/generic API and immutable-source acceptance passed: 220 workspace tests/33 suites and adapter conformance. Recovery/storage follow-up remains C06. |
 | PSTACK_LOCAL_SWARM_READY | NOT_VERIFIED | Existing pstack skill routes native tasks; explicit Fabric bridge pending. |
 | LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
 
@@ -146,3 +146,22 @@ cargo build --offline --workspace --bins
 ```
 
 All passed: focused regression 5.07s; 211 workspace tests/33 suites, 166.57s; combined gate 203.77s. Raw evidence: `local://317.log`. No model/provider calls. `copy_limit_bytes` bounds byte-copy fallback, not successful APFS clones; existing forced-copy backend tests pass, but native runtime fallback end-to-end remains `NOT_VERIFIED` on this APFS host.
+
+## C-04 immutable sources and durable reconnect
+
+`TESTED_WITH_FAKE`: explicit READY prepared-state IDs and full exact commit SHAs remain usable after the source checkout disappears; current-head never selects a different prepared commit. Admission validates ownership/readiness before allocation. Dirty changes are excluded and reported; each task freezes source provenance, and all referenced prepared states stay pinned across queued execution/restart. Inline prompt/source flags preserve literal bytes and reject conflicting inputs.
+
+Additional REDs caught identical idempotent reconnect unnecessarily depending on a moved checkout, and acknowledged manager shutdown leaving an unserviced listener backlog. The latter failed on stop/reconnect cycle 4 (`local://328.log`); Stop now acknowledges after endpoint teardown, client drain, scheduler join and owner-lock release. No automatic admission retry or persisted-PID signalling was added.
+
+Commands:
+
+```sh
+cargo test --offline -p fabric-cli --test workers manager_stop_acknowledges_release_before_immediate_reconnect -- --exact --nocapture
+cargo fmt --all --check
+cargo clippy --offline --workspace --all-targets -- -D warnings
+cargo test --offline --workspace
+cargo build --offline --bins
+/Users/maksimivanov/.bun/bin/bun integrations/omp/conformance.ts "$PWD/target/debug/fabric"
+```
+
+All passed: focused regression 14.54 s; 220 workspace tests/33 suites, 156.77 s; combined gate 201.35 s. Raw evidence: `local://330.log`. Separate store-focused migration/contract proof: 27 tests passed, `local://329.log`. No provider calls.

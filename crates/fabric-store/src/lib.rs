@@ -4,11 +4,13 @@ use std::{fmt, fs::OpenOptions, path::Path, str::FromStr, time::Duration};
 
 use fabric_domain::{
     ArtifactManifestId, BatchId, CaptureMetadata, FabricError, HarnessId, HarnessVersion,
-    PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState, WorkspaceId, WorkspaceState,
+    PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState, SourceProvenance,
+    WorkspaceId, WorkspaceState,
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 mod queue;
+use queue::insert_task_source;
 pub use queue::{AsyncBatch, AsyncEvent, AsyncTask, AsyncTaskStatus, NewAsyncTask};
 
 #[derive(Debug)]
@@ -225,7 +227,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=10 => {}
+            1..=11 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -374,6 +376,10 @@ impl Store {
             transaction.execute_batch(include_str!("async_queue.sql"))?;
             transaction.pragma_update(None, "user_version", 10)?;
         }
+        if version < 11 {
+            transaction.execute_batch(include_str!("task_sources.sql"))?;
+            transaction.pragma_update(None, "user_version", 11)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -446,7 +452,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=10) {
+        if !matches!(version, 5..=11) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -667,12 +673,16 @@ impl Store {
 
     /// Register every task and stable Run ID before admitting any worker.
     /// Run IDs intentionally have no foreign key: prelaunch errors may have no workspace.
-    pub fn create_batch(
+    pub fn create_batch_with_sources(
         &mut self,
         id: &BatchId,
         state: &PreparedStateId,
         tasks: &[BatchTask],
+        sources: &[SourceProvenance],
     ) -> Result<()> {
+        if !sources.is_empty() && sources.len() != tasks.len() {
+            return Err(StoreError::InvalidRecord("every task requires a source"));
+        }
         if tasks.is_empty() {
             return Err(StoreError::InvalidRecord("batch requires tasks"));
         }
@@ -695,6 +705,7 @@ impl Store {
                     task.prompt_file
                 ],
             )?;
+            insert_task_source(&transaction, &task.run_id, state, sources.get(position))?;
         }
         transaction.commit()?;
         Ok(())
@@ -834,12 +845,18 @@ impl Store {
                 [id.as_str()],
                 |row| row.get::<_, bool>(0),
             )?;
+        let task_pinned = version >= 11
+            && self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM batch_task_sources WHERE prepared_state_id = ?1)",
+                [id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
         Ok(self.connection.query_row(
             "SELECT CASE
              WHEN status != 'READY' THEN 'not_ready'
              WHEN EXISTS (SELECT 1 FROM runs WHERE prepared_state_id = ?1)
                OR EXISTS (SELECT 1 FROM batches WHERE prepared_state_id = ?1)
-               OR EXISTS (SELECT 1 FROM workspaces WHERE state_id = ?1) THEN 'historical_reference'
+               OR EXISTS (SELECT 1 FROM workspaces WHERE state_id = ?1) OR ?3 THEN 'historical_reference'
              WHEN ?2 THEN 'admitted_worker'
              WHEN NOT EXISTS (SELECT 1 FROM prepared_states newer
                WHERE newer.project_id = prepared_states.project_id AND newer.status = 'READY'
@@ -847,7 +864,7 @@ impl Store {
                  AND (newer.verified_at > prepared_states.verified_at
                    OR (newer.verified_at = prepared_states.verified_at AND newer.state_id > prepared_states.state_id)))
                THEN 'selected_state' ELSE NULL END
-             FROM prepared_states WHERE state_id = ?1", params![id.as_str(), reserved], |row| row.get(0))?)
+             FROM prepared_states WHERE state_id = ?1", params![id.as_str(), reserved, task_pinned], |row| row.get(0))?)
     }
 
     pub fn reserved_storage_bytes(&self) -> Result<u64> {

@@ -1,7 +1,7 @@
 //! Harness-independent worker intent; native configuration remains harness-owned.
 use serde::{Deserialize, Serialize};
 
-use crate::{CredentialConnectionRef, HarnessId, NativeConfigRef};
+use crate::{CredentialConnectionRef, HarnessId, NativeConfigRef, PreparedStateId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,12 +32,21 @@ pub enum ExecutionContext {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SourceRef {
     CurrentHead {},
     Prepared { state_id: String },
     Commit { sha: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceProvenance {
+    pub source_ref: SourceRef,
+    pub prepared_state_id: PreparedStateId,
+    pub base_commit_sha: String,
+    pub checkout_dirty: Option<bool>,
+    pub dirty_changes_excluded: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

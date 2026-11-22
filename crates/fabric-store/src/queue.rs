@@ -16,6 +16,7 @@ pub struct NewAsyncTask {
     pub harness: String,
     pub plan_json: String,
     pub consent_stamp: Option<String>,
+    pub source: Option<SourceProvenance>,
 }
 
 pub struct AsyncTask {
@@ -119,6 +120,12 @@ impl Store {
                 "INSERT INTO batch_tasks(batch_id,position,task_id,run_id,prompt_file) VALUES(?1,?2,?3,?4,'durable-input')",
                 params![batch.batch_id.as_str(),position as i64,task.task.task_id,task.task.run_id.as_str()],
             )?;
+            insert_task_source(
+                &tx,
+                &task.task.run_id,
+                &batch.prepared_state_id,
+                task.source.as_ref(),
+            )?;
             tx.execute(
                 "INSERT INTO async_tasks(run_id,prompt,harness,plan_json,consent_stamp,state) VALUES(?1,?2,?3,?4,?5,'QUEUED')",
                 params![task.task.run_id.as_str(),task.prompt,task.harness,task.plan_json,task.consent_stamp],
@@ -166,6 +173,37 @@ impl Store {
                 run_id:read_id(r,0)?,prompt:r.get(1)?,harness:r.get(2)?,plan_json:r.get(3)?,consent_stamp:r.get(4)?,
             }),
         ).optional()?.ok_or(StoreError::NotFound)
+    }
+
+    pub fn task_prepared_state(&self, run: &RunId) -> Result<PreparedStateId> {
+        Ok(self.connection.query_row(
+            "SELECT prepared_state_id FROM batch_task_sources WHERE run_id=?1",
+            [run.as_str()],
+            |row| read_id(row, 0),
+        )?)
+    }
+
+    pub fn task_source(&self, run: &RunId) -> Result<Option<SourceProvenance>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 11 {
+            return Ok(None);
+        }
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT provenance_json FROM batch_task_sources WHERE run_id=?1",
+                [run.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        json.map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|_| StoreError::InvalidRecord("invalid task source provenance"))
+        })
+        .transpose()
     }
 
     /// A durable claim precedes every side effect; an interrupted claim is never replayable.
@@ -265,4 +303,22 @@ pub fn terminal(state: RunState) -> bool {
         state,
         RunState::Succeeded | RunState::Failed | RunState::Cancelled | RunState::NeedsAttention
     )
+}
+
+pub(super) fn insert_task_source(
+    tx: &rusqlite::Transaction<'_>,
+    run: &RunId,
+    fallback: &PreparedStateId,
+    source: Option<&SourceProvenance>,
+) -> Result<()> {
+    let state = source.map_or(fallback, |source| &source.prepared_state_id);
+    let json = source
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| StoreError::InvalidRecord("invalid task source provenance"))?;
+    tx.execute(
+        "INSERT INTO batch_task_sources(run_id,prepared_state_id,provenance_json) VALUES(?1,?2,?3)",
+        params![run.as_str(), state.as_str(), json],
+    )?;
+    Ok(())
 }

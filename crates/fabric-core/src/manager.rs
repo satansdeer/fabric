@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{BatchId, ErrorKind, FabricError, HarnessId, HarnessPlan, RunId, RunState};
@@ -142,16 +142,24 @@ pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
     if let Request::Spawn {
         request,
         fake_binary,
-        ..
+        idempotency_key,
     } = &request
     {
-        crate::api::preflight_workers(
-            root,
-            request,
-            &RegistryOptions {
-                fake_binary: fake_binary.clone(),
-            },
-        )?;
+        let replay = if let Some(key) = idempotency_key {
+            let (_, store) = open_store(root)?;
+            idempotent_batch(&store, key, &request_digest(request, fake_binary)?)?.is_some()
+        } else {
+            false
+        };
+        if !replay {
+            crate::api::preflight_workers(
+                root,
+                request,
+                &RegistryOptions {
+                    fake_binary: fake_binary.clone(),
+                },
+            )?;
+        }
     }
     let endpoint = Endpoint::new(root)?;
     let wait = match &request {
@@ -343,16 +351,10 @@ impl Manager {
         let (_, mut store) = open_store(&self.root)?;
         if let Some(prior) = key
             .as_deref()
-            .map(|key| store.async_idempotency(key))
-            .transpose()
-            .map_err(error)?
+            .map(|key| idempotent_batch(&store, key, &digest))
+            .transpose()?
             .flatten()
         {
-            if prior.request_digest != digest {
-                return Err(invalid(
-                    "Idempotency key is already bound to a different request.",
-                ));
-            }
             self.schedule(prior.batch_id.clone())?;
             return accepted(&store, &prior.batch_id, generic);
         }
@@ -371,11 +373,13 @@ impl Manager {
             },
         )?;
         let mut tasks = Vec::with_capacity(prepared.tasks.len());
-        for ((task, (harness, (plan, stamp))), input) in prepared
+        let primary_state = prepared.sources[0].prepared_state_id.clone();
+        for (((task, (harness, (plan, stamp))), input), source) in prepared
             .tasks
             .into_iter()
             .zip(prepared.plans)
             .zip(prepared.inputs)
+            .zip(prepared.sources)
         {
             crate::run::validate_durable_plan(&plan)?;
             tasks.push(NewAsyncTask {
@@ -390,11 +394,12 @@ impl Manager {
                 })
                 .map_err(error)?,
                 consent_stamp: stamp,
+                source: Some(source),
             });
         }
         let batch = AsyncBatch {
             batch_id: BatchId::try_from(format!("b-{}", crate::run::new_run_id()?))?,
-            prepared_state_id: prepared.state.state_id,
+            prepared_state_id: primary_state,
             request_digest: digest,
             concurrency,
             options_json: serde_json::to_string(&Options::default()).map_err(error)?,
@@ -475,10 +480,6 @@ impl Manager {
             .async_batch(id)
             .map_err(error)?
             .ok_or_else(|| error("Missing async batch."))?;
-        let state = store
-            .prepared_state(&batch.prepared_state_id)
-            .map_err(error)?
-            .ok_or_else(|| error("Missing accepted prepared state."))?;
         let tasks = store.async_tasks(id).map_err(error)?;
         let options: Options = serde_json::from_str(&batch.options_json).map_err(error)?;
         crate::run::run_pool(tasks.len(), batch.concurrency, |index| {
@@ -497,6 +498,11 @@ impl Manager {
             let _ownership = OwnedTask { manager: self, run };
             let outcome = (|| {
                 let task = store.async_task(run).map_err(error)?;
+                let state_id = store.task_prepared_state(run).map_err(error)?;
+                let state = store
+                    .prepared_state(&state_id)
+                    .map_err(error)?
+                    .ok_or_else(|| error("Missing accepted prepared state."))?;
                 let accepted: AcceptedPlan =
                     serde_json::from_str(&task.plan_json).map_err(error)?;
                 let plan = accepted.plan;
@@ -609,9 +615,13 @@ impl Manager {
             .async_events(&batch, run.as_ref(), after)
             .map_err(error)?;
         let next = events.last().map_or(after, |event| event.cursor);
+        let tasks = tasks.iter().map(|task| {
+            let source = store.task_source(&task.run_id).map_err(error)?;
+            Ok(json!({"task_id":task.task_id,"run_id":task.run_id,"state":task.state,"terminal":terminal(task.queue_state),"source":source}))
+        }).collect::<Result<Vec<_>, FabricError>>()?;
         Ok(
             json!({"id":id,"batch_id":batch,"state":state,"terminal":settled,
-            "tasks":tasks.iter().map(|task| json!({"task_id":task.task_id,"run_id":task.run_id,"state":task.state,"terminal":terminal(task.queue_state)})).collect::<Vec<_>>(),
+            "tasks":tasks,
             "events":events,"next_cursor":next}),
         )
     }
@@ -624,7 +634,8 @@ impl Manager {
         let tasks = tasks.into_iter().map(|task| {
             let result: Option<Value> = task.result.as_deref().map(serde_json::from_str).transpose().map_err(error)?;
             let artifacts = store.artifacts(&task.run_id).map_err(error)?;
-            Ok(json!({"task_id":task.task_id,"run_id":task.run_id,"state":task.state,"result":result,"error":task.error,"artifacts":artifacts}))
+            let source = store.task_source(&task.run_id).map_err(error)?;
+            Ok(json!({"task_id":task.task_id,"run_id":task.run_id,"state":task.state,"source":source,"result":result,"error":task.error,"artifacts":artifacts}))
         }).collect::<Result<Vec<_>,FabricError>>()?;
         Ok(json!({"batch_id":batch,"terminal":settled,"succeeded":succeeded,"tasks":tasks}))
     }
@@ -738,7 +749,7 @@ pub fn serve(
     let listener = UnixListener::bind(&endpoint.socket).map_err(error)?;
     fs::set_permissions(&endpoint.socket, fs::Permissions::from_mode(0o600)).map_err(error)?;
     let socket_identity = fs::symlink_metadata(&endpoint.socket).map_err(error)?;
-    let _socket = SocketGuard {
+    let socket = SocketGuard {
         path: endpoint.socket.clone(),
         device: socket_identity.dev(),
         inode: socket_identity.ino(),
@@ -765,6 +776,9 @@ pub fn serve(
         .map_err(error)?;
     ready(json!({"manager_ready":true,"root":endpoint.root.path,"protocol_version":1}))?;
     let clients = Arc::new(AtomicUsize::new(0));
+    // At most MAX_CLIENTS handlers plus one accept already in flight can defer a reply.
+    // Sending must never block a handler that shutdown is waiting to drain.
+    let (stop_replies, pending_stops) = mpsc::sync_channel(MAX_CLIENTS + 1);
     loop {
         if manager
             .control
@@ -783,8 +797,10 @@ pub fn serve(
                 let clients = Arc::clone(&clients);
                 let manager = Arc::clone(&manager);
                 let identity = endpoint.root.clone();
+                let stop_replies = stop_replies.clone();
                 std::thread::spawn(move || {
                     let _client = ClientGuard(clients);
+                    let mut stop = false;
                     let outcome = (|| {
                         // Darwin may inherit O_NONBLOCK from the listener; frame writes must finish.
                         stream.set_nonblocking(false).map_err(error)?;
@@ -805,12 +821,20 @@ pub fn serve(
                             ));
                         }
                         crate::workspace::private_directory(&identity.path)?;
+                        stop = matches!(&envelope.request, Request::Stop);
                         manager.dispatch(envelope.request)
                     })();
+                    let defer_stop = stop && outcome.is_ok();
                     let reply = match outcome {
                         Ok(value) => json!({"ok":value}),
                         Err(failure) => json!({"error":failure}),
                     };
+                    if defer_stop {
+                        if let Err(failure) = stop_replies.try_send((stream, reply)) {
+                            eprintln!("fabric manager stop acknowledgement failed: {failure}");
+                        }
+                        return;
+                    }
                     if let Err(failure) = write_frame(&mut stream, &reply) {
                         eprintln!("fabric manager response failed: {failure}");
                     }
@@ -827,13 +851,22 @@ pub fn serve(
             Err(failure) => return Err(error(failure)),
         }
     }
-    // Finish the stop acknowledgement before the foreground server exits.
+    drop(listener);
+    drop(socket);
+    // Direct replies finish while this manager still owns the root.
     while clients.load(Ordering::Acquire) != 0 {
         std::thread::sleep(Duration::from_millis(5));
     }
     scheduler
         .join()
         .map_err(|_| error("Manager scheduler panicked."))?;
+    drop(lock);
+    // A successful Stop means immediate reconnect cannot reach the retiring listener.
+    for (mut stream, reply) in pending_stops.try_iter() {
+        if let Err(failure) = write_frame(&mut stream, &reply) {
+            eprintln!("fabric manager stop acknowledgement failed: {failure}");
+        }
+    }
     Ok(())
 }
 
@@ -892,11 +925,12 @@ fn accepted(store: &Store, id: &BatchId, generic: bool) -> Result<Value, FabricE
         let tasks = tasks
             .into_iter()
             .map(|task| {
-                json!({
-                    "task_id":task.task_id,"run_id":task.run_id,"status":"queued"
-                })
+                let source = store.task_source(&task.run_id).map_err(error)?;
+                Ok(json!({
+                    "task_id":task.task_id,"run_id":task.run_id,"status":"queued","source":source
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, FabricError>>()?;
         Ok(json!({"accepted":true,"batch_id":id,"tasks":tasks}))
     } else {
         let runs = tasks
@@ -924,6 +958,23 @@ fn request_digest(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(request, fake_binary)).map_err(error)?)
     ))
+}
+
+fn idempotent_batch(
+    store: &Store,
+    key: &str,
+    digest: &str,
+) -> Result<Option<AsyncBatch>, FabricError> {
+    let prior = store.async_idempotency(key).map_err(error)?;
+    if prior
+        .as_ref()
+        .is_some_and(|batch| batch.request_digest != digest)
+    {
+        return Err(invalid(
+            "Idempotency key is already bound to a different request.",
+        ));
+    }
+    Ok(prior)
 }
 
 fn aggregate(tasks: &[AsyncTaskStatus]) -> RunState {
@@ -976,6 +1027,7 @@ fn recovered_report(
         workspace_id: run.workspace_id.to_string(),
         prepared_state_id: run.prepared_state_id.to_string(),
         base_commit_sha: run.base_commit_sha.clone(),
+        source: store.task_source(&run.run_id).map_err(error)?,
         prompt_digest: run.prompt_digest.clone(),
         harness: run.harness.clone(),
         harness_version: run.harness_version.clone(),

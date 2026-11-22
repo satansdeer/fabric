@@ -23,7 +23,7 @@ pub use profile::{
     AgentProfile, CredentialConnectionRef, ModelPolicy, NativeConfigRef, ProfileEvidence,
 };
 pub use state::{PreparedStateStatus, RunState, WorkspaceState};
-pub use worker::{ExecutionContext, SourceRef, WorkerLimits, WorkerTask};
+pub use worker::{ExecutionContext, SourceProvenance, SourceRef, WorkerLimits, WorkerTask};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

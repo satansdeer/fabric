@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{
-    BatchId, ErrorKind, FabricError, HarnessId, HarnessPlan, HarnessRequest, ProfileEvidence,
-    RunId, RunState, WorkspaceId,
+    BatchId, ErrorKind, FabricError, HarnessId, HarnessPlan, HarnessRequest, PreparedStateId,
+    ProfileEvidence, RunId, RunState, SourceProvenance, SourceRef, WorkspaceId,
 };
 use fabric_runner::{AgentSpec, HarnessAdapter, HarnessRegistry, RegistryOptions};
 use fabric_store::{BatchTask, PreparedState, WorkerAttempt};
@@ -28,6 +28,8 @@ pub struct RunReport {
     pub workspace_id: String,
     pub prepared_state_id: String,
     pub base_commit_sha: String,
+    #[serde(default)]
+    pub source: Option<SourceProvenance>,
     pub prompt_digest: String,
     pub harness: String,
     pub harness_version: Option<String>,
@@ -120,8 +122,8 @@ pub fn foreground(
     options.validate()?;
     let request = options.request()?;
     let plan = crate::onboarding::plan(root, harness, request, &harness.probe()?)?;
-    let (root, state) = select_prepared(root, project_name)?;
-    foreground_prepared(
+    let (root, state, source) = select_prepared(root, project_name, &SourceRef::CurrentHead {})?;
+    let mut report = foreground_prepared(
         &root,
         &state,
         prompt_file,
@@ -129,31 +131,81 @@ pub fn foreground(
         options,
         &plan,
         new_run_id()?,
-    )
+    )?;
+    report.source = Some(source);
+    Ok(report)
 }
 
 fn select_prepared(
     root: &Path,
     project_name: &str,
-) -> Result<(PathBuf, PreparedState), FabricError> {
+    selection: &SourceRef,
+) -> Result<(PathBuf, PreparedState, SourceProvenance), FabricError> {
     let (root, store) = open_store(root)?;
+    let source_error = |message: &str| FabricError {
+        kind: ErrorKind::Source,
+        message: message.into(),
+    };
     let project = store
         .project_by_name(project_name)
         .map_err(error)?
-        .ok_or_else(|| error("Unknown project; register it with project add first."))?;
-    let source = fabric_project::resolve_source(Path::new(&project.source_path))?;
-    let state = store
-        .ready_state_for_commit(&project.project_id, &source.commit_sha)
-        .map_err(error)?
-        .ok_or_else(|| {
-            error("No READY state for current committed HEAD; run project prepare first.")
-        })?;
-    if source.dirty {
-        eprintln!(
-            "warning: dirty Git checkout; only committed HEAD is used; uncommitted changes are not imported."
-        );
+        .ok_or_else(|| source_error("Unknown project; register it with project add first."))?;
+    let mut checkout_dirty = None;
+    let state = match selection {
+        SourceRef::Prepared { state_id } => {
+            store.prepared_state(&PreparedStateId::try_from(state_id.clone())?).map_err(error)?
+        }
+        SourceRef::Commit { sha } => {
+            if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(FabricError { kind: ErrorKind::InvalidArguments,
+                    message: "Commit selection requires an exact full hexadecimal SHA.".into() });
+            }
+            store.ready_state_for_commit(&project.project_id, &sha.to_ascii_lowercase()).map_err(error)?
+        }
+        SourceRef::CurrentHead {} => {
+            let source = fabric_project::resolve_source(Path::new(&project.source_path))?;
+            checkout_dirty = Some(source.dirty);
+            if source.dirty {
+                eprintln!("warning: dirty Git checkout; only committed HEAD is used; uncommitted changes are not imported.");
+            }
+            store.ready_state_for_commit(&project.project_id, &source.commit_sha).map_err(error)?
+        }
+    }.ok_or_else(|| source_error("No READY prepared state matches the requested source; run project prepare first."))?;
+    if state.project_id != project.project_id
+        || state.status != fabric_domain::PreparedStateStatus::Ready
+    {
+        return Err(source_error(
+            "Requested source must be a READY prepared state owned by the project.",
+        ));
     }
-    Ok((root, state))
+    fabric_project::prepare::validate_ready(&root, &state).map_err(|failure| FabricError {
+        kind: ErrorKind::Source,
+        message: failure.message,
+    })?;
+    let provenance = SourceProvenance {
+        source_ref: selection.clone(),
+        prepared_state_id: state.state_id.clone(),
+        base_commit_sha: state.source_commit_sha.clone(),
+        checkout_dirty,
+        dirty_changes_excluded: true,
+    };
+    Ok((root, state, provenance))
+}
+
+pub(crate) fn preflight_sources<'a>(
+    root: &Path,
+    project: &str,
+    selections: impl Iterator<Item = Option<&'a SourceRef>>,
+) -> Result<(), FabricError> {
+    let current = SourceRef::CurrentHead {};
+    let mut seen = HashSet::new();
+    for selection in selections {
+        let selection = selection.unwrap_or(&current);
+        if seen.insert(selection) {
+            select_prepared(root, project, selection)?;
+        }
+    }
+    Ok(())
 }
 
 fn foreground_prepared(
@@ -399,6 +451,7 @@ pub(crate) fn execute_prepared(
         workspace_id: run.workspace_id.to_string(),
         prepared_state_id: run.prepared_state_id.to_string(),
         base_commit_sha: run.base_commit_sha,
+        source: store.task_source(&run_id).map_err(error)?,
         prompt_digest: run.prompt_digest,
         harness: run.harness,
         harness_version: run.harness_version,
@@ -489,6 +542,7 @@ pub(crate) struct ExecutionTask {
     pub prompt_file: String,
     pub harness: HarnessId,
     pub options: RunOptions,
+    pub source_ref: Option<SourceRef>,
 }
 
 pub(crate) struct ExecutionBatch {
@@ -571,6 +625,7 @@ pub fn spawn_many(
                 prompt_file,
                 harness,
                 options,
+                source_ref: None,
             })
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
@@ -593,7 +648,8 @@ pub(crate) fn spawn_execution(
     let concurrency = batch.concurrency;
     let PreparedBatch {
         root,
-        state,
+        states,
+        sources,
         mut tasks,
         plans,
         adapters,
@@ -603,16 +659,17 @@ pub(crate) fn spawn_execution(
     let (_, mut store) = open_store(&root)?;
     let _prompt_spool = PromptSpool::write(&root, &inputs, &mut tasks)?;
     store
-        .create_batch(&batch_id, &state.state_id, &tasks)
+        .create_batch_with_sources(&batch_id, &sources[0].prepared_state_id, &tasks, &sources)
         .map_err(error)?;
     run_pool(tasks.len(), concurrency, |index| {
         let (_, store) = open_store(&root)?;
         let task = &tasks[index];
+        let state = &states[&sources[index].prepared_state_id];
         let (harness_id, plan) = &plans[index];
         let outcome = match &inputs[index].prompt {
             Some(prompt) => execute_prepared(
                 &root,
-                &state,
+                state,
                 prompt,
                 adapters[harness_id].0.as_ref(),
                 &inputs[index].options,
@@ -621,7 +678,7 @@ pub(crate) fn spawn_execution(
             ),
             None => foreground_prepared(
                 &root,
-                &state,
+                state,
                 Path::new(&task.prompt_file),
                 adapters[harness_id].0.as_ref(),
                 &inputs[index].options,
@@ -672,7 +729,8 @@ pub(crate) fn spawn_execution(
 
 pub(crate) struct PreparedBatch {
     pub root: PathBuf,
-    pub state: PreparedState,
+    pub states: HashMap<PreparedStateId, PreparedState>,
+    pub sources: Vec<SourceProvenance>,
     pub tasks: Vec<BatchTask>,
     pub plans: Vec<(HarnessId, (HarnessPlan, Option<String>))>,
     pub adapters: PlannedAdapters,
@@ -752,10 +810,27 @@ pub(crate) fn prepare_batch(
         });
         plans.push((id, plan));
     }
-    let (root, state) = select_prepared(root, &batch.project)?;
+    let mut states = HashMap::new();
+    let mut selected = HashMap::new();
+    let mut sources = Vec::with_capacity(inputs.len());
+    let (root, _) = open_store(root)?;
+    let current = SourceRef::CurrentHead {};
+    for input in &inputs {
+        let selection = input.source_ref.as_ref().unwrap_or(&current);
+        let source = match selected.entry(selection.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let (_, state, source) = select_prepared(&root, &batch.project, selection)?;
+                states.entry(state.state_id.clone()).or_insert(state);
+                entry.insert(source)
+            }
+        };
+        sources.push(source.clone());
+    }
     Ok(PreparedBatch {
         root,
-        state,
+        states,
+        sources,
         tasks,
         plans,
         adapters,

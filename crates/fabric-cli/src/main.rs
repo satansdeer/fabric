@@ -4,10 +4,10 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use fabric_domain::{
     AgentProfile, Capability, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId,
-    HarnessRequest,
+    HarnessRequest, SourceRef, WorkerTask,
 };
 use serde::Serialize;
 
@@ -139,16 +139,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum WorkersCommands {
-    Spawn {
-        #[arg(long)]
-        request: PathBuf,
-        #[arg(long, required = true)]
-        json: bool,
-        #[arg(long)]
-        fake_binary: Option<PathBuf>,
-        #[arg(long)]
-        idempotency_key: Option<String>,
-    },
+    Spawn(SpawnArgs),
     Show {
         id: String,
         #[arg(long, required = true)]
@@ -173,6 +164,32 @@ enum WorkersCommands {
         #[arg(long, required = true)]
         json: bool,
     },
+}
+
+#[derive(Args)]
+struct SpawnArgs {
+    #[arg(long, required_unless_present = "project", conflicts_with_all = ["project", "harness", "prompt", "task_id", "model", "prepared_state", "commit"])]
+    request: Option<PathBuf>,
+    #[arg(long, required_unless_present = "request")]
+    project: Option<String>,
+    #[arg(long, required_unless_present = "request")]
+    harness: Option<HarnessId>,
+    #[arg(long, required_unless_present = "request")]
+    prompt: Option<String>,
+    #[arg(long)]
+    task_id: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, conflicts_with = "commit")]
+    prepared_state: Option<Box<str>>,
+    #[arg(long)]
+    commit: Option<Box<str>>,
+    #[arg(long, required = true)]
+    json: bool,
+    #[arg(long)]
+    fake_binary: Option<PathBuf>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -436,15 +453,7 @@ fn main() -> ExitCode {
             write_submit(cli.root, request, fake_binary, idempotency_key),
         ),
         Commands::Workers { command } => match command {
-            WorkersCommands::Spawn {
-                request,
-                json,
-                fake_binary,
-                idempotency_key,
-            } => (
-                json,
-                write_spawn(cli.root, request, fake_binary, idempotency_key),
-            ),
+            WorkersCommands::Spawn(args) => (args.json, write_spawn(cli.root, args)),
             WorkersCommands::Show { id, json, after } => (
                 json,
                 write_worker(
@@ -567,29 +576,51 @@ fn write_submit(
     )
 }
 
-fn write_spawn(
-    root: Option<PathBuf>,
-    path: PathBuf,
-    fake_binary: Option<PathBuf>,
-    idempotency_key: Option<String>,
-) -> Result<(), FabricError> {
-    let file = std::fs::File::open(path).map_err(|_| FabricError {
-        kind: ErrorKind::InvalidArguments,
-        message: "Cannot open worker request JSON file.".into(),
-    })?;
-    if !file.metadata().map_err(output_error)?.is_file() {
-        return Err(FabricError {
+fn write_spawn(root: Option<PathBuf>, args: SpawnArgs) -> Result<(), FabricError> {
+    let request = if let Some(path) = args.request {
+        let file = std::fs::File::open(path).map_err(|_| FabricError {
             kind: ErrorKind::InvalidArguments,
-            message: "Worker request must be a regular file.".into(),
-        });
-    }
-    let request = fabric_core::api::read_worker_request(file)?;
+            message: "Cannot open worker request JSON file.".into(),
+        })?;
+        if !file.metadata().map_err(output_error)?.is_file() {
+            return Err(FabricError {
+                kind: ErrorKind::InvalidArguments,
+                message: "Worker request must be a regular file.".into(),
+            });
+        }
+        fabric_core::api::read_worker_request(file)?
+    } else {
+        let missing = || FabricError {
+            kind: ErrorKind::InvalidArguments,
+            message: "Inline workers require --project, --harness, and --prompt.".into(),
+        };
+        let source_ref = args
+            .prepared_state
+            .map(|state_id| SourceRef::Prepared {
+                state_id: state_id.into(),
+            })
+            .or_else(|| args.commit.map(|sha| SourceRef::Commit { sha: sha.into() }));
+        fabric_core::api::WorkerBatchRequest {
+            project: args.project.ok_or_else(missing)?,
+            max_concurrency: 1,
+            placement: "local".into(),
+            tasks: vec![WorkerTask {
+                task_id: args.task_id.unwrap_or_else(|| "task".into()),
+                harness_id: args.harness.ok_or_else(missing)?,
+                prompt: args.prompt.ok_or_else(missing)?,
+                execution_context: None,
+                source_ref,
+                model: args.model,
+                limits: None,
+            }],
+        }
+    };
     write_worker(
         root,
         fabric_core::manager::Request::Spawn {
             request,
-            fake_binary,
-            idempotency_key,
+            fake_binary: args.fake_binary,
+            idempotency_key: args.idempotency_key,
         },
     )
 }
