@@ -127,6 +127,72 @@ fn json(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+#[test]
+fn harness_registry_unknown_id_and_neutral_core_preserve_attempt_evidence() {
+    let fixture = Fixture::new();
+    let unknown = fixture
+        .cli()
+        .args([
+            "run",
+            "test",
+            "--harness",
+            "unregistered-worker",
+            "--prompt-file",
+            "unused",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(unknown.stdout.is_empty());
+    let failure: serde_json::Value = serde_json::from_slice(&unknown.stderr).unwrap();
+    assert_eq!(failure["error"]["kind"], "unknown_harness", "{failure}");
+    assert!(!fixture.0.join("storage").exists());
+    for source in [
+        include_str!("../../fabric-core/src/lib.rs"),
+        include_str!("../../fabric-core/src/run.rs"),
+        include_str!("../../fabric-core/src/inspect.rs"),
+    ] {
+        for vendor_marker in ["\"omp\"", "\"OMP", ".omp/", "~/.omp"] {
+            assert!(!source.contains(vendor_marker), "{vendor_marker}");
+        }
+    }
+    fixture.setup();
+    let report = json(&fixture.run(0));
+    let attempts = report["worker_attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    let attempt = &attempts[0];
+    assert_eq!(attempt["run_id"], report["run_id"]);
+    assert_eq!(attempt["harness_requested"], "fake");
+    assert_eq!(attempt["harness_resolved"], "fake");
+    assert_eq!(attempt["harness_version"], "fabric-fake-harness 1");
+    assert_eq!(attempt["backend_id"], "trusted-local");
+    assert_eq!(attempt["exit_code"], 0);
+    assert!(attempt["started_at"].is_i64());
+    assert!(attempt["finished_at"].is_i64());
+    assert!(attempt["event_cursor"].as_u64().unwrap() > 0);
+    assert!(attempt["model_requested"].is_null());
+    assert!(attempt["model_resolved"].is_null());
+    assert!(attempt["profile_digest"].is_null());
+    let shown = json(
+        &fixture
+            .cli()
+            .args(["runs", "show", report["run_id"].as_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(shown["worker_attempts"], report["worker_attempts"]);
+    let mut legacy = report;
+    legacy.as_object_mut().unwrap().remove("worker_attempts");
+    let decoded: fabric_core::run::RunReport = serde_json::from_value(legacy).unwrap();
+    assert!(
+        serde_json::to_value(decoded).unwrap()["worker_attempts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn artifact_container(fixture: &Fixture, report: &serde_json::Value) -> PathBuf {
     fixture
         .0
@@ -303,6 +369,22 @@ fn reconcile_crashed_worker(close_descriptors: bool) {
         std::thread::yield_now();
     }
     let before = snapshot();
+    let attempt_snapshot = || {
+        let shown = json(
+            &fixture
+                .cli()
+                .args(["runs", "show", &run_id, "--json"])
+                .output()
+                .unwrap(),
+        );
+        shown["worker_attempts"].clone()
+    };
+    let attempts_before = attempt_snapshot();
+    assert_eq!(attempts_before.as_array().unwrap().len(), 1);
+    assert!(attempts_before[0]["started_at"].is_i64());
+    assert!(attempts_before[0]["finished_at"].is_null());
+    assert!(attempts_before[0]["exit_code"].is_null());
+    assert!(attempts_before[0]["exit_signal"].is_null());
     gc(&fixture, "--apply");
     assert_eq!(snapshot(), before);
     supervisor.kill().unwrap();
@@ -371,6 +453,7 @@ fn reconcile_crashed_worker(close_descriptors: bool) {
     let stable = snapshot();
     gc(&fixture, "--apply");
     assert_eq!(snapshot(), stable);
+    assert_eq!(attempt_snapshot(), attempts_before);
     assert!(tree.exists());
 }
 
@@ -708,6 +791,15 @@ fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() 
     assert_eq!(report["error_kind"], "timeout");
     assert!(report["exit_code"].is_null());
     assert!(report["exit_signal"].as_i64().is_some());
+    assert_eq!(
+        report["worker_attempts"][0]["termination_reason"],
+        "timeout"
+    );
+    assert_eq!(
+        report["worker_attempts"][0]["exit_signal"],
+        report["exit_signal"]
+    );
+    assert!(report["worker_attempts"][0]["exit_code"].is_null());
     assert!(start.elapsed() < std::time::Duration::from_secs(6));
     assert_tree_stopped(&fixture, &report);
     let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
@@ -1140,6 +1232,11 @@ fn foreground_fake_process_records_provenance_exit_and_recovers_changes_after_re
             Some("fabric-fake-harness 1")
         );
         assert_eq!(run.exit_code, Some(exit));
+        assert_eq!(report["worker_attempts"][0]["exit_code"], exit);
+        assert_eq!(
+            report["worker_attempts"][0]["started_at"].as_i64(),
+            run.started_at
+        );
         assert_eq!(run.base_commit_sha, base["source_commit_sha"]);
         assert!(run.pid_metadata.is_some());
         assert!(run.created_at <= run.started_at.unwrap());
@@ -1325,6 +1422,13 @@ printf '\n{"type":"finished"}\n{"last":true}'
         assert_eq!(report["events"]["parsed"], 3);
         assert_eq!(report["events"]["invalid"], 2);
         assert_eq!(report["events"]["oversized"], 1);
+        assert_eq!(report["worker_attempts"][0]["harness_requested"], "omp");
+        assert_eq!(report["worker_attempts"][0]["harness_resolved"], "omp");
+        assert_eq!(
+            report["worker_attempts"][0]["harness_version"],
+            report["harness_version"]
+        );
+        assert_eq!(report["worker_attempts"][0]["event_cursor"], 6);
         let tree = restored_workspace(&fixture, &report);
         let container = artifact_container(&fixture, &report);
         let records: Vec<serde_json::Value> = fs::read_to_string(container.join("events.jsonl"))
@@ -1708,6 +1812,8 @@ fn run_many_preserves_mixed_exit_and_prelaunch_failure_and_rejects_invalid_input
     assert_eq!(tasks[0]["result"]["state"], "SUCCEEDED");
     assert_eq!(tasks[1]["result"]["exit_code"], 7);
     assert_eq!(tasks[1]["result"]["state"], "FAILED");
+    assert_eq!(tasks[0]["result"]["worker_attempts"][0]["exit_code"], 0);
+    assert_eq!(tasks[1]["result"]["worker_attempts"][0]["exit_code"], 7);
     assert!(tasks[2]["result"].is_null());
     assert!(tasks[2]["error"].as_str().unwrap().contains("missing.json"));
     let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
@@ -2011,6 +2117,12 @@ printf 'existing sentinel' > "../../../artifacts/a-$run/sentinel"
         assert_eq!(run.state, RunState::NeedsAttention, "{failure}: {out:?}");
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(run.exit_signal, None);
+        let attempts = store.worker_attempts(&id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].exit_code, Some(0));
+        assert_eq!(attempts[0].exit_signal, None);
+        assert_eq!(attempts[0].termination_reason, None);
+        assert!(attempts[0].finished_at.is_some());
         assert_eq!(run.error_kind.as_deref(), Some("artifact_capture"));
         assert!(run.finished_at.is_some());
         assert!(run.artifact_manifest_id.is_none());

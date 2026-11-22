@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fabric_domain::{ErrorKind, FabricError};
+use fabric_domain::{ErrorKind, FabricError, HarnessId};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -76,8 +76,8 @@ struct RunManyArgs {
 struct WorkerArgs {
     #[command(flatten)]
     storage: StorageArgs,
-    #[arg(long, value_parser = ["fake", "omp"])]
-    harness: String,
+    #[arg(long)]
+    harness: HarnessId,
     /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
     #[arg(long)]
     fake_binary: Option<PathBuf>,
@@ -95,7 +95,7 @@ struct WorkerArgs {
     /// Per-worker wall-clock limit, enforced by Fabric (not a spending quota).
     #[arg(long, default_value = "3600")]
     timeout_seconds: std::num::NonZeroU64,
-    /// Best-effort OMP request budget; in-flight requests can exceed it.
+    /// Adapter-specific best-effort request budget; not a spending quota.
     #[arg(long)]
     max_cost_usd: Option<f64>,
     #[arg(long)]
@@ -299,26 +299,14 @@ fn with_harness<T>(
     options: &WorkerArgs,
     run: impl FnOnce(&(dyn fabric_runner::HarnessAdapter + Sync)) -> Result<T, FabricError>,
 ) -> Result<T, FabricError> {
-    match options.harness.as_str() {
-        "omp" => {
-            if options.fake_binary.is_some() {
-                return Err(FabricError {
-                    kind: ErrorKind::InvalidArguments,
-                    message: "--fake-binary is only valid with --harness fake.".into(),
-                });
-            }
-            run(&fabric_runner::OmpHarness::discover()?)
-        }
-        _ => {
-            let binary = match &options.fake_binary {
-                Some(binary) => binary.clone(),
-                None => std::env::current_exe()
-                    .map_err(output_error)?
-                    .with_file_name("fabric-fake-harness"),
-            };
-            run(&fabric_runner::FakeHarness::new(binary)?)
-        }
-    }
+    let registry = fabric_runner::HarnessRegistry::default();
+    let harness = registry.resolve(
+        &options.harness,
+        &fabric_runner::RegistryOptions {
+            fake_binary: options.fake_binary.clone(),
+        },
+    )?;
+    run(harness.as_ref())
 }
 
 fn write_run_many(root: Option<PathBuf>, args: RunManyArgs) -> Result<(), FabricError> {

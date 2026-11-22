@@ -2,7 +2,7 @@
 use std::path::Path;
 
 use fabric_domain::{ArtifactManifestId, ErrorKind, FabricError, RunId};
-use fabric_store::{Artifact, PreparedState, Project, Run, Store, Workspace};
+use fabric_store::{Artifact, PreparedState, Project, Run, Store, WorkerAttempt, Workspace};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -10,6 +10,7 @@ pub struct RunReport {
     pub run: Run,
     pub workspace: Workspace,
     pub prepared_state: PreparedState,
+    pub worker_attempts: Vec<WorkerAttempt>,
 }
 
 #[derive(Serialize)]
@@ -52,6 +53,7 @@ pub fn show(root: &Path, id: &RunId) -> Result<RunReport, FabricError> {
         run,
         workspace,
         prepared_state,
+        worker_attempts: store.worker_attempts(id).map_err(storage_error)?,
     })
 }
 

@@ -14,7 +14,7 @@ pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, S
 use supervision::{PipeReader, ProcessGroup};
 
 use capture::Capture;
-use fabric_domain::{ErrorKind, FabricError};
+use fabric_domain::{ErrorKind, FabricError, HarnessId, HarnessVersion};
 
 pub struct Execution {
     pub status: ExitStatus,
@@ -39,7 +39,7 @@ pub struct CommandSpec {
 }
 
 pub trait HarnessAdapter {
-    fn name(&self) -> &str;
+    fn id(&self) -> HarnessId;
     fn probe(&self) -> Result<HarnessInfo, FabricError>;
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError>;
 }
@@ -60,8 +60,8 @@ impl FakeHarness {
 }
 
 impl HarnessAdapter for FakeHarness {
-    fn name(&self) -> &str {
-        "fake"
+    fn id(&self) -> HarnessId {
+        "fake".parse().expect("registered harness ID")
     }
 
     fn probe(&self) -> Result<HarnessInfo, FabricError> {
@@ -69,12 +69,16 @@ impl HarnessAdapter for FakeHarness {
         if version != "fabric-fake-harness 1" {
             return Err(execution_error("Unsupported fake harness version."));
         }
+        HarnessVersion::validate(&version)?;
         Ok(HarnessInfo { version })
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
         if spec.max_cost_usd.is_some() {
-            return Err(execution_error("Fake harness does not support max cost."));
+            return Err(FabricError {
+                kind: ErrorKind::UnsupportedCapability,
+                message: "Fake harness does not support max cost.".into(),
+            });
         }
         Ok(CommandSpec {
             program: self.binary.clone(),
@@ -234,3 +238,6 @@ pub mod omp;
 pub use omp::OmpHarness;
 
 pub mod fake;
+
+mod registry;
+pub use registry::{HarnessRegistration, HarnessRegistry, RegistryOptions};

@@ -1,0 +1,84 @@
+{
+  "project": "Fabric harness-neutral architecture amendment",
+  "version": "0.2.1",
+  "applies_to": "FABRIC_PSTACK_UPDATE_SPEC.md",
+  "source": "FABRIC_HARNESS_NEUTRAL_ADDENDUM.md",
+  "implementation_rule": "Do these preflight/architecture stories before proceeding with new OMP-specific core features; preserve already completed FAB-* stories",
+  "stories": [
+    {
+      "id": "HN-01",
+      "title": "Audit and isolate shared core from OMP assumptions",
+      "depends_on": [],
+      "acceptance_tests": [
+        "HN-01",
+        "HN-08"
+      ],
+      "objective": "Inventory vendor-specific assumptions, introduce HarnessId/versioned adapter registry, preserve existing OMP behavior.",
+      "status": "done"
+    },
+    {
+      "id": "HN-02",
+      "title": "Version-specific harness probe and capability plan",
+      "depends_on": [
+        "HN-01"
+      ],
+      "acceptance_tests": [
+        "HN-03"
+      ],
+      "objective": "Declare support/limitations with typed failure before scheduling; no unavailable features silently downgraded.",
+      "status": "todo"
+    },
+    {
+      "id": "HN-03",
+      "title": "Two fake adapters and mixed-harness batch",
+      "depends_on": [
+        "HN-02"
+      ],
+      "acceptance_tests": [
+        "HN-02",
+        "HN-04"
+      ],
+      "objective": "Exercise different launch/event schemas in one batch through the same run lifecycle.",
+      "status": "todo"
+    },
+    {
+      "id": "HN-04",
+      "title": "Native profile and credential boundaries",
+      "depends_on": [
+        "HN-02"
+      ],
+      "acceptance_tests": [
+        "HN-05"
+      ],
+      "objective": "Per-adapter config discovery and secret-safe launch; no arbitrary env/Home propagation to remote.",
+      "status": "todo"
+    },
+    {
+      "id": "HN-05",
+      "title": "Second real harness adapter",
+      "depends_on": [
+        "HN-03",
+        "HN-04"
+      ],
+      "acceptance_tests": [
+        "HN-07"
+      ],
+      "objective": "Implement Codex or Qwen adapter and opt-in smoke test without default CI model calls.",
+      "status": "todo"
+    },
+    {
+      "id": "HN-06",
+      "title": "Control surface neutrality and pstack compatibility",
+      "depends_on": [
+        "HN-03",
+        "HN-05"
+      ],
+      "acceptance_tests": [
+        "HN-06",
+        "HN-09"
+      ],
+      "objective": "OMP extension and CLI share one run API; mixed-harness pstack scenario without harness-specific scripts.",
+      "status": "todo"
+    }
+  ]
+}

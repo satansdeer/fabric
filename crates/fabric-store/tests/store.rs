@@ -2,7 +2,8 @@ use std::sync::{Arc, Barrier};
 
 use fabric_domain::{PreparedStateStatus, RunState, WorkspaceState};
 use fabric_store::{
-    PreparedState, Project, Run, RunWorkspaceTransition, Store, StoreError, Workspace,
+    PreparedState, Project, Run, RunWorkspaceTransition, Store, StoreError, WorkerAttempt,
+    Workspace,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -98,7 +99,8 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
 fn remove_cleanup_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS storage_reservations;
+            "DROP TABLE IF EXISTS worker_attempts;
+             DROP TABLE IF EXISTS storage_reservations;
              DROP TABLE IF EXISTS worker_leases;
              DROP TABLE IF EXISTS cache_evictions;
              DROP TRIGGER immutable_cleanup_intent_insert;
@@ -209,7 +211,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -224,6 +226,59 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
             0o600
         );
     }
+}
+
+#[test]
+fn v8_database_adds_attempt_storage_without_rewriting_legacy_evidence() {
+    let (root, mut store) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = finalized_pair(&mut store, 91);
+    store
+        .create_worker_lease("legacy-owner", "private-authority", 999)
+        .unwrap();
+    store
+        .record_cleanup_intent(&run, &workspace, "legacy-cleanup", 301)
+        .unwrap();
+    let artifacts = store.artifacts(&run.run_id).unwrap();
+    drop(store);
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE IF EXISTS worker_attempts; PRAGMA user_version=8;")
+        .unwrap();
+    drop(db);
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.artifacts(&run.run_id).unwrap(), artifacts);
+    assert!(reopened.worker_attempts(&run.run_id).unwrap().is_empty());
+    assert_eq!(
+        reopened.worker_lease("legacy-owner").unwrap(),
+        Some(("private-authority".into(), 999))
+    );
+    assert_eq!(
+        reopened.cleanup_intent(&workspace.workspace_id).unwrap(),
+        Some("legacy-cleanup".into())
+    );
+    assert_eq!(reopened.run(&run.run_id).unwrap(), Some(run));
+    assert_eq!(
+        reopened.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        9,
+        "HN-01 must migrate v8 storage additively"
+    );
+    let attempts: i64 = db
+        .query_row("SELECT count(*) FROM worker_attempts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(attempts, 0, "legacy runs have no observed attempts");
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
 }
 
 #[test]
@@ -250,7 +305,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -981,8 +1036,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [8, 7, 6, 5] {
+    for version in [9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 8 {
+            db.execute_batch("DROP TABLE worker_attempts; PRAGMA user_version=8;")
+                .unwrap();
+        }
         if version == 7 {
             db.execute_batch("DROP TABLE worker_leases; PRAGMA user_version=7;")
                 .unwrap();
@@ -999,6 +1058,7 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
         let before = std::fs::read(&path).unwrap();
         let readonly = Store::open_existing_read_only(&path).unwrap();
         assert_eq!(readonly.run(&run.run_id).unwrap(), Some(run.clone()));
+        assert!(readonly.worker_attempts(&run.run_id).unwrap().is_empty());
         assert_eq!(
             readonly.workspace(&workspace.workspace_id).unwrap(),
             Some(workspace.clone())
@@ -1082,4 +1142,234 @@ fn read_only_inspection_refuses_symlink_hardlink_and_public_database_sidecars() 
             }
         }
     }
+}
+
+fn attempt(run: &Run, id: &str) -> WorkerAttempt {
+    WorkerAttempt {
+        attempt_id: id.into(),
+        run_id: run.run_id.clone(),
+        harness_requested: "future-harness".parse().unwrap(),
+        harness_resolved: "future-harness".parse().unwrap(),
+        harness_version: "future-cli 2.1+exact".into(),
+        model_requested: None,
+        model_resolved: None,
+        profile_digest: None,
+        backend_id: "local/trusted-local".into(),
+        event_cursor: 0,
+        created_at: 200,
+        started_at: None,
+        finished_at: None,
+        exit_code: None,
+        exit_signal: None,
+        termination_reason: None,
+    }
+}
+
+#[test]
+fn worker_attempts_preserve_durable_provenance_progress_and_terminal_evidence() {
+    let (root, mut store) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = pair(301);
+    let (other_run, other_workspace) = pair(302);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    store
+        .create_run_workspace(&other_run, &other_workspace)
+        .unwrap();
+    store
+        .create_worker_lease("owner", "original-authority", 999)
+        .unwrap();
+    assert!(store.worker_attempts(&run.run_id).unwrap().is_empty());
+    let mut observed = attempt(&run, "attempt-b");
+    observed.model_requested = Some("requested-model".into());
+    observed.model_resolved = Some("observed-model".into());
+    observed.profile_digest = Some("nonsecret-profile-digest".into());
+    store.record_worker_attempt(&observed).unwrap();
+    store.record_worker_attempt(&observed).unwrap();
+    observed.started_at = Some(201);
+    observed.event_cursor = 5;
+    store.record_worker_attempt(&observed).unwrap();
+    let mutations: &[fn(&mut WorkerAttempt)] = &[
+        |value| value.run_id = "run-302".parse().unwrap(),
+        |value| value.harness_requested = "another-harness".parse().unwrap(),
+        |value| value.harness_resolved = "another-harness".parse().unwrap(),
+        |value| value.harness_version = "different-version".into(),
+        |value| value.model_requested = None,
+        |value| value.model_resolved = None,
+        |value| value.profile_digest = None,
+        |value| value.backend_id = "another-backend".into(),
+        |value| value.created_at += 1,
+        |value| value.started_at = None,
+        |value| value.started_at = Some(200),
+        |value| value.started_at = Some(202),
+        |value| value.event_cursor = 4,
+        |value| value.event_cursor = u64::MAX,
+        |value| value.finished_at = Some(200),
+        |value| value.exit_code = Some(0),
+    ];
+    for mutate in mutations {
+        let mut changed = observed.clone();
+        mutate(&mut changed);
+        assert!(
+            store.record_worker_attempt(&changed).is_err(),
+            "{changed:?}"
+        );
+        assert_eq!(
+            store.worker_attempts(&run.run_id).unwrap(),
+            [observed.clone()]
+        );
+    }
+    observed.finished_at = Some(203);
+    observed.exit_code = Some(0);
+    observed.event_cursor = 9;
+    store.record_worker_attempt(&observed).unwrap();
+    store.record_worker_attempt(&observed).unwrap();
+    let terminal_mutations: &[fn(&mut WorkerAttempt)] = &[
+        |value| value.event_cursor += 1,
+        |value| value.finished_at = Some(204),
+        |value| value.finished_at = None,
+        |value| value.exit_code = Some(1),
+        |value| value.exit_code = None,
+        |value| {
+            value.exit_code = None;
+            value.exit_signal = Some(15);
+        },
+        |value| value.termination_reason = Some("invented-failure".into()),
+    ];
+    for mutate in terminal_mutations {
+        let mut changed = observed.clone();
+        mutate(&mut changed);
+        assert!(
+            store.record_worker_attempt(&changed).is_err(),
+            "{changed:?}"
+        );
+    }
+    let mut not_launched = attempt(&run, "attempt-a");
+    not_launched.finished_at = Some(202);
+    not_launched.termination_reason = Some("launch_failed".into());
+    store.record_worker_attempt(&not_launched).unwrap();
+    let expected = vec![not_launched, observed];
+    assert_eq!(store.worker_attempts(&run.run_id).unwrap(), expected);
+    assert!(store.worker_attempts(&other_run.run_id).unwrap().is_empty());
+    assert_eq!(store.run(&run.run_id).unwrap(), Some(run.clone()));
+    assert_eq!(
+        store.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace.clone())
+    );
+    assert_eq!(
+        store.worker_lease("owner").unwrap(),
+        Some(("original-authority".into(), 999))
+    );
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.worker_attempts(&run.run_id).unwrap(), expected);
+    assert_eq!(reopened.run(&run.run_id).unwrap(), Some(run));
+    assert_eq!(
+        reopened.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+    let db = Connection::open(&path).unwrap();
+    assert!(db.execute("DELETE FROM worker_attempts", []).is_err());
+    assert!(
+        db.execute("UPDATE worker_attempts SET event_cursor=0", [])
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .worker_attempts(&"run-301".parse().unwrap())
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn worker_attempts_reject_orphans_invalid_times_and_unobserved_terminal_values() {
+    let (_root, mut store) = fixture();
+    let (run, workspace) = pair(303);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    let initial = attempt(&run, "attempt");
+    let mutations: &[fn(&mut WorkerAttempt)] = &[
+        |value| value.attempt_id = "../outside".into(),
+        |value| value.run_id = "missing-run".parse().unwrap(),
+        |value| value.harness_version.clear(),
+        |value| value.harness_version = "version\ninjected".into(),
+        |value| value.backend_id.clear(),
+        |value| value.event_cursor = u64::MAX,
+        |value| value.created_at = -1,
+        |value| value.created_at = 199,
+        |value| value.started_at = Some(199),
+        |value| value.finished_at = Some(201),
+        |value| {
+            value.started_at = Some(202);
+            value.finished_at = Some(201);
+            value.exit_code = Some(0);
+        },
+        |value| value.exit_code = Some(0),
+        |value| value.exit_signal = Some(15),
+        |value| value.termination_reason = Some("not-finished".into()),
+        |value| {
+            value.finished_at = Some(202);
+            value.exit_code = Some(0);
+        },
+        |value| {
+            value.started_at = Some(201);
+            value.finished_at = Some(202);
+            value.exit_signal = Some(0);
+        },
+        |value| {
+            value.started_at = Some(201);
+            value.finished_at = Some(202);
+            value.exit_code = Some(0);
+            value.exit_signal = Some(15);
+        },
+    ];
+    for mutate in mutations {
+        let mut changed = initial.clone();
+        mutate(&mut changed);
+        assert!(
+            store.record_worker_attempt(&changed).is_err(),
+            "{changed:?}"
+        );
+        assert!(store.worker_attempts(&run.run_id).unwrap().is_empty());
+    }
+    store.record_worker_attempt(&initial).unwrap();
+    let mut interrupted = initial;
+    interrupted.started_at = Some(201);
+    interrupted.finished_at = Some(202);
+    interrupted.termination_reason = Some("supervisor_lost".into());
+    store.record_worker_attempt(&interrupted).unwrap();
+    let saved = store.worker_attempts(&run.run_id).unwrap();
+    assert_eq!(saved, [interrupted]);
+    assert_eq!(saved[0].exit_code, None);
+    assert_eq!(saved[0].exit_signal, None);
+}
+
+#[test]
+fn worker_attempts_read_only_consumers_see_committed_live_wal_without_writes() {
+    let (root, mut writer) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = pair(304);
+    writer.create_run_workspace(&run, &workspace).unwrap();
+    let observed = attempt(&run, "attempt-live");
+    writer.record_worker_attempt(&observed).unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let base = std::fs::read(&path).unwrap();
+    let mut progressed = observed;
+    progressed.started_at = Some(201);
+    progressed.event_cursor = 17;
+    writer.record_worker_attempt(&progressed).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), base);
+    let wal = path.with_extension("sqlite3-wal");
+    let wal_before = std::fs::read(&wal).unwrap();
+    assert!(!wal_before.is_empty());
+    let reader = Store::open_existing_read_only(&path).unwrap();
+    assert_eq!(
+        reader.worker_attempts(&run.run_id).unwrap(),
+        [progressed.clone()]
+    );
+    assert!(reader.record_worker_attempt(&progressed).is_err());
+    drop(reader);
+    assert_eq!(std::fs::read(&path).unwrap(), base);
+    assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
 }

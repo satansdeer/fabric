@@ -265,3 +265,66 @@ fn untrusted_policy_deserialization_rejects_bad_limits_and_unknown_fields() {
         .is_err()
     );
 }
+
+#[test]
+fn harness_identity_and_exact_version_evidence_are_extensible_and_validated() {
+    use fabric_domain::{HarnessId, HarnessVersion};
+
+    for value in ["fake-a", "future-harness-2042", "a", &"a".repeat(128)] {
+        let id: HarnessId = value.parse().unwrap();
+        assert_eq!(id.as_str(), value);
+        assert_eq!(id.to_string(), value);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessId>(&json).unwrap(), id);
+        assert_eq!(HarnessId::try_from(value.to_owned()).unwrap(), id);
+    }
+    for value in [
+        "",
+        "UPPER",
+        "has_space",
+        "../config",
+        "a/b",
+        "a\\b",
+        "é",
+        &"a".repeat(129),
+    ] {
+        assert_eq!(
+            value.parse::<HarnessId>().unwrap_err().kind,
+            ErrorKind::InvalidId
+        );
+        assert!(serde_json::from_str::<HarnessId>(&serde_json::to_string(value).unwrap()).is_err());
+    }
+    for value in [
+        "1.2.3+exact-build",
+        "future-cli 2042.01 (dev)",
+        " version with spaces ",
+    ] {
+        let version: HarnessVersion = value.parse().unwrap();
+        assert_eq!(version.as_str(), value);
+        assert_eq!(version.to_string(), value);
+        assert_eq!(
+            serde_json::from_str::<HarnessVersion>(&serde_json::to_string(&version).unwrap())
+                .unwrap(),
+            version
+        );
+        assert_eq!(HarnessVersion::try_from(value.to_owned()).unwrap(), version);
+    }
+    for value in ["", " \t ", "1\n2", "1\0", &"v".repeat(1025)] {
+        assert!(value.parse::<HarnessVersion>().is_err());
+        assert!(
+            serde_json::from_str::<HarnessVersion>(&serde_json::to_string(value).unwrap()).is_err()
+        );
+    }
+    for (kind, expected) in [
+        (ErrorKind::UnknownHarness, "unknown_harness"),
+        (ErrorKind::UnsupportedCapability, "unsupported_capability"),
+        (ErrorKind::UnsupportedVersion, "unsupported_version"),
+        (ErrorKind::ModelUnsupported, "model_unsupported"),
+        (ErrorKind::ModelUnverified, "model_unverified"),
+        (ErrorKind::UnsupportedPlacement, "unsupported_placement"),
+        (ErrorKind::InvalidProfile, "invalid_profile"),
+        (ErrorKind::AuthorizationRequired, "authorization_required"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), expected);
+    }
+}

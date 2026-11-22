@@ -5,11 +5,13 @@ use std::fmt;
 use serde::Serialize;
 
 mod capture;
+mod harness;
 mod ids;
 mod policy;
 mod state;
 
 pub use capture::{CaptureMetadata, CapturedFile, EventCounts};
+pub use harness::{HarnessId, HarnessVersion};
 pub use ids::*;
 pub use policy::{RetentionMode, RetentionPolicy, StoragePolicy};
 pub use state::{PreparedStateStatus, RunState, WorkspaceState};
@@ -26,6 +28,14 @@ pub enum ErrorKind {
     Source,
     Storage,
     NotFound,
+    UnknownHarness,
+    UnsupportedCapability,
+    UnsupportedVersion,
+    ModelUnsupported,
+    ModelUnverified,
+    UnsupportedPlacement,
+    InvalidProfile,
+    AuthorizationRequired,
 }
 
 #[derive(Debug, Serialize)]

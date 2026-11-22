@@ -235,3 +235,11 @@
 - Exact changed files: `crates/fabric-cli/src/main.rs`, `crates/fabric-cli/tests/run.rs`, `crates/fabric-core/src/lib.rs`, new `crates/fabric-core/src/inspect.rs`, `crates/fabric-store/src/lib.rs`, new `.github/workflows/macos.yml`, `README.md`, `PROGRESS.md`. No new dependencies, commits, PRD/VERIFICATION/original-requirement edits, remote actions, paid calls or parent crash-fixture mutation.
 - Manual gap: **AT-15 NOT EXECUTED**. README records a concrete separately approved current-interface OMP procedure requiring real parsed JSON events, prepared dependency visibility, nonempty preserved patch, observed version/exit, checksums and recovered file contents. Only prior version/help probes exist; model-demonstrated acceptance and `POC_READY_FOR_REVIEW` are explicitly not claimed.
 - Status: **READY_FOR_VERIFICATION** for implemented automated FAB-20 scope; parent independently verifies and owns final story status.
+
+## HN-01 — externally verified
+
+- Added the supplied amendment and accepted migration ADR; retained all prior FAB statuses. Audited the actual v0.1 implementation and pstack reference; the cited predecessor update spec is unavailable.
+- Implementers: Hn01Persistence (domain/store) and Hn01Runtime (runner/core/CLI). Behavioral RED evidence: `local://178.log` and `local://179.log`.
+- Added validated extensible harness/version evidence, registry-owned adapter construction/discovery, typed errors, additive v9 worker attempts, immutable provenance/terminal evidence and monotone progress. Existing Run constructors and historical storage remain intact.
+- Parent GREEN: 32 domain/store tests, strict workspace/all-target clippy, 138 workspace tests in 24 suites. Formatting-only anchored corrections followed by a clean fmt check. Evidence: `local://190.log`, `local://191.log`.
+- Status: HN-01 done. No model invocation, remote backend claim, or missing-predecessor acceptance claim.

@@ -515,8 +515,8 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
         id: std::cell::RefCell<Option<RunId>>,
     }
     impl HarnessAdapter for Tamper<'_> {
-        fn name(&self) -> &str {
-            "fake"
+        fn id(&self) -> fabric_domain::HarnessId {
+            "tamper-worker".parse().unwrap()
         }
         fn probe(&self) -> Result<HarnessInfo, FabricError> {
             Ok(HarnessInfo {
@@ -528,6 +528,16 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
             let text = fs::read_to_string(&marker).unwrap();
             self.id
                 .replace(Some(text.lines().nth(2).unwrap().parse().unwrap()));
+            let attempts = self
+                .fixture
+                .store()
+                .worker_attempts(self.id.borrow().as_ref().unwrap())
+                .unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].harness_requested, self.id());
+            assert_eq!(attempts[0].harness_version, "tamper-test");
+            assert_eq!(attempts[0].started_at, None);
+            assert_eq!(attempts[0].finished_at, None);
             fs::remove_file(marker).unwrap();
             Ok(CommandSpec {
                 program: "/usr/bin/touch".into(),
@@ -573,6 +583,16 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
     assert_eq!(run.exit_code, None);
     assert_eq!(run.started_at, None);
     assert_eq!(run.pid_metadata, None);
+    let attempts = store.worker_attempts(&run.run_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].started_at, None);
+    assert_eq!(attempts[0].exit_code, None);
+    assert_eq!(attempts[0].exit_signal, None);
+    assert!(attempts[0].finished_at.is_some());
+    assert_eq!(
+        attempts[0].termination_reason.as_deref(),
+        Some("execution_failed")
+    );
     let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
     assert_eq!(workspace.state, WorkspaceState::RecoveryRequired);
     assert!(Path::new(&workspace.managed_path).exists());

@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{BatchId, ErrorKind, FabricError, RunId, RunState, WorkspaceId};
 use fabric_runner::{AgentSpec, HarnessAdapter};
-use fabric_store::{BatchTask, PreparedState};
+use fabric_store::{BatchTask, PreparedState, WorkerAttempt};
 use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +43,8 @@ pub struct RunReport {
     /// Cleanup refusal never rewrites an already terminal process outcome.
     #[serde(default)]
     pub cleanup: Option<crate::workspace::GcItem>,
+    #[serde(default)]
+    pub worker_attempts: Vec<WorkerAttempt>,
 }
 
 pub struct RunOptions {
@@ -52,7 +54,7 @@ pub struct RunOptions {
     pub limits: fabric_runner::ExecutionLimits,
     pub cancellation: fabric_runner::CancellationToken,
     pub storage: crate::workspace::storage::StorageOptions,
-    /// Best-effort OMP request admission only, not an exact spending cap.
+    /// Adapter-specific best-effort request admission, not an exact spending cap.
     pub max_cost_usd: Option<f64>,
 }
 
@@ -71,21 +73,12 @@ impl Default for RunOptions {
 }
 
 impl RunOptions {
-    fn validate(&self, harness: &str) -> Result<(), FabricError> {
+    fn validate(&self) -> Result<(), FabricError> {
         self.limits.validate()?;
         validate_capture_limit(self.max_log_bytes)?;
         if self.max_artifact_bytes == 0 || self.max_artifact_bytes > i64::MAX as u64 {
             return Err(error(
                 "max_artifact_bytes must be positive and fit SQLite storage.",
-            ));
-        }
-        if self
-            .max_cost_usd
-            .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
-            || (self.max_cost_usd.is_some() && harness != "omp")
-        {
-            return Err(error(
-                "max_cost_usd must be finite, positive and used only with OMP.",
             ));
         }
         Ok(())
@@ -99,7 +92,7 @@ pub fn foreground(
     harness: &(impl HarnessAdapter + ?Sized),
     options: &RunOptions,
 ) -> Result<RunReport, FabricError> {
-    options.validate(harness.name())?;
+    options.validate()?;
     let (root, state) = select_prepared(root, project_name)?;
     foreground_prepared(
         &root,
@@ -163,7 +156,7 @@ fn foreground_prepared(
         run_id: run_id.clone(),
         workspace_id: workspace_id.clone(),
         prepared_state_id: state.state_id.clone(),
-        harness: harness.name().to_owned(),
+        harness: harness.id().to_string(),
         prompt_digest,
         created_at,
         // Startup reservation only, not a wall-clock run limit or deletion authority.
@@ -173,7 +166,27 @@ fn foreground_prepared(
     };
     let backend = LocalWorkspaceBackend::new(&root, ForkStrategy::CloneOrCopy)?;
     let workspace = create_workspace(&root, &backend, &request, options.copy_limit_bytes)?;
+    let harness_id = harness.id();
+    let mut attempt = WorkerAttempt {
+        attempt_id: format!("a-{run_id}"),
+        run_id: run_id.clone(),
+        harness_requested: harness_id.clone(),
+        harness_resolved: harness_id,
+        harness_version: harness_version.to_owned(),
+        model_requested: None,
+        model_resolved: None,
+        profile_digest: None,
+        backend_id: "trusted-local".into(),
+        event_cursor: 0,
+        created_at,
+        started_at: None,
+        finished_at: None,
+        exit_code: None,
+        exit_signal: None,
+        termination_reason: None,
+    };
     let execution = (|| {
+        store.record_worker_attempt(&attempt).map_err(error)?;
         let container = workspace
             .path()
             .parent()
@@ -218,9 +231,12 @@ fn foreground_prepared(
                 &token,
                 Some(reservation.file()),
                 |pid| {
+                    let started_at = now()?;
+                    attempt.started_at = Some(started_at);
+                    store.record_worker_attempt(&attempt).map_err(error)?;
                     reservation.started(&store, pid)?;
                     store
-                        .start_run(&run_id, harness_version, pid, now()?)
+                        .start_run(&run_id, harness_version, pid, started_at)
                         .map_err(error)
                 },
             );
@@ -237,13 +253,24 @@ fn foreground_prepared(
                 .storage_reason()
                 .or_else(|| crate::workspace::storage::violation(&root, fresh.path(), &storage));
         }
+        let finished_at = now()?;
+        attempt.finished_at = Some(finished_at);
+        attempt.exit_code = result.status.code();
+        attempt.exit_signal = result.status.signal();
+        attempt.termination_reason = result.stop_reason.map(|reason| reason.as_str().to_owned());
+        if let Ok(capture) = &result.capture {
+            attempt.event_cursor = capture.event_counts.parsed
+                + capture.event_counts.invalid
+                + capture.event_counts.oversized;
+        }
+        store.record_worker_attempt(&attempt).map_err(error)?;
         store
             .observe_run_exit(
                 &run_id,
                 result.status.code(),
                 result.status.signal(),
                 result.stop_reason.map(|reason| reason.as_str()),
-                now()?,
+                finished_at,
             )
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
@@ -264,6 +291,13 @@ fn foreground_prepared(
     let capture = match execution {
         Ok(capture) => capture,
         Err(failure) => {
+            let attempt_failure = if attempt.finished_at.is_none() {
+                attempt.finished_at = Some(now()?);
+                attempt.termination_reason = Some("execution_failed".into());
+                store.record_worker_attempt(&attempt).err()
+            } else {
+                None
+            };
             store
                 .fail_run_execution(
                     &run_id,
@@ -278,10 +312,16 @@ fn foreground_prepared(
                         failure.message
                     ))
                 })?;
-            return Err(error(format!(
-                "Run {run_id}: {} (workspace retained)",
-                failure.message
-            )));
+            if let Some(persist) = attempt_failure {
+                return Err(error(format!(
+                    "Run {run_id}: {}; could not persist worker attempt failure: {persist} (workspace retained)",
+                    failure.message
+                )));
+            }
+            return Err(FabricError {
+                kind: failure.kind,
+                message: format!("Run {run_id}: {} (workspace retained)", failure.message),
+            });
         }
     };
     drop(reservation);
@@ -314,6 +354,7 @@ fn foreground_prepared(
         capture,
         artifact_manifest_id: run.artifact_manifest_id.map(|id| id.to_string()),
         cleanup: Some(cleanup),
+        worker_attempts: store.worker_attempts(&run_id).map_err(error)?,
         created_at: run.created_at,
         started_at: run.started_at,
         finished_at: run.finished_at,
@@ -358,7 +399,7 @@ pub fn run_many(
     if concurrency == 0 {
         return Err(error("Concurrency must be positive."));
     }
-    options.validate(harness.name())?;
+    options.validate()?;
     let inputs: Vec<TaskInput> =
         serde_json::from_slice(&std::fs::read(manifest).map_err(error)?)
             .map_err(|failure| error(format!("Invalid task manifest: {failure}")))?;

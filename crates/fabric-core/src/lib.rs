@@ -27,7 +27,7 @@ pub struct ToolReport {
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub platform: PlatformReport,
-    pub tools: [ToolReport; 2],
+    pub tools: Vec<ToolReport>,
 }
 
 pub fn doctor() -> DoctorReport {
@@ -39,11 +39,14 @@ pub fn doctor() -> DoctorReport {
             supported: cfg!(target_os = "macos"),
             primary_supported_os: "macos",
         },
-        tools: ["git", "omp"].map(|name| ToolReport {
-            name,
-            path: path
-                .as_ref()
-                .and_then(|path| fabric_runner::discover_executable(name, path)),
-        }),
+        tools: std::iter::once("git")
+            .chain(fabric_runner::HarnessRegistry::default().doctor_executables())
+            .map(|name| ToolReport {
+                name,
+                path: path
+                    .as_ref()
+                    .and_then(|path| fabric_runner::discover_executable(name, path)),
+            })
+            .collect(),
     }
 }

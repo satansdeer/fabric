@@ -2,7 +2,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use fabric_domain::FabricError;
+use fabric_domain::{FabricError, HarnessId};
 
 use crate::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo, execution_error};
 
@@ -31,8 +31,8 @@ impl OmpHarness {
 }
 
 impl HarnessAdapter for OmpHarness {
-    fn name(&self) -> &str {
-        "omp"
+    fn id(&self) -> HarnessId {
+        "omp".parse().expect("registered harness ID")
     }
 
     fn probe(&self) -> Result<HarnessInfo, FabricError> {
@@ -45,6 +45,7 @@ impl HarnessAdapter for OmpHarness {
                 "OMP --version did not return a supported omp/VERSION line.",
             ));
         }
+        fabric_domain::HarnessVersion::validate(&version)?;
         Ok(HarnessInfo { version })
     }
 

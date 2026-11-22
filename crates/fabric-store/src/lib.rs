@@ -3,8 +3,8 @@
 use std::{fmt, fs::OpenOptions, path::Path, str::FromStr, time::Duration};
 
 use fabric_domain::{
-    ArtifactManifestId, BatchId, CaptureMetadata, FabricError, PreparedStateId,
-    PreparedStateStatus, ProjectId, RunId, RunState, WorkspaceId, WorkspaceState,
+    ArtifactManifestId, BatchId, CaptureMetadata, FabricError, HarnessId, HarnessVersion,
+    PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState, WorkspaceId, WorkspaceState,
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
@@ -97,6 +97,27 @@ pub struct Run {
     pub error_kind: Option<String>,
     pub artifact_manifest_id: Option<ArtifactManifestId>,
     pub capture: Option<CaptureMetadata>,
+}
+
+/// Durable evidence for one invocation; independent of Run and workspace lifetime.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerAttempt {
+    pub attempt_id: String,
+    pub run_id: RunId,
+    pub harness_requested: HarnessId,
+    pub harness_resolved: HarnessId,
+    pub harness_version: String,
+    pub model_requested: Option<String>,
+    pub model_resolved: Option<String>,
+    pub profile_digest: Option<String>,
+    pub backend_id: String,
+    pub event_cursor: u64,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub termination_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -201,7 +222,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=8 => {}
+            1..=9 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -342,6 +363,10 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 8)?;
         }
+        if version < 9 {
+            transaction.execute_batch(include_str!("worker_attempts.sql"))?;
+            transaction.pragma_update(None, "user_version", 9)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -414,10 +439,92 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=8) {
+        if !matches!(version, 5..=9) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
+    }
+
+    /// Insert observed invocation evidence or monotonically advance an existing attempt.
+    /// Exact replays are idempotent; SQLite enforces immutable provenance and terminal evidence.
+    pub fn record_worker_attempt(&self, attempt: &WorkerAttempt) -> Result<()> {
+        if attempt.attempt_id.is_empty()
+            || attempt.attempt_id.len() > 128
+            || !attempt
+                .attempt_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(StoreError::InvalidRecord("invalid worker attempt ID"));
+        }
+        HarnessVersion::validate(&attempt.harness_version)?;
+        if attempt.backend_id.trim().is_empty() || attempt.event_cursor > i64::MAX as u64 {
+            return Err(StoreError::InvalidRecord(
+                "invalid worker attempt backend or cursor",
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO worker_attempts (
+                attempt_id, run_id, harness_requested, harness_resolved, harness_version,
+                model_requested, model_resolved, profile_digest, backend_id, event_cursor,
+                created_at, started_at, finished_at, exit_code, exit_signal, termination_reason
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                run_id=excluded.run_id, harness_requested=excluded.harness_requested,
+                harness_resolved=excluded.harness_resolved, harness_version=excluded.harness_version,
+                model_requested=excluded.model_requested, model_resolved=excluded.model_resolved,
+                profile_digest=excluded.profile_digest, backend_id=excluded.backend_id,
+                event_cursor=excluded.event_cursor, created_at=excluded.created_at,
+                started_at=excluded.started_at, finished_at=excluded.finished_at,
+                exit_code=excluded.exit_code, exit_signal=excluded.exit_signal,
+                termination_reason=excluded.termination_reason",
+            params![
+                attempt.attempt_id, attempt.run_id.as_str(), attempt.harness_requested.as_str(),
+                attempt.harness_resolved.as_str(), attempt.harness_version, attempt.model_requested,
+                attempt.model_resolved, attempt.profile_digest, attempt.backend_id,
+                attempt.event_cursor, attempt.created_at, attempt.started_at, attempt.finished_at,
+                attempt.exit_code, attempt.exit_signal, attempt.termination_reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Legacy runs have no invented invocation history, including on older read-only schemas.
+    pub fn worker_attempts(&self, run_id: &RunId) -> Result<Vec<WorkerAttempt>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 9 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT attempt_id, run_id, harness_requested, harness_resolved, harness_version,
+                model_requested, model_resolved, profile_digest, backend_id, event_cursor,
+                created_at, started_at, finished_at, exit_code, exit_signal, termination_reason
+             FROM worker_attempts WHERE run_id = ?1 ORDER BY attempt_id",
+        )?;
+        Ok(statement
+            .query_map([run_id.as_str()], |row| {
+                Ok(WorkerAttempt {
+                    attempt_id: row.get(0)?,
+                    run_id: read_id(row, 1)?,
+                    harness_requested: read_id(row, 2)?,
+                    harness_resolved: read_id(row, 3)?,
+                    harness_version: row.get(4)?,
+                    model_requested: row.get(5)?,
+                    model_resolved: row.get(6)?,
+                    profile_digest: row.get(7)?,
+                    backend_id: row.get(8)?,
+                    event_cursor: row.get(9)?,
+                    created_at: row.get(10)?,
+                    started_at: row.get(11)?,
+                    finished_at: row.get(12)?,
+                    exit_code: row.get(13)?,
+                    exit_signal: row.get(14)?,
+                    termination_reason: row.get(15)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn run_ids(&self) -> Result<Vec<RunId>> {
