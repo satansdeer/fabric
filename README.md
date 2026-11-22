@@ -2,9 +2,9 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-06
+## Implemented: FAB-01 through FAB-07
 
-The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, and private prepared snapshots. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Preparation cache reuse/concurrency, worker execution and cleanup commands are not implemented yet.
+The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, and reusable private prepared snapshots. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Worker execution and cleanup commands are not implemented yet.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 
@@ -80,7 +80,11 @@ One total wall-clock deadline covers source inspection, clone, all recipe steps 
 
 Before READY, Fabric rechecks ownership, private Git metadata and final HEAD, measures every file/link including ignored `.deps/ready`, fsyncs files/directories/marker, and removes write/group/other permissions from regular files and directories. Relative symlinks are preserved only when their complete target chain resolves inside the prepared tree; Fabric never opens/chmods through them and syncs their containing directories. Absolute/escaping/dangling/cyclic links, special files, hardlinked files, shared Git metadata or altered ownership markers fail closed. READY is published only by the final durable SQLite transition; a directory alone is never proof of readiness. The base must never be used as a writable worker directory.
 
-Failures retain staging and mark the state FAILED, never READY. No cleanup is attempted. An interrupted process can leave PREPARING staging for later reconciliation. Duplicate keys currently fail closed without rerunning preparation: cache reuse, concurrent serialization and incomplete-stage recovery belong to FAB-07. Changing committed HEAD or recipe yields a new key now. JSON reports state/project IDs, key, exact source SHA, recipe/environment digests, prepared path, status, timestamps and measured size; environment values are not persisted.
+Unchanged preparation keys reuse the same READY state ID without rerunning any recipe step. Before reuse, Fabric checks the exact expected managed path, private real directories, ownership marker, read-only tree, safe internal symlinks, recorded size, private Git metadata and recorded source HEAD; invalid caches fail closed without mutation or deletion. Changing committed HEAD, recipe semantics or declared environment values creates a separate state; dirty source edits and undeclared environment changes do not.
+
+Requests for the same project/key serialize across processes using a private kernel file lock held through validation and the final DB transition. Waiting consumes the request's total deadline. Lock files under `preparation-locks/` are permanent coordination inodes, not stale-PID leases; do not remove them while Fabric may be running. Process death releases the lock automatically. Different keys do not share a preparation lock.
+
+Failures retain staging and mark the state FAILED, never READY. After acquiring the key lock, a repeat request reconciles an interrupted PREPARING record to FAILED, even if staging looks complete or was never created. No staging is deleted, resumed or promoted. **FAILED keys are terminal:** recipe side effects may already have happened, so repeating the identical request refuses safely without rerunning or overwriting evidence. For a deliberate new attempt, change the recipe, committed source commit or declared environment input; changing a recipe comment alone does not change its semantic fingerprint. READY metadata is also never rewritten. JSON reports state/project IDs, key, exact source SHA, recipe/environment digests, prepared path, status, timestamps and measured size; environment values are not persisted.
 
 `fabric-domain` uses opaque caller-supplied IDs (1–128 ASCII letters, digits, `_` or `-`); it does not generate IDs or perform filesystem operations. State wire names follow the specification. Run transitions follow its queued/preparing/running/finalizing graph; terminal states cannot be rewritten. Repeating a state is a no-op. Workspace transitions never authorize deletion: the future storage/cleanup layers must still verify ownership, leases and durable recovery artifacts.
 
@@ -106,4 +110,4 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 ```
 
-After dependencies have been cached, add `--offline` to Cargo build/test/clippy commands to prohibit registry access as well. No paid model smoke run is part of these stories. Project/preparation tests use temporary local Git repositories, including dirty and newly committed sources, ignored dependencies, literal argv/environment handling, hook/config suppression, retained failures, process-group/total timeouts and fail-closed managed paths.
+After dependencies have been cached, add `--offline` to Cargo build/test/clippy commands to prohibit registry access as well. No paid model smoke run is part of these stories. Project/preparation tests use temporary local Git repositories, including dirty and newly committed sources, ignored dependencies, literal argv/environment handling, hook/config suppression, retained failures, process-group/total timeouts, fail-closed managed paths, once-only cache side effects, competing CLI processes, and interrupted-stage reconciliation.

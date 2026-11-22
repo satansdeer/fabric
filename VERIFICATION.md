@@ -49,3 +49,11 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Initial review found regular-only freezing excluded ordinary dependency symlinks; required correction before acceptance. Independently passed internal-link/declared-PATH and escaping-link regressions after fix; outside target unchanged.
 - One initial test command targeted the wrong crate; corrected to CLI. One narrow name filter selected zero tests; corrected using observed test names. No passing claim based on either.
 - Implementer final fmt/clippy/workspace gates passed (43 tests).
+
+## FAB-07
+
+- Reviewed kernel-lock lifetime, cached provenance/ownership validation and fail-closed orphan preparation handling.
+- Independently passed all 15 preparation tests, including reuse, invalidation, cross-process serialization and interrupted staging.
+- Actual CLI repeated the operator fixture preparation and returned the original state ID unchanged.
+- Operator decision: uncertain FAILED keys retain evidence and refuse same-key retry; changing fingerprint inputs permits a new attempt.
+- Implementer final fmt/clippy/workspace gates passed (49 tests).

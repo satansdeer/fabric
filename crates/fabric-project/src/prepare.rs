@@ -85,11 +85,69 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
     }
     let prepared = root.join("prepared");
     ensure_private_directory(&prepared)?;
-    let container = prepared.join(format!(
-        "{}-{}",
-        project.project_id, fingerprint.preparation_key
-    ));
+    let key = format!("{}-{}", project.project_id, fingerprint.preparation_key);
+    let container = prepared.join(&key);
     let tree = container.join("tree");
+    // Keep the kernel lock through validation/publication. It releases on process death;
+    // lock files remain in place so waiters can never lock different inodes for one key.
+    let _lock = preparation_lock(&root, &key, deadline)?;
+    if let Some(state) = store
+        .prepared_state_by_key(&project.project_id, &fingerprint.preparation_key)
+        .map_err(storage_error)?
+    {
+        if state.status == PreparedStateStatus::Preparing {
+            // No live preparer owns this key. Its recipe may already have had side effects:
+            // never publish or rerun an uncertain stage, even if it looks complete.
+            store
+                .finish_preparation(&state.state_id, PreparedStateStatus::Failed, None, 0)
+                .map_err(storage_error)?;
+        }
+        if state.status != PreparedStateStatus::Ready {
+            return Err(source_error(format!(
+                "Preparation {} FAILED; staging retained at {}. This key cannot be retried safely; change the recipe, committed source commit, or declared environment inputs for a new attempt.",
+                state.state_id, state.prepared_path
+            )));
+        }
+        if Path::new(&state.prepared_path) != tree
+            || state.source_commit_sha != fingerprint.source_commit_sha
+            || state.recipe_digest != fingerprint.recipe_digest
+            || state.harness_environment_digest.as_deref()
+                != Some(fingerprint.environment_digest.as_str())
+        {
+            return Err(storage_error(
+                "Cached preparation path or provenance does not match the requested managed state.",
+            ));
+        }
+        validate_container(&container, &state.state_id)?;
+        if fs::symlink_metadata(&container)
+            .map_err(storage_error)?
+            .mode()
+            & 0o200
+            != 0
+            || fs::symlink_metadata(container.join(".fabric-owner"))
+                .map_err(storage_error)?
+                .mode()
+                & 0o200
+                != 0
+        {
+            return Err(storage_error(
+                "Cached READY ownership must remain read-only.",
+            ));
+        }
+        private_git(&tree)?;
+        if verify_tree(&tree, &tree, deadline, false)? != state.size_bytes {
+            return Err(storage_error(
+                "Cached READY tree size does not match its record.",
+            ));
+        }
+        let head = git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
+        if git_text(&head)? != state.source_commit_sha {
+            return Err(source_error(
+                "Cached READY HEAD does not match its recorded source.",
+            ));
+        }
+        return Ok(state);
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(storage_error)?;
@@ -114,7 +172,6 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
         verified_at: None,
         size_bytes: 0,
     };
-    // A duplicate key currently fails closed. FAB-07 owns reuse and serialization.
     store.create_prepared_state(&state).map_err(storage_error)?;
     let result = (|| {
         fs::DirBuilder::new()
@@ -184,7 +241,7 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
                 "Preparation changed the pinned Git HEAD; refusing READY.",
             ));
         }
-        let size = sync_and_freeze(&tree, &tree, deadline)?;
+        let size = verify_tree(&tree, &tree, deadline, true)?;
         fs::set_permissions(
             container.join(".fabric-owner"),
             fs::Permissions::from_mode(0o400),
@@ -240,6 +297,45 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
                 error
             )))
         }
+    }
+}
+
+fn preparation_lock(root: &Path, key: &str, deadline: Instant) -> Result<File, FabricError> {
+    let directory = root.join("preparation-locks");
+    ensure_private_directory(&directory)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(directory.join(format!("{key}.lock")))
+        .map_err(storage_error)?;
+    let meta = file.metadata().map_err(storage_error)?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.nlink() != 1
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(storage_error(
+            "Preparation lock must be a private owned regular file.",
+        ));
+    }
+    loop {
+        check_deadline(deadline)?;
+        // SAFETY: file owns this descriptor for the entire lock lifetime.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock
+            && error.kind() != std::io::ErrorKind::Interrupted
+        {
+            return Err(storage_error(error));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -498,7 +594,12 @@ fn validate_symlink(root: &Path, path: &Path, deadline: Instant) -> Result<(), F
     Ok(())
 }
 
-fn sync_and_freeze(root: &Path, path: &Path, deadline: Instant) -> Result<u64, FabricError> {
+fn verify_tree(
+    root: &Path,
+    path: &Path,
+    deadline: Instant,
+    freeze: bool,
+) -> Result<u64, FabricError> {
     check_deadline(deadline)?;
     let meta = fs::symlink_metadata(path).map_err(storage_error)?;
     // SAFETY: geteuid has no preconditions.
@@ -512,14 +613,20 @@ fn sync_and_freeze(root: &Path, path: &Path, deadline: Instant) -> Result<u64, F
         // Never open/chmod through a link; its containing directory is synced below.
         return Ok(meta.len());
     }
+    if !freeze && meta.mode() & 0o277 != 0 {
+        return Err(storage_error(
+            "Cached READY tree permissions are no longer immutable.",
+        ));
+    }
     let (size, mode) = if meta.is_dir() {
         let mut size = 0u64;
         for entry in fs::read_dir(path).map_err(storage_error)? {
             size = size
-                .checked_add(sync_and_freeze(
+                .checked_add(verify_tree(
                     root,
                     &entry.map_err(storage_error)?.path(),
                     deadline,
+                    freeze,
                 )?)
                 .ok_or_else(|| storage_error("Prepared size overflow."))?;
         }
@@ -531,9 +638,11 @@ fn sync_and_freeze(root: &Path, path: &Path, deadline: Instant) -> Result<u64, F
             "Special files and hardlinked files are forbidden in prepared trees.",
         ));
     };
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(storage_error)?;
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(storage_error)?;
+    if freeze {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(storage_error)?;
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(storage_error)?;
+    }
     Ok(size)
 }

@@ -506,3 +506,323 @@ fn escaping_symlinks_fail_without_mutating_external_target() {
         assert!(state.verified_at.is_none());
     }
 }
+
+fn counted_request(fixture: &Fixture, recipe: &Path) -> Command {
+    let mut command = fixture.cli();
+    command
+        .env("COUNTER", fixture.0.join("counter"))
+        .env("GATE", fixture.0.join("gate"))
+        .args(["project", "prepare", "test", "--json", "--recipe"])
+        .arg(recipe);
+    command
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "missing {}", path.display());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn ready_cache_reuses_once_and_commit_recipe_environment_separate_states() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let content = "version=1\nenvironment=['COUNTER','SELECTED']\n[[steps]]\nargv=['/bin/sh','-c','printf x >> \"$COUNTER\"; mkdir .deps; printf ready > .deps/ready; ln -s ready .deps/link']\n";
+    let recipe = fixture.recipe(content);
+    let first = json(&counted_request(&fixture, &recipe).output().unwrap());
+    let tree = Path::new(first["prepared_path"].as_str().unwrap());
+    let modified = fs::metadata(tree.join(".deps/ready"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::write(repo.join("tracked"), "uncommitted\n").unwrap();
+    let second = json(
+        &counted_request(&fixture, &recipe)
+            .env("UNDECLARED", "ignored")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(first, second);
+    assert_eq!(fs::read_to_string(fixture.0.join("counter")).unwrap(), "x");
+    assert_eq!(
+        fs::metadata(tree.join(".deps/ready"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified
+    );
+    assert_eq!(
+        fs::read_link(tree.join(".deps/link")).unwrap(),
+        Path::new("ready")
+    );
+    let selected = json(
+        &counted_request(&fixture, &recipe)
+            .env("SELECTED", "changed")
+            .output()
+            .unwrap(),
+    );
+    assert_ne!(first["state_id"], selected["state_id"]);
+    let recipe = fixture.recipe(&content.replace("printf ready", "printf changed"));
+    let changed_recipe = json(&counted_request(&fixture, &recipe).output().unwrap());
+    assert_ne!(first["state_id"], changed_recipe["state_id"]);
+    git(&repo, &["commit", "--quiet", "-am", "new committed head"]);
+    let changed_commit = json(&counted_request(&fixture, &recipe).output().unwrap());
+    assert_ne!(changed_recipe["state_id"], changed_commit["state_id"]);
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("counter")).unwrap(),
+        "xxxx"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join(".deps/ready")).unwrap(),
+        "ready"
+    );
+}
+
+#[test]
+fn concurrent_processes_wait_and_reuse_one_ready_publication() {
+    use std::process::Stdio;
+    let fixture = Fixture::new();
+    fixture.repo();
+    let recipe = fixture.recipe("version=1\nenvironment=['COUNTER','GATE']\n[[steps]]\nargv=['/bin/sh','-c','printf x >> \"$COUNTER\"; while test ! -f \"$GATE\"; do sleep 0.01; done; printf ready > result']\n");
+    let mut children = Vec::new();
+    for _ in 0..4 {
+        children.push(
+            counted_request(&fixture, &recipe)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    wait_for(&fixture.0.join("counter"));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        children
+            .iter_mut()
+            .all(|child| child.try_wait().unwrap().is_none())
+    );
+    fs::write(fixture.0.join("gate"), "release").unwrap();
+    let reports: Vec<_> = children
+        .into_iter()
+        .map(|child| json(&child.wait_with_output().unwrap()))
+        .collect();
+    assert!(reports.iter().all(|report| report == &reports[0]));
+    assert_eq!(fs::read_to_string(fixture.0.join("counter")).unwrap(), "x");
+}
+
+#[test]
+fn killed_preparation_reconciles_failed_and_repeat_retains_uncertain_evidence() {
+    use std::process::Stdio;
+    let fixture = Fixture::new();
+    fixture.repo();
+    let recipe = fixture.recipe("version=1\nenvironment=['COUNTER','GATE']\n[[steps]]\nargv=['/bin/sh','-c','printf retained > evidence; printf x >> \"$COUNTER\"; while test ! -f \"$GATE\"; do sleep 0.01; done']\n");
+    let mut child = counted_request(&fixture, &recipe)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&fixture.0.join("counter"));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // Let the orphaned trusted recipe exit; recovery must never publish its tree.
+    fs::write(fixture.0.join("gate"), "release").unwrap();
+    let container = fs::read_dir(fixture.0.join("storage/prepared"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = fs::read_to_string(container.join(".fabric-owner"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    assert_eq!(
+        store.prepared_state(&id).unwrap().unwrap().status,
+        fabric_domain::PreparedStateStatus::Preparing
+    );
+    for _ in 0..2 {
+        let out = counted_request(&fixture, &recipe).output().unwrap();
+        assert!(!out.status.success());
+        let message = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            message.contains("FAILED") && message.contains("retained"),
+            "{message}"
+        );
+        assert!(
+            message.contains("recipe") && message.contains("commit"),
+            "{message}"
+        );
+        let state = store.prepared_state(&id).unwrap().unwrap();
+        assert_eq!(state.status, fabric_domain::PreparedStateStatus::Failed);
+        assert!(state.verified_at.is_none());
+        assert_eq!(
+            fs::read_to_string(container.join("tree/evidence")).unwrap(),
+            "retained"
+        );
+    }
+    assert_eq!(fs::read_to_string(fixture.0.join("counter")).unwrap(), "x");
+}
+
+#[test]
+fn failed_recipe_repeats_without_overwriting_or_rerunning() {
+    let fixture = Fixture::new();
+    fixture.repo();
+    let recipe = fixture.recipe("version=1\nenvironment=['COUNTER']\n[[steps]]\nargv=['/bin/sh','-c','printf x >> \"$COUNTER\"; printf retained > evidence; exit 7']\n");
+    for _ in 0..2 {
+        let out = counted_request(&fixture, &recipe).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("retained"));
+    }
+    assert_eq!(fs::read_to_string(fixture.0.join("counter")).unwrap(), "x");
+    assert_eq!(
+        fs::read_dir(fixture.0.join("storage/prepared"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cache_refuses_tampered_marker_source_and_managed_paths_without_deletion() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for tamper in ["marker", "source", "tree", "container", "prepared", "lock"] {
+        let fixture = Fixture::new();
+        fixture.repo();
+        let recipe = fixture.recipe("version=1\nenvironment=['COUNTER']\n[[steps]]\nargv=['/bin/sh','-c','printf x >> \"$COUNTER\"; printf ready > result']\n");
+        let report = json(&counted_request(&fixture, &recipe).output().unwrap());
+        let tree = Path::new(report["prepared_path"].as_str().unwrap());
+        let container = tree.parent().unwrap();
+        let outside = fixture.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "untouched").unwrap();
+        match tamper {
+            "marker" => {
+                let marker = container.join(".fabric-owner");
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(marker, "wrong owner").unwrap();
+            }
+            "source" => {
+                let head = tree.join(".git/HEAD");
+                fs::set_permissions(&head, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(&head, format!("{}\n", "0".repeat(40))).unwrap();
+                fs::set_permissions(head, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            "lock" => {
+                let lock = fixture.0.join("storage/preparation-locks").join(format!(
+                    "{}-{}.lock",
+                    report["project_id"].as_str().unwrap(),
+                    report["preparation_key"].as_str().unwrap()
+                ));
+                fs::remove_file(&lock).unwrap();
+                symlink(outside.join("sentinel"), lock).unwrap();
+            }
+            _ => {
+                let target = match tamper {
+                    "tree" => tree.to_path_buf(),
+                    "container" => container.to_path_buf(),
+                    _ => fixture.0.join("storage/prepared"),
+                };
+                if tamper == "tree" {
+                    fs::set_permissions(container, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::rename(&target, target.with_extension("retained")).unwrap();
+                symlink(&outside, &target).unwrap();
+            }
+        }
+        assert!(
+            !counted_request(&fixture, &recipe)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{tamper}"
+        );
+        assert_eq!(fs::read_to_string(fixture.0.join("counter")).unwrap(), "x");
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "untouched"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+        let state = store
+            .prepared_state(&report["state_id"].as_str().unwrap().parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, fabric_domain::PreparedStateStatus::Ready);
+    }
+}
+
+#[test]
+fn orphan_record_without_stage_and_outside_cached_path_fail_closed() {
+    use fabric_domain::{PreparedStateId, PreparedStateStatus};
+    for ready in [false, true] {
+        let fixture = Fixture::new();
+        let repo = fixture.repo();
+        let recipe_path = fixture.recipe(
+            "version=1\n[[steps]]\nargv=['/bin/sh','-c','printf unexpected > recipe-ran']\n",
+        );
+        let recipe =
+            fabric_project::recipe::Recipe::parse(&fs::read_to_string(&recipe_path).unwrap())
+                .unwrap();
+        let fingerprint = recipe
+            .fingerprint(&git(&repo, &["rev-parse", "HEAD"]), &Default::default())
+            .unwrap();
+        let root = fixture.0.join("storage").canonicalize().unwrap();
+        let mut store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+        let project = store.project_by_name("test").unwrap().unwrap();
+        let outside = fixture.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "untouched").unwrap();
+        let expected = root
+            .join("prepared")
+            .join(format!(
+                "{}-{}",
+                project.project_id, fingerprint.preparation_key
+            ))
+            .join("tree");
+        let state = fabric_store::PreparedState {
+            state_id: PreparedStateId::try_from("seeded".to_owned()).unwrap(),
+            project_id: project.project_id,
+            preparation_key: fingerprint.preparation_key,
+            source_commit_sha: fingerprint.source_commit_sha,
+            recipe_digest: fingerprint.recipe_digest,
+            harness_environment_digest: Some(fingerprint.environment_digest),
+            prepared_path: if ready { &outside } else { &expected }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            status: PreparedStateStatus::Preparing,
+            created_at: 1,
+            verified_at: None,
+            size_bytes: 0,
+        };
+        store.create_prepared_state(&state).unwrap();
+        if ready {
+            store
+                .finish_preparation(&state.state_id, PreparedStateStatus::Ready, Some(1), 0)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            assert!(!fixture.prepare(&recipe_path).status.success());
+            let actual = store.prepared_state(&state.state_id).unwrap().unwrap();
+            assert_eq!(
+                actual.status,
+                if ready {
+                    PreparedStateStatus::Ready
+                } else {
+                    PreparedStateStatus::Failed
+                }
+            );
+            assert_eq!(
+                fs::read_to_string(outside.join("sentinel")).unwrap(),
+                "untouched"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+            assert!(!expected.exists());
+        }
+    }
+}

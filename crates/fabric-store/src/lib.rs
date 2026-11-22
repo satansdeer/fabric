@@ -230,21 +230,24 @@ impl Store {
              harness_environment_digest, prepared_path, status, created_at, verified_at, size_bytes
              FROM prepared_states WHERE state_id = ?1",
                 [id.as_str()],
-                |r| {
-                    Ok(PreparedState {
-                        state_id: read_id(r, 0)?,
-                        project_id: read_id(r, 1)?,
-                        preparation_key: r.get(2)?,
-                        source_commit_sha: r.get(3)?,
-                        recipe_digest: r.get(4)?,
-                        harness_environment_digest: r.get(5)?,
-                        prepared_path: r.get(6)?,
-                        status: read_state(r, 7)?,
-                        created_at: r.get(8)?,
-                        verified_at: r.get(9)?,
-                        size_bytes: r.get(10)?,
-                    })
-                },
+                read_prepared_state,
+            )
+            .optional()?)
+    }
+
+    pub fn prepared_state_by_key(
+        &self,
+        project_id: &ProjectId,
+        preparation_key: &str,
+    ) -> Result<Option<PreparedState>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT state_id, project_id, preparation_key, source_commit_sha, recipe_digest,
+                 harness_environment_digest, prepared_path, status, created_at, verified_at, size_bytes
+                 FROM prepared_states WHERE project_id = ?1 AND preparation_key = ?2",
+                params![project_id.as_str(), preparation_key],
+                read_prepared_state,
             )
             .optional()?)
     }
@@ -503,5 +506,21 @@ fn read_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         source_path: row.get(2)?,
         default_ref: row.get(3)?,
         created_at: row.get(4)?,
+    })
+}
+
+fn read_prepared_state(row: &Row<'_>) -> rusqlite::Result<PreparedState> {
+    Ok(PreparedState {
+        state_id: read_id(row, 0)?,
+        project_id: read_id(row, 1)?,
+        preparation_key: row.get(2)?,
+        source_commit_sha: row.get(3)?,
+        recipe_digest: row.get(4)?,
+        harness_environment_digest: row.get(5)?,
+        prepared_path: row.get(6)?,
+        status: read_state(row, 7)?,
+        created_at: row.get(8)?,
+        verified_at: row.get(9)?,
+        size_bytes: row.get(10)?,
     })
 }
