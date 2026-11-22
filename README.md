@@ -28,6 +28,8 @@ Issue-driven development: [local approval and worker workflow](docs/ISSUE_WORKFL
 
 Hosted GitHub intake: [Connect deployment and supervised consumer](docs/CONNECT.md), tracked in [#18](https://github.com/satansdeer/fabric/issues/18). Implementation passes provider-free end-to-end checks; launch is blocked by exhausted Netlify credits and missing `polyglo.tv` registration/delegation. A signed webhook queues work but cannot authorize execution or model spending.
 
+External trusted-local plugins: [installation, protocol v1 and authority boundary](docs/PLUGIN_PROTOCOL.md).
+
 **Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v13 adds bounded local observations to v12's immutable capture context; older runs have no retrospective activity samples and lacking capture evidence remain retained.
 
 ```sh

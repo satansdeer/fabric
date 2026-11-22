@@ -44,6 +44,17 @@ impl HarnessRegistry {
         id: &HarnessId,
         options: &RegistryOptions,
     ) -> Result<Box<dyn HarnessAdapter>, FabricError> {
+        if !self.entries.contains_key(id) {
+            if options.fake_binary.is_some() {
+                return Err(crate::execution_error(
+                    "External plugins do not accept --fake-binary.",
+                ));
+            }
+            if let Some(registry) = crate::plugin::configured_registry()? {
+                let manifest = registry.select(id, crate::plugin::PluginKind::Harness)?;
+                return Ok(Box::new(crate::plugin::PluginHarness::new(manifest)?));
+            }
+        }
         let registration = self.entries.get(id).ok_or_else(|| FabricError {
             kind: ErrorKind::UnknownHarness,
             message: format!("Unknown harness {id}; no adapter is registered."),

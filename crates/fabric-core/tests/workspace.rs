@@ -752,3 +752,56 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
     );
     assert_eq!(fixture.store().run(&request.run_id).unwrap().unwrap(), done);
 }
+
+#[test]
+fn external_plugin_reclaim_claim_cannot_bypass_artifacts_or_ownership() {
+    use fabric_runner::plugin::{PluginHost, PluginKind, PluginManifest, ProtocolRange};
+    let fixture = Fixture::new();
+    let request = fixture.request("plugin-reclaim");
+    let workspace = create_workspace(
+        &fixture.root,
+        &fixture.backend(),
+        &request,
+        fixture.state.size_bytes,
+    )
+    .unwrap();
+    let tree = workspace.path().to_owned();
+    let manifest = PluginManifest {
+        id: "external-target".parse().unwrap(),
+        version: "1.0.0".into(),
+        protocol: ProtocolRange { min: 1, max: 1 },
+        kind: PluginKind::Target,
+        executable: "/usr/bin/python3".into(),
+        args: vec![
+            format!(
+                "{}/../fabric-runner/tests/fixtures/plugin.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "target".into(),
+            "reclaim".into(),
+            fixture.temp.path().join("pid").display().to_string(),
+        ],
+        capabilities: vec!["target.plan".into()],
+    };
+    let error = PluginHost::default()
+        .target_plan(&manifest, &fabric_runner::CancellationToken::default())
+        .unwrap_err();
+    assert!(!error.message.contains("SECRET_CANARY"));
+    drop(workspace);
+    // The external result claims artifact verification and deletion authority.
+    // Existing Core recovery still retains the workspace with missing evidence.
+    let report = fabric_core::workspace::recover(&fixture.root, &request.run_id, true).unwrap();
+    assert_ne!(report.action, "reclaimed");
+    assert!(tree.join("tracked").is_file());
+    assert!(
+        fixture
+            .store()
+            .artifacts(&request.run_id)
+            .unwrap()
+            .is_empty()
+    );
+    fs::remove_file(tree.parent().unwrap().join(".fabric-owner")).unwrap();
+    assert!(runner_workspace(&fixture.root, &request.run_id).is_err());
+    let _ = fabric_core::workspace::recover(&fixture.root, &request.run_id, true);
+    assert!(tree.join("tracked").is_file());
+}
