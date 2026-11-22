@@ -512,7 +512,7 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
     use fabric_runner::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo};
     struct Tamper<'a> {
         fixture: &'a Fixture,
-        id: std::cell::RefCell<Option<RunId>>,
+        id: std::sync::Mutex<Option<RunId>>,
     }
     impl HarnessAdapter for Tamper<'_> {
         fn id(&self) -> fabric_domain::HarnessId {
@@ -558,11 +558,13 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
             let marker = spec.prompt_file.parent().unwrap().join(".fabric-owner");
             let text = fs::read_to_string(&marker).unwrap();
             self.id
-                .replace(Some(text.lines().nth(2).unwrap().parse().unwrap()));
+                .lock()
+                .unwrap()
+                .replace(text.lines().nth(2).unwrap().parse().unwrap());
             let attempts = self
                 .fixture
                 .store()
-                .worker_attempts(self.id.borrow().as_ref().unwrap())
+                .worker_attempts(self.id.lock().unwrap().as_ref().unwrap())
                 .unwrap();
             assert_eq!(attempts.len(), 1);
             assert_eq!(attempts[0].harness_requested, self.id());
@@ -586,7 +588,7 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
     let fixture = Fixture::new();
     let harness = Tamper {
         fixture: &fixture,
-        id: std::cell::RefCell::new(None),
+        id: std::sync::Mutex::new(None),
     };
     let prompt = fixture.temp.path().join("prompt");
     fs::write(&prompt, "literal prompt").unwrap();
@@ -606,7 +608,7 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
     assert!(!fixture.temp.path().join("MUST_NOT_RUN").exists());
     let store = fixture.store();
     let run = store
-        .run(harness.id.borrow().as_ref().unwrap())
+        .run(harness.id.lock().unwrap().as_ref().unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(run.state, RunState::NeedsAttention);
@@ -675,6 +677,8 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
         stderr: empty.clone(),
         events: empty,
         event_counts: fabric_domain::EventCounts::default(),
+        normalized_event_count: 0,
+        native_failure: None,
     };
     let manifest = "manifest-lifecycle".parse().unwrap();
     assert!(

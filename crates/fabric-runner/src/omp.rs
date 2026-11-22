@@ -3,11 +3,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use fabric_domain::{
-    CapabilitySupport, FabricError, HarnessCapabilityManifest, HarnessId, HarnessPlan,
-    HarnessRequest,
+    AgentEvent, Capability, CapabilitySupport, FabricError, HarnessCapabilityManifest, HarnessId,
+    HarnessPlan, HarnessRequest,
 };
 
-use crate::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo, execution_error};
+use crate::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo, NativeEvent, execution_error};
 
 const SUPPORTED_VERSION: &str = "omp/19.1.0";
 
@@ -47,12 +47,22 @@ impl HarnessAdapter for OmpHarness {
     }
 
     fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
-        crate::planning::local_manifest(
+        let mut manifest = crate::planning::local_manifest(
             self.id(),
             info,
             SUPPORTED_VERSION,
             CapabilitySupport::Native,
-        )
+        )?;
+        let usage = manifest
+            .capabilities
+            .iter_mut()
+            .find(|status| status.capability == Capability::UsageReport)
+            .expect("complete manifest");
+        usage.support = CapabilitySupport::Native;
+        usage.reason.code = "tested_message_end_usage".into();
+        usage.reason.message = "Pinned print-mode assistant message_end reports token usage when available; absent usage/pricing remains unknown.".into();
+        usage.minimum_version = Some(SUPPORTED_VERSION.into());
+        Ok(manifest)
     }
 
     fn plan(
@@ -87,6 +97,68 @@ impl HarnessAdapter for OmpHarness {
             args,
             environment: self.environment.clone(),
         })
+    }
+
+    fn normalize_event(&self, event: NativeEvent<'_>) -> Option<AgentEvent> {
+        // v19.1.0 print-mode.ts printableEvent and agent/src/types.ts:
+        // message_update drops snapshots; authoritative usage is on message_end.
+        let NativeEvent::Json(value) = event else {
+            return None;
+        };
+        match value["type"].as_str()? {
+            "message_update" => {
+                let update = &value["assistantMessageEvent"];
+                match update["type"].as_str()? {
+                    "text_delta" => Some(AgentEvent::Output {
+                        stream: "stdout".into(),
+                        text: update["delta"].as_str()?.into(),
+                    }),
+                    _ => None,
+                }
+            }
+            "tool_execution_start" | "tool_execution_end" => Some(AgentEvent::Tool {
+                name: value["toolName"].as_str()?.into(),
+                phase: if value["type"] == "tool_execution_start" {
+                    "start"
+                } else {
+                    "end"
+                }
+                .into(),
+            }),
+            "message_end" if value["message"]["role"] == "assistant" => {
+                let message = &value["message"];
+                let usage = message.get("usage")?.as_object()?;
+                Some(AgentEvent::Usage {
+                    input_tokens: usage.get("input").and_then(serde_json::Value::as_u64),
+                    output_tokens: usage.get("output").and_then(serde_json::Value::as_u64),
+                    cached_input_tokens: usage.get("cacheRead").and_then(serde_json::Value::as_u64),
+                    // The native cost field carries no pricing provenance;
+                    // zero cannot distinguish missing pricing from free billing.
+                    cost_usd: usage
+                        .get("cost")
+                        .and_then(|cost| cost["total"].as_f64())
+                        .filter(|cost| cost.is_finite() && *cost > 0.0),
+                })
+            }
+            "agent_end" if value["isTerminal"] == true => {
+                let message = value["messages"]
+                    .as_array()?
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "assistant")?;
+                if message["stopReason"] != "error" {
+                    return None;
+                }
+                Some(AgentEvent::Failure {
+                    code: "omp_terminal_error".into(),
+                    message: message["errorMessage"]
+                        .as_str()
+                        .unwrap_or("Terminal assistant turn failed")
+                        .into(),
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -140,6 +212,7 @@ mod tests {
         let command = harness
             .command(&AgentSpec {
                 prompt_file: &prompt,
+                request: &request,
                 max_cost_usd: plan.request.max_cost_usd,
             })
             .unwrap();
@@ -230,10 +303,71 @@ mod tests {
                 harness
                     .command(&AgentSpec {
                         prompt_file: &prompt,
+                        request: &HarnessRequest::default(),
                         max_cost_usd: None,
                     })
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn pinned_print_events_preserve_unknown_usage_and_only_terminal_errors_are_fatal() {
+        let harness = OmpHarness {
+            binary: "/unused".into(),
+            environment: Vec::new(),
+        };
+        let normalize =
+            |value: serde_json::Value| harness.normalize_event(NativeEvent::Json(&value));
+        assert_eq!(
+            normalize(serde_json::json!({
+                "type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}
+            })),
+            Some(AgentEvent::Output {
+                stream: "stdout".into(),
+                text: "hello".into()
+            })
+        );
+        assert!(normalize(serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"error","reason":"error"}})).is_none());
+        assert!(matches!(
+            normalize(
+                serde_json::json!({"type":"tool_execution_end","toolName":"bash","isError":true})
+            ),
+            Some(AgentEvent::Tool { .. })
+        ));
+        assert!(normalize(serde_json::json!({"type":"message_end","message":{"role":"assistant","stopReason":"error"}})).is_none());
+        assert_eq!(
+            normalize(serde_json::json!({"type":"message_end","message":{
+                "role":"assistant","usage":{"input":9,"cost":{"total":0}}
+            }})),
+            Some(AgentEvent::Usage {
+                input_tokens: Some(9),
+                output_tokens: None,
+                cached_input_tokens: None,
+                cost_usd: None
+            })
+        );
+        assert_eq!(
+            normalize(serde_json::json!({"type":"message_end","message":{
+                "role":"assistant","usage":{"output":2,"cacheRead":3,"cost":{"total":0.2}}
+            }})),
+            Some(AgentEvent::Usage {
+                input_tokens: None,
+                output_tokens: Some(2),
+                cached_input_tokens: Some(3),
+                cost_usd: Some(0.2)
+            })
+        );
+        for terminal in [false, true] {
+            let event = normalize(serde_json::json!({"type":"agent_end","isTerminal":terminal,
+                "messages":[{"role":"assistant","stopReason":"error","errorMessage":"request failed"}]}));
+            assert_eq!(matches!(event, Some(AgentEvent::Failure { .. })), terminal);
+        }
+        assert!(normalize(serde_json::json!({"type":"agent_end","isTerminal":true,
+            "messages":[{"role":"assistant","stopReason":"error"},{"role":"assistant","stopReason":"stop"}]})).is_none());
+        assert!(
+            normalize(serde_json::json!({"type":"unrecognized","error":"not a fatal event"}))
+                .is_none()
+        );
     }
 }

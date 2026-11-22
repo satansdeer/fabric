@@ -128,6 +128,242 @@ fn json(out: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn mixed_harness_batch_normalizes_events_and_rejects_late_unsupported_requests_atomically() {
+    let fixture = Fixture::new();
+    let (repo, base) = fixture.setup();
+    let prompts = fixture.0.join("mixed");
+    fs::create_dir(&prompts).unwrap();
+    for name in ["a", "b"] {
+        fs::write(
+            prompts.join(format!("{name}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "required_files": [".deps/ready"],
+                "writes": [{"path":"tracked","content":name}],
+                "absent_environment": ["HOME", "UNSELECTED_SECRET"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let manifest = prompts.join("tasks.json");
+    let tasks = serde_json::json!([
+        {"id":"json","prompt_file":"a.json","harness":"fake-a","request":{"model":"literal-model"}},
+        {"id":"text","prompt_file":"b.json","harness":"fake-b","request":{}}
+    ]);
+    fs::write(&manifest, serde_json::to_vec(&tasks).unwrap()).unwrap();
+    let invoke = || {
+        fixture
+            .cli()
+            .args(["run-many", "test", "--tasks"])
+            .arg(&manifest)
+            .args([
+                "--concurrency",
+                "2",
+                "--copy-limit-bytes",
+                "10485760",
+                "--model",
+                "default-must-not-override-explicit-request",
+                "--json",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+    };
+    let report = json(&invoke());
+    assert_eq!(report["succeeded"], true);
+    let results: Vec<_> = report["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| &task["result"])
+        .collect();
+    assert_ne!(results[0]["workspace_id"], results[1]["workspace_id"]);
+    for (index, result) in results.iter().enumerate() {
+        let harness = ["fake-a", "fake-b"][index];
+        assert_eq!(result["harness"], harness);
+        assert_eq!(result["prepared_state_id"], base["state_id"]);
+        assert_eq!(result["base_commit_sha"], base["source_commit_sha"]);
+        assert_eq!(result["state"], "SUCCEEDED");
+        assert_eq!(result["exit_code"], 0);
+        let attempt = &result["worker_attempts"][0];
+        assert_eq!(attempt["harness_requested"], harness);
+        assert_eq!(attempt["harness_resolved"], harness);
+        assert_eq!(attempt["backend_id"], "trusted-local");
+        assert_eq!(attempt["termination_reason"], serde_json::Value::Null);
+        assert_eq!(
+            attempt["event_cursor"],
+            result["capture"]["normalized_event_count"]
+        );
+        assert!(attempt["event_cursor"].as_u64().unwrap() >= 4);
+        assert_eq!(result["capture"]["native_failure"], serde_json::Value::Null);
+        assert_eq!(result["capture"]["truncated"], false);
+        verified_manifest(&fixture, result);
+        assert!(!Path::new(result["workspace_path"].as_str().unwrap()).exists());
+        let restored = restored_workspace(&fixture, result);
+        assert_eq!(
+            fs::read_to_string(restored.join("tracked")).unwrap(),
+            ["a", "b"][index]
+        );
+        let container = artifact_container(&fixture, result);
+        let events: Vec<serde_json::Value> = fs::read_to_string(container.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                record.get("event").cloned()
+            })
+            .collect();
+        assert_eq!(events.first().unwrap()["type"], "started");
+        assert_eq!(events.last().unwrap()["type"], "completed");
+        assert_eq!(events.last().unwrap()["success"], true);
+        assert!(events.iter().any(|event| event["type"] == "output"));
+        assert!(events.iter().any(|event| event["type"] == "tool"));
+        assert_eq!(
+            events.len() as u64,
+            attempt["event_cursor"].as_u64().unwrap()
+        );
+        if index == 0 {
+            assert_eq!(attempt["model_requested"], "literal-model");
+            assert_eq!(attempt["model_resolved"], "literal-model");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["type"] == "usage"
+                        && event["input_tokens"].as_u64().is_some())
+            );
+            assert!(
+                fs::read_to_string(container.join("stdout.log"))
+                    .unwrap()
+                    .contains("literal-model")
+            );
+        } else {
+            assert!(attempt["model_requested"].is_null());
+            assert!(attempt["model_resolved"].is_null());
+            assert!(!events.iter().any(|event| event["type"] == "usage"));
+            assert!(
+                serde_json::from_str::<serde_json::Value>(
+                    fs::read_to_string(container.join("stdout.log"))
+                        .unwrap()
+                        .lines()
+                        .next()
+                        .unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(base["prepared_path"].as_str().unwrap()).join("tracked"))
+            .unwrap(),
+        "original"
+    );
+    let inventory = || {
+        let db = rusqlite::Connection::open_with_flags(
+            fixture.0.join("storage/fabric.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        [
+            "runs",
+            "workspaces",
+            "batches",
+            "batch_tasks",
+            "worker_attempts",
+        ]
+        .map(|table| {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    let before = inventory();
+    let mut unsupported = tasks;
+    for request in [
+        serde_json::json!({"model":"forbidden"}),
+        serde_json::json!({"resume":"prior-session"}),
+    ] {
+        unsupported[1]["request"] = request;
+        fs::write(&manifest, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        let failure = invoke();
+        assert!(!failure.status.success(), "{failure:?}");
+        assert!(failure.stdout.is_empty());
+        let failure: serde_json::Value = serde_json::from_slice(&failure.stderr).unwrap();
+        assert_eq!(failure["error"]["kind"], "unsupported_capability");
+        assert_eq!(inventory(), before);
+    }
+    for directory in ["workspaces", "fork-staging"] {
+        let path = fixture.0.join("storage").join(directory);
+        assert!(!path.exists() || fs::read_dir(path).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn native_fatal_zero_exit_is_durably_failed_even_after_capture_truncation() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let binary = fixture.script_fake(
+        "head -c 8192 /dev/zero | tr '\\000' x\nprintf '\\n{\"type\":\"failure\",\"code\":\"fixture_fatal\",\"message\":\"native fatal\"}\\n'\nexit 0",
+    );
+    let prompt = fixture.0.join("fatal.json");
+    fs::write(&prompt, "{}").unwrap();
+    for limit in [1024, 1048576] {
+        let output = fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(&binary)
+            .arg("--prompt-file")
+            .arg(&prompt)
+            .args([
+                "--json",
+                "--copy-limit-bytes",
+                "10485760",
+                "--max-log-bytes",
+            ])
+            .arg(limit.to_string())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["state"], "FAILED");
+        assert_eq!(report["exit_code"], 0);
+        assert!(report["exit_signal"].is_null());
+        assert_eq!(report["error_kind"], "native_failure");
+        assert!(report["capture"]["native_failure"].is_string());
+        assert_eq!(report["capture"]["truncated"], limit == 1024);
+        assert_eq!(report["capture"]["normalized_event_count"], 3);
+        let attempt = &report["worker_attempts"][0];
+        assert_eq!(attempt["exit_code"], 0);
+        assert_eq!(attempt["termination_reason"], "native_failure");
+        assert_eq!(attempt["event_cursor"], 3);
+        verified_manifest(&fixture, &report);
+        let stored = fabric_store::Store::open(fixture.0.join("storage/fabric.db"))
+            .unwrap()
+            .run(&report["run_id"].as_str().unwrap().parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, fabric_domain::RunState::Failed);
+        assert_eq!(stored.error_kind.as_deref(), Some("native_failure"));
+        assert_eq!(stored.exit_code, Some(0));
+        if limit > 1024 {
+            let container = artifact_container(&fixture, &report);
+            let records: Vec<serde_json::Value> =
+                fs::read_to_string(container.join("events.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            assert_eq!(records.last().unwrap()["event"]["type"], "completed");
+            assert_eq!(records.last().unwrap()["event"]["success"], false);
+        }
+    }
+}
+
+#[test]
 fn unsupported_harness_requests_fail_before_run_or_batch_allocation() {
     let fixture = Fixture::new();
     fixture.setup();
@@ -242,6 +478,16 @@ fn direct_run_service_validates_budget_before_storage_allocation() {
     let harness =
         fabric_runner::FakeHarness::new(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness")))
             .unwrap();
+    let registry = fabric_runner::HarnessRegistry::default();
+    let registry_options = fabric_runner::RegistryOptions {
+        fake_binary: Some(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness"))),
+    };
+    let default_harness = "fake".parse().unwrap();
+    let harnesses = fabric_core::run::BatchHarnesses {
+        registry: &registry,
+        options: &registry_options,
+        default: Some(&default_harness),
+    };
     for (legacy, requested, expected) in [
         (
             Some(f64::NAN),
@@ -284,7 +530,7 @@ fn direct_run_service_validates_budget_before_storage_allocation() {
             .expect("budget must be rejected");
         assert_eq!(failure.kind, expected, "{failure}");
         let failure =
-            fabric_core::run::run_many(&root, "missing", &manifest, 2, &harness, &options)
+            fabric_core::run::run_many(&root, "missing", &manifest, 2, &harnesses, &options)
                 .err()
                 .expect("batch budget must be rejected");
         assert_eq!(failure.kind, expected, "{failure}");
@@ -1295,8 +1541,6 @@ fn batch_api_applies_wall_timeout_per_worker_without_discarding_other_results() 
     )
     .unwrap();
     fs::write(fixture.0.join("done.json"), "{}").unwrap();
-    let manifest = fixture.0.join("api-batch.json");
-    fs::write(&manifest, r#"[{"id":"timeout","prompt_file":"slow.json"},{"id":"success","prompt_file":"done.json"}]"#).unwrap();
     let options = fabric_core::run::RunOptions {
         copy_limit_bytes: 10485760,
         limits: fabric_runner::ExecutionLimits {
@@ -1305,15 +1549,34 @@ fn batch_api_applies_wall_timeout_per_worker_without_discarding_other_results() 
         },
         ..fabric_core::run::RunOptions::default()
     };
-    let harness =
-        fabric_runner::FakeHarness::new(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness")))
-            .unwrap();
-    let report = fabric_core::run::run_many(
+    let registry = fabric_runner::HarnessRegistry::default();
+    let registry_options = fabric_runner::RegistryOptions {
+        fake_binary: Some(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness"))),
+    };
+    let default_harness = "fake".parse().unwrap();
+    let report = fabric_core::run::spawn_many(
         &fixture.0.join("storage"),
         "test",
-        &manifest,
+        vec![
+            fabric_core::run::TaskInput {
+                id: "timeout".into(),
+                prompt_file: fixture.0.join("slow.json"),
+                harness: None,
+                request: None,
+            },
+            fabric_core::run::TaskInput {
+                id: "success".into(),
+                prompt_file: fixture.0.join("done.json"),
+                harness: None,
+                request: None,
+            },
+        ],
         1,
-        &harness,
+        &fabric_core::run::BatchHarnesses {
+            registry: &registry,
+            options: &registry_options,
+            default: Some(&default_harness),
+        },
         &options,
     )
     .unwrap();
@@ -1593,13 +1856,33 @@ printf '\n{"type":"finished"}\n{"last":true}'
             report["worker_attempts"][0]["harness_version"],
             report["harness_version"]
         );
-        assert_eq!(report["worker_attempts"][0]["event_cursor"], 6);
+        assert_eq!(
+            report["worker_attempts"][0]["event_cursor"],
+            report["capture"]["normalized_event_count"],
+        );
         let tree = restored_workspace(&fixture, &report);
         let container = artifact_container(&fixture, &report);
         let records: Vec<serde_json::Value> = fs::read_to_string(container.join("events.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 8);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.get("event").is_some())
+                .count() as u64,
+            report["capture"]["normalized_event_count"]
+                .as_u64()
+                .unwrap(),
+        );
+        assert_eq!(records.first().unwrap()["event"]["type"], "started");
+        assert_eq!(records.last().unwrap()["event"]["type"], "completed");
+        assert_eq!(records.last().unwrap()["event"]["success"], true);
+        let records: Vec<_> = records
+            .iter()
+            .filter(|record| record["status"] != "normalized")
             .collect();
         assert_eq!(records.len(), 6);
         for (index, record) in records.iter().enumerate() {

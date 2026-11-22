@@ -53,6 +53,14 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         println!("fabric-fake-harness 1");
         return Ok(0);
     }
+    if args == ["--protocol-a", "--version"] {
+        println!("fabric-fake-a 1");
+        return Ok(0);
+    }
+    if args == ["--protocol-b", "--version"] {
+        println!("fabric-fake-b 1");
+        return Ok(0);
+    }
     if args.len() == 2 && args[0] == "--heartbeat-child" {
         if args[1] == "ignore-term" {
             // SAFETY: deterministic fixture intentionally exercises KILL escalation.
@@ -63,10 +71,82 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         heartbeat("child.heartbeat")?;
         unreachable!();
     }
+    if args.len() == 5 && args[0] == "--protocol-a" && args[1] == "--input" && args[3] == "--model"
+    {
+        let model = args[4].to_str().ok_or("model must be UTF-8")?;
+        let request = fabric_domain::HarnessRequest {
+            model: Some(model.into()),
+            ..Default::default()
+        };
+        request.validate()?;
+        let task: Task = serde_json::from_slice(&fs::read(&args[2])?)?;
+        return run_a(task, model);
+    }
+    if args.len() == 3 && args[0] == "--protocol-b" && args[1] == "--task" {
+        let task: Task = serde_json::from_slice(&fs::read(&args[2])?)?;
+        return run_b(task);
+    }
     if args.len() != 2 || args[0] != "--prompt-file" {
         return Err("expected --prompt-file PATH".into());
     }
     let task: Task = serde_json::from_slice(&fs::read(&args[1])?)?;
+    let mut stdout = io::stdout().lock();
+    let mut event = |value: &serde_json::Value| -> io::Result<()> {
+        serde_json::to_writer(&mut stdout, value)?;
+        writeln!(stdout)?;
+        stdout.flush()
+    };
+    event(&serde_json::json!({"type":"started"}))?;
+    execute_mutations(&task)?;
+    for value in &task.events {
+        event(value)?;
+    }
+    execute_process_tree(&task)?;
+    event(&serde_json::json!({"type":"finished", "exit_code":task.exit_code}))?;
+    Ok(task.exit_code)
+}
+
+fn run_a(task: Task, model: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    let mut stdout = io::stdout().lock();
+    let mut emit = |value: &serde_json::Value| -> io::Result<()> {
+        serde_json::to_writer(&mut stdout, value)?;
+        writeln!(stdout)?;
+        stdout.flush()
+    };
+    emit(&serde_json::json!({"kind":"model","model":model}))?;
+    emit(&serde_json::json!({"kind":"output","body":format!("fake-a model={model}")}))?;
+    emit(&serde_json::json!({"kind":"tool","name":"fixture-write","phase":"start"}))?;
+    execute_mutations(&task)?;
+    emit(&serde_json::json!({"kind":"tool","name":"fixture-write","phase":"end"}))?;
+    for value in &task.events {
+        emit(value)?;
+    }
+    // Fixture token units, not provider billing or a fabricated dollar price.
+    emit(&serde_json::json!({"kind":"usage","input":1,"output":1,"cached":0}))?;
+    execute_process_tree(&task)?;
+    Ok(task.exit_code)
+}
+
+fn run_b(task: Task) -> Result<u8, Box<dyn std::error::Error>> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "OUTPUT fake-b plaintext")?;
+    writeln!(stdout, "TOOL start fixture-write")?;
+    stdout.flush()?;
+    execute_mutations(&task)?;
+    writeln!(stdout, "TOOL end fixture-write")?;
+    for value in &task.events {
+        if let Some(line) = value.as_str() {
+            writeln!(stdout, "{line}")?;
+        } else {
+            return Err("fake-b task events must be plaintext strings".into());
+        }
+    }
+    stdout.flush()?;
+    execute_process_tree(&task)?;
+    Ok(task.exit_code)
+}
+
+fn execute_mutations(task: &Task) -> Result<(), Box<dyn std::error::Error>> {
     for name in &task.absent_environment {
         if std::env::var_os(name).is_some() {
             return Err("unexpected inherited environment".into());
@@ -76,13 +156,6 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         validate_path(Path::new(path))?;
         fs::read(path)?;
     }
-    let mut stdout = io::stdout().lock();
-    let mut event = |value: &serde_json::Value| -> io::Result<()> {
-        serde_json::to_writer(&mut stdout, value)?;
-        writeln!(stdout)?;
-        stdout.flush()
-    };
-    event(&serde_json::json!({"type":"started"}))?;
     for write in &task.writes {
         let path = Path::new(&write.path);
         validate_path(path)?;
@@ -91,10 +164,11 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         }
         fs::write(path, &write.content)?;
     }
-    for value in &task.events {
-        event(value)?;
-    }
-    if let Some(tree) = task.process_tree {
+    Ok(())
+}
+
+fn execute_process_tree(task: &Task) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(tree) = &task.process_tree {
         let mut child = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "--heartbeat-child",
@@ -105,7 +179,6 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 },
             ])
             .spawn()?;
-        // Wait for the child to install its signal disposition before publishing readiness.
         let start = std::time::Instant::now();
         while !Path::new("child.heartbeat").exists() {
             if child.try_wait()?.is_some() || start.elapsed() > std::time::Duration::from_secs(5) {
@@ -119,8 +192,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             heartbeat("parent.heartbeat")?;
         }
     }
-    event(&serde_json::json!({"type":"finished", "exit_code":task.exit_code}))?;
-    Ok(task.exit_code)
+    Ok(())
 }
 
 fn heartbeat(path: &str) -> io::Result<()> {

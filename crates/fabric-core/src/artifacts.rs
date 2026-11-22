@@ -74,6 +74,10 @@ struct RegisteredCapture {
     stderr: RegisteredCapturedFile,
     events: RegisteredCapturedFile,
     event_counts: RegisteredEventCounts,
+    #[serde(default)]
+    normalized_event_count: u64,
+    #[serde(default)]
+    native_failure: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -202,7 +206,7 @@ pub(super) fn verify_registered(
             != run
                 .error_kind
                 .as_deref()
-                .filter(|reason| matches!(*reason, "timeout" | "cancelled"))
+                .filter(|reason| matches!(*reason, "timeout" | "cancelled" | "native_failure"))
         || manifest.capture.limit_bytes != capture.limit_bytes
         || manifest.capture.persisted_bytes != capture.persisted_bytes
         || manifest.capture.truncated != capture.truncated
@@ -217,6 +221,8 @@ pub(super) fn verify_registered(
         || manifest.capture.event_counts.parsed != capture.event_counts.parsed
         || manifest.capture.event_counts.invalid != capture.event_counts.invalid
         || manifest.capture.event_counts.oversized != capture.event_counts.oversized
+        || manifest.capture.normalized_event_count != capture.normalized_event_count
+        || manifest.capture.native_failure != capture.native_failure
         || total > manifest.artifact_limit_bytes
         || manifest.files.len() != files.len() - 1
     {
@@ -509,7 +515,7 @@ pub(super) fn capture(
         stop_reason: run
             .error_kind
             .as_deref()
-            .filter(|reason| matches!(*reason, "timeout" | "cancelled")),
+            .filter(|reason| matches!(*reason, "timeout" | "cancelled" | "native_failure")),
         capture: output,
         artifact_limit_bytes: limit,
         source_scope: "tracked_and_nonignored_untracked",

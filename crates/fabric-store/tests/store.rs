@@ -141,6 +141,8 @@ fn finalized_pair(store: &mut Store, index: usize) -> (Run, Workspace) {
         stderr: empty.clone(),
         events: empty,
         event_counts: fabric_domain::EventCounts::default(),
+        normalized_event_count: 0,
+        native_failure: None,
     };
     let manifest = format!("manifest-{index}").parse().unwrap();
     let artifacts: Vec<_> = [

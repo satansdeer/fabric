@@ -341,7 +341,7 @@ After dependencies have been cached, add `--offline` to Cargo build/test/clippy 
 
 ## Harness-neutral amendment
 
-The supplied v0.2.1 amendment is tracked separately in `PRD_HARNESS_NEUTRAL.json`. HN-01/02 are complete: registry-owned adapters, durable worker-attempt evidence, exact version probes and fail-closed capability planning. Existing v0.1 commands and storage remain compatible.
+The supplied v0.2.1 amendment is tracked separately in `PRD_HARNESS_NEUTRAL.json`. HN-01/02/03 are complete: registry-owned adapters, durable worker-attempt evidence, exact version probes, fail-closed capability planning and mixed-harness batches. Existing v0.1 commands and storage remain compatible.
 
 ```sh
 fabric harnesses list --json
@@ -349,5 +349,20 @@ fabric harnesses doctor fake --json
 fabric harnesses doctor omp --json
 ```
 
-Doctors are bounded, version-only probes, not provider/authentication or model checks. Supported pins currently are `fabric-fake-harness 1` and `omp/19.1.0`; other versions fail `unsupported_version`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating a worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Missing usage is unknown. No model/resume support or paid live acceptance is implied by a successful doctor.
+Doctors are bounded, version-only probes, not provider/authentication or model checks. Supported pins are `fabric-fake-harness 1`, `fabric-fake-a 1`, `fabric-fake-b 1` and `omp/19.1.0`; other versions fail `unsupported_version`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating any batch or worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Only fake-a currently supports model override. Missing usage/cost remains unknown; resume is unsupported.
 
+
+`run-many` accepts task-local harnesses and complete request overrides; `--harness` supplies an optional default. Prompt paths resolve against the task manifest's directory. For example, `tasks.json`:
+
+```json
+[
+  {"id":"json-worker","prompt_file":"first.txt","harness":"fake-a"},
+  {"id":"text-worker","prompt_file":"second.txt","harness":"fake-b"}
+]
+```
+
+```sh
+fabric run-many PROJECT --tasks tasks.json --concurrency 2 --json
+```
+
+Both distinct fixture protocols use the same pool, attempt records, isolated forks, bounded capture and safe reclaim. `events.jsonl` retains raw native records and adds normalized Started/Output/Tool/Usage/Completed/Failure events with sequence numbers; malformed or oversized frames remain bounded. Native fatal errors fail the run even when the process exits zero or the capture cap is exhausted. Recoverable native tool/message errors do not imply terminal failure. OMP event conformance uses pinned protocol fixtures, not paid live validation. Native profile/credential boundaries remain the next story.

@@ -173,3 +173,10 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independently reviewed request validation, adapter version pins and all-task common-plan admission before mutable core operations. Missing/configuration-required capabilities fail closed; non-finite/nonpositive/conflicting budgets fail before allocation.
 - Implementer RED artifacts: `local://194.log`, `local://196.log`. Parent strict all-target clippy and 150 workspace tests across 24 suites passed (`local://203.log`); initial formatting-only failures were corrected with anchored edits and the subsequent fmt check passed.
 - Actual CLI proof (`local://204.log`): list reports registered IDs, fake doctor returns all 13 capability statuses and exact pin, installed OMP doctor observes `omp/19.1.0`. Probes are bounded version-only invocations; no billing/model request occurred. Unsupported requests retain unchanged run/workspace/batch/attempt counts in permanent CLI coverage.
+
+## HN-03 — mixed protocols and normalized capture
+
+- Implementer RED: distinct fake adapters were unknown (`/tmp/fabric-hn03-protocols-red.log`); task-local harnesses were rejected because batch `--harness` was mandatory (`/tmp/fabric-hn03-core-red.log`).
+- Two real fixture subprocess protocols now share batch admission, concurrency, prepared state, attempts, capture and cleanup. Permanent coverage checks model/usage attribution, absent usage, atomic rejection of a late unsupported request, native fatal with OS exit zero, post-cap fatal detection, malformed/oversized frames and recoverable OMP errors.
+- Parent found and fixed strict artifact-verifier drift for the new capture evidence; normalized counters/native failure are compared during reclaim, including terminal reason preservation. Registered adapter expectations and the existing store capture fixture were migrated.
+- Parent GREEN: `cargo fmt --all -- --check`, strict workspace/all-target Clippy and all 162 tests across 26 suites passed (`local://226.log`). No provider/model requests occurred. OMP normalization is source-checked against v19.1.0 and exercised by fixtures, not a live billed run.

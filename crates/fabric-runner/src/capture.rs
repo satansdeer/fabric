@@ -3,22 +3,24 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::sync::Mutex;
 
-use fabric_domain::{CaptureMetadata, CapturedFile, EventCounts};
+use fabric_domain::{AgentEvent, CaptureMetadata, CapturedFile, EventCounts};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::jsonl::{Event, Events};
+use crate::{EventFormat, HarnessAdapter, NativeEvent};
 
 pub const TRUNCATION_MARKER: &[u8] = b"\n[FABRIC CAPTURE TRUNCATED]\n";
 
 /// Files must be freshly created private outputs. `None` disables event decoding
 /// for version probes; ordinary runs always supply an events.jsonl file.
-pub struct Capture {
+pub struct Capture<'a> {
     state: Mutex<State>,
     decode_events: bool,
+    harness: Option<&'a dyn HarnessAdapter>,
 }
 
-impl Capture {
+impl<'a> Capture<'a> {
     pub fn new(
         stdout: File,
         stderr: File,
@@ -33,6 +35,7 @@ impl Capture {
         }
         Ok(Self {
             decode_events: events.is_some(),
+            harness: None,
             state: Mutex::new(State {
                 files: [
                     Sink::new(Some(stdout)),
@@ -44,8 +47,39 @@ impl Capture {
                 truncated: false,
                 seen: [0, 0],
                 error: None,
+                normalized_event_count: 0,
+                native_failure: None,
             }),
         })
+    }
+
+    pub fn with_harness(mut self, harness: &'a dyn HarnessAdapter) -> Self {
+        self.harness = Some(harness);
+        self
+    }
+
+    pub(crate) fn lifecycle(&self, event: AgentEvent) {
+        if self.harness.is_some() && self.decode_events {
+            let mut state = self.state.lock().unwrap();
+            state.normalized(&event);
+        }
+    }
+
+    pub(crate) fn completed(
+        &self,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        success: bool,
+    ) {
+        if self.harness.is_some() && self.decode_events {
+            let mut state = self.state.lock().unwrap();
+            let success = success && state.native_failure.is_none();
+            state.normalized(&AgentEvent::Completed {
+                exit_code,
+                exit_signal,
+                success,
+            });
+        }
     }
 
     pub(crate) fn stdout(&self, pipe: impl Read) -> io::Result<EventCounts> {
@@ -59,26 +93,40 @@ impl Capture {
             io::copy(&mut reader, &mut io::sink())?;
             return Ok(counts);
         }
-        let mut events = Events::new(BufReader::new(reader));
+        let format = self
+            .harness
+            .map_or(EventFormat::JsonLines, HarnessAdapter::event_format);
+        let mut events = Events::with_format(BufReader::new(reader), format);
         // Reuse one bounded serialization buffer, never retain event values.
         let mut encoded = Vec::new();
         while let Some(event) = events.next() {
             let event = event?;
-            let (status, value) = match &event {
+            let (status, value, text) = match &event {
                 Event::Parsed(value) => {
                     counts.parsed += 1;
-                    ("parsed", Some(value))
+                    ("parsed", Some(value), None)
+                }
+                Event::Text(text) => {
+                    counts.parsed += 1;
+                    ("text", None, Some(text.as_str()))
                 }
                 Event::Invalid => {
                     counts.invalid += 1;
-                    ("invalid", None)
+                    ("invalid", None, None)
                 }
                 Event::Oversized => {
                     counts.oversized += 1;
-                    ("oversized", None)
+                    ("oversized", None, None)
                 }
             };
+            // Keep decoding and inspecting bounded frames after persistence is full.
+            let normalized = self.harness.and_then(|harness| match &event {
+                Event::Parsed(value) => harness.normalize_event(NativeEvent::Json(value)),
+                Event::Text(text) => harness.normalize_event(NativeEvent::Text(text)),
+                Event::Invalid | Event::Oversized => None,
+            });
             let mut state = self.state.lock().unwrap();
+            let sequence = normalized.as_ref().map(|event| state.observe(event));
             if state.truncated || state.error.is_some() {
                 continue;
             }
@@ -90,6 +138,9 @@ impl Capture {
                     line_bytes: events.line_bytes(),
                     status,
                     value,
+                    text,
+                    event: normalized.as_ref(),
+                    sequence,
                 },
             )?;
             encoded.push(b'\n');
@@ -135,6 +186,8 @@ impl Capture {
             stderr,
             events,
             event_counts,
+            normalized_event_count: state.normalized_event_count,
+            native_failure: state.native_failure,
         })
     }
 }
@@ -146,14 +199,20 @@ struct Record<'a> {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'a AgentEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
 }
 
-struct RawReader<'a, R> {
+struct RawReader<'a, 'h, R> {
     pipe: R,
-    capture: &'a Capture,
+    capture: &'a Capture<'h>,
     stream: usize,
 }
-impl<R: Read> Read for RawReader<'_, R> {
+impl<R: Read> Read for RawReader<'_, '_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let length = self.pipe.read(buffer)?;
         let mut state = self.capture.state.lock().unwrap();
@@ -170,8 +229,42 @@ struct State {
     truncated: bool,
     seen: [u64; 2],
     error: Option<io::Error>,
+    normalized_event_count: u64,
+    native_failure: Option<String>,
 }
 impl State {
+    fn observe(&mut self, event: &AgentEvent) -> u64 {
+        self.normalized_event_count += 1;
+        if let AgentEvent::Failure { code, .. } = event {
+            if self.native_failure.is_none() {
+                self.native_failure = Some(code.clone());
+            }
+        }
+        self.normalized_event_count
+    }
+
+    fn normalized(&mut self, event: &AgentEvent) {
+        let sequence = self.observe(event);
+        if self.truncated || self.error.is_some() {
+            return;
+        }
+        let record = Record {
+            line_number: 0,
+            line_bytes: 0,
+            status: "normalized",
+            value: None,
+            text: None,
+            event: Some(event),
+            sequence: Some(sequence),
+        };
+        match serde_json::to_vec(&record) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                self.persist(2, &bytes, true);
+            }
+            Err(error) => self.error = Some(io::Error::other(error)),
+        }
+    }
     fn persist(&mut self, stream: usize, bytes: &[u8], whole_record: bool) {
         if bytes.is_empty() || self.truncated || self.error.is_some() {
             return;
@@ -267,5 +360,77 @@ mod tests {
             TRUNCATION_MARKER.len() as u64 - 1,
         );
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn bounded_frames_keep_unknown_and_malformed_evidence_without_inventing_completion() {
+        let harness = crate::FakeAHarness::new("/unused".into()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("events");
+        let capture = Capture::new(
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            Some(File::create(&path).unwrap()),
+            1_000_000,
+        )
+        .unwrap()
+        .with_harness(&harness);
+        let mut bytes = b"{\"kind\":\"unknown\",\"data\":1}\nnot-json\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', crate::jsonl::MAX_LINE_BYTES + 1));
+        bytes.extend_from_slice(b"\n{\"kind\":\"output\",\"body\":\"ok\"}\n{\"kind\":");
+        let counts = capture.stdout(bytes.as_slice()).unwrap();
+        let metadata = capture.finish(counts).unwrap();
+        assert_eq!(
+            metadata.event_counts,
+            EventCounts {
+                parsed: 2,
+                invalid: 2,
+                oversized: 1
+            }
+        );
+        assert_eq!(metadata.normalized_event_count, 1);
+        assert!(metadata.native_failure.is_none());
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[0]["value"]["data"], 1);
+        assert_eq!(records[2]["status"], "oversized");
+        assert_eq!(records[3]["event"]["type"], "output");
+        assert!(
+            records
+                .iter()
+                .all(|record| record["event"]["type"] != "completed")
+        );
+    }
+
+    #[test]
+    fn plaintext_is_bounded_and_missing_usage_is_not_fabricated() {
+        let harness = crate::FakeBHarness::new("/unused".into()).unwrap();
+        let capture = Capture::new(
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            Some(tempfile::tempfile().unwrap()),
+            1_000_000,
+        )
+        .unwrap()
+        .with_harness(&harness);
+        let mut bytes = b"OUTPUT hi\r\nTOOL start fixture-write\nunrecognized\n\xff\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', crate::jsonl::MAX_LINE_BYTES + 1));
+        bytes.extend_from_slice(b"\nTOOL end fixture-write");
+        let counts = capture.stdout(bytes.as_slice()).unwrap();
+        let metadata = capture.finish(counts).unwrap();
+        assert_eq!(
+            metadata.event_counts,
+            EventCounts {
+                parsed: 4,
+                invalid: 1,
+                oversized: 1
+            }
+        );
+        assert_eq!(metadata.normalized_event_count, 3);
+        assert!(metadata.native_failure.is_none());
     }
 }

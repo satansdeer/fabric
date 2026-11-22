@@ -1094,7 +1094,7 @@ impl Store {
         Ok(())
     }
 
-    /// Persist the observed wait result before finalization. Signals have no exit code.
+    /// Persist the observed wait result and supervision/native failure before finalization.
     pub fn observe_run_exit(
         &self,
         id: &RunId,
@@ -1111,9 +1111,10 @@ impl Store {
                     | "workspace_limit"
                     | "storage_pressure"
                     | "storage_meter_failed"
+                    | "native_failure"
             )
         ) {
-            return Err(StoreError::InvalidRecord("Invalid supervision reason"));
+            return Err(StoreError::InvalidRecord("Invalid termination reason"));
         }
         let count = self.connection.execute(
             "UPDATE runs SET state = 'FINALIZING', exit_code = ?1, updated_at = ?2,
@@ -1259,7 +1260,7 @@ impl Store {
              ELSE 'NEEDS_ATTENTION' END, harness_version = ?1,
              updated_at = ?2, finished_at = ?2,
              error_kind = CASE WHEN state = 'PREPARING' AND ?4 THEN 'cancelled'
-               WHEN error_kind IN ('timeout', 'cancelled', 'workspace_limit', 'storage_pressure', 'storage_meter_failed') THEN error_kind
+               WHEN error_kind IN ('timeout', 'cancelled', 'workspace_limit', 'storage_pressure', 'storage_meter_failed', 'native_failure') THEN error_kind
                WHEN capture_metadata IS NOT NULL THEN 'artifact_capture'
                ELSE 'harness_execution' END
              WHERE run_id = ?3 AND state IN ('PREPARING', 'FINALIZING')

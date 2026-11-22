@@ -1,4 +1,5 @@
 //! Foreground execution and verified capture followed by the shared safe reclaim path.
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -8,9 +9,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{
-    BatchId, ErrorKind, FabricError, HarnessPlan, HarnessRequest, RunId, RunState, WorkspaceId,
+    BatchId, ErrorKind, FabricError, HarnessId, HarnessPlan, HarnessRequest, RunId, RunState,
+    WorkspaceId,
 };
-use fabric_runner::{AgentSpec, HarnessAdapter};
+use fabric_runner::{AgentSpec, HarnessAdapter, HarnessRegistry, RegistryOptions};
 use fabric_store::{BatchTask, PreparedState, WorkerAttempt};
 use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend};
 use serde::{Deserialize, Serialize};
@@ -108,7 +110,7 @@ pub fn foreground(
     root: &Path,
     project_name: &str,
     prompt_file: &Path,
-    harness: &(impl HarnessAdapter + ?Sized),
+    harness: &dyn HarnessAdapter,
     options: &RunOptions,
 ) -> Result<RunReport, FabricError> {
     options.validate()?;
@@ -154,7 +156,7 @@ fn foreground_prepared(
     root: &Path,
     state: &PreparedState,
     prompt_file: &Path,
-    harness: &(impl HarnessAdapter + ?Sized),
+    harness: &dyn HarnessAdapter,
     options: &RunOptions,
     plan: &HarnessPlan,
     run_id: RunId,
@@ -226,12 +228,14 @@ fn foreground_prepared(
             Some(events),
             options.max_log_bytes,
         )
-        .map_err(error)?;
+        .map_err(error)?
+        .with_harness(harness);
         File::open(container)
             .and_then(|file| file.sync_all())
             .map_err(error)?;
         let command = harness.command(&AgentSpec {
             prompt_file: &prompt_path,
+            request: &plan.request,
             max_cost_usd: plan.request.max_cost_usd,
         })?;
         // This validation must remain immediately before launch, not merely at fork time.
@@ -278,11 +282,20 @@ fn foreground_prepared(
         attempt.finished_at = Some(finished_at);
         attempt.exit_code = result.status.code();
         attempt.exit_signal = result.status.signal();
-        attempt.termination_reason = result.stop_reason.map(|reason| reason.as_str().to_owned());
+        let native_failure = result
+            .capture
+            .as_ref()
+            .ok()
+            .and_then(|capture| capture.native_failure.as_ref());
+        let reason = result
+            .stop_reason
+            .map(|reason| reason.as_str())
+            .or_else(|| native_failure.map(|_| "native_failure"));
+        attempt.termination_reason = reason.map(str::to_owned);
         if let Ok(capture) = &result.capture {
-            attempt.event_cursor = capture.event_counts.parsed
-                + capture.event_counts.invalid
-                + capture.event_counts.oversized;
+            // Observed normalized events, including events dropped after truncation;
+            // this cursor is not a promise that every event remains replayable.
+            attempt.event_cursor = capture.normalized_event_count;
         }
         store.record_worker_attempt(&attempt).map_err(error)?;
         store
@@ -290,7 +303,7 @@ fn foreground_prepared(
                 &run_id,
                 result.status.code(),
                 result.status.signal(),
-                result.stop_reason.map(|reason| reason.as_str()),
+                reason,
                 finished_at,
             )
             .map_err(error)?;
@@ -387,11 +400,21 @@ fn foreground_prepared(
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TaskInput {
-    id: String,
-    prompt_file: PathBuf,
+pub struct TaskInput {
+    pub id: String,
+    pub prompt_file: PathBuf,
+    #[serde(default)]
+    pub harness: Option<HarnessId>,
+    #[serde(default)]
+    pub request: Option<HarnessRequest>,
+}
+
+pub struct BatchHarnesses<'a> {
+    pub registry: &'a HarnessRegistry,
+    pub options: &'a RegistryOptions,
+    pub default: Option<&'a HarnessId>,
 }
 
 #[derive(Serialize)]
@@ -414,17 +437,39 @@ pub fn run_many(
     project_name: &str,
     manifest: &Path,
     concurrency: usize,
-    harness: &(impl HarnessAdapter + Sync + ?Sized),
+    harnesses: &BatchHarnesses<'_>,
+    options: &RunOptions,
+) -> Result<BatchReport, FabricError> {
+    let mut inputs: Vec<TaskInput> =
+        serde_json::from_slice(&std::fs::read(manifest).map_err(error)?)
+            .map_err(|failure| error(format!("Invalid task manifest: {failure}")))?;
+    let parent = std::path::absolute(manifest)
+        .map_err(error)?
+        .parent()
+        .ok_or_else(|| error("Manifest has no parent directory."))?
+        .to_owned();
+    for task in &mut inputs {
+        if !task.prompt_file.as_os_str().is_empty() {
+            task.prompt_file = parent.join(&task.prompt_file);
+        }
+    }
+    spawn_many(root, project_name, inputs, concurrency, harnesses, options)
+}
+
+/// Shared typed batch service; prompt paths are already resolved by the caller.
+pub fn spawn_many(
+    root: &Path,
+    project_name: &str,
+    inputs: Vec<TaskInput>,
+    concurrency: usize,
+    harnesses: &BatchHarnesses<'_>,
     options: &RunOptions,
 ) -> Result<BatchReport, FabricError> {
     if concurrency == 0 {
         return Err(error("Concurrency must be positive."));
     }
     options.validate()?;
-    let inputs: Vec<TaskInput> =
-        serde_json::from_slice(&std::fs::read(manifest).map_err(error)?)
-            .map_err(|failure| error(format!("Invalid task manifest: {failure}")))?;
-    let mut ids = std::collections::HashSet::with_capacity(inputs.len());
+    let mut ids = HashSet::with_capacity(inputs.len());
     if inputs.is_empty()
         || inputs.iter().any(|task| {
             task.id.trim().is_empty()
@@ -436,29 +481,45 @@ pub fn run_many(
             "Task manifest requires nonempty unique IDs and prompt paths, and at least one task.",
         ));
     }
-    let request = options.request()?;
-    let plan = harness.plan(&request, &harness.probe()?)?;
-    let parent = std::path::absolute(manifest)
-        .map_err(error)?
-        .parent()
-        .ok_or_else(|| error("Manifest has no parent directory."))?
-        .to_owned();
-    let tasks = inputs
-        .into_iter()
-        .map(|task| {
-            Ok(BatchTask {
-                task_id: task.id,
-                run_id: new_run_id()?,
-                prompt_file: parent
-                    .join(task.prompt_file)
-                    .into_os_string()
-                    .into_string()
-                    .map_err(|_| error("Prompt paths must be UTF-8."))?,
-                result: None,
-                error: None,
-            })
-        })
-        .collect::<Result<Vec<_>, FabricError>>()?;
+    let mut adapters = HashMap::new();
+    let mut tasks = Vec::with_capacity(inputs.len());
+    let mut plans = Vec::with_capacity(inputs.len());
+    // Entire batch admission is read-only until every adapter/request has a plan.
+    for task in inputs {
+        let id = task
+            .harness
+            .or_else(|| harnesses.default.cloned())
+            .ok_or_else(|| FabricError {
+                kind: ErrorKind::UnknownHarness,
+                message: format!("Task {} requires a harness or a batch default.", task.id),
+            })?;
+        let request = match task.request {
+            Some(request) => request,
+            None => options.request()?,
+        };
+        request.validate()?;
+        let (adapter, probe) = match adapters.entry(id.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let adapter = harnesses.registry.resolve(&id, harnesses.options)?;
+                let probe = adapter.probe()?;
+                entry.insert((adapter, probe))
+            }
+        };
+        let plan = adapter.plan(&request, probe)?;
+        tasks.push(BatchTask {
+            task_id: task.id,
+            run_id: new_run_id()?,
+            prompt_file: task
+                .prompt_file
+                .into_os_string()
+                .into_string()
+                .map_err(|_| error("Prompt paths must be UTF-8."))?,
+            result: None,
+            error: None,
+        });
+        plans.push((id, plan));
+    }
     let (root, state) = select_prepared(root, project_name)?;
     let batch_id = BatchId::try_from(format!("b-{}", new_run_id()?.as_str()))?;
     let (_, mut store) = open_store(&root)?;
@@ -474,13 +535,14 @@ pub fn run_many(
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(task) = tasks.get(index) else { break };
+                    let (harness_id, plan) = &plans[index];
                     let outcome = foreground_prepared(
                         &root,
                         &state,
                         Path::new(&task.prompt_file),
-                        harness,
+                        adapters[harness_id].0.as_ref(),
                         options,
-                        &plan,
+                        plan,
                         task.run_id.clone(),
                     )
                     .and_then(|report| serde_json::to_string(&report).map_err(error));

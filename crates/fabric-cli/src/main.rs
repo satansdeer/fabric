@@ -65,6 +65,8 @@ struct RunArgs {
     name: String,
     #[arg(long)]
     prompt_file: PathBuf,
+    #[arg(long)]
+    harness: HarnessId,
     #[command(flatten)]
     options: WorkerArgs,
 }
@@ -72,11 +74,14 @@ struct RunArgs {
 #[derive(clap::Args)]
 struct RunManyArgs {
     name: String,
-    /// JSON list of {id, prompt_file}; relative prompts resolve against its parent.
+    /// JSON list of {id, prompt_file, harness?, request?}; prompts resolve against its parent.
     #[arg(long)]
     tasks: PathBuf,
     #[arg(long)]
     concurrency: std::num::NonZeroUsize,
+    /// Default harness, optional when every task selects its own.
+    #[arg(long)]
+    harness: Option<HarnessId>,
     #[command(flatten)]
     options: WorkerArgs,
 }
@@ -85,8 +90,6 @@ struct RunManyArgs {
 struct WorkerArgs {
     #[command(flatten)]
     storage: StorageArgs,
-    #[arg(long)]
-    harness: HarnessId,
     /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
     #[arg(long)]
     fake_binary: Option<PathBuf>,
@@ -286,9 +289,20 @@ fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let interrupt = fabric_runner::ForegroundInterrupt::install()?;
     let options = run_options(&args.options, interrupt.token());
-    let report = with_harness(&args.options, |harness| {
-        fabric_core::run::foreground(&root, &args.name, &args.prompt_file, harness, &options)
-    })?;
+    let id = &args.harness;
+    let harness = fabric_runner::HarnessRegistry::default().resolve(
+        id,
+        &fabric_runner::RegistryOptions {
+            fake_binary: args.options.fake_binary.clone(),
+        },
+    )?;
+    let report = fabric_core::run::foreground(
+        &root,
+        &args.name,
+        &args.prompt_file,
+        harness.as_ref(),
+        &options,
+    )?;
     let mut stdout = io::stdout().lock();
     if args.options.json {
         serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
@@ -344,35 +358,26 @@ fn run_options(
         },
     }
 }
-
-fn with_harness<T>(
-    options: &WorkerArgs,
-    run: impl FnOnce(&(dyn fabric_runner::HarnessAdapter + Sync)) -> Result<T, FabricError>,
-) -> Result<T, FabricError> {
-    let registry = fabric_runner::HarnessRegistry::default();
-    let harness = registry.resolve(
-        &options.harness,
-        &fabric_runner::RegistryOptions {
-            fake_binary: options.fake_binary.clone(),
-        },
-    )?;
-    run(harness.as_ref())
-}
-
 fn write_run_many(root: Option<PathBuf>, args: RunManyArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let interrupt = fabric_runner::ForegroundInterrupt::install()?;
     let options = run_options(&args.options, interrupt.token());
-    let report = with_harness(&args.options, |harness| {
-        fabric_core::run::run_many(
-            &root,
-            &args.name,
-            &args.tasks,
-            args.concurrency.get(),
-            harness,
-            &options,
-        )
-    })?;
+    let registry = fabric_runner::HarnessRegistry::default();
+    let registry_options = fabric_runner::RegistryOptions {
+        fake_binary: args.options.fake_binary.clone(),
+    };
+    let report = fabric_core::run::run_many(
+        &root,
+        &args.name,
+        &args.tasks,
+        args.concurrency.get(),
+        &fabric_core::run::BatchHarnesses {
+            registry: &registry,
+            options: &registry_options,
+            default: args.harness.as_ref(),
+        },
+        &options,
+    )?;
     let mut stdout = io::stdout().lock();
     if args.options.json {
         serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;

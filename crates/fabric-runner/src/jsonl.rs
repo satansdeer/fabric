@@ -1,6 +1,7 @@
 //! Streaming JSONL decoding: one bounded line/event, never the whole output.
 use std::io::{self, BufRead};
 
+use crate::EventFormat;
 pub use fabric_domain::EventCounts as Summary;
 use serde_json::Value;
 
@@ -9,6 +10,7 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 #[derive(Debug)]
 pub enum Event {
     Parsed(Value),
+    Text(String),
     Invalid,
     Oversized,
 }
@@ -20,15 +22,21 @@ pub struct Events<R> {
     line: Vec<u8>,
     line_number: u64,
     line_bytes: u64,
+    format: EventFormat,
 }
 
 impl<R: BufRead> Events<R> {
     pub fn new(reader: R) -> Self {
+        Self::with_format(reader, EventFormat::JsonLines)
+    }
+
+    pub fn with_format(reader: R, format: EventFormat) -> Self {
         Self {
             reader,
             line: Vec::with_capacity(MAX_LINE_BYTES),
             line_number: 0,
             line_bytes: 0,
+            format,
         }
     }
 
@@ -46,6 +54,7 @@ impl<R: BufRead> Events<R> {
         for event in self {
             match event? {
                 Event::Parsed(_) => summary.parsed += 1,
+                Event::Text(_) => summary.parsed += 1,
                 Event::Invalid => summary.invalid += 1,
                 Event::Oversized => summary.oversized += 1,
             }
@@ -92,9 +101,15 @@ impl<R: BufRead> Iterator for Events<R> {
         Some(Ok(if oversized {
             Event::Oversized
         } else {
-            match serde_json::from_slice(&self.line) {
-                Ok(value) => Event::Parsed(value),
-                Err(_) => Event::Invalid,
+            match self.format {
+                EventFormat::JsonLines => match serde_json::from_slice(&self.line) {
+                    Ok(value) => Event::Parsed(value),
+                    Err(_) => Event::Invalid,
+                },
+                EventFormat::TextLines => match std::str::from_utf8(&self.line) {
+                    Ok(text) => Event::Text(text.trim_end_matches('\r').to_owned()),
+                    Err(_) => Event::Invalid,
+                },
             }
         }))
     }

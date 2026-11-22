@@ -10,7 +10,7 @@ mod ids;
 mod policy;
 mod state;
 
-pub use capture::{CaptureMetadata, CapturedFile, EventCounts};
+pub use capture::{AgentEvent, CaptureMetadata, CapturedFile, EventCounts};
 pub use harness::{
     Capability, CapabilityReason, CapabilityStatus, CapabilitySupport, HarnessCapabilityManifest,
     HarnessId, HarnessPlan, HarnessRequest, HarnessVersion,

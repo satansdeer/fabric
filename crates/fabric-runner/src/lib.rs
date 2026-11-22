@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,8 +16,8 @@ use supervision::{PipeReader, ProcessGroup};
 
 use capture::Capture;
 use fabric_domain::{
-    CapabilitySupport, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId, HarnessPlan,
-    HarnessRequest, HarnessVersion,
+    AgentEvent, CapabilitySupport, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId,
+    HarnessPlan, HarnessRequest, HarnessVersion,
 };
 
 pub struct Execution {
@@ -32,6 +33,7 @@ pub struct HarnessInfo {
 pub struct AgentSpec<'a> {
     pub prompt_file: &'a Path,
     pub max_cost_usd: Option<f64>,
+    pub request: &'a HarnessRequest,
 }
 
 pub struct CommandSpec {
@@ -41,7 +43,18 @@ pub struct CommandSpec {
     pub environment: Vec<(OsString, OsString)>,
 }
 
-pub trait HarnessAdapter {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventFormat {
+    JsonLines,
+    TextLines,
+}
+
+pub enum NativeEvent<'a> {
+    Json(&'a serde_json::Value),
+    Text(&'a str),
+}
+
+pub trait HarnessAdapter: Sync {
     fn id(&self) -> HarnessId;
     fn probe(&self) -> Result<HarnessInfo, FabricError>;
     fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
@@ -60,6 +73,12 @@ pub trait HarnessAdapter {
         negotiate(request, self.capabilities(info)?, false)
     }
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError>;
+    fn event_format(&self) -> EventFormat {
+        EventFormat::JsonLines
+    }
+    fn normalize_event(&self, _event: NativeEvent<'_>) -> Option<AgentEvent> {
+        None
+    }
 }
 
 pub struct FakeHarness {
@@ -106,6 +125,23 @@ impl HarnessAdapter for FakeHarness {
             environment: Vec::new(),
         })
     }
+
+    fn normalize_event(&self, event: NativeEvent<'_>) -> Option<AgentEvent> {
+        let NativeEvent::Json(value) = event else {
+            return None;
+        };
+        match value["type"].as_str()? {
+            "output" => Some(AgentEvent::Output {
+                stream: "stdout".into(),
+                text: value["text"].as_str()?.into(),
+            }),
+            "failure" => Some(AgentEvent::Failure {
+                code: value["code"].as_str()?.into(),
+                message: value["message"].as_str()?.into(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Core must supply a freshly validated owned fork as cwd. The callback commits
@@ -113,7 +149,7 @@ impl HarnessAdapter for FakeHarness {
 pub fn execute(
     spec: &CommandSpec,
     cwd: &Path,
-    capture: Capture,
+    capture: Capture<'_>,
     limits: &ExecutionLimits,
     cancellation: &CancellationToken,
     owner_lease: Option<&File>,
@@ -157,6 +193,9 @@ pub fn execute(
         ))
     })?;
     let mut group = ProcessGroup::new(child, launched);
+    capture.lifecycle(AgentEvent::Started {
+        pid: group.child.id(),
+    });
     let stopped = AtomicBool::new(false);
     let stdout = PipeReader::new(group.child.stdout.take().expect("piped stdout"), &stopped)
         .map_err(execution_error)?;
@@ -177,6 +216,11 @@ pub fn execute(
             .map_err(|_| execution_error("Stderr capture panicked."))?;
         Ok::<_, FabricError>((status?, events.and_then(|events| stderr.map(|()| events))))
     })?;
+    capture.completed(
+        status.0.code(),
+        status.0.signal(),
+        status.0.success() && status.1.is_none(),
+    );
     Ok(Execution {
         status: status.0,
         stop_reason: status.1,
@@ -195,6 +239,14 @@ fn probe_version(
     binary: &Path,
     environment: Vec<(OsString, OsString)>,
 ) -> Result<String, FabricError> {
+    probe_version_args(binary, vec!["--version".into()], environment)
+}
+
+fn probe_version_args(
+    binary: &Path,
+    args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+) -> Result<String, FabricError> {
     // Version probes use the same concurrent bounded draining path as runs.
     let mut output = tempfile::tempfile().map_err(execution_error)?;
     let capture = Capture::new(
@@ -207,7 +259,7 @@ fn probe_version(
     let result = execute(
         &CommandSpec {
             program: binary.to_owned(),
-            args: vec!["--version".into()],
+            args,
             environment,
         },
         Path::new("/"),
@@ -258,6 +310,8 @@ pub mod omp;
 pub use omp::OmpHarness;
 
 pub mod fake;
+mod fake_adapters;
+pub use fake_adapters::{FakeAHarness, FakeBHarness};
 
 mod registry;
 pub use registry::{HarnessRegistration, HarnessRegistry, RegistryOptions};

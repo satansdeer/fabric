@@ -16,6 +16,17 @@ fn info() -> HarnessInfo {
 }
 
 #[test]
+fn distinct_fake_protocols_are_registered() {
+    let registry = HarnessRegistry::default();
+    for id in ["fake-a", "fake-b"] {
+        let adapter = registry
+            .resolve(&id.parse().unwrap(), &Default::default())
+            .unwrap_or_else(|error| panic!("{id} must be registered: {error}"));
+        assert_eq!(adapter.id().as_str(), id);
+    }
+}
+
+#[test]
 fn fake_plans_without_spawning_and_reports_all_capabilities_honestly() {
     let adapter = fake();
     let plan = adapter.plan(&HarnessRequest::default(), &info()).unwrap();
@@ -189,6 +200,6 @@ fn unattested_adapters_default_to_unsupported_and_registry_ids_are_sorted() {
     let ids = HarnessRegistry::default().ids();
     assert_eq!(
         ids.iter().map(HarnessId::as_str).collect::<Vec<_>>(),
-        ["fake", "omp"]
+        ["fake", "fake-a", "fake-b", "omp"]
     );
 }

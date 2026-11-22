@@ -130,3 +130,99 @@ fn cancelled_token_never_launches_and_a_failed_start_callback_cannot_hang_drains
         }
     }
 }
+
+#[test]
+fn native_fatal_zero_exit_is_observed_even_after_capture_is_full() {
+    let harness = fabric_runner::FakeHarness::new("/unused".into()).unwrap();
+    for limit in [256, 100_000] {
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        let capture = Capture::new(
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            Some(File::create(&events).unwrap()),
+            limit,
+        )
+        .unwrap()
+        .with_harness(&harness);
+        let script = if limit == 256 {
+            "head -c 100000 /dev/zero; printf '\\n{\"type\":\"failure\",\"code\":\"fixture_fatal\",\"message\":\"native fatal\"}\\n'"
+        } else {
+            "printf '{\"type\":\"failure\",\"code\":\"fixture_fatal\",\"message\":\"native fatal\"}\\n'"
+        };
+        let result = execute(
+            &command(script),
+            root.path(),
+            capture,
+            &fabric_runner::ExecutionLimits::default(),
+            &fabric_runner::CancellationToken::default(),
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "native evidence must not rewrite OS status"
+        );
+        let metadata = result.capture.unwrap();
+        assert_eq!(metadata.native_failure.as_deref(), Some("fixture_fatal"));
+        assert_eq!(metadata.normalized_event_count, 3);
+        assert_eq!(metadata.truncated, limit == 256);
+        assert!(metadata.persisted_bytes <= limit);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(events)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0]["event"]["type"], "started");
+        if metadata.truncated {
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record["event"]["type"] != "completed")
+            );
+            assert!((records.len() as u64) < metadata.normalized_event_count);
+        } else {
+            let terminal = &records.last().unwrap()["event"];
+            assert_eq!(terminal["type"], "completed");
+            assert_eq!(terminal["exit_code"], 0);
+            assert_eq!(terminal["success"], false);
+        }
+    }
+}
+
+#[test]
+fn process_terminal_events_are_observed_not_guessed_from_native_claims() {
+    let harness = fabric_runner::FakeHarness::new("/unused".into()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("events");
+    let capture = Capture::new(
+        tempfile::tempfile().unwrap(),
+        tempfile::tempfile().unwrap(),
+        Some(File::create(&path).unwrap()),
+        100_000,
+    )
+    .unwrap()
+    .with_harness(&harness);
+    let result = execute(
+        &command("printf '{\"type\":\"finished\",\"exit_code\":0}\\n'; exit 7"),
+        root.path(),
+        capture,
+        &fabric_runner::ExecutionLimits::default(),
+        &fabric_runner::CancellationToken::default(),
+        None,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(result.status.code(), Some(7));
+    let metadata = result.capture.unwrap();
+    assert_eq!(metadata.normalized_event_count, 2);
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let terminal = &records.last().unwrap()["event"];
+    assert_eq!(terminal["exit_code"], 7);
+    assert_eq!(terminal["success"], false);
+}

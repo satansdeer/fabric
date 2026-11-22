@@ -250,3 +250,10 @@
 - Added the exact 13-capability vocabulary, default-deny manifests/plans, validated requests and version pins. Foreground and batch plans reject unsupported model/resume/capabilities/placement/access/budgets before storage/workspace/batch allocation. Invocation evidence uses the negotiated exact version.
 - Parent GREEN: strict workspace/all-target clippy and all 150 workspace tests across 24 suites (`local://203.log`); anchored layout corrections then clean fmt check. Actual CLI list and fake/installed OMP doctors passed (`local://204.log`), observing `omp/19.1.0` without a model request.
 - Status: HN-02 done. Only exact tested fake/OMP versions are accepted; model override, resume and usage remain explicitly unsupported at this stage. Native HOME isolation is the next profile-boundary story, not claimed here.
+
+## HN-03 — externally verified
+
+- Implementers: Hn03Protocols (domain/runner) and Hn03Batch (core/CLI), each with observed behavioral RED before production edits. Added distinct fake-a JSONL/model/usage and fake-b plaintext protocols, task-local harness/request resolution and all-task planning before allocation.
+- Shared normalized events retain native evidence and bounded framing. Foreground lifecycle emits Started/Completed, detects terminal native failure independently of OS status and capture truncation, and preserves unknown usage. Pinned OMP normalization distinguishes terminal agent errors from recoverable tool/message failures.
+- Parent GREEN exposed capture-schema drift in the strict artifact verifier; fixed the shared verifier, migrated store fixtures/adapter expectations, and applied anchored formatting corrections. Formatting, strict workspace/all-target Clippy and all 162 tests across 26 suites passed (`local://226.log`).
+- Status: HN-03 done. No paid live validation or profile/credential isolation claim; HN-04 follows.

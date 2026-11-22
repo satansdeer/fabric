@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use fabric_domain::{ErrorKind, FabricError, HarnessId};
 
-use crate::{FakeHarness, HarnessAdapter, OmpHarness};
+use crate::{FakeAHarness, FakeBHarness, FakeHarness, HarnessAdapter, OmpHarness};
 
 #[derive(Default)]
 pub struct RegistryOptions {
@@ -14,7 +14,7 @@ pub struct RegistryOptions {
 pub struct HarnessRegistration {
     pub id: HarnessId,
     pub doctor_executable: Option<&'static str>,
-    pub create: fn(&RegistryOptions) -> Result<Box<dyn HarnessAdapter + Sync>, FabricError>,
+    pub create: fn(&RegistryOptions) -> Result<Box<dyn HarnessAdapter>, FabricError>,
 }
 
 pub struct HarnessRegistry {
@@ -43,7 +43,7 @@ impl HarnessRegistry {
         &self,
         id: &HarnessId,
         options: &RegistryOptions,
-    ) -> Result<Box<dyn HarnessAdapter + Sync>, FabricError> {
+    ) -> Result<Box<dyn HarnessAdapter>, FabricError> {
         let registration = self.entries.get(id).ok_or_else(|| FabricError {
             kind: ErrorKind::UnknownHarness,
             message: format!("Unknown harness {id}; no adapter is registered."),
@@ -94,13 +94,41 @@ impl Default for HarnessRegistry {
                 },
             },
             HarnessRegistration {
+                id: "fake-a".parse().expect("registered harness ID"),
+                doctor_executable: None,
+                create: |options| {
+                    let binary = match &options.fake_binary {
+                        Some(binary) => binary.clone(),
+                        None => std::env::current_exe()
+                            .map_err(crate::execution_error)?
+                            .with_file_name("fabric-fake-harness"),
+                    };
+                    Ok(Box::new(FakeAHarness::new(binary)?))
+                },
+            },
+            HarnessRegistration {
+                id: "fake-b".parse().expect("registered harness ID"),
+                doctor_executable: None,
+                create: |options| {
+                    let binary = match &options.fake_binary {
+                        Some(binary) => binary.clone(),
+                        None => std::env::current_exe()
+                            .map_err(crate::execution_error)?
+                            .with_file_name("fabric-fake-harness"),
+                    };
+                    Ok(Box::new(FakeBHarness::new(binary)?))
+                },
+            },
+            HarnessRegistration {
                 id: "omp".parse().expect("registered harness ID"),
                 doctor_executable: Some("omp"),
                 create: |options| {
                     if options.fake_binary.is_some() {
                         return Err(FabricError {
                             kind: ErrorKind::InvalidArguments,
-                            message: "--fake-binary is only valid with --harness fake.".into(),
+                            message:
+                                "--fake-binary is only valid with --harness fake, fake-a or fake-b."
+                                    .into(),
                         });
                     }
                     Ok(Box::new(OmpHarness::discover()?))

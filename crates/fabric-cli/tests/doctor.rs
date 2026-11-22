@@ -124,7 +124,7 @@ mod unix {
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty());
         let ids: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(ids, serde_json::json!(["fake", "omp"]));
+        assert_eq!(ids, serde_json::json!(["fake", "fake-a", "fake-b", "omp"]));
         let output = invoke(&[
             "harnesses",
             "doctor",
