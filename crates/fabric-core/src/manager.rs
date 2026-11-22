@@ -584,7 +584,7 @@ impl Manager {
                 .as_ref()
                 .filter(|run| terminal(run.state) && run.state != RunState::NeedsAttention)
             {
-                if let Some(report) = recovered_report(&self.root, &store, run)? {
+                if let Some(report) = recovered_report(&store, run)? {
                     let result = serde_json::to_string(&report).map_err(error)?;
                     store
                         .complete_async_task(&task.run_id, run.state, Ok(&result), false)
@@ -632,7 +632,35 @@ impl Manager {
         let settled = tasks.iter().all(|task| terminal(task.queue_state));
         let succeeded = settled.then(|| tasks.iter().all(|task| task.state == RunState::Succeeded));
         let tasks = tasks.into_iter().map(|task| {
-            let result: Option<Value> = task.result.as_deref().map(serde_json::from_str).transpose().map_err(error)?;
+            let mut result: Option<Value> = task.result.as_deref().map(serde_json::from_str).transpose().map_err(error)?;
+            if let Some(run) = store.run(&task.run_id).map_err(error)? {
+                if result.is_none() {
+                    result = recovered_report(&store, &run)?
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(error)?;
+                }
+                if let Some(Value::Object(report)) = &mut result {
+                    let workspace = store.workspace(&run.workspace_id).map_err(error)?
+                        .ok_or_else(|| error("Missing retained workspace metadata."))?;
+                    let durable = json!({
+                        "state":run.state,
+                        "exit_code":run.exit_code,
+                        "exit_signal":run.exit_signal,
+                        "error_kind":run.error_kind,
+                        "started_at":run.started_at,
+                        "finished_at":run.finished_at,
+                        "capture":run.capture,
+                        "events":run.capture.as_ref().map(|capture| &capture.event_counts),
+                        "artifact_manifest_id":run.artifact_manifest_id,
+                        "cleanup":durable_cleanup(&workspace),
+                        "worker_attempts":store.worker_attempts(&run.run_id).map_err(error)?
+                    });
+                    if let Value::Object(durable) = durable {
+                        report.extend(durable);
+                    }
+                }
+            }
             let artifacts = store.artifacts(&task.run_id).map_err(error)?;
             let source = store.task_source(&task.run_id).map_err(error)?;
             Ok(json!({"task_id":task.task_id,"run_id":task.run_id,"state":task.state,"source":source,"result":result,"error":task.error,"artifacts":artifacts}))
@@ -1008,7 +1036,6 @@ fn aggregate(tasks: &[AsyncTaskStatus]) -> RunState {
 }
 
 fn recovered_report(
-    root: &Path,
     store: &Store,
     run: &fabric_store::Run,
 ) -> Result<Option<RunReport>, FabricError> {
@@ -1016,12 +1043,12 @@ fn recovered_report(
         return Ok(None);
     };
     let task = store.async_task(&run.run_id).map_err(error)?;
-    let plan: HarnessPlan = serde_json::from_str(&task.plan_json).map_err(error)?;
+    let plan: AcceptedPlan = serde_json::from_str(&task.plan_json).map_err(error)?;
     let workspace = store
         .workspace(&run.workspace_id)
         .map_err(error)?
         .ok_or_else(|| error("Missing retained workspace metadata."))?;
-    let cleanup = crate::workspace::reclaim_run(root, &run.run_id).ok();
+    let cleanup = Some(durable_cleanup(&workspace));
     Ok(Some(RunReport {
         run_id: run.run_id.to_string(),
         workspace_id: run.workspace_id.to_string(),
@@ -1031,7 +1058,7 @@ fn recovered_report(
         prompt_digest: run.prompt_digest.clone(),
         harness: run.harness.clone(),
         harness_version: run.harness_version.clone(),
-        profile: Some(plan.profile),
+        profile: Some(plan.plan.profile),
         state: run.state,
         exit_code: run.exit_code,
         exit_signal: run.exit_signal,
@@ -1046,6 +1073,25 @@ fn recovered_report(
         cleanup,
         worker_attempts: store.worker_attempts(&run.run_id).map_err(error)?,
     }))
+}
+
+fn durable_cleanup(workspace: &fabric_store::Workspace) -> crate::workspace::GcItem {
+    let reclaimed = workspace.state == fabric_domain::WorkspaceState::Reclaimed;
+    crate::workspace::GcItem {
+        workspace_id: workspace.workspace_id.clone(),
+        run_id: workspace.run_id.clone(),
+        action: if reclaimed { "reclaimed" } else { "retained" }.into(),
+        reason: workspace.retention_reason.clone().unwrap_or_else(|| {
+            match workspace.state {
+                fabric_domain::WorkspaceState::Reclaimed => "reclaimed_artifacts_preserved",
+                fabric_domain::WorkspaceState::Active => "active_worker",
+                fabric_domain::WorkspaceState::CleanupPending => "verified_capture_cleanup_pending",
+                _ => "recoverability_not_verified",
+            }
+            .into()
+        }),
+        detail: None,
+    }
 }
 
 fn terminal(state: RunState) -> bool {

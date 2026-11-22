@@ -169,6 +169,14 @@ pub struct Artifact {
     pub size_bytes: u64,
 }
 
+/// Immutable prelaunch evidence needed to finish capture without replaying execution.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureContext {
+    pub profile: fabric_domain::ProfileEvidence,
+    pub artifact_limit_bytes: u64,
+}
+
 impl Store {
     /// Opens a file-backed WAL database. The parent directory must already exist.
     /// New database files are owner-only on Unix; callers own storage-root validation.
@@ -227,7 +235,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=11 => {}
+            1..=12 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -380,6 +388,92 @@ impl Store {
             transaction.execute_batch(include_str!("task_sources.sql"))?;
             transaction.pragma_update(None, "user_version", 11)?;
         }
+        if version < 12 {
+            transaction.execute_batch(
+                "CREATE TABLE run_capture_contexts (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                    context_json TEXT NOT NULL CHECK(json_valid(context_json))
+                      CHECK(json_type(context_json) IS 'object')
+                      CHECK(json_type(context_json, '$.profile') IS 'object')
+                      CHECK(json_type(context_json, '$.artifact_limit_bytes') IS 'integer')
+                      CHECK(typeof(json_extract(context_json, '$.artifact_limit_bytes')) = 'integer')
+                      CHECK(json_extract(context_json, '$.artifact_limit_bytes') > 0)
+                      CHECK(json_type(context_json, '$.profile.digest') IS 'text')
+                      CHECK(length(json_extract(context_json, '$.profile.digest')) = 64)
+                      CHECK(json_extract(context_json, '$.profile.digest') NOT GLOB '*[^0-9a-f]*')
+                      CHECK(json_type(context_json, '$.profile.native_config_fingerprint') IS 'text')
+                      CHECK(length(json_extract(context_json, '$.profile.native_config_fingerprint')) = 64)
+                      CHECK(json_extract(context_json, '$.profile.native_config_fingerprint') NOT GLOB '*[^0-9a-f]*')
+                      CHECK(json_type(context_json, '$.profile.portable') IS 'true'
+                         OR json_type(context_json, '$.profile.portable') IS 'false')
+                      CHECK(json_type(context_json, '$.profile.diagnostics') IS 'array')
+                 );
+                 CREATE TRIGGER valid_capture_context BEFORE INSERT ON run_capture_contexts
+                 WHEN (SELECT count(*) FROM json_each(NEW.context_json)) != 2
+                   OR EXISTS (SELECT 1 FROM json_each(NEW.context_json)
+                        WHERE key NOT IN ('profile', 'artifact_limit_bytes'))
+                   OR (SELECT count(*) FROM json_each(NEW.context_json, '$.profile')) != 4
+                   OR EXISTS (SELECT 1 FROM json_each(NEW.context_json, '$.profile')
+                        WHERE key NOT IN ('digest', 'native_config_fingerprint', 'portable', 'diagnostics'))
+                 BEGIN SELECT RAISE(ABORT, 'invalid capture context fields'); END;
+                 CREATE TRIGGER valid_capture_context_evidence BEFORE INSERT ON run_capture_contexts
+                 WHEN NOT EXISTS (
+                    SELECT 1 FROM runs r JOIN workspaces w ON w.workspace_id = r.workspace_id
+                    JOIN worker_attempts a ON a.run_id = r.run_id
+                    WHERE r.run_id = NEW.run_id AND r.state = 'PREPARING'
+                      AND r.started_at IS NULL AND r.finished_at IS NULL
+                      AND r.pid_metadata IS NULL AND r.exit_code IS NULL AND r.exit_signal IS NULL
+                      AND r.error_kind IS NULL AND r.capture_metadata IS NULL
+                      AND r.artifact_manifest_id IS NULL
+                      AND w.run_id = r.run_id AND w.state_id = r.prepared_state_id
+                      AND w.state = 'ACTIVE' AND w.retention_reason IS NULL
+                      AND a.harness_resolved = r.harness
+                      AND a.profile_digest = json_extract(NEW.context_json, '$.profile.digest')
+                      AND a.started_at IS NULL AND a.finished_at IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = w.workspace_id)
+                 ) OR EXISTS (
+                    SELECT 1 FROM worker_attempts a WHERE a.run_id = NEW.run_id
+                      AND (a.profile_digest IS NOT json_extract(NEW.context_json, '$.profile.digest')
+                        OR a.started_at IS NOT NULL OR a.finished_at IS NOT NULL)
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'capture context requires matching prelaunch evidence'); END;
+                 CREATE TRIGGER immutable_capture_context_insert BEFORE INSERT ON run_capture_contexts
+                 WHEN EXISTS (SELECT 1 FROM run_capture_contexts WHERE run_id = NEW.run_id)
+                 BEGIN SELECT RAISE(ABORT, 'capture context is immutable'); END;
+                 CREATE TRIGGER immutable_capture_context_update BEFORE UPDATE ON run_capture_contexts
+                 BEGIN SELECT RAISE(ABORT, 'capture context is immutable'); END;
+                 CREATE TRIGGER immutable_capture_context_delete BEFORE DELETE ON run_capture_contexts
+                 BEGIN SELECT RAISE(ABORT, 'capture context is immutable'); END;
+                 DROP TRIGGER immutable_manifest;
+                 CREATE TRIGGER immutable_manifest BEFORE UPDATE OF artifact_manifest_id ON runs
+                 WHEN (OLD.artifact_manifest_id IS NOT NULL
+                    AND NEW.artifact_manifest_id IS NOT OLD.artifact_manifest_id)
+                   OR (OLD.artifact_manifest_id IS NULL AND NEW.artifact_manifest_id IS NOT NULL
+                     AND (NOT EXISTS (SELECT 1 FROM artifacts
+                            WHERE run_id = NEW.run_id AND kind = 'manifest'
+                              AND relative_path = 'artifacts/' || NEW.artifact_manifest_id || '/manifest.json')
+                       OR NOT (
+                         (OLD.state = 'FINALIZING' AND NEW.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED'))
+                         OR (OLD.state = 'NEEDS_ATTENTION' AND NEW.state = OLD.state
+                           AND OLD.capture_metadata IS NOT NULL
+                           AND NEW.capture_metadata IS OLD.capture_metadata
+                           AND NEW.run_id IS OLD.run_id AND NEW.batch_id IS OLD.batch_id
+                           AND NEW.project_id IS OLD.project_id
+                           AND NEW.prepared_state_id IS OLD.prepared_state_id
+                           AND NEW.base_commit_sha IS OLD.base_commit_sha
+                           AND NEW.harness IS OLD.harness AND NEW.harness_version IS OLD.harness_version
+                           AND NEW.prompt_digest IS OLD.prompt_digest
+                           AND NEW.workspace_id IS OLD.workspace_id
+                           AND NEW.pid_metadata IS OLD.pid_metadata
+                           AND NEW.exit_code IS OLD.exit_code AND NEW.exit_signal IS OLD.exit_signal
+                           AND NEW.created_at IS OLD.created_at AND NEW.updated_at IS OLD.updated_at
+                           AND NEW.started_at IS OLD.started_at AND NEW.finished_at IS OLD.finished_at
+                           AND NEW.error_kind IS OLD.error_kind)
+                       )))
+                 BEGIN SELECT RAISE(ABORT, 'manifest association is immutable'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 12)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -452,7 +546,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=11) {
+        if !matches!(version, 5..=12) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -600,8 +694,9 @@ impl Store {
         }
         if !matches!(
             run.state,
-            RunState::Succeeded | RunState::Failed | RunState::Cancelled
-        ) || run.workspace_id != workspace.workspace_id
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled | RunState::NeedsAttention
+        ) || (run.state == RunState::NeedsAttention && run.capture.is_none())
+            || run.workspace_id != workspace.workspace_id
             || workspace.run_id != run.run_id
             || workspace.state_id != run.prepared_state_id
             || workspace.state != WorkspaceState::CleanupPending
@@ -1153,6 +1248,44 @@ impl Store {
         Ok(())
     }
 
+    /// Record only the actual matching prelaunch profile; never reconstruct legacy evidence.
+    pub fn record_capture_context(&self, id: &RunId, context: &CaptureContext) -> Result<()> {
+        validate_capture_context(context)?;
+        let encoded = serde_json::to_string(context)
+            .map_err(|_| StoreError::InvalidRecord("Cannot encode capture context"))?;
+        self.connection.execute(
+            "INSERT INTO run_capture_contexts (run_id, context_json) VALUES (?1, ?2)",
+            params![id.as_str(), encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Older schemas/runs intentionally have no fabricated capture context.
+    pub fn capture_context(&self, id: &RunId) -> Result<Option<CaptureContext>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 12 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT context_json FROM run_capture_contexts WHERE run_id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|encoded| {
+                let context = serde_json::from_str(&encoded)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid capture context"))?;
+                validate_capture_context(&context)?;
+                Ok(context)
+            })
+            .transpose()
+    }
+
     /// The bounded output files have already been synced by the runner.
     pub fn record_capture(&self, id: &RunId, capture: &CaptureMetadata) -> Result<()> {
         let encoded = serde_json::to_string(capture)
@@ -1177,49 +1310,13 @@ impl Store {
         artifacts: &[Artifact],
         now: i64,
     ) -> Result<()> {
-        let prefix = format!("artifacts/{manifest}/");
-        if ![
-            "stdout",
-            "stderr",
-            "events",
-            "tracked_patch",
-            "untracked_archive",
-            "prompt",
-            "manifest",
-        ]
-        .iter()
-        .all(|kind| artifacts.iter().filter(|file| file.kind == *kind).count() == 1)
-            || artifacts.iter().any(|file| {
-                file.sha256.len() != 64
-                    || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || !file.relative_path.starts_with(&prefix)
-                    || Path::new(&file.relative_path)
-                        .components()
-                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
-            })
-        {
-            return Err(StoreError::InvalidRecord(
-                "Incomplete or invalid artifact manifest",
-            ));
-        }
+        validate_artifacts(manifest, artifacts)?;
         let encoded = serde_json::to_string(capture)
             .map_err(|_| StoreError::InvalidRecord("Cannot encode capture metadata"))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for file in artifacts {
-            transaction.execute(
-                "INSERT INTO artifacts (run_id, kind, relative_path, sha256, size_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    id.as_str(),
-                    file.kind,
-                    file.relative_path,
-                    file.sha256,
-                    file.size_bytes
-                ],
-            )?;
-        }
+        insert_artifacts(&transaction, id, artifacts)?;
         let count = transaction.execute(
             "UPDATE runs SET state = CASE WHEN error_kind = 'cancelled' THEN 'CANCELLED'
              WHEN error_kind IS NOT NULL THEN 'FAILED'
@@ -1239,6 +1336,62 @@ impl Store {
             [id.as_str()],
         )?;
         if count != 1 {
+            return Err(StoreError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Associate caller-verified recovery files without inventing process completion.
+    /// Filesystem ownership, inactivity and full manifest verification remain caller obligations.
+    pub fn recover_artifacts(
+        &mut self,
+        expected_run: &Run,
+        expected_workspace: &Workspace,
+        manifest: &ArtifactManifestId,
+        artifacts: &[Artifact],
+    ) -> Result<()> {
+        validate_artifacts(manifest, artifacts)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::query_run(&transaction, &expected_run.run_id)?.as_ref() != Some(expected_run)
+            || Self::query_workspace(&transaction, &expected_workspace.workspace_id)?.as_ref()
+                != Some(expected_workspace)
+        {
+            return Err(StoreError::Conflict);
+        }
+        if expected_run.state != RunState::NeedsAttention
+            || expected_run.capture.is_none()
+            || expected_run.artifact_manifest_id.is_some()
+            || expected_workspace.state != WorkspaceState::RecoveryRequired
+            || expected_run.workspace_id != expected_workspace.workspace_id
+            || expected_workspace.run_id != expected_run.run_id
+            || expected_workspace.state_id != expected_run.prepared_state_id
+        {
+            return Err(StoreError::InvalidRecord(
+                "Workspace is not recovery eligible",
+            ));
+        }
+        let has_intent: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = ?1)",
+            [expected_workspace.workspace_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_intent {
+            return Err(StoreError::Conflict);
+        }
+        insert_artifacts(&transaction, &expected_run.run_id, artifacts)?;
+        if transaction.execute(
+            "UPDATE runs SET artifact_manifest_id = ?1 WHERE run_id = ?2",
+            params![manifest.as_str(), expected_run.run_id.as_str()],
+        )? != 1
+            || transaction.execute(
+                "UPDATE workspaces SET state = 'CLEANUP_PENDING',
+                 lease_expires_at = NULL, retention_reason = NULL WHERE workspace_id = ?1",
+                [expected_workspace.workspace_id.as_str()],
+            )? != 1
+        {
             return Err(StoreError::Conflict);
         }
         transaction.commit()?;
@@ -1563,6 +1716,77 @@ impl Store {
     }
 }
 
+fn validate_capture_context(context: &CaptureContext) -> Result<()> {
+    let digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if context.artifact_limit_bytes == 0
+        || context.artifact_limit_bytes > i64::MAX as u64
+        || !digest(&context.profile.digest)
+        || !digest(&context.profile.native_config_fingerprint)
+    {
+        return Err(StoreError::InvalidRecord("Invalid capture context"));
+    }
+    Ok(())
+}
+
+fn validate_artifacts(manifest: &ArtifactManifestId, artifacts: &[Artifact]) -> Result<()> {
+    let prefix = format!("artifacts/{manifest}/");
+    let kinds = [
+        "stdout",
+        "stderr",
+        "events",
+        "tracked_patch",
+        "untracked_archive",
+        "prompt",
+        "manifest",
+    ];
+    if !kinds
+        .iter()
+        .all(|kind| artifacts.iter().filter(|file| file.kind == *kind).count() == 1)
+        || artifacts.iter().any(|file| {
+            file.sha256.len() != 64
+                || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || file.size_bytes > i64::MAX as u64
+                || !file.relative_path.starts_with(&prefix)
+                || Path::new(&file.relative_path)
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || (file.kind == "manifest"
+                    && file.relative_path.strip_prefix(&prefix) != Some("manifest.json"))
+        })
+    {
+        return Err(StoreError::InvalidRecord(
+            "Incomplete or invalid artifact manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_artifacts(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &RunId,
+    artifacts: &[Artifact],
+) -> Result<()> {
+    for file in artifacts {
+        transaction.execute(
+            "INSERT INTO artifacts (run_id, kind, relative_path, sha256, size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.as_str(),
+                file.kind,
+                file.relative_path,
+                file.sha256,
+                file.size_bytes
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn conversion_error(
     index: usize,
     error: impl std::error::Error + Send + Sync + 'static,
@@ -1646,4 +1870,306 @@ fn read_prepared_state(row: &Row<'_>) -> rusqlite::Result<PreparedState> {
         verified_at: row.get(9)?,
         size_bytes: row.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn schema12_preserves_v11_evidence_and_restricts_recovery_associations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fabric.db");
+        let mut store = Store::open(&path).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO projects VALUES ('p', 'project', '/source', 'HEAD', 100);
+             INSERT INTO prepared_states VALUES
+               ('s', 'p', 'key', 'commit', 'recipe', NULL, '/prepared', 'READY', 100, 100, 0);",
+            )
+            .unwrap();
+        fn pair(store: &Store, id: &str) -> RunId {
+            let transaction = store.connection.unchecked_transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO runs (run_id, project_id, prepared_state_id, base_commit_sha,
+                  harness, prompt_digest, state, workspace_id, created_at, updated_at)
+                 VALUES (?1, 'p', 's', 'commit', 'fake', 'prompt', 'PREPARING', ?1, 100, 100)",
+                    [id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO workspaces (workspace_id, run_id, managed_path, state_id,
+                  state, usage_bytes) VALUES (?1, ?1, ?1, 's', 'ACTIVE', 42)",
+                    [id],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            id.parse().unwrap()
+        }
+        let legacy = pair(&store, "legacy");
+        let empty = fabric_domain::CapturedFile {
+            size_bytes: 0,
+            sha256: "0".repeat(64),
+        };
+        let capture = CaptureMetadata {
+            limit_bytes: 100,
+            persisted_bytes: 0,
+            truncated: false,
+            stdout_bytes_seen: 0,
+            stderr_bytes_seen: 0,
+            stdout: empty.clone(),
+            stderr: empty.clone(),
+            events: empty,
+            event_counts: fabric_domain::EventCounts::default(),
+            normalized_event_count: 0,
+            native_failure: None,
+        };
+        store.start_run(&legacy, "1", 123, 101).unwrap();
+        store
+            .observe_run_exit(&legacy, Some(7), None, None, 102)
+            .unwrap();
+        store.record_capture(&legacy, &capture).unwrap();
+        store
+            .fail_run_execution(&legacy, "1", "capture interrupted", 103, false)
+            .unwrap();
+        // Reconstruct the actual v11 schema boundary, not legacy context evidence.
+        store.connection.execute_batch(
+            "DROP TABLE run_capture_contexts;
+             DROP TRIGGER immutable_manifest;
+             CREATE TRIGGER immutable_manifest BEFORE UPDATE OF artifact_manifest_id ON runs
+             WHEN (OLD.artifact_manifest_id IS NOT NULL
+                AND NEW.artifact_manifest_id IS NOT OLD.artifact_manifest_id)
+               OR (OLD.artifact_manifest_id IS NULL AND NEW.artifact_manifest_id IS NOT NULL
+                   AND (OLD.state != 'FINALIZING'
+                       OR NEW.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+                       OR NOT EXISTS (SELECT 1 FROM artifacts
+                           WHERE run_id = NEW.run_id AND kind = 'manifest'
+                             AND relative_path = 'artifacts/' || NEW.artifact_manifest_id || '/manifest.json')))
+             BEGIN SELECT RAISE(ABORT, 'manifest association is immutable'); END;
+             PRAGMA user_version = 11;",
+        ).unwrap();
+        let before = store.run(&legacy).unwrap().unwrap();
+        let workspace = store.workspace(&before.workspace_id).unwrap().unwrap();
+        assert!(store.capture_context(&legacy).unwrap().is_none());
+        drop(store);
+        let readonly = Store::open_existing_read_only(&path).unwrap();
+        assert!(readonly.capture_context(&legacy).unwrap().is_none());
+        drop(readonly);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.run(&legacy).unwrap().as_ref(), Some(&before));
+        assert_eq!(
+            store.workspace(&workspace.workspace_id).unwrap().as_ref(),
+            Some(&workspace)
+        );
+        assert!(store.capture_context(&legacy).unwrap().is_none());
+        let context = CaptureContext {
+            profile: fabric_domain::ProfileEvidence {
+                digest: "a".repeat(64),
+                native_config_fingerprint: "b".repeat(64),
+                portable: true,
+                diagnostics: Vec::new(),
+            },
+            artifact_limit_bytes: 1024,
+        };
+        assert!(store.record_capture_context(&legacy, &context).is_err());
+        let modern = pair(&store, "modern");
+        assert!(store.record_capture_context(&modern, &context).is_err());
+        let attempt = WorkerAttempt {
+            attempt_id: "attempt".into(),
+            run_id: modern.clone(),
+            harness_requested: "fake".parse().unwrap(),
+            harness_resolved: "fake".parse().unwrap(),
+            harness_version: "1".into(),
+            model_requested: None,
+            model_resolved: None,
+            profile_digest: Some(context.profile.digest.clone()),
+            backend_id: "trusted-local".into(),
+            event_cursor: 0,
+            created_at: 100,
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            exit_signal: None,
+            termination_reason: None,
+        };
+        store.record_worker_attempt(&attempt).unwrap();
+        let mut mismatch = context.clone();
+        mismatch.profile.digest = "c".repeat(64);
+        assert!(store.record_capture_context(&modern, &mismatch).is_err());
+        store.record_capture_context(&modern, &context).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.capture_context(&modern).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&context).unwrap(),
+        );
+        assert!(store.record_capture_context(&modern, &context).is_err());
+        for sql in [
+            "UPDATE run_capture_contexts SET context_json = context_json",
+            "DELETE FROM run_capture_contexts",
+            "INSERT OR REPLACE INTO run_capture_contexts SELECT * FROM run_capture_contexts",
+        ] {
+            assert!(store.connection.execute(sql, []).is_err(), "{sql}");
+        }
+        let manifest: ArtifactManifestId = "recovered".parse().unwrap();
+        let files: Vec<_> = [
+            "stdout",
+            "stderr",
+            "events",
+            "tracked_patch",
+            "untracked_archive",
+            "prompt",
+            "manifest",
+        ]
+        .into_iter()
+        .map(|kind| Artifact {
+            kind: kind.into(),
+            relative_path: format!(
+                "artifacts/{manifest}/{}",
+                if kind == "manifest" {
+                    "manifest.json"
+                } else {
+                    kind
+                }
+            ),
+            sha256: "0".repeat(64),
+            size_bytes: 0,
+        })
+        .collect();
+        let mut stale = before.clone();
+        stale.updated_at += 1;
+        assert!(matches!(
+            store.recover_artifacts(&stale, &workspace, &manifest, &files),
+            Err(StoreError::Conflict),
+        ));
+        assert!(
+            store
+                .recover_artifacts(&before, &workspace, &manifest, &files[..6])
+                .is_err()
+        );
+        assert!(store.artifacts(&legacy).unwrap().is_empty());
+        // A manifest row alone cannot authorize recovery without persisted capture.
+        store.connection.execute(
+            "INSERT INTO artifacts VALUES ('modern', 'manifest', 'artifacts/recovered/manifest.json', ?1, 0)",
+            ["0".repeat(64)],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET state = 'NEEDS_ATTENTION' WHERE run_id = 'modern'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE runs SET artifact_manifest_id = 'recovered' WHERE run_id = 'modern'",
+                    [],
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE artifacts SET sha256 = sha256 WHERE run_id = 'modern'",
+                [],
+            )
+            .unwrap_err();
+        // The preceding immutable row deliberately occupies the same manifest path.
+        assert!(
+            store
+                .recover_artifacts(&before, &workspace, &manifest, &files)
+                .is_err()
+        );
+        assert_eq!(store.run(&legacy).unwrap().as_ref(), Some(&before));
+        let manifest: ArtifactManifestId = "legacy-recovered".parse().unwrap();
+        let files: Vec<_> = files
+            .into_iter()
+            .map(|mut file| {
+                file.relative_path = file.relative_path.replacen(
+                    "artifacts/recovered/",
+                    "artifacts/legacy-recovered/",
+                    1,
+                );
+                file
+            })
+            .collect();
+        {
+            let transaction = store.connection.unchecked_transaction().unwrap();
+            insert_artifacts(&transaction, &legacy, &files).unwrap();
+            assert!(
+                transaction
+                    .execute(
+                        "UPDATE runs SET artifact_manifest_id = 'legacy-recovered',
+                 updated_at = updated_at + 1 WHERE run_id = 'legacy'",
+                        [],
+                    )
+                    .is_err()
+            );
+            assert!(
+                transaction
+                    .execute(
+                        "UPDATE runs SET artifact_manifest_id = 'legacy-recovered',
+                 exit_code = 0 WHERE run_id = 'legacy'",
+                        [],
+                    )
+                    .is_err()
+            );
+            assert!(
+                transaction
+                    .execute(
+                        "UPDATE runs SET artifact_manifest_id = 'legacy-recovered',
+                 capture_metadata = NULL WHERE run_id = 'legacy'",
+                        [],
+                    )
+                    .is_err()
+            );
+            transaction.rollback().unwrap();
+        }
+        store
+            .recover_artifacts(&before, &workspace, &manifest, &files)
+            .unwrap();
+        let mut recovered = before.clone();
+        recovered.artifact_manifest_id = Some(manifest);
+        assert_eq!(store.run(&legacy).unwrap().as_ref(), Some(&recovered));
+        let reclaimed = store.workspace(&workspace.workspace_id).unwrap().unwrap();
+        assert_eq!(reclaimed.state, WorkspaceState::CleanupPending);
+        assert_eq!(reclaimed.lease_expires_at, None);
+        assert_eq!(reclaimed.retention_reason, None);
+        assert_eq!(store.artifacts(&legacy).unwrap().len(), 7);
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE runs SET artifact_manifest_id = 'replacement' WHERE run_id = 'legacy'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute("DELETE FROM artifacts WHERE run_id = 'legacy'", [],)
+                .is_err()
+        );
+        store
+            .record_cleanup_intent(&recovered, &reclaimed, "verified", 200)
+            .unwrap();
+        store
+            .finish_cleanup(&workspace.workspace_id, "verified")
+            .unwrap();
+        assert_eq!(store.run(&legacy).unwrap().as_ref(), Some(&recovered));
+        assert!(
+            store
+                .recover_artifacts(
+                    &before,
+                    &workspace,
+                    recovered.artifact_manifest_id.as_ref().unwrap(),
+                    &files
+                )
+                .is_err()
+        );
+    }
 }

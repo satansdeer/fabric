@@ -99,7 +99,8 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
 fn remove_task_source_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS batch_task_sources;
+            "DROP TABLE IF EXISTS run_capture_contexts;
+         DROP TABLE IF EXISTS batch_task_sources;
          DROP TRIGGER IF EXISTS run_requires_batch_task;
          CREATE TRIGGER run_requires_batch_task BEFORE INSERT ON runs
          WHEN NEW.batch_id IS NOT NULL AND NOT EXISTS (
@@ -247,7 +248,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -303,7 +304,7 @@ fn v8_database_adds_attempt_storage_without_rewriting_legacy_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        11,
+        12,
         "C-02 must preserve earlier additive migrations"
     );
     let attempts: i64 = db
@@ -342,7 +343,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -607,7 +608,7 @@ fn v9_migration_adds_queue_without_rewriting_completed_run_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        11
+        12
     );
 }
 
@@ -1303,8 +1304,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [11, 10, 9, 8, 7, 6, 5] {
+    for version in [12, 11, 10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 11 {
+            db.execute_batch("DROP TABLE run_capture_contexts; PRAGMA user_version=11;")
+                .unwrap();
+        }
         if version == 10 {
             remove_task_source_schema(&db);
             db.pragma_update(None, "user_version", 10).unwrap();

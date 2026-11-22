@@ -279,6 +279,15 @@ pub(crate) fn execute_prepared(
     };
     let execution = (|| {
         store.record_worker_attempt(&attempt).map_err(error)?;
+        store
+            .record_capture_context(
+                &run_id,
+                &fabric_store::CaptureContext {
+                    profile: plan.profile.clone(),
+                    artifact_limit_bytes: options.max_artifact_bytes,
+                },
+            )
+            .map_err(error)?;
         let container = workspace
             .path()
             .parent()

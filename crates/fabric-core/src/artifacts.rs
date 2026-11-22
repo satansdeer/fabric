@@ -114,26 +114,44 @@ pub(super) fn verify_registered(
     store: &Store,
     run: &fabric_store::Run,
 ) -> Result<(), FabricError> {
+    let manifest = run
+        .artifact_manifest_id
+        .as_ref()
+        .ok_or_else(|| error("Missing registered artifact manifest"))?;
+    let files = store.artifacts(&run.run_id).map_err(error)?;
+    let directory = root.join("artifacts").join(format!("a-{}", run.run_id));
+    verify_files(root, store, run, manifest, &directory, &files, true)
+}
+
+fn verify_files(
+    root: &Path,
+    store: &Store,
+    run: &fabric_store::Run,
+    manifest: &ArtifactManifestId,
+    directory: &Path,
+    files: &[Artifact],
+    sealed: bool,
+) -> Result<(), FabricError> {
     let expected_id = format!("a-{}", run.run_id);
-    if run.artifact_manifest_id.as_ref().map(|id| id.as_str()) != Some(expected_id.as_str()) {
+    if manifest.as_str() != expected_id {
         return Err(error("Missing or unexpected registered artifact manifest"));
     }
     private_directory(root)?;
     if fs::canonicalize(root).map_err(error)? != root {
         return Err(error("Artifact root is not canonical"));
     }
-    let artifacts = root.join("artifacts");
-    let directory = artifacts.join(&expected_id);
-    for path in [&artifacts, &directory] {
+    let parent = directory
+        .parent()
+        .ok_or_else(|| error("Missing artifact parent"))?;
+    for path in [parent, directory] {
         private_directory(path)?;
         if fs::canonicalize(path).map_err(error)? != *path {
             return Err(error("Artifact directory has a symlink ancestor"));
         }
     }
-    if fs::symlink_metadata(&directory).map_err(error)?.mode() & 0o222 != 0 {
+    if sealed && fs::symlink_metadata(directory).map_err(error)?.mode() & 0o222 != 0 {
         return Err(error("Artifact directory is not sealed"));
     }
-    let files = store.artifacts(&run.run_id).map_err(error)?;
     let expected = [
         ("stdout", "stdout.log"),
         ("stderr", "stderr.log"),
@@ -150,8 +168,10 @@ pub(super) fn verify_registered(
         ("verified_untracked_stderr", "verified.stderr"),
         ("manifest", "manifest.json"),
     ];
-    if files.len() != expected.len() {
-        return Err(error("Incomplete registered artifact set"));
+    if files.len() != expected.len()
+        || fs::read_dir(directory).map_err(error)?.count() != expected.len()
+    {
+        return Err(error("Incomplete or foreign artifact set"));
     }
     let mut total = 0_u64;
     for (kind, name) in expected {
@@ -166,9 +186,9 @@ pub(super) fn verify_registered(
         total = total
             .checked_add(file.size_bytes)
             .ok_or_else(|| error("Artifact size overflow"))?;
-        let path = root.join(&file.relative_path);
+        let path = directory.join(name);
         let metadata = private_file(&path)?;
-        if metadata.mode() & 0o222 != 0 || metadata.len() != file.size_bytes {
+        if (sealed && metadata.mode() & 0o222 != 0) || metadata.len() != file.size_bytes {
             return Err(error("Artifact is writable or has an unexpected size"));
         }
         let actual = checksum(&path)?;
@@ -180,10 +200,17 @@ pub(super) fn verify_registered(
         .iter()
         .find(|file| file.kind == "manifest")
         .ok_or_else(|| error("Missing manifest"))?;
-    let reader = BufReader::new(
-        open(&root.join(&manifest_file.relative_path))?.take(manifest_file.size_bytes),
-    );
+    let reader =
+        BufReader::new(open(&directory.join("manifest.json"))?.take(manifest_file.size_bytes));
     let manifest: RegisteredManifest = serde_json::from_reader(reader).map_err(error)?;
+    if let Some(context) = store.capture_context(&run.run_id).map_err(error)? {
+        if manifest.artifact_limit_bytes != context.artifact_limit_bytes
+            || serde_json::to_value(&manifest.profile).map_err(error)?
+                != serde_json::to_value(Some(&context.profile)).map_err(error)?
+        {
+            return Err(error("Manifest differs from immutable capture context"));
+        }
+    }
     let attempts = store.worker_attempts(&run.run_id).map_err(error)?;
     let profile_digest = manifest
         .profile
@@ -283,11 +310,168 @@ pub(super) fn verify_registered(
     {
         return Err(error("Prompt artifact differs from registered digest"));
     }
-    let actual = checksum(&root.join(&manifest_file.relative_path))?;
+    let actual = checksum(&directory.join("manifest.json"))?;
     if actual.size_bytes != manifest_file.size_bytes || actual.sha256 != manifest_file.sha256 {
         return Err(error("Manifest changed during verification"));
     }
     Ok(())
+}
+
+/// The caller holds root admission/cleanup authority and a proven inactive owner.
+/// Existing partial or foreign captures are never overwritten or removed.
+pub(super) fn recover_capture(
+    root: &Path,
+    store: &Store,
+    run: &fabric_store::Run,
+    workspace: &crate::workspace::RunnerWorkspace,
+    apply: bool,
+) -> Result<Option<(ArtifactManifestId, Vec<Artifact>)>, FabricError> {
+    let manifest = ArtifactManifestId::try_from(format!("a-{}", run.run_id))?;
+    let destination = root.join("artifacts").join(manifest.as_str());
+    let stage = root.join("artifact-staging").join(manifest.as_str());
+    let present = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(failure) => Err(error(failure)),
+    };
+    let final_present = present(&destination)?;
+    let stage_present = present(&stage)?;
+    if final_present && stage_present {
+        return Err(error(
+            "Both staged and promoted capture evidence exist; retain both for inspection",
+        ));
+    }
+    if final_present || stage_present {
+        let directory = if final_present { &destination } else { &stage };
+        private_directory(directory)?;
+        if fs::canonicalize(directory).map_err(error)? != *directory {
+            return Err(error("Capture evidence path has a symlink ancestor"));
+        }
+        let manifest_path = directory.join("manifest.json");
+        let metadata = private_file(&manifest_path)?;
+        // A manifest has a fixed fourteen-file vocabulary; bound untrusted JSON.
+        if metadata.len() > 16 * 1024 * 1024 {
+            return Err(error("Capture manifest exceeds inspection bound"));
+        }
+        let mut bytes = Vec::new();
+        open(&manifest_path)?
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(error)?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(error("Capture manifest changed during inspection"));
+        }
+        let metadata: RegisteredManifest = serde_json::from_slice(&bytes).map_err(|failure| {
+            error(format!(
+                "Incomplete or invalid capture manifest; retain evidence: {failure}"
+            ))
+        })?;
+        let mut files = metadata
+            .files
+            .into_iter()
+            .map(|file| Artifact {
+                kind: file.kind,
+                relative_path: file.relative_path,
+                sha256: file.sha256,
+                size_bytes: file.size_bytes,
+            })
+            .collect::<Vec<_>>();
+        files.push(Artifact {
+            kind: "manifest".into(),
+            relative_path: format!("artifacts/{manifest}/manifest.json"),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            size_bytes: bytes.len() as u64,
+        });
+        verify_files(root, store, run, &manifest, directory, &files, false)?;
+        if apply {
+            for file in &files {
+                let name = Path::new(&file.relative_path)
+                    .file_name()
+                    .ok_or_else(|| error("Invalid artifact name"))?;
+                let path = directory.join(name);
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).map_err(error)?;
+                sync(&path)?;
+            }
+            sync(directory)?;
+            if stage_present {
+                ensure_directory(&root.join("artifacts"))?;
+                promote(&stage, &destination)?;
+            }
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o500)).map_err(error)?;
+            sync(&destination)?;
+            sync(&root.join("artifacts"))?;
+            if stage_present {
+                sync(&root.join("artifact-staging"))?;
+            }
+            verify_files(root, store, run, &manifest, &destination, &files, true)?;
+        }
+        return Ok(Some((manifest, files)));
+    }
+    let output = run
+        .capture
+        .as_ref()
+        .ok_or_else(|| error("Complete durable capture metadata is unavailable; unknown output and completion remain retained"))?;
+    let context = store
+        .capture_context(&run.run_id)
+        .map_err(error)?
+        .ok_or_else(|| error("Immutable profile and artifact-limit capture context is unavailable; historical evidence cannot be reconstructed"))?;
+    let attempts = store.worker_attempts(&run.run_id).map_err(error)?;
+    if attempts.is_empty()
+        || attempts.iter().any(|attempt| {
+            attempt.profile_digest.as_deref() != Some(context.profile.digest.as_str())
+        })
+    {
+        return Err(error(
+            "Capture context differs from durable worker profile evidence",
+        ));
+    }
+    let container = workspace
+        .path()
+        .parent()
+        .ok_or_else(|| error("Missing container"))?;
+    for (name, expected) in [
+        ("stdout.log", &output.stdout),
+        ("stderr.log", &output.stderr),
+        ("events.jsonl", &output.events),
+    ] {
+        if &checksum(&container.join(name))? != expected {
+            return Err(error(
+                "Durable output checksum changed; recovery evidence retained",
+            ));
+        }
+    }
+    if checksum(&container.join("prompt.input"))?.sha256 != run.prompt_digest {
+        return Err(error(
+            "Recovery prompt differs from durable admission digest",
+        ));
+    }
+    validate_git(&workspace.path().join(".git"))?;
+    let prepared = store
+        .prepared_state(&run.prepared_state_id)
+        .map_err(error)?
+        .ok_or_else(|| error("Missing pinned prepared state"))?;
+    if !apply {
+        return Ok(None);
+    }
+    let captured = capture_in_workspace(
+        root,
+        store,
+        workspace,
+        &prepared,
+        output,
+        &context.profile,
+        context.artifact_limit_bytes,
+    )?;
+    verify_files(
+        root,
+        store,
+        run,
+        &captured.0,
+        &destination,
+        &captured.1,
+        true,
+    )?;
+    Ok(Some(captured))
 }
 
 pub(super) fn capture(
@@ -300,6 +484,19 @@ pub(super) fn capture(
     limit: u64,
 ) -> Result<(ArtifactManifestId, Vec<Artifact>), FabricError> {
     let workspace = capture_workspace(root, id)?;
+    capture_in_workspace(root, store, &workspace, prepared, output, profile, limit)
+}
+
+fn capture_in_workspace(
+    root: &Path,
+    store: &Store,
+    workspace: &crate::workspace::RunnerWorkspace,
+    prepared: &PreparedState,
+    output: &CaptureMetadata,
+    profile: &ProfileEvidence,
+    limit: u64,
+) -> Result<(ArtifactManifestId, Vec<Artifact>), FabricError> {
+    let id = workspace.run_id();
     let run = store
         .run(id)
         .map_err(error)?

@@ -6,7 +6,7 @@
 
 | Gate | Current status | Evidence |
 |---|---|---|
-| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Async/generic API and immutable-source acceptance passed: 220 workspace tests/33 suites and adapter conformance. Recovery/storage follow-up remains C06. |
+| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Async/generic API, immutable sources and C06 recovery/storage acceptance pass. Two CLI recovery tests include twenty real fake-worker processes; three capture cutpoints and schema-12 guards pass. Final release gates remain C07. |
 | PSTACK_LOCAL_SWARM_READY | TESTED_WITH_FAKE | Pstack `437dd8e`: explicit local-route generator/fail-closed drift tests pass; installed OMP 19.1.0 discovers `/skill:swarm`; native typed tools drive four fake workers, progress/reconnect, independent failure/artifacts/reclaim and cancel. Model-selected routing remains NOT_VERIFIED. |
 | LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
 
@@ -191,3 +191,36 @@ All passed: focused regression 14.54 s; 220 workspace tests/33 suites, 156.77 s;
   `/var/folders/1f/387q3rgd0_l041rkswmt1t_r0000gn/T/fabric-omp-host-8mOJ30`.
   This is native control-plane proof with fake workers, not live authentication,
   model-selected pstack routing, Codex/OMP live workers or cloud readiness.
+
+## C-06 recovery and retained storage
+
+Provider-free checks on macOS:
+
+```sh
+cargo test --offline --locked -p fabric-cli --test recovery -- --nocapture
+cargo test --offline --locked -p fabric-core gc_recovers_promoted_sealed_capture_before_database_association -- --nocapture
+cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapture
+```
+
+- Two CLI tests passed in 46.05s. The mixed case starts twenty real fake-worker
+  processes at concurrency four: successes, nonzero exits, cancellation, capture
+  and cleanup I/O failures, partial staging, corrupt marker, substituted symlink
+  and two genuinely killed supervisor processes.
+- Fourteen runs are safely reclaimed; six remain retained with actionable
+  ownership/evidence reasons. Repeated inspection/recovery/GC preserves artifacts,
+  recorded outcomes, attempts, unknown completion and external/source sentinels.
+  Cached async results expose newly registered artifacts and cleanup state.
+- One core regression passed in 10.82s across three interrupted-capture boundaries:
+  promoted/sealed, promoted/unsealed and complete/unsealed staging. A SQLite
+  transaction abort creates the orphan; permission/rename changes simulate the
+  other durable cutpoints. These are not claimed as process-crash injections.
+- The schema-12 unit check passed in 0.02s: v11 evidence survives migration,
+  pre-execution capture context is immutable, stale/invalid associations roll
+  back, and recovery cannot manufacture an observed outcome or alter attempts.
+- The first combined run failed both CLI tests because a shared store validator
+  rejected current fourteen-file captures as not exactly seven. The correction
+  preserves required legacy kinds and restores extended current manifests.
+- Logical retained-byte accounting is best effort, not exclusive APFS allocation.
+  Partial/corrupt evidence and live or unverifiable ownership remain retained.
+  No provider/model calls were made; live OMP/Codex and model-selected routing
+  remain `BLOCKED` / `NOT_VERIFIED`.

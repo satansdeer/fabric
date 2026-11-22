@@ -128,6 +128,14 @@ enum Commands {
         #[command(subcommand)]
         command: RunsCommands,
     },
+    /// Inspect a retained run; reclaim only with explicit --apply and verified evidence.
+    Recover {
+        id: fabric_domain::RunId,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect storage or reclaim fully captured private workspaces.
     Storage {
         #[arg(long, global = true)]
@@ -529,6 +537,7 @@ fn main() -> ExitCode {
             })(),
         ),
         Commands::Runs { command, json } => (json, write_runs(cli.root, command, json)),
+        Commands::Recover { id, apply, json } => (json, write_recover(cli.root, id, apply, json)),
         Commands::Storage { command, json } => (json, write_storage(cli.root, command, json)),
     };
     match result {
@@ -911,6 +920,41 @@ fn write_inspection(report: &impl Serialize, json: bool) -> Result<(), FabricErr
     stdout.flush().map_err(output_error)
 }
 
+fn write_recover(
+    root: Option<PathBuf>,
+    id: fabric_domain::RunId,
+    apply: bool,
+    json: bool,
+) -> Result<(), FabricError> {
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let report = fabric_core::workspace::recover(&root, &id, apply)?;
+    if json {
+        return write_inspection(&report, true);
+    }
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
+        "Recovery ({}): run {} / workspace {}\n{} ({})",
+        report.mode, report.run_id, report.workspace_id, report.action, report.reason
+    )
+    .map_err(output_error)?;
+    if let Some(detail) = &report.detail {
+        writeln!(stdout, "{detail}").map_err(output_error)?;
+    }
+    if report.action == "would_recover" {
+        writeln!(
+            stdout,
+            "Apply verified recovery: fabric recover {} --apply",
+            report.run_id
+        )
+        .map_err(output_error)?;
+    } else if report.action == "retained" {
+        writeln!(stdout, "Workspace retained for safety; resolve the reason above, then inspect again with fabric recover {} --json.", report.run_id)
+            .map_err(output_error)?;
+    }
+    stdout.flush().map_err(output_error)
+}
+
 fn write_storage(
     root: Option<PathBuf>,
     command: StorageCommands,
@@ -929,11 +973,21 @@ fn write_storage(
             for item in report.caches.iter().chain(&report.workspaces) {
                 writeln!(
                     stdout,
-                    "{}: {:?} bytes ({}){}",
+                    "{}{}: {} logical bytes ({})\n  {}{}",
                     item.id,
-                    item.usage_bytes,
+                    item.run_id
+                        .as_ref()
+                        .map(|id| format!(" / run {id}"))
+                        .unwrap_or_default(),
+                    item.usage_bytes
+                        .map(|bytes| bytes.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
                     item.retention_reason,
-                    item.diagnostic.as_deref().unwrap_or("")
+                    item.action,
+                    item.diagnostic
+                        .as_ref()
+                        .map(|diagnostic| format!("\n  {diagnostic}"))
+                        .unwrap_or_default()
                 )
                 .map_err(output_error)?;
             }

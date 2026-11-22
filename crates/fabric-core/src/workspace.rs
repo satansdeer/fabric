@@ -212,14 +212,28 @@ fn owned_workspace(
     {
         return Err(storage_error("Workspace ownership is not runner-ready."));
     }
-    validate_directories(&root, &workspace)?;
+    validate_owned_workspace(&root, &run, &workspace)
+}
+
+fn validate_owned_workspace(
+    root: &Path,
+    run: &Run,
+    workspace: &Workspace,
+) -> Result<RunnerWorkspace, FabricError> {
+    if workspace.run_id != run.run_id
+        || workspace.workspace_id != run.workspace_id
+        || workspace.state_id != run.prepared_state_id
+    {
+        return Err(storage_error("Workspace ownership records do not match."));
+    }
+    validate_directories(root, workspace)?;
     let path = Path::new(&workspace.managed_path);
     let marker = path
         .parent()
         .ok_or_else(|| storage_error("Missing workspace container."))?
         .join(".fabric-owner");
     let recorded = private_file(&marker)?;
-    let expected = marker_contents(&root, &workspace);
+    let expected = marker_contents(root, workspace);
     let mut input = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -251,7 +265,7 @@ fn owned_workspace(
         }
     }
     Ok(RunnerWorkspace {
-        run_id: run.run_id,
+        run_id: run.run_id.clone(),
         path: path.to_owned(),
     })
 }
@@ -374,7 +388,7 @@ pub fn garbage_collect(root: &Path, apply: bool) -> Result<GcReport, FabricError
     let known: std::collections::HashSet<_> = ids.iter().map(WorkspaceId::as_str).collect();
     let mut items = Vec::new();
     for id in &ids {
-        items.push(clean_one(&root, &mut store, id, apply, &mut |_| Ok(()))?);
+        items.push(recover_one(&root, &mut store, id, apply)?);
     }
     let root_directory = OpenOptions::new()
         .read(true)
@@ -404,6 +418,138 @@ pub fn garbage_collect(root: &Path, apply: bool) -> Result<GcReport, FabricError
         items,
         unknown_paths,
     })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RecoveryReport {
+    pub mode: &'static str,
+    pub run_id: RunId,
+    pub workspace_id: WorkspaceId,
+    pub state: RunState,
+    pub workspace_state: WorkspaceState,
+    pub action: String,
+    pub reason: String,
+    pub detail: Option<String>,
+    pub artifact_manifest_id: Option<fabric_domain::ArtifactManifestId>,
+}
+
+/// Inspect by default. Applying never launches or retries accepted native work.
+pub fn recover(root: &Path, id: &RunId, apply: bool) -> Result<RecoveryReport, FabricError> {
+    let (root, mut store, _lease) = cleanup_store(root, apply, false)?;
+    if apply {
+        leases::reconcile(&root, &mut store)?;
+    }
+    let run = store
+        .run(id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("Unknown recovery Run"))?;
+    let item = recover_one(&root, &mut store, &run.workspace_id, apply)?;
+    let run = store.run(id).map_err(storage_error)?.unwrap();
+    let workspace = store
+        .workspace(&run.workspace_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("Missing recovery workspace"))?;
+    Ok(RecoveryReport {
+        mode: if apply { "apply" } else { "inspect" },
+        run_id: run.run_id,
+        workspace_id: workspace.workspace_id,
+        state: run.state,
+        workspace_state: workspace.state,
+        action: match item.action.as_str() {
+            "reclaimed" => "reclaimed",
+            "would_recover" | "would_reclaim" => "would_recover",
+            "skipped" if item.reason == "already_reclaimed" => "already_reclaimed",
+            _ => "retained",
+        }
+        .into(),
+        reason: item.reason,
+        detail: item.detail,
+        artifact_manifest_id: run.artifact_manifest_id,
+    })
+}
+
+fn recover_one(
+    root: &Path,
+    store: &mut Store,
+    id: &WorkspaceId,
+    apply: bool,
+) -> Result<GcItem, FabricError> {
+    let workspace = store
+        .workspace(id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("Unknown recovery workspace"))?;
+    let run = store
+        .run(&workspace.run_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("Missing recovery Run"))?;
+    if !matches!(
+        workspace.state,
+        WorkspaceState::Active | WorkspaceState::RecoveryRequired
+    ) || run.artifact_manifest_id.is_some()
+        || matches!(
+            run.state,
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled
+        )
+    {
+        return clean_one(root, store, id, apply, &mut |_| Ok(()));
+    }
+    let mut item = GcItem {
+        workspace_id: id.clone(),
+        run_id: run.run_id.clone(),
+        action: "refused".into(),
+        reason: "recovery_evidence_unavailable".into(),
+        detail: None,
+    };
+    let result: Result<(), FabricError> = (|| {
+        let owner = match leases::status(root, store, run.run_id.as_str())? {
+            leases::Status::Inactive(guard) => guard,
+            leases::Status::Active => {
+                item.reason = "worker_owner_active".into();
+                return Ok(());
+            }
+            leases::Status::Unknown | leases::Status::Legacy => {
+                item.reason = "worker_owner_unverifiable".into();
+                return Ok(());
+            }
+        };
+        if apply
+            && (run.state != RunState::NeedsAttention
+                || workspace.state != WorkspaceState::RecoveryRequired)
+        {
+            item.reason = "run_not_recovery_required".into();
+            return Ok(());
+        }
+        item.reason = "unsafe_path_or_owner".into();
+        let owned = validate_owned_workspace(root, &run, &workspace)?;
+        item.reason = if run.capture.is_some() {
+            "incomplete_or_invalid_capture"
+        } else {
+            "capture_metadata_unavailable"
+        }
+        .into();
+        let captured = crate::artifacts::recover_capture(root, store, &run, &owned, apply)?;
+        if !apply {
+            item.action = "would_recover".into();
+            item.reason = "captureable_inactive_workspace".into();
+            return Ok(());
+        }
+        let (manifest, artifacts) = captured
+            .ok_or_else(|| storage_error("Recovery did not establish a complete capture"))?;
+        validate_owned_workspace(root, &run, &workspace)?;
+        item.reason = "recovery_association_conflict".into();
+        store
+            .recover_artifacts(&run, &workspace, &manifest, &artifacts)
+            .map_err(storage_error)?;
+        // The root guard remains held. Release our run flock before the existing
+        // descriptor cleanup engine acquires that same authority independently.
+        drop(owner);
+        item = clean_one(root, store, id, true, &mut |_| Ok(()))?;
+        Ok(())
+    })();
+    if let Err(failure) = result {
+        item.detail = Some(failure.message);
+    }
+    Ok(item)
 }
 
 pub(super) fn reclaim_run(root: &Path, id: &RunId) -> Result<GcItem, FabricError> {
@@ -554,9 +700,10 @@ fn clean_one(
         }
         let _owner = match leases::status(root, store, workspace.run_id.as_str())? {
             leases::Status::Active => return Ok(("refused", "worker_owner_active")),
-            leases::Status::Unknown => return Ok(("refused", "worker_owner_unverifiable")),
-            leases::Status::Inactive(guard) => Some(guard),
-            leases::Status::Legacy => None,
+            leases::Status::Unknown | leases::Status::Legacy => {
+                return Ok(("refused", "worker_owner_unverifiable"));
+            }
+            leases::Status::Inactive(guard) => guard,
         };
         if workspace.state != WorkspaceState::CleanupPending || workspace.retention_reason.is_some()
         {
@@ -568,7 +715,7 @@ fn clean_one(
             .ok_or_else(|| storage_error("Missing cleanup Run"))?;
         if !matches!(
             run.state,
-            RunState::Succeeded | RunState::Failed | RunState::Cancelled
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled | RunState::NeedsAttention
         ) {
             return Ok(("refused", "run_not_terminal"));
         }
@@ -968,6 +1115,10 @@ mod cleanup_tests {
     }
     impl Fixture {
         pub(super) fn captured() -> Self {
+            Self::capture(false)
+        }
+
+        fn capture(interrupt_association: bool) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
@@ -1004,10 +1155,18 @@ mod cleanup_tests {
             db.execute_batch("CREATE TRIGGER test_lease AFTER UPDATE OF state ON workspaces
                 WHEN NEW.state='CLEANUP_PENDING' BEGIN
                 UPDATE workspaces SET lease_expires_at=9223372036854775807 WHERE workspace_id=NEW.workspace_id; END;").unwrap();
+            if interrupt_association {
+                db.execute_batch(
+                    "CREATE TRIGGER test_association BEFORE UPDATE OF artifact_manifest_id ON runs
+                     WHEN NEW.artifact_manifest_id IS NOT NULL
+                     BEGIN SELECT RAISE(ABORT, 'injected artifact association interruption'); END;",
+                )
+                .unwrap();
+            }
             drop(db);
             let prompt = temp.path().join("prompt");
             fs::write(&prompt, b"prompt").unwrap();
-            let report = crate::run::foreground(
+            let result = crate::run::foreground(
                 &root,
                 "fixture",
                 &prompt,
@@ -1016,21 +1175,37 @@ mod cleanup_tests {
                     copy_limit_bytes: 1024 * 1024,
                     ..crate::run::RunOptions::default()
                 },
-            )
-            .unwrap();
-            assert_eq!(
-                report.cleanup.as_ref().unwrap().reason,
-                "worker_lease_valid"
             );
+            let id = if interrupt_association {
+                let error = result.err().expect("association must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected artifact association interruption"),
+                    "{error}"
+                );
+                let (_, store) = open_store(&root).unwrap();
+                let ids = store.workspace_ids().unwrap();
+                assert_eq!(ids.len(), 1);
+                ids.into_iter().next().unwrap()
+            } else {
+                let report = result.unwrap();
+                assert_eq!(
+                    report.cleanup.as_ref().unwrap().reason,
+                    "worker_lease_valid"
+                );
+                report.workspace_id.parse().unwrap()
+            };
             let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
             db.execute_batch(
-                "DROP TRIGGER test_lease; UPDATE workspaces SET lease_expires_at=NULL;",
+                "DROP TRIGGER test_lease; DROP TRIGGER IF EXISTS test_association;
+                 UPDATE workspaces SET lease_expires_at=NULL;",
             )
             .unwrap();
             Self {
                 temp,
                 root: root.canonicalize().unwrap(),
-                id: report.workspace_id.parse().unwrap(),
+                id,
             }
         }
     }
@@ -1045,6 +1220,155 @@ mod cleanup_tests {
                 }
             }
             writable(self.temp.path());
+        }
+    }
+
+    #[test]
+    fn gc_recovers_promoted_sealed_capture_before_database_association() {
+        for boundary in 0..3 {
+            recover_promoted_capture(boundary);
+        }
+    }
+
+    fn recover_promoted_capture(boundary: u8) {
+        use sha2::{Digest, Sha256};
+
+        // Abort only the association transaction, after the real capture has been
+        // promoted and sealed. This is a durable-boundary fault, not a SIGKILL.
+        let fixture = Fixture::capture(true);
+        let (_, store) = open_store(&fixture.root).unwrap();
+        let workspace = store.workspace(&fixture.id).unwrap().unwrap();
+        let before = store.run(&workspace.run_id).unwrap().unwrap();
+        let attempts = store.worker_attempts(&before.run_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(before.state, RunState::NeedsAttention);
+        assert_eq!(workspace.state, WorkspaceState::RecoveryRequired);
+        assert_eq!(before.exit_code, Some(0));
+        assert!(before.capture.is_some());
+        assert!(before.artifact_manifest_id.is_none());
+        assert!(store.artifacts(&before.run_id).unwrap().is_empty());
+        let manifest_id = format!("a-{}", before.run_id);
+        let final_path = fixture.root.join("artifacts").join(&manifest_id);
+        assert_eq!(
+            fs::metadata(&final_path).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert!(
+            !fixture
+                .root
+                .join("artifact-staging")
+                .join(&manifest_id)
+                .exists()
+        );
+        let manifest_bytes = fs::read(final_path.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        let mut expected: Vec<fabric_store::Artifact> =
+            serde_json::from_value(manifest["files"].clone()).unwrap();
+        expected.push(fabric_store::Artifact {
+            kind: "manifest".into(),
+            relative_path: format!("artifacts/{manifest_id}/manifest.json"),
+            sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+            size_bytes: manifest_bytes.len() as u64,
+        });
+        expected.sort_by(|left, right| left.kind.cmp(&right.kind));
+        assert_eq!(expected.len(), 14);
+        let evidence = expected
+            .iter()
+            .map(|artifact| {
+                let bytes = fs::read(fixture.root.join(&artifact.relative_path)).unwrap();
+                assert_eq!(bytes.len() as u64, artifact.size_bytes);
+                assert_eq!(format!("{:x}", Sha256::digest(&bytes)), artifact.sha256);
+                (artifact.relative_path.clone(), bytes)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fs::read(final_path.join("stdout.log")).unwrap(),
+            b"worker log\n"
+        );
+        assert_eq!(
+            fs::read(final_path.join("prompt.input")).unwrap(),
+            b"prompt"
+        );
+        assert_eq!(
+            manifest["profile"]["digest"].as_str().unwrap(),
+            attempts[0].profile_digest.as_deref().unwrap()
+        );
+        if boundary != 0 {
+            fs::set_permissions(&final_path, fs::Permissions::from_mode(0o700)).unwrap();
+            if boundary == 2 {
+                for artifact in &expected {
+                    fs::set_permissions(
+                        fixture.root.join(&artifact.relative_path),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                }
+                let stage = fixture.root.join("artifact-staging").join(&manifest_id);
+                fs::rename(&final_path, &stage).unwrap();
+                File::open(stage).unwrap().sync_all().unwrap();
+                File::open(fixture.root.join("artifact-staging"))
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            }
+            File::open(fixture.root.join("artifacts"))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        let inspection = recover(&fixture.root, &before.run_id, false).unwrap();
+        assert_eq!(inspection.action, "would_recover", "{inspection:?}");
+        assert_eq!(store.run(&before.run_id).unwrap().unwrap(), before);
+        drop(store);
+
+        let report = garbage_collect(&fixture.root, true).unwrap();
+        let item = report
+            .items
+            .iter()
+            .find(|item| item.workspace_id == fixture.id)
+            .unwrap();
+        assert_eq!(item.action, "reclaimed", "{item:?}");
+        let (_, store) = open_store(&fixture.root).unwrap();
+        let recovered = store.run(&before.run_id).unwrap().unwrap();
+        let mut unchanged = before.clone();
+        unchanged.artifact_manifest_id = Some(manifest_id.parse().unwrap());
+        unchanged.updated_at = recovered.updated_at;
+        assert_eq!(recovered, unchanged);
+        assert_eq!(store.worker_attempts(&before.run_id).unwrap(), attempts);
+        let mut registered = store.artifacts(&before.run_id).unwrap();
+        registered.sort_by(|left, right| left.kind.cmp(&right.kind));
+        assert_eq!(registered, expected);
+        assert_eq!(
+            store.workspace(&fixture.id).unwrap().unwrap().state,
+            WorkspaceState::Reclaimed
+        );
+        assert!(
+            !Path::new(&workspace.managed_path)
+                .parent()
+                .unwrap()
+                .exists()
+        );
+        crate::artifacts::verify_registered(&fixture.root, &store, &recovered).unwrap();
+        drop(store);
+
+        for _ in 0..2 {
+            let report = garbage_collect(&fixture.root, true).unwrap();
+            let item = report
+                .items
+                .iter()
+                .find(|item| item.workspace_id == fixture.id)
+                .unwrap();
+            assert_eq!(item.reason, "already_reclaimed");
+            let (_, store) = open_store(&fixture.root).unwrap();
+            assert_eq!(store.run(&before.run_id).unwrap().unwrap(), recovered);
+            let mut registered = store.artifacts(&before.run_id).unwrap();
+            registered.sort_by(|left, right| left.kind.cmp(&right.kind));
+            assert_eq!(registered, expected);
+            assert_eq!(store.worker_attempts(&before.run_id).unwrap(), attempts);
+            for (relative_path, bytes) in &evidence {
+                assert_eq!(fs::read(fixture.root.join(relative_path)).unwrap(), *bytes);
+            }
+            crate::artifacts::verify_registered(&fixture.root, &store, &recovered).unwrap();
         }
     }
 

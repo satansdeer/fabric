@@ -12,7 +12,7 @@ Execution contract: one bounded acceptance criterion at a time, failing behavior
 | C-03 generic request | DONE | Eight generic-worker scenarios, existing v1 SIGTERM/privacy regression, and full compatibility gates passed: 211 tests/33 suites plus Bun conformance. |
 | C-04 immutable sources | DONE | Exact prepared/SHA sources, original-checkout independence, frozen provenance/pins, inline CLI and restart/idempotency acceptance; 220 tests/33 suites plus Bun conformance. |
 | C-05 OMP/pstack | DONE | Actual REDs fixed; legacy/typed conformance and installed OMP 19.1.0 native schema/tool/four-worker/progress/reconnect/failure/artifact/reclaim/cancel proof pass. Explicit local pstack generator tests and actual skill discovery pass; live/model routing remains unverified. |
-| C-06 recovery/storage | IN_PROGRESS | Real capture-failure acceptance reaches missing `recover` RED; promoted sealed-capture GC regression is being driven before production authorization. |
+| C-06 recovery/storage | DONE | Provider-free 20-worker recovery/retention acceptance, three interrupted-capture cutpoints and schema-12 guards pass; observed outcomes and unknown completion stay unchanged. |
 | C-07 release gates | NOT_VERIFIED | Exact CI/evidence gates and opt-in live scripts; live provider calls require approval. |
 
 ## C-00
@@ -72,4 +72,9 @@ Focused checks, fmt, warning-denying clippy, all 190 tests across 31 suites, bin
 ## C-06 acceptance
 
 - Public actual RED: `recover_inspects_captureable_failure_then_seals_and_reclaims_without_inventing_success` reaches a real fake exit 7 and deterministic capture I/O failure, then fails because `recover` is unrecognized (one failed test, 3.04s; `local://348.log`). No durable-evidence/ownership edits or live model calls. Acceptance expansion authorized.
-- Private sealed/promoted-capture GC regression initially exposed three test compilation errors, corrected without production changes; behavioral RED is pending. C05's native gate is now complete.
+- Private promoted/sealed-capture regression: three test-only compilation errors corrected; actual behavioral RED then observed (4.33s, `local://350.log`): GC refuses with `workspace_not_cleanup_pending` instead of recovering/reclaiming the real orphaned artifact set. Fault is an association-transaction abort after genuine sealing/promotion, not SIGKILL.
+- Production authorized after both actual REDs and C05's completed native gate. Runtime owner must persist trustworthy pre-execution capture context, narrowly adopt verified orphan artifacts, preserve observed/unknown outcomes and historical evidence, hold positive inactive ownership through recovery, refresh cached async results truthfully, and expose retained run/action/bytes.
+- C05 committed/pushed as `2f2c833797`; pstack remains `437dd8e4b2ec579202fce2e81ca0900765b16472`. C06 in-progress tests and production are excluded from that C05 commit.
+- First combined C06 run exposed a shared validator regression: it required exactly seven artifacts although current captures contain fourteen. Both public tests failed. Parent removed that restriction while retaining mandatory-kind, digest, size and path validation, then removed two unnecessary full-Run verifier copies.
+- Focused GREEN: both public recovery tests pass (46.05s), including twenty real fake-worker processes at concurrency four; interrupted promoted/sealed, promoted/unsealed and complete-staging recovery passes (10.82s); schema-12 historical/context/association guard unit test passes (0.02s).
+- Recovered captureable failures remain `NEEDS_ATTENTION`; unknown supervisor-crash outcomes stay unknown and retained. Live/unknown ownership, partial staging, corrupt markers and substituted paths are not reclaimed. Async results refresh durable artifact/cleanup evidence without requeueing.

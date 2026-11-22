@@ -339,10 +339,12 @@ pub fn prepare(
 #[derive(serde::Serialize)]
 pub struct UsageItem {
     pub id: String,
+    pub run_id: Option<RunId>,
     pub path: String,
     pub usage_bytes: Option<u64>,
     pub retention_reason: String,
     pub diagnostic: Option<String>,
+    pub action: String,
 }
 #[derive(serde::Serialize)]
 pub struct StorageReport {
@@ -356,37 +358,50 @@ pub struct StorageReport {
 }
 pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, FabricError> {
     let (root, store, _lease) = cleanup_store(root, false, true)?;
-    let item =
-        |id: String, path: String, expected: PathBuf, retention_reason: String, absent: bool| {
-            let measured = if Path::new(&path) != expected {
-                Err(storage_error(
-                    "Registered storage path is not its owned location",
-                ))
-            } else if absent {
-                match std::fs::symlink_metadata(expected.parent().unwrap()) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-                    Err(error) => Err(storage_error(error)),
-                    Ok(_) => Err(storage_error(
-                        "Reclaimed storage container unexpectedly exists",
-                    )),
-                }
-            } else {
-                expected
-                    .parent()
-                    .and_then(Path::parent)
-                    .ok_or_else(|| storage_error("Missing storage parent"))
-                    .and_then(private_directory)
-                    .and_then(|()| private_directory(expected.parent().unwrap()))
-                    .and_then(|()| usage(&expected))
-            };
-            UsageItem {
-                id,
-                path,
-                retention_reason,
-                usage_bytes: measured.as_ref().ok().copied(),
-                diagnostic: measured.err().map(|e| e.message),
+    let item = |id: String,
+                path: String,
+                expected: PathBuf,
+                retention_reason: String,
+                absent: bool,
+                container: bool| {
+        let measured = if Path::new(&path) != expected {
+            Err(storage_error(
+                "Registered storage path is not its owned location",
+            ))
+        } else if absent {
+            match std::fs::symlink_metadata(expected.parent().unwrap()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(storage_error(error)),
+                Ok(_) => Err(storage_error(
+                    "Reclaimed storage container unexpectedly exists",
+                )),
             }
+        } else {
+            expected
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| storage_error("Missing storage parent"))
+                .and_then(private_directory)
+                .and_then(|()| private_directory(expected.parent().unwrap()))
+                .and_then(|()| {
+                    if container {
+                        private_directory(&expected)?;
+                        usage(expected.parent().unwrap())
+                    } else {
+                        usage(&expected)
+                    }
+                })
         };
+        UsageItem {
+            id,
+            run_id: None,
+            path,
+            retention_reason,
+            usage_bytes: measured.as_ref().ok().copied(),
+            diagnostic: measured.err().map(|e| e.message),
+            action: "No recovery action required.".into(),
+        }
+    };
     let caches = store
         .prepared_states()
         .map_err(storage_error)?
@@ -406,10 +421,11 @@ pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, Fa
                 expected,
                 reason,
                 false,
+                false,
             ))
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
-    let workspaces = store
+    let mut workspaces = store
         .workspace_ids()
         .map_err(storage_error)?
         .into_iter()
@@ -428,15 +444,30 @@ pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, Fa
                 .into()
             });
             let expected = root.join("fork-staging").join(id.as_str()).join("tree");
-            Ok(item(
+            let mut entry = item(
                 id.to_string(),
                 workspace.managed_path,
                 expected,
                 reason,
                 workspace.state == WorkspaceState::Reclaimed,
-            ))
+                true,
+            );
+            entry.action = match workspace.state {
+                WorkspaceState::Reclaimed => "Already reclaimed; artifacts preserved.".into(),
+                WorkspaceState::Active => format!(
+                    "Worker for Run {} may be active; do not remove its workspace.",
+                    workspace.run_id
+                ),
+                _ => format!(
+                    "Inspect recovery: fabric recover {} --json",
+                    workspace.run_id
+                ),
+            };
+            entry.run_id = Some(workspace.run_id);
+            Ok(entry)
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
+    workspaces.sort_by(|left, right| right.usage_bytes.cmp(&left.usage_bytes));
     Ok(StorageReport {
         accounting: "logical_bytes_best_effort_not_exclusive",
         managed_bytes: usage(&root)?,
