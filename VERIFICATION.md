@@ -109,3 +109,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed pinned-base binary tracked diff, private synced artifact staging, no-replace publication, checksums and atomic terminal registration.
 - Independently passed binary staged/unstaged patch round-trip and capture-failure retention regressions. Failed publication/registration, bounded capture and tampered output cannot claim terminal success.
 - Implementer final fmt/clippy/workspace gates passed (96 tests). Workspaces remain retained: untracked archive and deletion authority are not yet implemented.
+
+## FAB-16
+
+- Reviewed bounded tar writing, no-follow descriptor traversal, ignored exclusion, symlink refusal and complete-capture cleanup eligibility.
+- Independently passed real archive extraction (bytes, modes, links, unusual paths) and capture-failure retention regressions, including outside-link and size-limit cases.
+- Implementer final fmt/clippy/workspace gates passed (98 tests). Complete manifests permit CLEANUP_PENDING; this story performs no deletion.

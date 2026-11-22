@@ -641,6 +641,7 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
         "stderr",
         "events",
         "tracked_patch",
+        "untracked_archive",
         "prompt",
         "manifest",
     ]
@@ -668,7 +669,7 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
     assert_eq!(done.error_kind.as_deref(), Some("harness_exit"));
     assert_eq!(done.capture, Some(capture.clone()));
     assert_eq!(done.artifact_manifest_id.as_ref(), Some(&manifest));
-    assert_eq!(fixture.store().artifacts(&request.run_id).unwrap().len(), 6);
+    assert_eq!(fixture.store().artifacts(&request.run_id).unwrap().len(), 7);
     let db = rusqlite::Connection::open(fixture.root.join("fabric.db")).unwrap();
     assert!(
         db.execute(

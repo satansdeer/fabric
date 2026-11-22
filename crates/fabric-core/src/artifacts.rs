@@ -1,8 +1,12 @@
-//! Tracked recovery evidence. Publication never authorizes workspace deletion.
+//! Complete non-ignored source recovery evidence; deletion requires separate GC checks.
+use std::collections::HashSet;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use fabric_domain::{
@@ -32,7 +36,6 @@ struct Manifest<'a> {
     stop_reason: Option<&'a str>,
     capture: &'a CaptureMetadata,
     artifact_limit_bytes: u64,
-    // This manifest covers tracked edits only, even when the workspace has no untracked files.
     source_scope: &'static str,
     files: &'a [Artifact],
 }
@@ -67,7 +70,7 @@ pub(super) fn capture(
         .map_err(error)?;
     sync(&staging_root)?;
     let mut remaining = limit;
-    let mut files = Vec::with_capacity(7);
+    let mut files = Vec::with_capacity(12);
     for (name, kind, expected) in [
         ("stdout.log", "stdout", &output.stdout),
         ("stderr.log", "stderr", &output.stderr),
@@ -103,14 +106,7 @@ pub(super) fn capture(
     }
     // Reuse the owned, bounded process/drain path rather than buffering a binary patch.
     // Compare to the pinned launch HEAD, not a potentially worker-moved branch tip.
-    let git_capture = fabric_runner::capture::Capture::new(
-        create(&stage.join("tracked.patch"))?,
-        create(&stage.join("git.stderr"))?,
-        None,
-        remaining,
-    )
-    .map_err(error)?;
-    let command = CommandSpec {
+    let mut command = CommandSpec {
         program: "/usr/bin/git".into(),
         args: [
             "--git-dir=.git",
@@ -149,26 +145,14 @@ pub(super) fn capture(
         .map(|(key, value)| (key.into(), value.into()))
         .collect(),
     };
-    let result = fabric_runner::execute(
+    let patch = capture_git(
         &command,
         workspace.path(),
-        git_capture,
-        &ExecutionLimits {
-            timeout: Duration::from_secs(60),
-            ..Default::default()
-        },
-        &CancellationToken::default(),
-        |_| Ok(()),
+        &stage,
+        "tracked.patch",
+        "git.stderr",
+        &mut remaining,
     )?;
-    let patch = result.capture.map_err(error)?;
-    if !result.status.success() || result.stop_reason.is_some() || patch.truncated {
-        return Err(error(
-            "Tracked artifact capture failed or exceeded artifact limit; recovery required",
-        ));
-    }
-    remaining = remaining
-        .checked_sub(patch.persisted_bytes)
-        .ok_or_else(|| error("Artifact limit exceeded"))?;
     files.push(record(
         &manifest,
         "tracked.patch",
@@ -181,8 +165,112 @@ pub(super) fn capture(
         "capture_diagnostic",
         patch.stderr,
     ));
+    command.args.truncate(8);
+    command.args.extend(
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+            .into_iter()
+            .map(Into::into),
+    );
+    let listing = capture_git(
+        &command,
+        workspace.path(),
+        &stage,
+        "untracked.paths",
+        "untracked.stderr",
+        &mut remaining,
+    )?;
+    command.args.truncate(8);
+    command.args.extend(
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+            "--",
+        ]
+        .into_iter()
+        .map(Into::into),
+    );
+    let ignored = capture_git(
+        &command,
+        workspace.path(),
+        &stage,
+        "ignored.paths",
+        "ignored.stderr",
+        &mut remaining,
+    )?;
+    let archive = archive_untracked(
+        workspace.path(),
+        &stage.join("untracked.paths"),
+        &stage.join("ignored.paths"),
+        &stage.join("untracked.tar"),
+        &mut remaining,
+    )?;
+    files.push(record(
+        &manifest,
+        "ignored.paths",
+        "ignored_paths",
+        ignored.stdout,
+    ));
+    files.push(record(
+        &manifest,
+        "ignored.stderr",
+        "ignored_stderr",
+        ignored.stderr,
+    ));
+    command.args.truncate(8);
+    command.args.extend(
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+            .into_iter()
+            .map(Into::into),
+    );
+    files.push(record(
+        &manifest,
+        "untracked.tar",
+        "untracked_archive",
+        archive,
+    ));
+    let verified = capture_git(
+        &command,
+        workspace.path(),
+        &stage,
+        "verified.paths",
+        "verified.stderr",
+        &mut remaining,
+    )?;
+    if listing.stdout != verified.stdout {
+        return Err(error(
+            "Untracked paths changed during capture; recovery required",
+        ));
+    }
+    files.push(record(
+        &manifest,
+        "untracked.paths",
+        "untracked_paths",
+        listing.stdout,
+    ));
+    files.push(record(
+        &manifest,
+        "untracked.stderr",
+        "untracked_stderr",
+        listing.stderr,
+    ));
+    files.push(record(
+        &manifest,
+        "verified.paths",
+        "verified_untracked_paths",
+        verified.stdout,
+    ));
+    files.push(record(
+        &manifest,
+        "verified.stderr",
+        "verified_untracked_stderr",
+        verified.stderr,
+    ));
     let metadata = Manifest {
-        format_version: 1,
+        format_version: 2,
         manifest_id: manifest.as_str(),
         run_id: id.as_str(),
         workspace_id: run.workspace_id.as_str(),
@@ -200,7 +288,7 @@ pub(super) fn capture(
             .filter(|reason| matches!(*reason, "timeout" | "cancelled")),
         capture: output,
         artifact_limit_bytes: limit,
-        source_scope: "tracked_only",
+        source_scope: "tracked_and_nonignored_untracked",
         files: &files,
     };
     let bytes = serde_json::to_vec_pretty(&metadata).map_err(error)?;
@@ -252,6 +340,435 @@ pub(super) fn capture(
         }
     }
     Ok((manifest, files))
+}
+
+fn capture_git(
+    command: &CommandSpec,
+    workspace: &Path,
+    stage: &Path,
+    stdout: &str,
+    stderr: &str,
+    remaining: &mut u64,
+) -> Result<CaptureMetadata, FabricError> {
+    let capture = fabric_runner::capture::Capture::new(
+        create(&stage.join(stdout))?,
+        create(&stage.join(stderr))?,
+        None,
+        *remaining,
+    )
+    .map_err(error)?;
+    let result = fabric_runner::execute(
+        command,
+        workspace,
+        capture,
+        &ExecutionLimits {
+            timeout: Duration::from_secs(60),
+            ..Default::default()
+        },
+        &CancellationToken::default(),
+        |_| Ok(()),
+    )?;
+    let capture = result.capture.map_err(error)?;
+    if !result.status.success() || result.stop_reason.is_some() || capture.truncated {
+        return Err(error(
+            "Git artifact capture failed or exceeded artifact limit; recovery required",
+        ));
+    }
+    *remaining = remaining
+        .checked_sub(capture.persisted_bytes)
+        .ok_or_else(|| error("Artifact limit exceeded"))?;
+    Ok(capture)
+}
+
+// This writer counts tar headers, GNU long names/links, padding and end markers too.
+struct ArchiveWriter<'a> {
+    file: File,
+    remaining: &'a mut u64,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl Write for ArchiveWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > *self.remaining {
+            return Err(std::io::Error::other(
+                "Untracked archive exceeds artifact limit; recovery required",
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        *self.remaining -= written as u64;
+        self.size += written as u64;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn archive_untracked(
+    workspace: &Path,
+    listing: &Path,
+    ignored_listing: &Path,
+    destination: &Path,
+    remaining: &mut u64,
+) -> Result<CapturedFile, FabricError> {
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(workspace)
+        .map_err(error)?;
+    // Git omits FIFOs and sockets from ls-files entirely. Inspect nonignored directories
+    // as well, so that their omission can never grant cleanup authority.
+    let mut ignored = HashSet::new();
+    for path in fs::read(ignored_listing)
+        .map_err(error)?
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = path.strip_suffix(b"/").unwrap_or(path);
+        if !safe_path(path) {
+            return Err(error("Unsafe ignored Git path"));
+        }
+        ignored.insert(PathBuf::from(OsStr::from_bytes(path)));
+    }
+    let mut inspected = Vec::new();
+    inspect_directory(&root, Path::new(""), &ignored, &mut inspected)?;
+    let writer = ArchiveWriter {
+        file: create(destination)?,
+        remaining,
+        hasher: Sha256::new(),
+        size: 0,
+    };
+    let mut archive = tar::Builder::new(writer);
+    let mut directories = HashSet::new();
+    let mut captured = Vec::new();
+    let mut input = BufReader::new(open(listing)?);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if input.read_until(0, &mut bytes).map_err(error)? == 0 {
+            break;
+        }
+        if bytes.pop() != Some(0) || !safe_path(&bytes) {
+            return Err(error("Unsafe or unterminated untracked Git path"));
+        }
+        let path = Path::new(OsStr::from_bytes(&bytes));
+        let mut prefix = PathBuf::new();
+        for component in path.parent().unwrap().components() {
+            prefix.push(component);
+            if directories.insert(prefix.clone()) {
+                let directory = open_relative(&root, &prefix)?;
+                let metadata = stat(&directory)?;
+                append_header(
+                    &mut archive,
+                    &prefix,
+                    &metadata,
+                    tar::EntryType::Directory,
+                    std::io::empty(),
+                )?;
+                captured.push((prefix.clone(), metadata));
+            }
+        }
+        let (parent, name, metadata) = entry(&root, path)?;
+        let kind = metadata.st_mode & libc::S_IFMT;
+        if metadata.st_uid != unsafe { libc::geteuid() } {
+            return Err(error("Untracked input is not owned by the current user"));
+        }
+        if kind == libc::S_IFREG && metadata.st_nlink == 1 {
+            let mut source = open_at(&parent, &name, libc::O_NONBLOCK)?;
+            unchanged(&metadata, &stat(&source)?)?;
+            append_header(
+                &mut archive,
+                path,
+                &metadata,
+                tar::EntryType::Regular,
+                (&mut source).take(metadata.st_size as u64),
+            )?;
+            unchanged(&metadata, &stat(&source)?)?;
+        } else if kind == libc::S_IFLNK {
+            let mut target = [0u8; 4096];
+            // SAFETY: valid parent descriptor, name and writable output buffer. No target is opened.
+            let length = unsafe {
+                libc::readlinkat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    target.as_mut_ptr().cast(),
+                    target.len(),
+                )
+            };
+            if length < 0 {
+                return Err(error(std::io::Error::last_os_error()));
+            }
+            let length = length as usize;
+            if length == target.len() || !safe_link(&root, path, &target[..length])? {
+                return Err(error("Unsafe untracked symlink target; recovery required"));
+            }
+            let mut header = header(&metadata, tar::EntryType::Symlink)?;
+            archive
+                .append_link(
+                    &mut header,
+                    path,
+                    Path::new(OsStr::from_bytes(&target[..length])),
+                )
+                .map_err(error)?;
+        } else {
+            return Err(error(
+                "Untracked input is not an independent file or safe symlink",
+            ));
+        }
+        unchanged(&metadata, &entry(&root, path)?.2)?;
+        captured.push((path.to_owned(), metadata));
+    }
+    // Reopen from the anchored root: changed parents, types, identities or content fail closed.
+    for (path, metadata) in captured {
+        unchanged(&metadata, &entry(&root, &path)?.2)?;
+    }
+    for (path, metadata) in inspected {
+        if path.as_os_str().is_empty() {
+            unchanged(&metadata, &stat(&root)?)?;
+        } else {
+            unchanged(&metadata, &entry(&root, &path)?.2)?;
+        }
+    }
+    let writer = archive.into_inner().map_err(error)?;
+    writer.file.sync_all().map_err(error)?;
+    Ok(CapturedFile {
+        size_bytes: writer.size,
+        sha256: format!("{:x}", writer.hasher.finalize()),
+    })
+}
+
+fn safe_path(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes
+            .split(|byte| *byte == b'/')
+            .all(|part| !part.is_empty() && part != b"." && part != b".." && part != b".git")
+}
+
+fn safe_link(root: &File, path: &Path, bytes: &[u8]) -> Result<bool, FabricError> {
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    let mut target = path.parent().unwrap().to_owned();
+    // Do not normalize "..": an earlier component might be a symlink.
+    for component in Path::new(OsStr::from_bytes(bytes)).components() {
+        match component {
+            Component::Normal(name) if name != ".git" => target.push(name),
+            Component::CurDir => (),
+            _ => return Ok(false),
+        }
+    }
+    // Refuse chains and symlink ancestors, rather than resolving (and reading) outside paths.
+    if target.as_os_str().is_empty() {
+        return Ok(true);
+    }
+    Ok(entry(root, &target)?.2.st_mode & libc::S_IFMT != libc::S_IFLNK)
+}
+
+fn inspect_directory(
+    directory: &File,
+    prefix: &Path,
+    ignored: &HashSet<PathBuf>,
+    inspected: &mut Vec<(PathBuf, libc::stat)>,
+) -> Result<(), FabricError> {
+    inspected.push((prefix.to_owned(), stat(directory)?));
+    // fdopendir owns this duplicate, leaving our anchored descriptor alive.
+    // SAFETY: directory is a live descriptor.
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: duplicate transfers to the directory stream on success.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir failed, so duplicate is still ours.
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            // SAFETY: this owns the live directory stream.
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let stream = Stream(stream);
+    loop {
+        #[cfg(target_os = "macos")]
+        // SAFETY: libc supplies this thread's errno location.
+        let errno = unsafe { libc::__error() };
+        #[cfg(not(target_os = "macos"))]
+        // SAFETY: libc supplies this thread's errno location.
+        let errno = unsafe { libc::__errno_location() };
+        // SAFETY: errno is thread-local and the directory stream is live.
+        unsafe {
+            *errno = 0;
+        }
+        let item = unsafe { libc::readdir(stream.0) };
+        if item.is_null() {
+            // SAFETY: errno is a valid thread-local pointer.
+            if unsafe { *errno } != 0 {
+                return Err(error(std::io::Error::last_os_error()));
+            }
+            break;
+        }
+        // SAFETY: readdir's name is NUL-terminated and valid until the next call.
+        let name = unsafe { CStr::from_ptr((*item).d_name.as_ptr()) };
+        if [b".".as_slice(), b"..", b".git"].contains(&name.to_bytes()) {
+            continue;
+        }
+        let path = prefix.join(OsStr::from_bytes(name.to_bytes()));
+        if ignored.contains(&path) {
+            continue;
+        }
+        let metadata = stat_at(directory, name)?;
+        match metadata.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                let child = open_at(directory, name, libc::O_DIRECTORY)?;
+                unchanged(&metadata, &stat(&child)?)?;
+                inspect_directory(&child, &path, ignored, inspected)?;
+                unchanged(&metadata, &stat_at(directory, name)?)?;
+            }
+            libc::S_IFREG | libc::S_IFLNK => (),
+            _ => {
+                return Err(error(
+                    "Nonignored special file cannot be safely archived; recovery required",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_at(parent: &File, name: &CStr, flags: i32) -> Result<File, FabricError> {
+    // SAFETY: valid descriptor and NUL-terminated component; no symlink is followed.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | flags,
+        )
+    };
+    if fd < 0 {
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: openat returned a new, exclusively owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_relative(root: &File, path: &Path) -> Result<File, FabricError> {
+    let mut directory = root.try_clone().map_err(error)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(error("Unsafe archive ancestor"));
+        };
+        directory = open_at(
+            &directory,
+            &CString::new(name.as_bytes()).map_err(error)?,
+            libc::O_DIRECTORY,
+        )?;
+    }
+    Ok(directory)
+}
+
+fn entry(root: &File, path: &Path) -> Result<(File, CString, libc::stat), FabricError> {
+    let parent = open_relative(
+        root,
+        path.parent()
+            .ok_or_else(|| error("Missing archive parent"))?,
+    )?;
+    let name = CString::new(
+        path.file_name()
+            .ok_or_else(|| error("Missing archive name"))?
+            .as_bytes(),
+    )
+    .map_err(error)?;
+    let metadata = stat_at(&parent, &name)?;
+    Ok((parent, name, metadata))
+}
+
+fn stat_at(parent: &File, name: &CStr) -> Result<libc::stat, FabricError> {
+    let mut metadata = std::mem::MaybeUninit::uninit();
+    // SAFETY: valid descriptor, component and output storage; final symlinks are not followed.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: successful fstatat initialized the output.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn stat(file: &File) -> Result<libc::stat, FabricError> {
+    let mut metadata = std::mem::MaybeUninit::uninit();
+    // SAFETY: valid descriptor and output storage.
+    if unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) } != 0 {
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: successful fstat initialized the output.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn unchanged(before: &libc::stat, after: &libc::stat) -> Result<(), FabricError> {
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || before.st_mode != after.st_mode
+        || before.st_nlink != after.st_nlink
+        || before.st_uid != after.st_uid
+        || before.st_gid != after.st_gid
+        || before.st_size != after.st_size
+        || before.st_mtime != after.st_mtime
+        || before.st_mtime_nsec != after.st_mtime_nsec
+        || before.st_ctime != after.st_ctime
+        || before.st_ctime_nsec != after.st_ctime_nsec
+    {
+        return Err(error(
+            "Untracked input changed during capture; recovery required",
+        ));
+    }
+    Ok(())
+}
+
+fn header(metadata: &libc::stat, kind: tar::EntryType) -> Result<tar::Header, FabricError> {
+    if metadata.st_mode & 0o7000 != 0 || metadata.st_size < 0 || metadata.st_mtime < 0 {
+        return Err(error("Untracked metadata cannot be safely represented"));
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(kind);
+    header.set_mode(u32::from(metadata.st_mode) & 0o777);
+    header.set_uid(u64::from(metadata.st_uid));
+    header.set_gid(u64::from(metadata.st_gid));
+    header.set_mtime(metadata.st_mtime as u64);
+    header.set_size(if kind.is_file() {
+        metadata.st_size as u64
+    } else {
+        0
+    });
+    Ok(header)
+}
+
+fn append_header(
+    archive: &mut tar::Builder<ArchiveWriter<'_>>,
+    path: &Path,
+    metadata: &libc::stat,
+    kind: tar::EntryType,
+    source: impl Read,
+) -> Result<(), FabricError> {
+    archive
+        .append_data(&mut header(metadata, kind)?, path, source)
+        .map_err(error)
 }
 
 fn record(manifest: &ArtifactManifestId, name: &str, kind: &str, file: CapturedFile) -> Artifact {
@@ -406,5 +923,66 @@ fn error(value: impl std::fmt::Display) -> FabricError {
     FabricError {
         kind: ErrorKind::Storage,
         message: format!("Artifact capture: {value}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn untracked_paths_and_descriptor_validation_refuse_tampering() {
+        assert!(safe_path(b"literal\nname/\xff"));
+        for path in [
+            b"/outside".as_slice(),
+            b"../outside",
+            b"a/../outside",
+            b"a//b",
+            b".git/config",
+            b"a/./b",
+        ] {
+            assert!(!safe_path(path));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::create_dir(tree.join("dir")).unwrap();
+        fs::write(tree.join("dir/file"), b"original").unwrap();
+        let root = File::open(&tree).unwrap();
+        fs::write(tree.join("inside"), b"lexical bait").unwrap();
+        symlink(temp.path(), tree.join("hop")).unwrap();
+        assert!(!safe_link(&root, Path::new("link"), b"hop/../inside").unwrap());
+        let before = entry(&root, Path::new("dir/file")).unwrap().2;
+        fs::remove_file(tree.join("dir/file")).unwrap();
+        symlink("../../outside", tree.join("dir/file")).unwrap();
+        let (parent, name, after) = entry(&root, Path::new("dir/file")).unwrap();
+        assert!(unchanged(&before, &after).is_err());
+        assert!(open_at(&parent, &name, libc::O_NONBLOCK).is_err());
+        fs::write(temp.path().join("outside"), b"outside sentinel").unwrap();
+        fs::remove_file(tree.join("dir/file")).unwrap();
+        fs::remove_dir(tree.join("dir")).unwrap();
+        symlink(temp.path(), tree.join("dir")).unwrap();
+        assert!(entry(&root, Path::new("dir/outside")).is_err());
+        let listing = temp.path().join("paths");
+        fs::write(&listing, b"dir/outside\0").unwrap();
+        fs::set_permissions(&listing, fs::Permissions::from_mode(0o600)).unwrap();
+        let ignored = temp.path().join("ignored");
+        fs::write(&ignored, []).unwrap();
+        let mut remaining = 65536;
+        assert!(
+            archive_untracked(
+                &tree,
+                &listing,
+                &ignored,
+                &temp.path().join("archive.tar"),
+                &mut remaining
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(temp.path().join("outside")).unwrap(),
+            b"outside sentinel"
+        );
     }
 }

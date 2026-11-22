@@ -521,7 +521,7 @@ impl Store {
         Ok(())
     }
     /// Register verified promoted files and terminal completion in one transaction.
-    /// Tracked capture alone never authorizes workspace cleanup.
+    /// Complete tracked and non-ignored untracked capture precedes cleanup eligibility.
     pub fn finish_run(
         &mut self,
         id: &RunId,
@@ -536,6 +536,7 @@ impl Store {
             "stderr",
             "events",
             "tracked_patch",
+            "untracked_archive",
             "prompt",
             "manifest",
         ]
@@ -585,8 +586,8 @@ impl Store {
             return Err(StoreError::Conflict);
         }
         let count = transaction.execute(
-            "UPDATE workspaces SET state = 'RETAINED', lease_expires_at = NULL,
-             retention_reason = 'Tracked capture verified; untracked capture pending; no cleanup authority'
+            "UPDATE workspaces SET state = 'CLEANUP_PENDING', lease_expires_at = NULL,
+             retention_reason = NULL
              WHERE run_id = ?1 AND state = 'ACTIVE'",
             [id.as_str()],
         )?;

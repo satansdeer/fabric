@@ -188,7 +188,14 @@ fn verified_manifest(fixture: &Fixture, report: &serde_json::Value) -> serde_jso
         report["artifact_manifest_id"]
     );
     let files = store.artifacts(&id).unwrap();
-    assert_eq!(files.len(), 7);
+    let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
+    assert_eq!(
+        workspace.state,
+        fabric_domain::WorkspaceState::CleanupPending
+    );
+    assert!(workspace.lease_expires_at.is_none());
+    let total: u64 = files.iter().map(|file| file.size_bytes).sum();
+    assert_eq!(files.len(), 14);
     let mut manifest = None;
     for file in files {
         let path = root.join(&file.relative_path);
@@ -211,8 +218,10 @@ fn verified_manifest(fixture: &Fixture, report: &serde_json::Value) -> serde_jso
     assert_eq!(manifest["exit_code"], report["exit_code"]);
     assert_eq!(manifest["exit_signal"], report["exit_signal"]);
     assert_eq!(manifest["capture"], report["capture"]);
-    assert_eq!(manifest["source_scope"], "tracked_only");
+    assert_eq!(manifest["source_scope"], "tracked_and_nonignored_untracked");
+    assert_eq!(manifest["format_version"], 2);
     assert_eq!(manifest["recipe_digest"].as_str().unwrap().len(), 64);
+    assert!(total <= manifest["artifact_limit_bytes"].as_u64().unwrap());
     manifest
 }
 
@@ -580,14 +589,8 @@ fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
         assert!(run.artifact_manifest_id.is_some());
         verified_manifest(&fixture, &report);
         let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
-        assert_eq!(workspace.state, WorkspaceState::Retained);
-        assert!(
-            workspace
-                .retention_reason
-                .as_deref()
-                .unwrap()
-                .contains("capture")
-        );
+        assert_eq!(workspace.state, WorkspaceState::CleanupPending);
+        assert!(workspace.retention_reason.is_none());
         let tree = Path::new(&workspace.managed_path);
         assert_eq!(
             fs::read_to_string(tree.join("tracked")).unwrap(),
@@ -1160,6 +1163,115 @@ fn run_many_preserves_mixed_exit_and_prelaunch_failure_and_rejects_invalid_input
 }
 
 #[test]
+fn untracked_archive_restores_bytes_modes_links_and_excludes_ignored_dependencies() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let (repo, _) = fixture.setup();
+    let executable = fixture.script_fake(
+        r#"
+mkdir 'source dir'
+chmod 750 'source dir'
+printf '\000original\377' > 'source dir/file
+with newline'
+chmod 751 'source dir/file
+with newline'
+ln -s 'file
+with newline' 'source dir/link'
+printf 'ignored unique bytes' > .deps/ignored
+printf 'tracked result' > tracked
+/usr/bin/mkfifo .deps/ignored-pipe
+mkdir 'source dir/long path'
+i=0; name='source dir/long path/'; while [ "$i" -lt 120 ]; do name="${name}x"; i=$((i+1)); done
+printf 'long path bytes' > "$name"
+"#,
+    );
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "archive fixture").unwrap();
+    let report = json(
+        &fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(executable)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap(),
+    );
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let run = store
+        .run(&report["run_id"].as_str().unwrap().parse().unwrap())
+        .unwrap()
+        .unwrap();
+    let files = store.artifacts(&run.run_id).unwrap();
+    let archive = files
+        .iter()
+        .find(|file| file.kind == "untracked_archive")
+        .expect("complete source capture must publish a restorable untracked archive");
+    let archive = fixture.0.join("storage").join(&archive.relative_path);
+    let bytes = fs::read(&archive).unwrap();
+    assert!(
+        !bytes
+            .windows(b"ignored unique bytes".len())
+            .any(|part| part == b"ignored unique bytes")
+    );
+    verified_manifest(&fixture, &report);
+    assert_eq!(
+        store.workspace(&run.workspace_id).unwrap().unwrap().state,
+        fabric_domain::WorkspaceState::CleanupPending
+    );
+    // Restore into a fresh committed checkout, not the still-retained worker.
+    let restored = fixture.0.join("restored archive");
+    fixture.git(
+        &repo,
+        &[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            repo.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ],
+    );
+    success(
+        &Command::new("/usr/bin/tar")
+            .arg("-xpf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&restored)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read(restored.join("source dir/file\nwith newline")).unwrap(),
+        b"\0original\xff"
+    );
+    assert_eq!(
+        fs::metadata(restored.join("source dir/file\nwith newline"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
+    );
+    assert_eq!(
+        fs::metadata(restored.join("source dir"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+    assert_eq!(
+        fs::read_link(restored.join("source dir/link")).unwrap(),
+        Path::new("file\nwith newline")
+    );
+    let long = format!("source dir/long path/{}", "x".repeat(120));
+    assert_eq!(fs::read(restored.join(long)).unwrap(), b"long path bytes");
+    assert!(!restored.join(".deps").exists());
+    assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"original");
+}
+
+#[test]
 fn tracked_binary_patch_round_trips_staged_and_unstaged_changes() {
     let fixture = Fixture::new();
     let (repo, _) = fixture.setup();
@@ -1252,10 +1364,23 @@ printf '{"captured":true}\n'
 #[test]
 fn capture_failures_durably_retain_workspace_and_never_claim_terminal_success() {
     use fabric_domain::{RunState, WorkspaceState};
-    for failure in ["promotion", "registration", "limit", "tampered_output"] {
+    for failure in [
+        "promotion",
+        "registration",
+        "limit",
+        "tampered_output",
+        "outside_link",
+        "relative_outside_link",
+        "untracked_limit",
+        "metadata_limit",
+        "special_file",
+    ] {
         let fixture = Fixture::new();
         fixture.setup();
         let root = fixture.0.join("storage");
+        let sentinel = fixture.0.join("outside-sentinel");
+        fs::write(&sentinel, "outside secret target never captured").unwrap();
+        let absolute_link = format!("/bin/ln -s '{}' outside-link", sentinel.display());
         let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
         if failure == "registration" {
             db.execute_batch(
@@ -1273,6 +1398,17 @@ printf 'existing sentinel' > "../../../artifacts/a-$run/sentinel"
 "#
             }
             "tampered_output" => r#"/bin/rm ../stdout.log; /bin/ln -s /etc/passwd ../stdout.log"#,
+            "outside_link" => absolute_link.as_str(),
+            "relative_outside_link" => {
+                "/bin/mkdir links; /bin/ln -s ../../../../../outside-sentinel links/outside-link"
+            }
+            "untracked_limit" => {
+                "printf 'unique untracked recovery' > unique-large.bin; /usr/bin/head -c 65536 /dev/zero >> unique-large.bin"
+            }
+            "metadata_limit" => {
+                "i=0; while [ \"$i\" -lt 40 ]; do : > \"empty-$i\"; i=$((i+1)); done"
+            }
+            "special_file" => "/usr/bin/mkfifo untracked-fifo",
             _ => "",
         };
         let executable = fixture.script_fake(&format!(
@@ -1289,6 +1425,9 @@ printf 'existing sentinel' > "../../../artifacts/a-$run/sentinel"
             .args(["--json", "--copy-limit-bytes", "10485760"]);
         if failure == "limit" {
             command.args(["--max-artifact-bytes", "32"]);
+        }
+        if matches!(failure, "untracked_limit" | "metadata_limit") {
+            command.args(["--max-artifact-bytes", "16384"]);
         }
         let out = command.output().unwrap();
         assert!(!out.status.success(), "{failure}: {out:?}");
@@ -1312,6 +1451,44 @@ printf 'existing sentinel' > "../../../artifacts/a-$run/sentinel"
         let tree = Path::new(&workspace.managed_path);
         assert_eq!(fs::read(tree.join("tracked")).unwrap(), b"retained edit");
         assert_eq!(fs::read(tree.join("untracked.txt")).unwrap(), b"uncaptured");
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"outside secret target never captured"
+        );
+        if failure == "untracked_limit" {
+            let mut expected = b"unique untracked recovery".to_vec();
+            expected.resize(expected.len() + 65536, 0);
+            assert_eq!(fs::read(tree.join("unique-large.bin")).unwrap(), expected);
+        }
+        if matches!(failure, "untracked_limit" | "metadata_limit") {
+            let stage = root.join(format!("artifact-staging/a-{id}"));
+            let size: u64 = fs::read_dir(stage)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum();
+            assert!(
+                size <= 16384,
+                "tar metadata and partial output must respect the cap"
+            );
+        }
+        if matches!(failure, "outside_link" | "relative_outside_link") {
+            assert!(
+                workspace
+                    .retention_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("symlink")
+            );
+            let stage = root.join(format!("artifact-staging/a-{id}"));
+            for file in fs::read_dir(stage).unwrap() {
+                let bytes = fs::read(file.unwrap().path()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(b"outside secret target never captured".len())
+                        .any(|part| part == b"outside secret target never captured")
+                );
+            }
+        }
         assert_eq!(
             fs::read(tree.parent().unwrap().join("prompt.input")).unwrap(),
             fs::read(&prompt).unwrap()
