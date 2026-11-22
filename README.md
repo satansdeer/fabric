@@ -1,6 +1,6 @@
 # Fabric
 
-A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
+Fabric is a macOS-first, harness-neutral local worker layer: durable asynchronous handles, immutable prepared sources, independent writable workspaces, captured evidence and verified reclaim. **Trusted local code only:** not a sandbox, cloud backend or multi-tenant security boundary.
 
 ## Implemented: FAB-01 through FAB-20 (automated scope)
 
@@ -11,6 +11,20 @@ Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 Native prerequisites: macOS, Xcode Command Line Tools (`xcode-select --install`) for Git/linking, and a Rust toolchain with rustfmt/clippy. CI uses Rust 1.91 on `macos-latest`. APFS supports native `clonefile` full-tree forks; other local filesystems require an explicitly admitted ordinary copy. SQLite is bundled. OMP is optional for deterministic tests and must be installed/configured separately for an approved model run. No Linux support or sandbox isolation is claimed.
 
 **AT-15 is NOT EXECUTED.** Automated acceptance is not model-demonstrated acceptance; the project is not declared `POC_READY_FOR_REVIEW`.
+
+### Release evidence
+
+| Independent gate | Evidence and limitation |
+| --- | --- |
+| `LOCAL_WORKER_API_READY` | Provider-free local lifecycle/API acceptance; see the recorded [verification](docs/VERIFICATION.md), not a provider-authentication claim. |
+| `PSTACK_LOCAL_SWARM_READY` | Provider-free typed controls, installed OMP host and explicit local pstack bridge; model-selected `/skill:swarm` routing remains **NOT_VERIFIED**. |
+| `LIVE_HARNESS_VERIFIED` | **NOT_VERIFIED / BLOCKED** pending explicit spending authorization and actual OMP, Codex and mixed-harness evidence. |
+
+The C05 installed OMP 19.1.0 proof used real tools and separate fake workers, but **no agent/model turn**. Native skill discovery does not prove a model chose that route. Default checks never invoke paid providers. Native-context consent is not consent to provider spending; local pstack execution is not cloud parity.
+
+See [control surfaces](docs/CONTROL_SURFACES.md), [product boundary](docs/PRODUCT_BOUNDARY.md), [removals and compatibility](docs/REMOVALS.md), and the explicitly opt-in [live smoke guide](docs/LIVE_SMOKES.md).
+
+**Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v12 records immutable capture context; older runs lacking sufficient evidence remain retained.
 
 ```sh
 cargo build --locked -p fabric-cli
@@ -304,48 +318,15 @@ Library callers pass `fabric_core::run::RunOptions` to `foreground`/`run_many`, 
 
 For OMP only, `--max-cost-usd USD` (API `RunOptions::max_cost_usd`) passes its supported `--max-cost=USD` request-budget flag. Values must be finite and positive. OMP stops admitting new model requests once its reported spend reaches this budget; in-flight calls can overshoot, so it is **best effort, not an exact billing cap**. Unsupported installed OMP versions can reject the flag as an ordinary observed harness failure. Fabric enforces its own wall timeout; it does not depend on OMP `--max-time`, promise exact provider accounting, or make unapproved paid calls.
 
-### Installed OMP adapter (manual execution requires spending approval)
+### Installed OMP adapter (live execution requires spending approval)
 
-After explicit approval for model spending, the corresponding command is:
+The adapter pins `omp/19.1.0`; Codex pins `codex-cli 0.171.0`. Version-only doctors do not authenticate or prove model availability. Both adapters currently reject Fabric model overrides; explicitly choose and authorize the native configured model before a live invocation, with no guessed model or fallback.
 
-```sh
-./target/debug/fabric --root /private/path/to/fabric run my-project \
-  --harness omp --prompt-file ./prompt.md --copy-limit-bytes 104857600 --json
-```
+OMP runs `omp -p --mode json --no-session --no-title -- PROMPT` in a freshly validated private fork. The prompt is one literal argv value, not a shell command; native OMP message semantics still apply. Workers/probes clear inherited environment and use private HOME/XDG. Only consented native context or an explicit advanced profile authorizes selected native configuration/credential references; arbitrary ambient keys are not forwarded. Trusted configuration may execute commands and is not a security sandbox.
 
-OMP discovery reuses doctor's executable PATH lookup, resolving relative entries before changing cwd. Missing OMP fails with installation/PATH guidance before creating a run or workspace. Each single run or batch probes the selected executable once using `--version`; the exact returned version line (minus CR/LF) is persisted, not a configured version. The installed macOS binary was observed on 2026-11-22 as `omp/19.1.0`; its actual `--help` documents print mode, JSON mode, positional messages, `--no-session` and `--no-title`. Only version/help probes were executed; **AT-15 actual model smoke is not complete**.
+#### AT-15: operator-only live acceptance
 
-The existing foreground runner launches `omp -p --mode json --no-session --no-title -- PROMPT` in the freshly validated private fork. UTF-8 prompt snapshot contents are one argv value, verbatim including leading flags, newlines, quotes, shell characters and empty input. NUL/non-UTF-8 inputs fail clearly; operating-system argv size limits still apply. There is no shell interpolation or Fabric prompt-file expansion. OMP may interpret its own message syntax (for example leading `@` file references); argv fidelity is not a promise to disable OMP's message semantics.
-
-The process environment is cleared first. OMP receives fixed `LC_ALL=C`, default `PATH=/usr/bin:/bin`, and only explicitly allowlisted ambient `PATH`, `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `TMPDIR` when set. HOME/XDG permit OMP's normal installed config/auth mechanism without reading/copying credentials into Fabric-managed data; arbitrary API keys, secrets, injection variables and `PI_*` overrides are not inherited. Config files and the trusted OMP process itself remain outside Fabric's sandbox guarantees. The fake harness keeps its fixed minimal environment.
-
-#### AT-15: explicit opt-in operator procedure (pending approval)
-
-Do not execute this section without separate approval for real provider/model spending. First run `omp --version` and `omp --help` yourself: confirm the installed interface above, configured model and normal OMP authentication. Do not put credentials in prompts, recipes, task manifests or Fabric flags. `doctor --json` only discovers the executable; it does not prove authentication/model availability.
-
-After approval, choose a dedicated private root and a disposable **committed local Git fixture** containing `tracked.txt` with `original`, and `.gitignore` containing `.deps/`. Prepare it using the recipe contract above with this step: `argv = ["/bin/sh", "-c", "mkdir .deps; printf ready > .deps/ready"]`. Use absolute paths below; the recipe is outside the source checkout.
-
-```sh
-FABRIC=./target/debug/fabric
-ROOT=/private/path/to/approved-fabric
-REPO=/private/path/to/disposable-git-fixture
-$FABRIC --root "$ROOT" project add --name omp-smoke --path "$REPO"
-$FABRIC --root "$ROOT" project prepare omp-smoke --recipe /private/path/to/recipe.toml --json
-cat > /private/path/to/approved-prompt.txt <<'PROMPT'
-Read .deps/ready and require its exact contents to be ready. Change tracked.txt to "model edited" plus a newline. Create model-note.txt containing "model created" plus a newline. Do not change anything else. Report what you actually did.
-PROMPT
-$FABRIC --root "$ROOT" run omp-smoke --harness omp \
-  --prompt-file /private/path/to/approved-prompt.txt \
-  --timeout-seconds 120 --max-cost-usd 0.25 --copy-limit-bytes 104857600 --json
-$FABRIC --root "$ROOT" runs list --json
-# Set RUN_ID to the observed run_id, not a fabricated expected value:
-$FABRIC --root "$ROOT" runs show "$RUN_ID" --json
-$FABRIC --root "$ROOT" runs artifacts "$RUN_ID" --json
-$FABRIC --root "$ROOT" storage status --json
-$FABRIC --root "$ROOT" storage gc --dry-run --json
-```
-
-Require the observed OMP version, zero exit, SUCCEEDED Run, source/recipe/prompt digests, actual parsed JSON records in `events.jsonl`, a nonempty preserved `tracked.patch`, complete checksummed artifacts and reclaimed workspace; inspect any actual failure instead of relabeling it success. Follow recovery below in a separate checkout and verify the two requested file contents and unchanged original/base `.deps/ready`. Save actual command outputs, Run ID, version, provenance, checksums and recovered bytes outside the managed root for review. If approved, repeat with four distinct prompt files in the existing `run-many` manifest format and `--concurrency 2`, verifying independent Run IDs/artifacts. Budget flags are best effort and in-flight requests may overshoot. No command in this procedure has been executed against a model as part of automated acceptance.
+**NOT EXECUTED / BLOCKED** without separate provider-spending authorization. Follow [LIVE_SMOKES.md](docs/LIVE_SMOKES.md) for immutable-source OMP, Codex, mixed async batches and explicitly local pstack smoke recipes, outcome/artifact verification, recovery and reclaim evidence. The existing [Codex smoke](scripts/smoke-codex.sh) is provider-free without `--run`; only an explicitly authorized run with an operator-supplied profile may report live PASS.
 
 ### Read-only inspection and recovery
 
@@ -367,7 +348,7 @@ Storage figures count best-effort **logical bytes**, not APFS-exclusive allocati
 
 ### Deterministic acceptance map
 
-All names below refer to permanent tests run by `cargo test --offline --workspace`; no installed OMP, credentials or paid calls are needed. The macOS workflow fetches locked dependencies first, then runs fmt, strict clippy and the complete offline workspace suite.
+All names below refer to permanent tests included in `RUST_TEST_THREADS=4 cargo test --offline --locked --workspace`; no installed OMP, credentials or paid calls are needed. The macOS release gate fetches locked dependencies first, then runs fmt, strict clippy and the bounded-parallel offline workspace suite. This command documents the gate, not a claim that default-parallel execution passed; see [verification](docs/VERIFICATION.md) for observed results.
 
 | Acceptance | Runnable evidence |
 | --- | --- |
@@ -419,11 +400,11 @@ cargo test --locked -p fabric-project --test recipe
 cargo test --locked -p fabric-cli --test prepare
 cargo test --locked -p fabric-workspace --test fork
 cargo test --locked -p fabric-core --test workspace
-cargo test --locked -p fabric-cli --test run
+RUST_TEST_THREADS=4 cargo test --offline --locked -p fabric-cli --test run
 cargo test --locked -p fabric-runner
 cargo fmt --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
+RUST_TEST_THREADS=4 cargo test --offline --locked --workspace
 ```
 
 After dependencies have been cached, add `--offline` to Cargo build/test/clippy commands to prohibit registry access as well. Paid/model smoke is excluded from automated checks; AT-15 remains pending explicit approval. Project/preparation tests use temporary local Git repositories, including dirty and newly committed sources, ignored dependencies, literal argv/environment handling, hook/config suppression, retained failures, process-group/total timeouts, fail-closed managed paths, once-only cache side effects, competing CLI processes, and interrupted-stage reconciliation. Fork tests force admitted ordinary copies, compare every tree entry/content and independent inode, preserve executable/chained symlink behavior, concurrently edit siblings without base leakage, and reject insufficient admission, existing destinations and source/destination tampering.

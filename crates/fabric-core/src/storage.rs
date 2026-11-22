@@ -467,7 +467,7 @@ pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, Fa
             Ok(entry)
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
-    workspaces.sort_by(|left, right| right.usage_bytes.cmp(&left.usage_bytes));
+    workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.usage_bytes));
     Ok(StorageReport {
         accounting: "logical_bytes_best_effort_not_exclusive",
         managed_bytes: usage(&root)?,

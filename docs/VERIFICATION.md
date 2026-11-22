@@ -6,7 +6,7 @@
 
 | Gate | Current status | Evidence |
 |---|---|---|
-| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Async/generic API, immutable sources and C06 recovery/storage acceptance pass. Two CLI recovery tests include twenty real fake-worker processes; three capture cutpoints and schema-12 guards pass. Final release gates remain C07. |
+| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Final local fmt/strict lint/build and all 224 workspace tests pass. Async/generic API, immutable sources and C06 recovery/storage include twenty real fake-worker processes, three capture cutpoints and schema-12 guards. Both OMP protocols and actual native control-plane checks pass without provider calls. |
 | PSTACK_LOCAL_SWARM_READY | TESTED_WITH_FAKE | Pstack `437dd8e`: explicit local-route generator/fail-closed drift tests pass; installed OMP 19.1.0 discovers `/skill:swarm`; native typed tools drive four fake workers, progress/reconnect, independent failure/artifacts/reclaim and cancel. Model-selected routing remains NOT_VERIFIED. |
 | LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
 
@@ -228,3 +228,37 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
   and exposed an outdated cleanup contract: verified recovered
   `NEEDS_ATTENTION` / `CLEANUP_PENDING` is now eligible. The corrected test still
   refuses `RECOVERY_REQUIRED` and passed its focused rerun (0.02s).
+
+## C-07 release gates
+
+- Native OMP 19.1.0, legacy adapter and typed-tool checks all passed against the
+  current Fabric binary (85.52s combined), with pinned pstack plugin `437dd8e`.
+  Actual schemas/tools, early four-worker handles, ordinary visible context,
+  close/reconnect, independent failure, artifact digests/reclaim, cancellation
+  and `/skill:swarm` discovery were observed. No agent/provider turn was sent.
+- Native-host evidence:
+  `/var/folders/1f/387q3rgd0_l041rkswmt1t_r0000gn/T/fabric-omp-host-uGdDOe`.
+- `bash scripts/smoke-codex.sh` returned `NOT_VERIFIED` with explicit opt-in and
+  provider-charge warning; no profile or provider was invoked.
+- Human CLI surfaces were launched against that private fake-worker fixture:
+  `storage status` displayed logical bytes, Run IDs and reclaim actions;
+  `recover RUN_ID` displayed inspection-only `already_reclaimed`.
+- Updated macOS workflow YAML parsed successfully. It retains locked offline
+  Rust gates and adds both Bun protocols plus checksum-verified native OMP and
+  pinned real pstack plugin discovery. Remote execution is not yet verified.
+- The initial workspace run passed the C06 twenty-worker recovery scenario,
+  then reported 42 passing CLI run checks and four failures: a legacy-profile
+  fixture still had schema12 capture context, two total-CLI timing assertions
+  expired, and a cooperative TERM fixture was killed before exit zero.
+  The legacy fixture now models v11 before migration; cooperative fixtures use
+  an explicit two-second TERM grace. Outcome and timing assertions remain.
+- CI/release acceptance uses `RUST_TEST_THREADS=4` to bound process-heavy
+  test-case contention, not omit tests. A later strict lint rejected the
+  descending storage comparator; `sort_by_key(Reverse(...))` preserves its
+  ordering without allocation. The corrected gate passed on local
+  Rust/Clippy 1.100.0: formatting, strict offline workspace/all-target lint,
+  all 224 tests across 34 suites (289.49s), and locked offline binary builds
+  (302.22s combined). No test was filtered out.
+- Ten live-guide shell blocks and embedded Python parsed successfully without
+  execution. The guide's `sh scripts/smoke-codex.sh` default returned
+  `NOT_VERIFIED`; no live provider recipe was executed.

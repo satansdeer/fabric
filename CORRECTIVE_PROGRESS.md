@@ -13,7 +13,7 @@ Execution contract: one bounded acceptance criterion at a time, failing behavior
 | C-04 immutable sources | DONE | Exact prepared/SHA sources, original-checkout independence, frozen provenance/pins, inline CLI and restart/idempotency acceptance; 220 tests/33 suites plus Bun conformance. |
 | C-05 OMP/pstack | DONE | Actual REDs fixed; legacy/typed conformance and installed OMP 19.1.0 native schema/tool/four-worker/progress/reconnect/failure/artifact/reclaim/cancel proof pass. Explicit local pstack generator tests and actual skill discovery pass; live/model routing remains unverified. |
 | C-06 recovery/storage | DONE | Provider-free 20-worker recovery/retention acceptance, three interrupted-capture cutpoints and schema-12 guards pass; observed outcomes and unknown completion stay unchanged. |
-| C-07 release gates | NOT_VERIFIED | Exact CI/evidence gates and opt-in live scripts; live provider calls require approval. |
+| C-07 release gates | IN_PROGRESS | Local fmt/strict lint/build, 224 workspace tests, both protocols and native OMP host pass; CI and opt-in guides implemented. Remote CI pending; provider-backed execution remains BLOCKED/NOT_VERIFIED. |
 
 ## C-00
 
@@ -79,3 +79,11 @@ Focused checks, fmt, warning-denying clippy, all 190 tests across 31 suites, bin
 - Focused GREEN: both public recovery tests pass (46.05s), including twenty real fake-worker processes at concurrency four; interrupted promoted/sealed, promoted/unsealed and complete-staging recovery passes (10.82s); schema-12 historical/context/association guard unit test passes (0.02s).
 - Recovered captureable failures remain `NEEDS_ATTENTION`; unknown supervisor-crash outcomes stay unknown and retained. Live/unknown ownership, partial staging, corrupt markers and substituted paths are not reclaimed. Async results refresh durable artifact/cleanup evidence without requeueing.
 - Formatting passed. Twenty-six store integration checks passed; the obsolete denial of captured `NEEDS_ATTENTION` / `CLEANUP_PENDING` was updated to retain/refuse `RECOVERY_REQUIRED`. Its focused contract test then passed (0.02s); full workspace release rerun belongs to C07.
+
+## C-07 acceptance
+
+- C06 commits `b514b0a869` and `77a0cdc700` are pushed. Delegated C07 work produced the pinned macOS CI gate, removal inventory and opt-in live guides; parent owns acceptance and publication.
+- Native OMP 19.1.0, legacy and typed protocol checks passed without a model turn. Codex smoke returned default `NOT_VERIFIED`; no paid OMP/Codex or mixed-provider authorization exists.
+- Initial workspace release run reached 42 passing CLI run checks and four failures: historical profile evidence retained schema12 context, two total-CLI deadlines exceeded, and a cooperative worker was killed before observed exit zero. The historical fixture now genuinely migrates v11; two cooperative TERM fixtures explicitly allow two seconds. Existing outcome and elapsed assertions remain intact.
+- CI and the release command bound process-heavy test-case parallelism with `RUST_TEST_THREADS=4`. A subsequent strict lint rejected the storage comparator; allocation-free `sort_by_key(Reverse(...))` preserves its descending optional-byte order. The corrected gate passed: fmt, strict offline clippy, all 224 tests/34 suites (289.49s) and locked offline binary builds (302.22s combined), with local Rust/Clippy 1.100.0.
+- Workflow YAML and its four-thread gate validated. Ten live-guide Bash blocks and embedded Python parsed without executing them; the documented `sh scripts/smoke-codex.sh` also returned non-spending `NOT_VERIFIED`. Remote CI is not yet verified.

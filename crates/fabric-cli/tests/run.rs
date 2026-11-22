@@ -3155,6 +3155,7 @@ fn storage_workspace_monitor_terminates_owned_group_and_zero_exit_is_failure() {
     let mut options = storage_options();
     options.storage.policy.max_workspace_bytes = 1024 * 1024;
     options.max_artifact_bytes = 8 * 1024 * 1024;
+    options.limits.term_grace = std::time::Duration::from_secs(2);
     let started = std::time::Instant::now();
     let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
@@ -3202,6 +3203,7 @@ fn storage_pressure_keeps_its_reason_and_captures_evidence() {
     fs::write(&prompt, "{}").unwrap();
     let mut options = storage_options();
     options.storage.meter = std::sync::Arc::new(PressureDisk(pressure));
+    options.limits.term_grace = std::time::Duration::from_secs(2);
     let report = fabric_core::run::foreground(
         &fixture.0.join("storage"),
         "test",
@@ -3765,6 +3767,11 @@ fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compat
         }
         if matches!(case, "legacy" | "missing-digest") {
             db.execute("UPDATE worker_attempts SET profile_digest=NULL", [])
+                .unwrap();
+        }
+        if case == "legacy" {
+            // Historical runs predate the immutable prelaunch capture context.
+            db.execute_batch("DROP TABLE run_capture_contexts; PRAGMA user_version=11;")
                 .unwrap();
         }
         if case == "changed-digest" {
