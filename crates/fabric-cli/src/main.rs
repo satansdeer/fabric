@@ -44,6 +44,12 @@ enum ProjectCommands {
     },
     /// Report the persisted source identity.
     Status { name: String },
+    /// Prepare current committed HEAD in a private managed snapshot.
+    Prepare {
+        name: String,
+        #[arg(long)]
+        recipe: PathBuf,
+    },
 }
 
 #[derive(Serialize)]
@@ -54,6 +60,21 @@ struct ProjectReport<'a> {
     default_ref: &'a str,
     source_commit_sha: &'a str,
     created_at: i64,
+}
+
+#[derive(Serialize)]
+struct PreparationReport<'a> {
+    state_id: &'a str,
+    project_id: &'a str,
+    preparation_key: &'a str,
+    source_commit_sha: &'a str,
+    recipe_digest: &'a str,
+    environment_digest: Option<&'a str>,
+    prepared_path: &'a str,
+    status: fabric_domain::PreparedStateStatus,
+    created_at: i64,
+    verified_at: Option<i64>,
+    size_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -102,6 +123,35 @@ fn write_project(
         Some(root) => root,
         None => fabric_project::default_root()?,
     };
+    if let ProjectCommands::Prepare { name, recipe } = command {
+        let state = fabric_project::prepare::prepare(&root, &name, &recipe)?;
+        let report = PreparationReport {
+            state_id: state.state_id.as_str(),
+            project_id: state.project_id.as_str(),
+            preparation_key: &state.preparation_key,
+            source_commit_sha: &state.source_commit_sha,
+            recipe_digest: &state.recipe_digest,
+            environment_digest: state.harness_environment_digest.as_deref(),
+            prepared_path: &state.prepared_path,
+            status: state.status,
+            created_at: state.created_at,
+            verified_at: state.verified_at,
+            size_bytes: state.size_bytes,
+        };
+        let mut stdout = io::stdout().lock();
+        if json {
+            serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
+            writeln!(stdout).map_err(output_error)?;
+        } else {
+            writeln!(
+                stdout,
+                "Prepared: {}\nStatus: READY\nSource SHA: {}\nPath: {}\nSize: {} bytes",
+                report.state_id, report.source_commit_sha, report.prepared_path, report.size_bytes
+            )
+            .map_err(output_error)?;
+        }
+        return stdout.flush().map_err(output_error);
+    }
     let project = match command {
         ProjectCommands::Add { name, path } => {
             let registration = fabric_project::register(&root, &name, &path)?;
@@ -115,6 +165,7 @@ fn write_project(
             registration.project
         }
         ProjectCommands::Status { name } => fabric_project::status(&root, &name)?,
+        ProjectCommands::Prepare { .. } => unreachable!("preparation handled above"),
     };
     let report = ProjectReport {
         project_id: project.project_id.as_str(),

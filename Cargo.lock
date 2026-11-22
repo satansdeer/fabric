@@ -194,6 +194,7 @@ dependencies = [
  "fabric-core",
  "fabric-domain",
  "fabric-project",
+ "fabric-store",
  "serde",
  "serde_json",
 ]
@@ -219,6 +220,7 @@ version = "0.1.0"
 dependencies = [
  "fabric-domain",
  "fabric-store",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

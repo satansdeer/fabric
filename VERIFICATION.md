@@ -41,3 +41,11 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed strict recipe validation and streaming domain-separated SHA-256 identity; selected environment values are not returned as metadata.
 - Independently ran all four recipe tests: passed (canonical ordering/defaults, invalidation, argv boundaries and invalid-input rejection).
 - Implementer supplied RED evidence and passing fmt/clippy/workspace checks (34 tests).
+
+## FAB-06
+
+- Independently passed seven preparation tests and actual CLI preparation against the dirty operator fixture: ignored marker present, committed-only base, original dirty checkout unchanged.
+- Reviewed preparation process groups/timeouts, private clone, freeze and durable READY publication.
+- Initial review found regular-only freezing excluded ordinary dependency symlinks; required correction before acceptance. Independently passed internal-link/declared-PATH and escaping-link regressions after fix; outside target unchanged.
+- One initial test command targeted the wrong crate; corrected to CLI. One narrow name filter selected zero tests; corrected using observed test names. No passing claim based on either.
+- Implementer final fmt/clippy/workspace gates passed (43 tests).

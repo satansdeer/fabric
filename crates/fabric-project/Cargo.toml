@@ -11,3 +11,4 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+libc = "0.2"

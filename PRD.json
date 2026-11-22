@@ -101,7 +101,7 @@
       "acceptance_tests": [
         "AT-02"
       ],
-      "status": "todo"
+      "status": "verified"
     },
     {
       "id": "FAB-07",

@@ -15,3 +15,6 @@ serde_json.workspace = true
 fabric-domain.workspace = true
 fabric-core.workspace = true
 fabric-project = { path = "../fabric-project" }
+
+[dev-dependencies]
+fabric-store = { path = "../fabric-store" }

@@ -1,6 +1,7 @@
-//! Local-only Git source registration. The persisted default_ref is an exact commit,
-//! never a moving branch; preparation must use that pin, not the current checkout.
+//! Local-only Git registration and preparation. Registration keeps its original
+//! committed SHA; each preparation request separately resolves current committed HEAD.
 
+pub mod prepare;
 pub mod recipe;
 
 use std::fs;
