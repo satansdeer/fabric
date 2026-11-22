@@ -93,6 +93,12 @@ impl RunOptions {
                 message: "max_artifact_bytes must be positive and fit SQLite storage.".into(),
             });
         }
+        if self.copy_limit_bytes > i64::MAX as u64 {
+            return Err(FabricError {
+                kind: ErrorKind::InvalidArguments,
+                message: "copy_limit_bytes must fit SQLite storage.".into(),
+            });
+        }
         Ok(())
     }
 
@@ -233,6 +239,7 @@ pub(crate) fn execute_prepared(
 ) -> Result<RunReport, FabricError> {
     let (plan, consent) = planned;
     crate::onboarding::revalidate(root, plan, consent.as_deref())?;
+    let mut progress = crate::logs::Progress::new(options);
     if options.cancellation.is_cancelled() {
         return Err(error("Cancelled before launch; task was not started."));
     }
@@ -277,8 +284,10 @@ pub(crate) fn execute_prepared(
         exit_signal: None,
         termination_reason: None,
     };
+    let activity = fabric_runner::activity::SharedActivity::default();
     let execution = (|| {
         store.record_worker_attempt(&attempt).map_err(error)?;
+        progress.save(&store, &run_id, &activity)?;
         store
             .record_capture_context(
                 &run_id,
@@ -307,7 +316,8 @@ pub(crate) fn execute_prepared(
             options.max_log_bytes,
         )
         .map_err(error)?
-        .with_harness(harness);
+        .with_harness(harness)
+        .with_activity(std::sync::Arc::clone(&activity));
         File::open(container)
             .and_then(|file| file.sync_all())
             .map_err(error)?;
@@ -325,9 +335,13 @@ pub(crate) fn execute_prepared(
         let token = options.cancellation.worker_token();
         let done = std::sync::atomic::AtomicBool::new(false);
         crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
+        let observation_store = open_store(&root)?.1;
         let mut result = std::thread::scope(|scope| {
             let monitor = scope.spawn(|| {
                 crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done);
+            });
+            let observations = scope.spawn(|| {
+                crate::logs::monitor(observation_store, &run_id, &progress, &activity, &done)
             });
             let result = fabric_runner::execute(
                 &command,
@@ -349,9 +363,13 @@ pub(crate) fn execute_prepared(
             );
             done.store(true, std::sync::atomic::Ordering::Release);
             monitor.thread().unpark();
+            observations.thread().unpark();
             monitor
                 .join()
                 .map_err(|_| error("Storage monitor panicked"))?;
+            observations
+                .join()
+                .map_err(|_| error("Activity monitor panicked"))??;
             result
         })?;
         // A fast zero-exit worker must not hide an oversized final workspace.
@@ -391,6 +409,8 @@ pub(crate) fn execute_prepared(
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
         store.record_capture(&run_id, &capture).map_err(error)?;
+        progress.artifact_capture_started_at_ms = Some(fabric_runner::activity::timestamp_ms());
+        progress.save(&store, &run_id, &activity)?;
         let (manifest, artifacts) = crate::artifacts::capture(
             &root,
             &store,
@@ -400,6 +420,8 @@ pub(crate) fn execute_prepared(
             &plan.profile,
             options.max_artifact_bytes,
         )?;
+        progress.artifacts_captured_at_ms = Some(fabric_runner::activity::timestamp_ms());
+        progress.save(&store, &run_id, &activity)?;
         store
             .finish_run(&run_id, &capture, &manifest, &artifacts, now()?)
             .map_err(error)?;
@@ -451,6 +473,8 @@ pub(crate) fn execute_prepared(
             detail: Some(failure.message),
         }
     });
+    progress.cleanup_observed_at_ms = Some(fabric_runner::activity::timestamp_ms());
+    progress.save(&store, &run_id, &activity)?;
     let run = store
         .run(&run_id)
         .map_err(error)?
@@ -883,10 +907,12 @@ pub(crate) fn run_pool(
 }
 
 fn validate_capture_limit(max_log_bytes: u64) -> Result<(), FabricError> {
-    if max_log_bytes < fabric_runner::capture::TRUNCATION_MARKER.len() as u64 {
+    if max_log_bytes < fabric_runner::capture::TRUNCATION_MARKER.len() as u64
+        || max_log_bytes > i64::MAX as u64
+    {
         return Err(FabricError {
             kind: ErrorKind::InvalidArguments,
-            message: "Capture limit must fit the truncation marker.".into(),
+            message: "Capture limit must fit the truncation marker and SQLite storage.".into(),
         });
     }
     Ok(())

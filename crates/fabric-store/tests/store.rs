@@ -86,6 +86,35 @@ fn fixture() -> (TempDir, Store) {
     (root, store)
 }
 
+#[test]
+fn observations_remain_bounded_and_readable_after_reopen() {
+    let (root, mut store) = fixture();
+    let (run, workspace) = pair(0);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    store
+        .record_observation(&run.run_id, r#"{"bytes":1}"#)
+        .unwrap();
+    assert!(
+        store
+            .record_observation(&run.run_id, "invalid json")
+            .is_err()
+    );
+    assert!(
+        store
+            .record_observation(&run.run_id, &" ".repeat(8193))
+            .is_err()
+    );
+    store
+        .record_observation(&run.run_id, r#"{"bytes":2}"#)
+        .unwrap();
+    drop(store);
+    let store = Store::open_existing_read_only(root.path().join("fabric.sqlite3")).unwrap();
+    assert_eq!(
+        store.observation(&run.run_id).unwrap(),
+        Some((2, r#"{"bytes":2}"#.into()))
+    );
+}
+
 fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
     RunWorkspaceTransition {
         expected_run: RunState::Queued,
@@ -99,7 +128,8 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
 fn remove_task_source_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS run_capture_contexts;
+            "DROP TABLE IF EXISTS run_observations;
+         DROP TABLE IF EXISTS run_capture_contexts;
          DROP TABLE IF EXISTS batch_task_sources;
          DROP TRIGGER IF EXISTS run_requires_batch_task;
          CREATE TRIGGER run_requires_batch_task BEFORE INSERT ON runs
@@ -248,7 +278,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -304,7 +334,7 @@ fn v8_database_adds_attempt_storage_without_rewriting_legacy_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        12,
+        13,
         "C-02 must preserve earlier additive migrations"
     );
     let attempts: i64 = db
@@ -343,7 +373,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -608,7 +638,7 @@ fn v9_migration_adds_queue_without_rewriting_completed_run_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        12
+        13
     );
 }
 
@@ -1304,8 +1334,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [12, 11, 10, 9, 8, 7, 6, 5] {
+    for version in [13, 12, 11, 10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 12 {
+            db.execute_batch("DROP TABLE run_observations; PRAGMA user_version=12;")
+                .unwrap();
+        }
         if version == 11 {
             db.execute_batch("DROP TABLE run_capture_contexts; PRAGMA user_version=11;")
                 .unwrap();

@@ -1249,7 +1249,7 @@ fn create(path: &Path) -> Result<File, FabricError> {
         .map_err(error)
 }
 
-fn open(path: &Path) -> Result<File, FabricError> {
+pub(super) fn open(path: &Path) -> Result<File, FabricError> {
     let recorded = private_file(path)?;
     let file = OpenOptions::new()
         .read(true)

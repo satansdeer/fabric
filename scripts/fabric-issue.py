@@ -131,13 +131,36 @@ def issue_snapshot(args):
     return snapshot
 
 
-def worker_request(snapshot, project, prepared, harness):
+LIMITS = {
+    "timeout_seconds": (600, 1, 604800),
+    "copy_limit_bytes": (104857600, 0, 9223372036854775807),
+    "max_log_bytes": (1048576, len(b"\n[FABRIC CAPTURE TRUNCATED]\n"), 9223372036854775807),
+    "max_artifact_bytes": (10485760, 1, 9223372036854775807),
+}
+
+
+def add_limit_arguments(parser):
+    for name, (default, minimum, maximum) in LIMITS.items():
+        parser.add_argument("--" + name.replace("_", "-"), type=int, default=default,
+                            help=f"Worker resource limit ({minimum}..{maximum}, default {default}); part of durable identity")
+
+
+def selected_limits(args):
+    limits = {}
+    for name, (_, minimum, maximum) in LIMITS.items():
+        value = getattr(args, name)
+        require(type(value) is int and minimum <= value <= maximum,
+                f"Invalid --{name.replace('_', '-')} (expected {minimum}..{maximum}).")
+        limits[name] = value
+    return limits
+
+
+def worker_request(snapshot, project, prepared, harness, limits):
     task = {
         "task_id": f"issue-{snapshot['issue_number']}", "harness_id": harness,
         "source_ref": {"kind": "prepared", "state_id": prepared},
         "prompt": canonical({"instructions": POLICY, "issue": snapshot}),
-        "limits": {"timeout_seconds": 600, "copy_limit_bytes": 104857600,
-                   "max_log_bytes": 1048576, "max_artifact_bytes": 10485760},
+        "limits": limits,
     }
     if harness != "fake":
         task["execution_context"] = {"kind": "native"}
@@ -224,7 +247,8 @@ def accepted_handles(response, request):
 
 def summary(state, path):
     output = {"issue_url": state["snapshot"]["issue_url"],
-              "idempotency_key": state["idempotency_key"], "state_file": str(path)}
+              "idempotency_key": state["idempotency_key"], "state_file": str(path),
+              "limits": state["request"]["tasks"][0]["limits"]}
     if state.get("accepted") is not None:
         batch, runs = accepted_handles(state["accepted"], state["request"])
         output.update(accepted=True, batch_id=batch, run_ids=runs)
@@ -298,6 +322,7 @@ def post(args, state, path, output):
 
 
 def dispatch(args, output):
+    limits = selected_limits(args)  # Before fetching issue data or attempting admission.
     require(args.harness == "fake" or args.allow_model_spend,
             "Native workers require --allow-model-spend and prior Fabric native consent; this is not a cost cap.")
     require(args.fake_binary is None or args.harness == "fake",
@@ -310,7 +335,7 @@ def dispatch(args, output):
     require(re.fullmatch(r"[0-9a-f]{64}", args.approve) is not None
             and args.approve == snapshot["approval_sha256"],
             "Approval digest mismatch; preview the current issue and explicitly approve its SHA256.")
-    request = worker_request(snapshot, args.project, args.prepared_state, args.harness)
+    request = worker_request(snapshot, args.project, args.prepared_state, args.harness, limits)
     key = identity(snapshot, request, fake_binary)
     directory = root / "issue-bridge"
     private_directory(directory)
@@ -402,6 +427,7 @@ def parse_args():
             command.add_argument("--harness", required=True, choices=("omp", "codex", "fake"))
             command.add_argument("--allow-model-spend", action="store_true")
             command.add_argument("--fake-binary")
+            add_limit_arguments(command)
         if name == "show":
             command.add_argument("--state", required=True)
             command.add_argument("--wait-seconds", type=int, default=0)

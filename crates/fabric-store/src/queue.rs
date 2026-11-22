@@ -45,6 +45,39 @@ pub struct AsyncEvent {
 }
 
 impl Store {
+    /// Content-free identity for observers; never loads prompts, plans or results.
+    pub fn async_log_identity(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<(ProjectId, BatchId, RunState, String, i64, i64)>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT p.project_id,b.batch_id,
+             CASE WHEN q.state IN ('SUCCEEDED','FAILED','CANCELLED','NEEDS_ATTENTION')
+               THEN q.state ELSE COALESCE(r.state,q.state) END,q.harness,b.created_at,
+             COALESCE((SELECT created_at FROM async_events e
+                       WHERE e.batch_id=b.batch_id AND e.run_id=q.run_id
+                       ORDER BY cursor DESC LIMIT 1),b.created_at)
+             FROM async_tasks q JOIN batch_tasks t USING(run_id)
+             JOIN async_batches b USING(batch_id) JOIN batches a USING(batch_id)
+             JOIN prepared_states p ON p.state_id=a.prepared_state_id
+             LEFT JOIN runs r ON r.run_id=q.run_id WHERE q.run_id=?1",
+                [run.as_str()],
+                |row| {
+                    Ok((
+                        read_id(row, 0)?,
+                        read_id(row, 1)?,
+                        read_state(row, 2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     pub fn async_batch(&self, id: &BatchId) -> Result<Option<AsyncBatch>> {
         Ok(self.connection.query_row(
             "SELECT a.batch_id,b.prepared_state_id,a.request_digest,a.concurrency,a.options_json,a.fake_binary

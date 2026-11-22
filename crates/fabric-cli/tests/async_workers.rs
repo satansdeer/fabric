@@ -785,3 +785,142 @@ fn running_manager_crash_never_signals_a_worker_from_persisted_pid_metadata() {
         "uncertainty must retain original workspace protection"
     );
 }
+
+#[test]
+fn live_logs_survive_truncation_viewer_interrupt_and_owned_cancellation() {
+    let mut fixture = Fixture::new();
+    let wrapper = fixture.path.join("gated-fake");
+    let script = fs::read_to_string(&wrapper).unwrap().replace(
+        "  sleep 0.02",
+        "  printf 'PRIVATE-RAW-CONTENT-0123456789\\n'\n  sleep 0.02",
+    );
+    fs::write(wrapper, script).unwrap();
+    let request = fixture.request(&[0], 1, None);
+    let mut value: Value = serde_json::from_slice(&fs::read(&request).unwrap()).unwrap();
+    value["options"]["timeout_seconds"] = json!(7200);
+    value["options"]["max_log_bytes"] = json!(1024);
+    fs::write(&request, serde_json::to_vec(&value).unwrap()).unwrap();
+    let accepted = fixture.accept(&request, Some("live-observations"));
+    let run = accepted["run_ids"][0].as_str().unwrap();
+    let repeat = fixture.accept(&request, Some("live-observations"));
+    assert_eq!(accepted["run_ids"], repeat["run_ids"]);
+    value["options"]["timeout_seconds"] = json!(7201);
+    fs::write(&request, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(
+        !fixture
+            .run(fixture.submit_command(&request, Some("live-observations")))
+            .status
+            .success()
+    );
+    fixture.started(0);
+    let logs = |args: &[&str]| {
+        let mut command = fixture.cli();
+        command.args(["runs", "logs", run, "--json"]).args(args);
+        fixture.run(command)
+    };
+    let mut live = Value::Null;
+    eventually(|| {
+        live = parsed(&logs(&[]));
+        live["progress"]["activity"]["capture_truncated"] == true
+    });
+    assert_eq!(live["state"], "RUNNING");
+    assert_eq!(live["progress"]["timeout_seconds"], 7200);
+    assert_eq!(live["batch_id"], accepted["batch_id"]);
+    assert_eq!(live["verified_progress"], "not_assessed");
+    assert_eq!(live["process_observation"], "observed_alive_at_timestamp");
+    assert!(!live["configured_deadline_at_ms"].is_null());
+    assert!(!live.to_string().contains("PRIVATE-RAW"));
+    let observed = live["progress"]["activity"]["stdout_bytes"]
+        .as_u64()
+        .unwrap();
+    let cursor = live["next_cursor"].as_u64().unwrap().to_string();
+    eventually(|| {
+        let report = parsed(&logs(&["--after", &cursor]));
+        report["changed"] == true
+            && report["progress"]["activity"]["stdout_bytes"]
+                .as_u64()
+                .unwrap()
+                > observed
+    });
+    let first = logs(&["--raw", "stdout", "--limit-bytes", "7"]);
+    assert!(String::from_utf8_lossy(&first.stderr).contains("SENSITIVE LOCAL RAW LOGS"));
+    let first = parsed(&first);
+    assert_eq!(first["raw"], "PRIVATE");
+    assert_eq!(first["next_cursor"], 7);
+    let next = parsed(&logs(&[
+        "--raw",
+        "stdout",
+        "--limit-bytes",
+        "4",
+        "--after",
+        "7",
+    ]));
+    assert_eq!(next["raw"], "-RAW");
+    for args in [
+        vec!["--limit-bytes", "0"],
+        vec!["--limit-bytes", "65537"],
+        vec!["--after", "18446744073709551615"],
+        vec!["--raw", "stdout", "--after", "9999999"],
+        vec!["--raw", "../../foreign"],
+    ] {
+        assert!(!logs(&args).status.success(), "{args:?}");
+    }
+    let mut show = fixture.cli();
+    show.args(["runs", "show", run, "--json"]);
+    let shown = parsed(&fixture.run(show));
+    let tree = PathBuf::from(shown["workspace"]["managed_path"].as_str().unwrap());
+    let container = tree.parent().unwrap();
+    let stderr = container.join("stderr.log");
+    let backup = container.join("stderr.saved");
+    fs::rename(&stderr, &backup).unwrap();
+    std::os::unix::fs::symlink(fixture.path.join("heartbeat.0"), &stderr).unwrap();
+    assert!(!logs(&["--raw", "stderr"]).status.success());
+    fs::remove_file(&stderr).unwrap();
+    fs::create_dir(&stderr).unwrap();
+    assert!(!logs(&["--raw", "stderr"]).status.success());
+    fs::remove_dir(&stderr).unwrap();
+    fs::rename(backup, stderr).unwrap();
+    let marker = container.join(".fabric-owner");
+    let original = fs::read(&marker).unwrap();
+    fs::write(&marker, b"foreign ownership").unwrap();
+    assert!(!logs(&["--raw", "stdout"]).status.success());
+    fs::write(marker, original).unwrap();
+    let mut follow = fixture.cli();
+    follow.args([
+        "runs",
+        "logs",
+        run,
+        "--raw",
+        "stdout",
+        "--follow",
+        "--limit-bytes",
+        "32",
+    ]);
+    let mut viewer = fixture.spawn(follow);
+    eventually(|| fs::metadata(&viewer.stdout).is_ok_and(|metadata| metadata.len() > 0));
+    // Signal only the viewer Child owned by this fixture, not a persisted worker PID.
+    assert_eq!(
+        unsafe { libc::kill(viewer.child.id() as i32, libc::SIGINT) },
+        0
+    );
+    checked(&viewer.output());
+    assert_eq!(fixture.query("status", run)["terminal"], false);
+    assert!(!fixture.path.join("signalled.0").exists());
+    assert_eq!(fixture.query("cancel", run)["acknowledged"], true);
+    assert_eq!(fixture.terminal(run)["state"], "CANCELLED");
+    eventually(|| fixture.path.join("signalled.0").exists());
+    let retained = parsed(&logs(&[]));
+    assert_eq!(retained["workspace_state"], "RECLAIMED");
+    assert_eq!(retained["process_observation"], "observed_exited");
+    assert!(!retained["progress"]["cleanup_observed_at_ms"].is_null());
+    assert!(
+        retained["progress"]["activity"]["persisted_bytes"]
+            .as_u64()
+            .unwrap()
+            <= 1024
+    );
+    assert!(!tree.exists());
+    let raw = parsed(&logs(&["--raw", "stdout", "--limit-bytes", "65536"]));
+    assert!(raw["raw"].as_str().unwrap().contains("PRIVATE-RAW"));
+    assert_eq!(raw["raw_eof"], true);
+}

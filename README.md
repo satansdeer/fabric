@@ -28,7 +28,7 @@ Issue-driven development: [local approval and worker workflow](docs/ISSUE_WORKFL
 
 Hosted GitHub intake: [Connect deployment and supervised consumer](docs/CONNECT.md), tracked in [#18](https://github.com/satansdeer/fabric/issues/18). Implementation passes provider-free end-to-end checks; launch is blocked by exhausted Netlify credits and missing `polyglo.tv` registration/delegation. A signed webhook queues work but cannot authorize execution or model spending.
 
-**Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v12 records immutable capture context; older runs lacking sufficient evidence remain retained.
+**Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v13 adds bounded local observations to v12's immutable capture context; older runs have no retrospective activity samples and lacking capture evidence remain retained.
 
 ```sh
 cargo build --locked -p fabric-cli
@@ -175,6 +175,36 @@ The core persists PREPARING before fork work, RUNNING with the actual child PID/
 **Source artifacts are durable before reclaim.** A streamed binary Git diff against the pinned launch HEAD captures the combined staged and unstaged tracked result (including staged additions). A restorable GNU tar archive captures Git's NUL-delimited nonignored untracked paths, exact file bytes, ordinary permission bits, directories and safe relative symlinks. Ignored dependencies stay out of this archive. The version-2 manifest covers the archive, exact `prompt.input`, bounded stdout/stderr/events, Git capture diagnostics, IDs, source SHA, recipe/prompt digests, harness/version, observed exit/stop reason and output truncation metadata. Files are privately staged, synced, SHA-256 verified, sealed read-only, and atomically promoted with no overwrite before a single SQLite artifact-registration/terminal-completion transaction. `--max-artifact-bytes N` defaults to 100 MiB per run, counting all promoted bytes including tar headers, path listings and the manifest; exceeding it fails capture rather than publishing partial source evidence. Git capture has its own 60-second bound and is not cancelled by the worker's cancellation token.
 
 **Verified capture marks the workspace CLEANUP_PENDING, then invokes the same safe reclaim path as GC.** Successful, failed-exit, timeout, cancellation and batch runs share this pipeline. Deletion and parent-directory sync precede RECLAIMED; artifacts remain independently recoverable. JSON includes a `cleanup` result; refusal leaves the completed Run outcome unchanged and the workspace available for inspection/retry. Failed publication/registration, oversize data/metadata, unsafe links, hardlinks, special files or observed path/type changes preserve the workspace and staging/promoted evidence as NEEDS_ATTENTION / RECOVERY_REQUIRED, without a registered incomplete manifest. Source reads are descriptor-relative and refuse symlink ancestors; external or chained links fail closed without reading their targets. Reservations and expiry never authorize deletion. Output/artifact/wall-time bounds do not impose workspace, memory or spending quotas. Atomic artifact publication currently supports macOS; other platforms fail closed and retain recovery evidence.
+
+### Watch a running worker locally
+
+```sh
+# Metadata only, before exit or after capture/reclaim:
+fabric --root "$ROOT" runs logs "$RUN" --json
+fabric --root "$ROOT" runs logs "$RUN" --after "$NEXT_CURSOR" --json
+fabric --root "$ROOT" runs logs "$RUN" --follow
+# Ctrl-C stops only this viewer. It does not cancel the worker.
+
+# Explicit sensitive-content opt-in; never post/upload this output:
+fabric --root "$ROOT" runs logs "$RUN" --raw stdout --limit-bytes 4096 --follow
+# --raw stderr or --raw events selects the other local stream.
+
+# Inspect twice, compare timestamps/counters and actual work, then decide:
+fabric --root "$ROOT" runs logs "$RUN" --json
+sleep 30
+fabric --root "$ROOT" runs logs "$RUN" --json
+# Only an explicit operator decision stops the owned process group:
+fabric --root "$ROOT" cancel "$RUN" --json
+fabric --root "$ROOT" runs artifacts "$RUN" --json
+```
+
+`runs logs` correlates project/batch/run/attempt/harness with queued/start/exit, context validation, capture and cleanup timestamps. Metadata is an at-most-8-KiB persisted snapshot per run, sampled every 250 ms while supervising; it continues counting observed stdout/stderr bytes, bounded frames and normalized/tool events after the combined raw/event capture budget fills. This is a coalesced activity view, not a replay journal or synthetic model progress. `verified_progress: not_assessed` is deliberate: output, a recently **observed** alive process, and correct task progress are different facts. Compare `sampled_at_ms`, `process_alive_observed_at_ms` and output/tool timestamps; persisted PID metadata is never liveness authority. Silence alone is not a stall verdict. Current/last tool is an allowlisted category (unknown names become `other`), a last-observed slot rather than a concurrent-tool inventory.
+
+Metadata cursors are revisions; raw cursors are byte offsets, separate for stdout/stderr/events. Use the returned `next_cursor` only with the same run/mode/stream. Reads accept 1–65536 raw bytes (default 16384), reject future/malformed cursors, and emit bounded JSON records; raw chunks are JSON-escaped, lossy UTF-8, so split/invalid characters can be replaced. Follow emits JSON lines until terminal/EOF or Ctrl-C. Core opens only owned run-container or registered sealed artifact files, rejecting symlinks, special files and foreign paths; it never accepts a caller-supplied log path.
+
+Default diagnostics omit native content and raw errors. **Opt-in raw logs can contain prompts, credentials, model reasoning, arbitrary tool arguments/results and native errors. There is no universal secret redaction.** Keep them private and local, never upload to GitHub/Connect. No new service, provider SDK or sandbox is involved; native environment fidelity and trusted-local execution remain unchanged.
+
+Healthy long-running example (illustrative, not a native-run verification): explicitly select a 7200-second emergency deadline with 64 MiB combined raw/event capture and 128 MiB artifacts using the [bridge limit flags](docs/ISSUE_WORKFLOW.md#dispatch-one-bounded-worker). At minute 15, raw capture may be truncated while observed-byte/tool counters still advance and process observations remain fresh. Leave healthy work running; investigate actual task evidence if counters are quiet. The configured deadline is reported from the observed start (the supervisor's monotonic timer is authoritative), not an inactivity detector or spending cap. There is no inactivity kill, automatic restart or 600-second restart loop. Existing explicit cancel still TERM/KILLs and reaps the owned group, then captures artifacts and attempts protected reclaim.
 
 ### Inspect or reclaim captured workspaces
 
