@@ -200,6 +200,6 @@ fn unattested_adapters_default_to_unsupported_and_registry_ids_are_sorted() {
     let ids = HarnessRegistry::default().ids();
     assert_eq!(
         ids.iter().map(HarnessId::as_str).collect::<Vec<_>>(),
-        ["fake", "fake-a", "fake-b", "omp"]
+        ["codex", "fake", "fake-a", "fake-b", "omp"]
     );
 }

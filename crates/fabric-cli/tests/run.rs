@@ -3796,3 +3796,199 @@ fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compat
         }
     }
 }
+
+fn codex_fixture(fixture: &Fixture, version: &str) -> serde_json::Value {
+    use std::os::unix::fs::PermissionsExt;
+    let config = fixture.0.join("codex-config");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "# selected config\n").unwrap();
+    fs::write(config.join("auth.json"), "opaque-auth-secret-sentinel").unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+test -d "$HOME"
+test -d "$XDG_CONFIG_HOME"
+test -d "$XDG_DATA_HOME"
+test -d "$XDG_STATE_HOME"
+test -d "$XDG_CACHE_HOME"
+test -z "${{UNSELECTED_SECRET-}}${{OPENAI_API_KEY-}}${{CODEX_ACCESS_TOKEN-}}${{HTTPS_PROXY-}}"
+if [ "$1" = --version ]; then
+    test -z "${{CODEX_API_KEY-}}"
+    printf '%s\n' '{version}'
+    exit 0
+fi
+test "$#" = 9
+test "$1" = exec
+test "$2" = --json
+test "$3" = --ephemeral
+test "$4" = --color
+test "$5" = never
+test "$6" = --sandbox
+test "$7" = workspace-write
+test "$8" = --
+test "$9" = 'literal ; $(touch INJECTED)'
+"#
+    );
+    let script = format!(
+        "{script}\ntest \"$CODEX_HOME\" = '{}'\ntest \"$HOME\" != '{}'\ntest \"$CODEX_API_KEY\" = authorized-key-secret-sentinel\ntest -f .deps/ready\ntest -f tracked\ntest -z \"$(cat)\"\nprintf codex-change > tracked\nprintf '%s\\n' '{{\"type\":\"item.updated\",\"item\":{{\"id\":\"a\",\"type\":\"agent_message\",\"text\":\"partial\"}}}}' '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"a\",\"type\":\"agent_message\",\"text\":\"done\"}}}}' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":12,\"cached_input_tokens\":3,\"output_tokens\":4}}}}'\n",
+        config.display(),
+        fixture.0.display()
+    );
+    let binary = fixture.0.join("codex");
+    fs::write(&binary, script).unwrap();
+    fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+    serde_json::json!({
+        "harness_id":"codex", "harness_version":"codex-cli 0.171.0",
+        "native_config_refs":[{"kind":"native-config-dir","path":config}],
+        "connection_refs":[{"kind":"native-auth","name":"native-config-dir"},{"kind":"env","name":"CODEX_API_KEY"}]
+    })
+}
+
+fn codex_cli(fixture: &Fixture) -> Command {
+    let mut command = fixture.cli();
+    command
+        .env("PATH", format!("{}:/usr/bin:/bin", fixture.0.display()))
+        .env("CODEX_API_KEY", "authorized-key-secret-sentinel")
+        .env("OPENAI_API_KEY", "unselected-openai-secret")
+        .env("CODEX_HOME", fixture.0.join("hostile-config"))
+        .env("CODEX_ACCESS_TOKEN", "unselected-token-secret")
+        .env("HTTPS_PROXY", "unselected-proxy-secret");
+    command
+}
+
+#[test]
+fn codex_cli_mixed_batch_preserves_profile_artifacts_and_atomic_admission() {
+    let fixture = Fixture::new();
+    let (repo, base) = fixture.setup();
+    let profile = codex_fixture(&fixture, "codex-cli 0.171.0");
+    fs::write(
+        fixture.0.join("codex-prompt"),
+        "literal ; $(touch INJECTED)",
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join("fake-prompt"),
+        r#"{"writes":[{"path":"tracked","content":"fake-change"}]}"#,
+    )
+    .unwrap();
+    let tasks_path = fixture.0.join("codex-tasks.json");
+    let tasks = serde_json::json!([
+        {"id":"fake","harness":"fake-b","prompt_file":"fake-prompt","request":{}},
+        {"id":"codex","harness":"codex","prompt_file":"codex-prompt","request":{"profile":profile}}
+    ]);
+    fs::write(&tasks_path, serde_json::to_vec(&tasks).unwrap()).unwrap();
+    let invoke = || {
+        codex_cli(&fixture)
+            .args(["run-many", "test", "--tasks"])
+            .arg(&tasks_path)
+            .args([
+                "--concurrency",
+                "2",
+                "--json",
+                "--copy-limit-bytes",
+                "10485760",
+            ])
+            .output()
+            .unwrap()
+    };
+    let output = invoke();
+    let report = json(&output);
+    assert_eq!(report["succeeded"], true);
+    for (index, harness) in ["fake-b", "codex"].iter().enumerate() {
+        let run = &report["tasks"][index]["result"];
+        assert_eq!(run["harness"], *harness);
+        assert_eq!(run["state"], "SUCCEEDED");
+        assert_eq!(run["prepared_state_id"], base["state_id"]);
+        assert_eq!(run["worker_attempts"][0]["harness_resolved"], *harness);
+        assert_eq!(run["capture"]["truncated"], false);
+        verified_manifest(&fixture, run);
+        assert!(!Path::new(run["workspace_path"].as_str().unwrap()).exists());
+        let restored = restored_workspace(&fixture, run);
+        assert_eq!(
+            fs::read_to_string(restored.join("tracked")).unwrap(),
+            ["fake-change", "codex-change"][index]
+        );
+        if *harness == "codex" {
+            assert_eq!(run["harness_version"], "codex-cli 0.171.0");
+            assert_eq!(run["profile"]["portable"], false);
+            assert_eq!(run["profile"]["digest"].as_str().unwrap().len(), 64);
+            assert_eq!(
+                run["profile"]["native_config_fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                64
+            );
+            assert_eq!(
+                run["worker_attempts"][0]["profile_digest"],
+                run["profile"]["digest"]
+            );
+            let events =
+                fs::read_to_string(artifact_container(&fixture, run).join("events.jsonl")).unwrap();
+            let events: Vec<serde_json::Value> = events
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone()
+                })
+                .collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "output")
+                    .count(),
+                1
+            );
+            assert!(events.iter().any(|event| event["type"] == "usage"
+                && event["input_tokens"] == 12
+                && event["output_tokens"] == 4
+                && event["cost_usd"].is_null()));
+        }
+        for file in fs::read_dir(artifact_container(&fixture, run)).unwrap() {
+            let bytes = fs::read(file.unwrap().path()).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("secret-sentinel"));
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked")).unwrap(),
+        "original"
+    );
+    assert!(!repo.join("INJECTED").exists());
+    let before = fixture.inventory();
+    for mode in ["version", "auth", "missing-env", "model", "resume"] {
+        let mut rejected = tasks.clone();
+        if mode == "version" {
+            codex_fixture(&fixture, "codex-cli 999.0.0");
+        } else {
+            codex_fixture(&fixture, "codex-cli 0.171.0");
+        }
+        match mode {
+            "auth" => rejected[1]["request"]["profile"]["connection_refs"] = serde_json::json!([]),
+            "model" => rejected[1]["request"]["model"] = serde_json::json!("unverified-model"),
+            "resume" => rejected[1]["request"]["resume"] = serde_json::json!("prior-session"),
+            _ => {}
+        }
+        fs::write(&tasks_path, serde_json::to_vec(&rejected).unwrap()).unwrap();
+        let failure = if mode == "missing-env" {
+            codex_cli(&fixture)
+                .env_remove("CODEX_API_KEY")
+                .args(["run-many", "test", "--tasks"])
+                .arg(&tasks_path)
+                .args(["--concurrency", "2", "--json"])
+                .output()
+                .unwrap()
+        } else {
+            invoke()
+        };
+        assert!(!failure.status.success(), "{mode}: {failure:?}");
+        let error: serde_json::Value = serde_json::from_slice(&failure.stderr).unwrap();
+        assert!(error["error"]["kind"].is_string());
+        if mode == "version" {
+            assert_eq!(error["error"]["kind"], "unsupported_version");
+        }
+        if mode == "model" || mode == "resume" {
+            assert_eq!(error["error"]["kind"], "unsupported_capability");
+        }
+        assert_eq!(fixture.inventory(), before, "{mode}");
+        assert!(!String::from_utf8_lossy(&failure.stderr).contains("secret"));
+    }
+}

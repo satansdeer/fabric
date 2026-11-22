@@ -349,7 +349,7 @@ fabric harnesses doctor fake --json
 fabric harnesses doctor omp --json
 ```
 
-Doctors are bounded, version-only probes, not provider/authentication or model checks. Supported pins are `fabric-fake-harness 1`, `fabric-fake-a 1`, `fabric-fake-b 1` and `omp/19.1.0`; other versions fail `unsupported_version`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating any batch or worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Only fake-a currently supports model override. Missing usage/cost remains unknown; resume is unsupported.
+Doctors are bounded, version-only probes, not provider/authentication or model checks. Supported pins are `fabric-fake-harness 1`, `fabric-fake-a 1`, `fabric-fake-b 1`, `omp/19.1.0` and `codex-cli 0.171.0`; other versions fail `unsupported_version`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating any batch or worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Only fake-a currently supports model override. Missing usage/cost remains unknown; resume is unsupported.
 
 
 `run-many` accepts task-local harnesses and complete request overrides; `--harness` supplies an optional default. Prompt paths resolve against the task manifest's directory. For example, `tasks.json`:
@@ -382,3 +382,23 @@ Workers and version probes clear the inherited environment and use private HOME/
 Only approved OMP provider variable names may be selected; unselected keys, profile selectors and proxies are not inherited. The referenced value must already exist in the launching process; never put credentials in profile JSON. Native config references accept absolute existing `native-home` and `native-agent-dir` directories. A selected native `agent.db` requires explicit `{"kind":"native-auth","name":"native-home"}` authorization; Fabric checks metadata without opening or hashing the auth database.
 
 Reports and sealed manifests retain an opaque profile digest, bounded non-auth config fingerprint and scope diagnostics. Legacy manifests without profiles remain readable. Native config is trusted-local, not a sandbox or atomic reproducible HOME snapshot; fingerprints exclude auth, plugin/skill trees and external services. Explicit skill/plugin/MCP imports that cannot be enforced fail before allocation.
+
+### Codex adapter: source/fixture-conformant
+
+`codex` targets upstream `rust-v0.171.0` (`codex-cli 0.171.0`). It runs ephemeral `exec --json` workers with native workspace-write sandboxing and pinned noninteractive approval behavior. Fabric still owns lifecycle, bounded capture and reclaim; this is not a hard-read-only or multitenant isolation guarantee.
+
+An explicit profile can authorize an existing environment connection without inheriting ambient Codex configuration:
+
+```json
+{
+  "harness_id":"codex",
+  "harness_version":"codex-cli 0.171.0",
+  "connection_refs":[{"kind":"env","name":"CODEX_API_KEY"}]
+}
+```
+
+Optional `native_config_refs` accept one absolute existing `native-config-dir` path (`CODEX_HOME`). If that directory exposes `auth.json`, separately authorize `{"kind":"native-auth","name":"native-config-dir"}`; Fabric checks regular-file metadata without opening, copying or fingerprinting auth. Only bounded `config.toml` content enters the non-auth fingerprint. Selected native config is trusted-local and may reference external services; it is not portable or fully fingerprinted.
+
+Final assistant text, tool lifecycle and token usage are normalized; cost remains unknown. Exact model override, resume/follow-up, cost caps and unsupported skill/plugin/MCP imports fail before allocation. Native raw logs remain private artifacts and may contain sensitive harness output.
+
+`scripts/smoke-codex.sh` defaults to `NOT_VERIFIED` without invoking a provider. Explicit `--run --profile /absolute/profile.json` enables a potentially billed smoke, requires the exact installed version, and checks output, sealed evidence and cleanup before reporting PASS. No live Codex run has been verified here; deterministic fixture conformance is not provider/authentication validation.

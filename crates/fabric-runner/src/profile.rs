@@ -164,3 +164,76 @@ pub(crate) fn runtime_environment(binary: &Path) -> Result<Vec<(OsString, OsStri
     })?;
     Ok(vec![("PATH".into(), path)])
 }
+
+/// Hash only the adapter's finite non-auth file list, with bounded streaming reads.
+pub(crate) fn native_fingerprint(
+    root: Option<&Path>,
+    domain: &[u8],
+    files: &[&str],
+    message: &str,
+) -> Result<String, FabricError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    for name in files {
+        hash.update(name.as_bytes());
+        let Some(root) = root else {
+            hash.update(b"absent");
+            continue;
+        };
+        let failure = || invalid(message);
+        let path = root.join(name);
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    return Err(failure());
+                }
+                hash.update(b"absent");
+                continue;
+            }
+            Err(_) => return Err(failure()),
+        };
+        let before = file.metadata().map_err(|_| failure())?;
+        if !before.is_file() || before.len() > 1024 * 1024 {
+            return Err(failure());
+        }
+        hash.update(b"present");
+        hash.update(before.len().to_le_bytes());
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = file.read(&mut buffer).map_err(|_| failure())?;
+            if count == 0 {
+                break;
+            }
+            total += count as u64;
+            if total > 1024 * 1024 {
+                return Err(failure());
+            }
+            hash.update(&buffer[..count]);
+        }
+        let same = |after: &std::fs::Metadata| {
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec()
+                && before.ctime() == after.ctime()
+                && before.ctime_nsec() == after.ctime_nsec()
+        };
+        if total != before.len()
+            || !same(&file.metadata().map_err(|_| failure())?)
+            || !same(&std::fs::metadata(path).map_err(|_| failure())?)
+        {
+            return Err(failure());
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}

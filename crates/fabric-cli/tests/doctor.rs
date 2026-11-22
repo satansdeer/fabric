@@ -1,6 +1,21 @@
 use std::process::Command;
 
 #[test]
+fn codex_discovery_is_registered_without_allocating_storage() {
+    let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
+        .args(["harnesses", "list", "--json"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let ids: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        ids.as_array().unwrap().iter().any(|id| id == "codex"),
+        "{ids}"
+    );
+}
+
+#[test]
 fn doctor_json_without_path_reports_platform_and_missing_tools() {
     let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
         .args(["doctor", "--json"])
@@ -11,7 +26,7 @@ fn doctor_json_without_path_reports_platform_and_missing_tools() {
     assert!(output.status.success(), "{:?}", output);
     assert!(output.stderr.is_empty());
     let expected = format!(
-        "{{\"platform\":{{\"os\":\"{}\",\"arch\":\"{}\",\"supported\":{},\"primary_supported_os\":\"macos\"}},\"tools\":[{{\"name\":\"git\",\"path\":null}},{{\"name\":\"omp\",\"path\":null}}]}}\n",
+        "{{\"platform\":{{\"os\":\"{}\",\"arch\":\"{}\",\"supported\":{},\"primary_supported_os\":\"macos\"}},\"tools\":[{{\"name\":\"git\",\"path\":null}},{{\"name\":\"codex\",\"path\":null}},{{\"name\":\"omp\",\"path\":null}}]}}\n",
         std::env::consts::OS,
         std::env::consts::ARCH,
         cfg!(target_os = "macos"),
@@ -124,7 +139,10 @@ mod unix {
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty());
         let ids: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(ids, serde_json::json!(["fake", "fake-a", "fake-b", "omp"]));
+        assert_eq!(
+            ids,
+            serde_json::json!(["codex", "fake", "fake-a", "fake-b", "omp"])
+        );
         let output = invoke(&[
             "harnesses",
             "doctor",
@@ -188,7 +206,7 @@ mod unix {
         fs::write(first.join("git"), "not executable").unwrap();
         fs::set_permissions(first.join("git"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::create_dir(first.join("omp")).unwrap();
-        for name in ["git", "omp"] {
+        for name in ["git", "codex", "omp"] {
             let path = bin.join(name);
             fs::write(
                 &path,
@@ -218,7 +236,7 @@ mod unix {
         assert_eq!(report["platform"]["os"], std::env::consts::OS);
         assert_eq!(report["platform"]["supported"], cfg!(target_os = "macos"));
         assert_eq!(report["platform"]["primary_supported_os"], "macos");
-        for (index, name) in ["git", "omp"].iter().enumerate() {
+        for (index, name) in ["git", "codex", "omp"].iter().enumerate() {
             assert_eq!(report["tools"][index]["name"], *name);
             assert_eq!(
                 report["tools"][index]["path"],
@@ -248,10 +266,47 @@ mod unix {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert!(report["tools"][0]["path"].is_null());
         // macOS may canonicalize /var to /private/var when resolving cwd.
-        let discovered = PathBuf::from(report["tools"][1]["path"].as_str().unwrap());
+        let discovered = PathBuf::from(report["tools"][2]["path"].as_str().unwrap());
         assert_eq!(
             discovered.canonicalize().unwrap(),
             target.canonicalize().unwrap()
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_doctor_is_authfree_exact_pinned_and_preallocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("fabric-codex-doctor-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let binary = root.join("codex");
+    for (version, supported) in [("codex-cli 0.171.0", true), ("codex-cli 0.171.1", false)] {
+        std::fs::write(&binary, format!(
+            "#!/bin/sh\nset -eu\ntest \"$#\" = 1\ntest \"$1\" = --version\ntest -d \"$HOME\"\ntest -z \"${{CODEX_API_KEY-}}${{OPENAI_API_KEY-}}${{UNSELECTED_SECRET-}}\"\nprintf '%s\\n' '{version}'\n"
+        )).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
+            .env_clear()
+            .env("PATH", &root)
+            .env("CODEX_API_KEY", "must-not-forward")
+            .env("OPENAI_API_KEY", "must-not-forward")
+            .env("UNSELECTED_SECRET", "must-not-forward")
+            .arg("--root")
+            .arg(root.join("unallocated"))
+            .args(["harnesses", "doctor", "codex", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), supported, "{output:?}");
+        if supported {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["version"], version);
+            assert_eq!(report["harness_id"], "codex");
+        } else {
+            let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(error["error"]["kind"], "unsupported_version");
+        }
+        assert!(!root.join("unallocated").exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }

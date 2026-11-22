@@ -313,6 +313,8 @@ pub mod capture;
 pub mod jsonl;
 pub mod omp;
 pub use omp::OmpHarness;
+pub mod codex;
+pub use codex::CodexHarness;
 
 pub mod fake;
 mod fake_adapters;

@@ -1,15 +1,11 @@
 //! Pinned OMP-native local configuration and credential authorization.
 use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_domain::{
     CapabilityReason, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessRequest,
     ProfileEvidence,
 };
-use sha2::{Digest, Sha256};
 
 // Explicit finite subset of v19.1.0 documented provider variables, not arbitrary env names.
 const ENV_KEYS: &[&str] = &[
@@ -120,7 +116,12 @@ pub(super) fn resolve(
             "OMP requires at least one explicitly authorized available native-auth or approved env connection.",
         ));
     }
-    let fingerprint = fingerprint(agent.as_deref())?;
+    let fingerprint = crate::profile::native_fingerprint(
+        agent.as_deref(),
+        b"omp-native-config-v1",
+        CONFIG_FILES,
+        "Selected OMP native config changed, is unreadable or exceeds the 1 MiB per-file bound.",
+    )?;
     let mut diagnostics = vec![CapabilityReason {
         code: "auth_availability_only".into(),
         message: "Explicit credential connection availability checked locally; provider login validity, entitlement and model availability are not validated. No auth refresh, auth-store reads or command-key execution performed by Fabric.".into(),
@@ -135,79 +136,4 @@ pub(super) fn resolve(
         crate::profile::evidence(request, manifest, fingerprint, !native, diagnostics)?,
         environment,
     ))
-}
-
-fn fingerprint(agent: Option<&Path>) -> Result<String, FabricError> {
-    let mut hash = Sha256::new();
-    hash.update(b"omp-native-config-v1");
-    for name in CONFIG_FILES {
-        hash.update(name.as_bytes());
-        let Some(agent) = agent else {
-            hash.update(b"absent");
-            continue;
-        };
-        let path = agent.join(name);
-        let mut file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A dangling selected config link is not an absent configuration.
-                if std::fs::symlink_metadata(&path).is_ok() {
-                    return Err(crate::profile::invalid(
-                        "Selected OMP native config is unreadable.",
-                    ));
-                }
-                hash.update(b"absent");
-                continue;
-            }
-            Err(_) => {
-                return Err(crate::profile::invalid(
-                    "Selected OMP native config is unreadable.",
-                ));
-            }
-        };
-        let failure = || {
-            crate::profile::invalid(
-                "Selected OMP native config changed, is unreadable or exceeds the 1 MiB per-file bound.",
-            )
-        };
-        let before = file.metadata().map_err(|_| failure())?;
-        if !before.is_file() || before.len() > 1024 * 1024 {
-            return Err(failure());
-        }
-        hash.update(b"present");
-        hash.update(before.len().to_le_bytes());
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let count = file.read(&mut buffer).map_err(|_| failure())?;
-            if count == 0 {
-                break;
-            }
-            total += count as u64;
-            if total > 1024 * 1024 {
-                return Err(failure());
-            }
-            hash.update(&buffer[..count]);
-        }
-        let same = |after: &std::fs::Metadata| {
-            before.dev() == after.dev()
-                && before.ino() == after.ino()
-                && before.len() == after.len()
-                && before.mtime() == after.mtime()
-                && before.mtime_nsec() == after.mtime_nsec()
-                && before.ctime() == after.ctime()
-                && before.ctime_nsec() == after.ctime_nsec()
-        };
-        if total != before.len()
-            || !same(&file.metadata().map_err(|_| failure())?)
-            || !same(&std::fs::metadata(path).map_err(|_| failure())?)
-        {
-            return Err(failure());
-        }
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }

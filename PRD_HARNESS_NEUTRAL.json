@@ -64,7 +64,7 @@
         "HN-07"
       ],
       "objective": "Implement Codex or Qwen adapter and opt-in smoke test without default CI model calls.",
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "HN-06",

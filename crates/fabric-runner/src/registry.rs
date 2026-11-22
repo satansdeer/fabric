@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use fabric_domain::{ErrorKind, FabricError, HarnessId};
 
-use crate::{FakeAHarness, FakeBHarness, FakeHarness, HarnessAdapter, OmpHarness};
+use crate::{CodexHarness, FakeAHarness, FakeBHarness, FakeHarness, HarnessAdapter, OmpHarness};
 
 #[derive(Default)]
 pub struct RegistryOptions {
@@ -80,6 +80,21 @@ impl Default for HarnessRegistry {
     fn default() -> Self {
         let mut registry = Self::new();
         for registration in [
+            HarnessRegistration {
+                id: "codex".parse().expect("registered harness ID"),
+                doctor_executable: Some("codex"),
+                create: |options| {
+                    if options.fake_binary.is_some() {
+                        return Err(FabricError {
+                            kind: ErrorKind::InvalidArguments,
+                            message:
+                                "--fake-binary is only valid with --harness fake, fake-a or fake-b."
+                                    .into(),
+                        });
+                    }
+                    Ok(Box::new(CodexHarness::discover()?))
+                },
+            },
             HarnessRegistration {
                 id: "fake".parse().expect("registered harness ID"),
                 doctor_executable: None,
@@ -182,6 +197,6 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(failure.kind, ErrorKind::UnknownHarness);
-        assert_eq!(registry.doctor_executables(), ["omp"]);
+        assert_eq!(registry.doctor_executables(), ["codex", "omp"]);
     }
 }

@@ -265,3 +265,10 @@
 - Parent fixed legacy fixture authorization and a serde unit-variant loophole that ignored unexpected native-default model-policy fields. Existing legacy artifact verification remains compatible.
 - Parent GREEN: formatting, strict workspace/all-target Clippy and all 171 tests across 28 suites passed (`local://262.log`). Actual CLI help exposes `--profile`; installed OMP doctor reports `omp/19.1.0` with no credential/model request (`local://258.log`).
 - Status: HN-04 done. Native roots remain trusted-local/opaque; availability checks are not provider-auth validation, and fingerprints are not atomic HOME snapshots.
+
+## HN-05 — externally verified
+
+- Implementers: Hn05Codex (runner/profile/registry) and Hn05Integration (CLI fixtures/opt-in smoke), each with behavioral RED before production. Added the source-pinned `codex-cli 0.171.0` ephemeral adapter, explicit credential/config scope and shared bounded non-auth fingerprinting.
+- Mixed Codex/fake-b fixture batches retain harness/profile identities, normalized usage, sealed artifacts and verified reclaim. Native fatal errors remain observable after capture truncation; missing cost and unverified resolved model remain unknown/unsupported.
+- Parent corrected raw-versus-normalized capture assertions and the old registry ID expectation. Formatting and strict workspace/all-target Clippy passed; workspace tests passed across `local://270.log` and `local://271.log` after those fixes.
+- Status: HN-05 done. Actual discovery includes Codex but no executable is installed. `scripts/smoke-codex.sh` defaults to `NOT_VERIFIED`; live Codex/model/provider validation remains unperformed. HN-06 follows.
