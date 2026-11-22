@@ -196,6 +196,7 @@ dependencies = [
  "fabric-project",
  "fabric-runner",
  "fabric-store",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
