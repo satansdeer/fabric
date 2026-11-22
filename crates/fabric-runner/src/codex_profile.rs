@@ -14,6 +14,39 @@ fn authorization(message: &str) -> FabricError {
     }
 }
 
+pub(super) fn discover(
+    harness_id: fabric_domain::HarnessId,
+    harness_version: String,
+) -> Result<crate::NativeContext, FabricError> {
+    let root = crate::profile::native_root("CODEX_HOME", ".codex")?;
+    let auth = root.join("auth.json");
+    let credential_available =
+        root.is_dir() && std::fs::symlink_metadata(&auth).is_ok_and(|metadata| metadata.is_file());
+    let profile = fabric_domain::AgentProfile {
+        harness_id,
+        harness_version,
+        native_config_refs: vec![fabric_domain::NativeConfigRef {
+            kind: "native-config-dir".into(),
+            path: root,
+        }],
+        model_policy: fabric_domain::ModelPolicy::NativeDefault {},
+        skills: Vec::new(),
+        plugins: Vec::new(),
+        mcp: Vec::new(),
+        connection_refs: vec![fabric_domain::CredentialConnectionRef {
+            kind: "native-auth".into(),
+            name: "native-config-dir".into(),
+        }],
+    };
+    profile.validate()?;
+    Ok(crate::NativeContext {
+        profile,
+        credential_paths: vec![auth],
+        credential_available,
+        exposure: "Selected CODEX_HOME, including native auth.json authentication, config.toml and native skills/MCP/commands. Fabric inspects auth metadata only and does not inspect keychains; the harness owns authentication. Private runtime HOME/XDG; no ambient provider keys. Trusted local execution, not a sandbox.".into(),
+    })
+}
+
 pub(super) fn resolve(
     request: &HarnessRequest,
     manifest: &HarnessCapabilityManifest,

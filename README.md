@@ -32,6 +32,24 @@ The JSON report has stable field names and tool ordering:
 
 Successful reports go to stdout with exit status 0. Invalid arguments with `--json` produce a structured `{"error":{"kind":"invalid_arguments","message":"..."}}` on stderr and exit status 2. Output failures use error kind `output` and a nonzero status. Help and version retain standard CLI text output.
 
+### Discover and connect a native harness
+
+Run from the project's Git checkout:
+
+```sh
+fabric --root /private/path/to/fabric init --harness omp --check
+fabric --root /private/path/to/fabric init --harness omp
+# Or connect explicitly without the guided project/recipe workflow:
+fabric --root /private/path/to/fabric harness connect omp --yes
+fabric --root /private/path/to/fabric harness revoke omp
+```
+
+`init --check` and noninteractive `init` only report discovery, source/READY status and next actions. Interactive `init` asks separately before connecting, registering the project, creating a private recipe, and executing the reviewed preparation recipe. It never adds a recipe to the source checkout.
+
+OMP selects `$PI_CODING_AGENT_DIR` or `~/.omp/agent`; Codex selects `$CODEX_HOME` or `~/.codex`. Only adapter-approved exact versions are accepted. Discovery examines credential-file metadata, not credential contents, and does not authenticate or invoke a model. Connect displays the exact selected native paths and exposure: native configuration, skills/extensions/plugins, MCP and commands are trusted local code, not sandboxed.
+
+Consent is an owner-only, bounded, atomic local reference record, never copied credentials. Workers retain private HOME/XDG directories and do not inherit arbitrary provider keys. Native configuration/path identity changes require reconnecting. Revocation blocks future implicitly authorized launches, including already planned launches; it neither kills running workers nor invalidates separately supplied explicit profiles. Machine-readable connect requires `--yes --json` and emits no interactive prompt.
+
 ### Register a local Git project
 
 ```sh

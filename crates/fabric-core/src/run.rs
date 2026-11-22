@@ -117,7 +117,7 @@ pub fn foreground(
 ) -> Result<RunReport, FabricError> {
     options.validate()?;
     let request = options.request()?;
-    let plan = harness.plan(&request, &harness.probe()?)?;
+    let plan = crate::onboarding::plan(root, harness, request, &harness.probe()?)?;
     let (root, state) = select_prepared(root, project_name)?;
     foreground_prepared(
         &root,
@@ -160,9 +160,11 @@ fn foreground_prepared(
     prompt_file: &Path,
     harness: &dyn HarnessAdapter,
     options: &RunOptions,
-    plan: &HarnessPlan,
+    planned: &(HarnessPlan, Option<String>),
     run_id: RunId,
 ) -> Result<RunReport, FabricError> {
+    let (plan, consent) = planned;
+    crate::onboarding::revalidate(root, plan, consent.as_deref())?;
     if options.cancellation.is_cancelled() {
         return Err(error("Cancelled before launch; task was not started."));
     }
@@ -235,6 +237,7 @@ fn foreground_prepared(
         File::open(container)
             .and_then(|file| file.sync_all())
             .map_err(error)?;
+        crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
         let command = harness.command(&AgentSpec {
             prompt_file: &prompt_path,
             request: &plan.request,
@@ -247,6 +250,7 @@ fn foreground_prepared(
         reservation.launching(&store)?;
         let token = options.cancellation.worker_token();
         let done = std::sync::atomic::AtomicBool::new(false);
+        crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
         let mut result = std::thread::scope(|scope| {
             let monitor = scope.spawn(|| {
                 crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done);
@@ -516,7 +520,7 @@ pub fn spawn_many(
                 entry.insert((adapter, probe))
             }
         };
-        let plan = adapter.plan(&request, probe)?;
+        let plan = crate::onboarding::plan(root, adapter.as_ref(), request, probe)?;
         tasks.push(BatchTask {
             task_id: task.id,
             run_id: new_run_id()?,

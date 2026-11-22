@@ -14,6 +14,43 @@ pub(crate) fn invalid(message: &str) -> FabricError {
     }
 }
 
+pub(crate) fn native_root(
+    variable: &str,
+    default: &str,
+) -> Result<std::path::PathBuf, FabricError> {
+    let path = match std::env::var_os(variable) {
+        Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
+        Some(_) => {
+            return Err(invalid(
+                "Native config directory override is empty; configure an absolute native directory.",
+            ));
+        }
+        None => std::path::PathBuf::from(
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    invalid(
+                        "HOME is unavailable; explicitly configure the harness native directory.",
+                    )
+                })?,
+        )
+        .join(default),
+    };
+    if !path.is_absolute() {
+        return Err(invalid(
+            "Native config directory must be absolute; set the harness directory override explicitly.",
+        ));
+    }
+    // Resolve selected directory links once, before displaying the exact consent target.
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(_) => Err(invalid(
+            "Native config directory metadata is inaccessible; repair its local permissions.",
+        )),
+    }
+}
+
 pub(crate) fn effective_request(
     request: &HarnessRequest,
     manifest: &HarnessCapabilityManifest,
@@ -187,7 +224,7 @@ pub(crate) fn native_fingerprint(
         let path = root.join(name);
         let mut file = match std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(&path)
         {
             Ok(file) => file,
@@ -201,7 +238,7 @@ pub(crate) fn native_fingerprint(
             Err(_) => return Err(failure()),
         };
         let before = file.metadata().map_err(|_| failure())?;
-        if !before.is_file() || before.len() > 1024 * 1024 {
+        if !before.is_file() || before.nlink() != 1 || before.len() > 1024 * 1024 {
             return Err(failure());
         }
         hash.update(b"present");

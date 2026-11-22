@@ -184,6 +184,11 @@ pub fn status(root: &Path, name: &str) -> Result<Project, FabricError> {
         .ok_or_else(|| project_not_found(name))
 }
 
+/// Initialize the existing private local storage layout without registering a project.
+pub fn initialize(root: &Path) -> Result<(), FabricError> {
+    open_store(root, true).map(drop)
+}
+
 fn open_store(root: &Path, create: bool) -> Result<Store, FabricError> {
     if root.as_os_str().is_empty() {
         return Err(storage_error("Fabric storage root must not be empty."));

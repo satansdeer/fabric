@@ -30,6 +30,16 @@ pub struct HarnessInfo {
     pub version: String,
 }
 
+/// Metadata-only description of the native context offered for local consent.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeContext {
+    pub profile: fabric_domain::AgentProfile,
+    pub credential_paths: Vec<PathBuf>,
+    pub credential_available: bool,
+    pub exposure: String,
+}
+
 pub struct AgentSpec<'a> {
     pub profile: &'a fabric_domain::ProfileEvidence,
     pub prompt_file: &'a Path,
@@ -58,6 +68,12 @@ pub enum NativeEvent<'a> {
 pub trait HarnessAdapter: Sync {
     fn id(&self) -> HarnessId;
     fn probe(&self) -> Result<HarnessInfo, FabricError>;
+    fn native_context(&self) -> Result<NativeContext, FabricError> {
+        Err(FabricError {
+            kind: ErrorKind::UnsupportedCapability,
+            message: "This harness has no native-context onboarding adapter; use an explicit supported profile.".into(),
+        })
+    }
     fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
         HarnessVersion::validate(&info.version)?;
         Ok(HarnessCapabilityManifest::unsupported(

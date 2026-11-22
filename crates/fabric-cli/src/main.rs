@@ -1,3 +1,5 @@
+mod onboarding;
+
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +23,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect this checkout and explicitly connect its native harness context.
+    Init {
+        #[arg(long)]
+        harness: Option<HarnessId>,
+        /// Read-only, noninteractive discovery.
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage explicit trusted-local native-context consent.
+    Harness {
+        #[command(subcommand)]
+        command: onboarding::HarnessCommand,
+    },
     /// Report platform support and discover local tools without executing them.
     Doctor {
         /// Emit a stable machine-readable report.
@@ -282,6 +299,15 @@ fn main() -> ExitCode {
         }
     };
     let (json, result) = match cli.command {
+        Commands::Init {
+            harness,
+            check,
+            json,
+        } => (json, onboarding::init(cli.root, harness, check, json)),
+        Commands::Harness { command } => {
+            let json = command.json();
+            (json, onboarding::harness(cli.root, command))
+        }
         Commands::Doctor { json } => (json, write_doctor(json)),
         Commands::Harnesses { command, json } => (json, write_harnesses(command, json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),

@@ -36,6 +36,40 @@ fn authorization(message: &str) -> FabricError {
     }
 }
 
+pub(super) fn discover(
+    harness_id: fabric_domain::HarnessId,
+    harness_version: String,
+) -> Result<crate::NativeContext, FabricError> {
+    let root = crate::profile::native_root("PI_CODING_AGENT_DIR", ".omp/agent")?;
+    let auth = root.join("agent.db");
+    let credential_available = root.is_dir()
+        && std::fs::symlink_metadata(&auth)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+    let profile = fabric_domain::AgentProfile {
+        harness_id,
+        harness_version,
+        native_config_refs: vec![fabric_domain::NativeConfigRef {
+            kind: "native-agent-dir".into(),
+            path: root,
+        }],
+        model_policy: fabric_domain::ModelPolicy::NativeDefault {},
+        skills: Vec::new(),
+        plugins: Vec::new(),
+        mcp: Vec::new(),
+        connection_refs: vec![fabric_domain::CredentialConnectionRef {
+            kind: "native-auth".into(),
+            name: "native-home".into(),
+        }],
+    };
+    profile.validate()?;
+    Ok(crate::NativeContext {
+        profile,
+        credential_paths: vec![auth],
+        credential_available,
+        exposure: "Selected OMP agent directory, including native agent.db authentication and configured skills, extensions, plugins, MCP and commands. Fabric inspects auth metadata only; the harness may read/use it. Private runtime HOME/XDG; no ambient provider keys. Trusted local execution, not a sandbox.".into(),
+    })
+}
+
 pub(super) fn resolve(
     request: &HarnessRequest,
     manifest: &HarnessCapabilityManifest,

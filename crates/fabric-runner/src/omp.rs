@@ -41,6 +41,10 @@ impl HarnessAdapter for OmpHarness {
         Ok(HarnessInfo { version })
     }
 
+    fn native_context(&self) -> Result<crate::NativeContext, FabricError> {
+        profile::discover(self.id(), self.probe()?.version)
+    }
+
     fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
         let mut manifest = crate::planning::local_manifest(
             self.id(),
