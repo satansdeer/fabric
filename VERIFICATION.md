@@ -97,3 +97,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Reviewed fixed-size worker pool, once-per-batch prepared-state/version selection and durable ordered task results.
 - Independently ran both batch CLI regressions: passed. Four external workers demonstrate peak two with cap two; mixed exit/prelaunch failures preserve individual outcomes and make batch unsuccessful.
 - Implementer final fmt/clippy/workspace gates passed (83 tests).
+
+## FAB-14
+
+- Reviewed macOS owned/unreaped process-group identity, TERM/grace/KILL escalation, cancellation and bounded pipe draining.
+- Independently ran three timeout and two cancellation regressions: passed. Tests include TERM-ignoring descendants, heartbeat cessation, Ctrl-C and preserved observed outcomes.
+- Implementer final fmt/clippy/workspace gates passed (93 tests). No stale persisted PID is adopted for signalling; model cost controls remain best effort.

@@ -47,6 +47,7 @@ fn pair(index: usize) -> (Run, Workspace) {
         workspace_id: format!("workspace-{index}").parse().unwrap(),
         pid_metadata: None,
         exit_code: None,
+        exit_signal: None,
         created_at: 200,
         updated_at: 200,
         started_at: None,
@@ -129,7 +130,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -155,7 +156,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     drop(store);
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch("DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN capture_metadata; PRAGMA user_version=1;")
+        .execute_batch("DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN capture_metadata; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=1;")
         .unwrap();
     drop(connection);
     let reopened = Store::open(&path).unwrap();
@@ -169,7 +170,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -181,7 +182,7 @@ fn v2_database_upgrades_without_losing_run_ownership() {
     drop(store);
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch(
-        "DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; PRAGMA user_version=2;",
+        "DROP TRIGGER run_requires_batch_task; DROP TABLE batch_tasks; DROP TABLE batches; ALTER TABLE runs DROP COLUMN exit_signal; PRAGMA user_version=2;",
     ).unwrap();
     drop(connection);
     let reopened = Store::open(&path).unwrap();

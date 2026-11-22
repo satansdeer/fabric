@@ -2,6 +2,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +29,10 @@ pub struct RunReport {
     pub harness_version: Option<String>,
     pub state: RunState,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub exit_signal: Option<i32>,
+    #[serde(default)]
+    pub error_kind: Option<String>,
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
@@ -36,26 +41,60 @@ pub struct RunReport {
     pub capture: fabric_domain::CaptureMetadata,
 }
 
+pub struct RunOptions {
+    pub copy_limit_bytes: u64,
+    pub max_log_bytes: u64,
+    pub limits: fabric_runner::ExecutionLimits,
+    pub cancellation: fabric_runner::CancellationToken,
+    /// Best-effort OMP request admission only, not an exact spending cap.
+    pub max_cost_usd: Option<f64>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            copy_limit_bytes: 0,
+            max_log_bytes: fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
+            limits: fabric_runner::ExecutionLimits::default(),
+            cancellation: fabric_runner::CancellationToken::default(),
+            max_cost_usd: None,
+        }
+    }
+}
+
+impl RunOptions {
+    fn validate(&self, harness: &str) -> Result<(), FabricError> {
+        self.limits.validate()?;
+        validate_capture_limit(self.max_log_bytes)?;
+        if self
+            .max_cost_usd
+            .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+            || (self.max_cost_usd.is_some() && harness != "omp")
+        {
+            return Err(error(
+                "max_cost_usd must be finite, positive and used only with OMP.",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub fn foreground(
     root: &Path,
     project_name: &str,
     prompt_file: &Path,
     harness: &(impl HarnessAdapter + ?Sized),
-    copy_limit_bytes: u64,
-    max_log_bytes: u64,
+    options: &RunOptions,
 ) -> Result<RunReport, FabricError> {
-    validate_capture_limit(max_log_bytes)?;
+    options.validate(harness.name())?;
     let (root, state) = select_prepared(root, project_name)?;
     foreground_prepared(
         &root,
         &state,
         prompt_file,
         harness,
-        &ExecutionOptions {
-            copy_limit_bytes,
-            max_log_bytes,
-            harness_version: harness.probe()?.version,
-        },
+        options,
+        &harness.probe()?.version,
         new_run_id()?,
     )
 }
@@ -84,20 +123,18 @@ fn select_prepared(
     Ok((root, state))
 }
 
-struct ExecutionOptions {
-    copy_limit_bytes: u64,
-    max_log_bytes: u64,
-    harness_version: String,
-}
-
 fn foreground_prepared(
     root: &Path,
     state: &PreparedState,
     prompt_file: &Path,
     harness: &(impl HarnessAdapter + ?Sized),
-    options: &ExecutionOptions,
+    options: &RunOptions,
+    harness_version: &str,
     run_id: RunId,
 ) -> Result<RunReport, FabricError> {
+    if options.cancellation.is_cancelled() {
+        return Err(error("Cancelled before launch; task was not started."));
+    }
     // Snapshot once: digest and child input cannot disagree after this point.
     let prompt = std::fs::read(prompt_file)
         .map_err(|failure| error(format!("Prompt {}: {failure}", prompt_file.display())))?;
@@ -144,16 +181,30 @@ fn foreground_prepared(
             .map_err(error)?;
         let command = harness.command(&AgentSpec {
             prompt_file: &prompt_path,
+            max_cost_usd: options.max_cost_usd,
         })?;
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
-        let result = fabric_runner::execute(&command, fresh.path(), capture, |pid| {
-            store
-                .start_run(&run_id, &options.harness_version, pid, now()?)
-                .map_err(error)
-        })?;
+        let result = fabric_runner::execute(
+            &command,
+            fresh.path(),
+            capture,
+            &options.limits,
+            &options.cancellation,
+            |pid| {
+                store
+                    .start_run(&run_id, harness_version, pid, now()?)
+                    .map_err(error)
+            },
+        )?;
         store
-            .observe_run_exit(&run_id, result.status.code(), now()?)
+            .observe_run_exit(
+                &run_id,
+                result.status.code(),
+                result.status.signal(),
+                result.stop_reason.map(|reason| reason.as_str()),
+                now()?,
+            )
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
         store.finish_run(&run_id, &capture, now()?).map_err(error)?;
@@ -163,7 +214,13 @@ fn foreground_prepared(
         Ok(capture) => capture,
         Err(failure) => {
             store
-                .fail_run_execution(&run_id, &options.harness_version, &failure.message, now()?)
+                .fail_run_execution(
+                    &run_id,
+                    harness_version,
+                    &failure.message,
+                    now()?,
+                    options.cancellation.is_cancelled(),
+                )
                 .map_err(|persist| {
                     error(format!(
                         "{}; could not persist run failure: {persist}",
@@ -190,6 +247,8 @@ fn foreground_prepared(
         harness_version: run.harness_version,
         state: run.state,
         exit_code: run.exit_code,
+        exit_signal: run.exit_signal,
+        error_kind: run.error_kind,
         events: capture.event_counts.clone(),
         capture,
         created_at: run.created_at,
@@ -231,13 +290,12 @@ pub fn run_many(
     manifest: &Path,
     concurrency: usize,
     harness: &(impl HarnessAdapter + Sync + ?Sized),
-    copy_limit_bytes: u64,
-    max_log_bytes: u64,
+    options: &RunOptions,
 ) -> Result<BatchReport, FabricError> {
     if concurrency == 0 {
         return Err(error("Concurrency must be positive."));
     }
-    validate_capture_limit(max_log_bytes)?;
+    options.validate(harness.name())?;
     let inputs: Vec<TaskInput> =
         serde_json::from_slice(&std::fs::read(manifest).map_err(error)?)
             .map_err(|failure| error(format!("Invalid task manifest: {failure}")))?;
@@ -275,11 +333,7 @@ pub fn run_many(
         })
         .collect::<Result<Vec<_>, FabricError>>()?;
     let (root, state) = select_prepared(root, project_name)?;
-    let options = ExecutionOptions {
-        copy_limit_bytes,
-        max_log_bytes,
-        harness_version: harness.probe()?.version,
-    };
+    let harness_version = harness.probe()?.version;
     let batch_id = BatchId::try_from(format!("b-{}", new_run_id()?.as_str()))?;
     let (_, mut store) = open_store(&root)?;
     store
@@ -299,7 +353,8 @@ pub fn run_many(
                         &state,
                         Path::new(&task.prompt_file),
                         harness,
-                        &options,
+                        options,
+                        &harness_version,
                         task.run_id.clone(),
                     )
                     .and_then(|report| serde_json::to_string(&report).map_err(error));

@@ -119,6 +119,356 @@ fn json(out: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() {
+    use fabric_domain::{RunId, RunState};
+    let fixture = Fixture::new();
+    fixture.setup();
+    let prompt = fixture.0.join("timeout.json");
+    fs::write(&prompt, r#"{"process_tree":{"ignore_child_term":true}}"#).unwrap();
+    let start = std::time::Instant::now();
+    let out = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--prompt-file"])
+        .arg(prompt)
+        .args([
+            "--timeout-seconds",
+            "1",
+            "--json",
+            "--copy-limit-bytes",
+            "10485760",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("timeout must return durable run report: {out:?}"));
+    assert_eq!(report["state"], "FAILED");
+    assert_eq!(report["error_kind"], "timeout");
+    assert!(report["exit_code"].is_null());
+    assert!(report["exit_signal"].as_i64().is_some());
+    assert!(start.elapsed() < std::time::Duration::from_secs(6));
+    let workspace = Path::new(report["workspace_path"].as_str().unwrap());
+    assert_tree_stopped(workspace);
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let run = store
+        .run(&RunId::try_from(report["run_id"].as_str().unwrap().to_owned()).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::Failed);
+    assert_eq!(run.error_kind.as_deref(), Some("timeout"));
+    assert_eq!(run.exit_code, None);
+    assert_eq!(
+        run.exit_signal,
+        report["exit_signal"].as_i64().map(|signal| signal as i32)
+    );
+}
+
+fn assert_tree_stopped(workspace: &Path) {
+    let paths = [
+        workspace.join("parent.heartbeat"),
+        workspace.join("child.heartbeat"),
+    ];
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+    assert!(before.iter().all(|bytes| !bytes.is_empty()));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for (path, expected) in paths.iter().zip(before) {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            expected,
+            "writer survived: {path:?}"
+        );
+    }
+}
+
+fn wait_for_tree(fixture: &Fixture) -> PathBuf {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(entries) = fs::read_dir(fixture.0.join("storage/fork-staging")) {
+            for entry in entries {
+                let tree = entry.unwrap().path().join("tree");
+                if fs::metadata(tree.join("parent.heartbeat")).is_ok_and(|meta| meta.len() > 0) {
+                    return tree;
+                }
+            }
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(8),
+            "worker was not ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn ctrl_c_cancels_live_worker_and_preserves_observed_exit() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let prompt = fixture.0.join("cancel.json");
+    fs::write(&prompt, r#"{"process_tree":{"ignore_child_term":true}}"#).unwrap();
+    let child = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--prompt-file"])
+        .arg(prompt)
+        .args([
+            "--timeout-seconds",
+            "10",
+            "--json",
+            "--copy-limit-bytes",
+            "10485760",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let tree = wait_for_tree(&fixture);
+    for _ in 0..2 {
+        success(
+            &Command::new("/bin/kill")
+                .args(["-INT", &child.id().to_string()])
+                .output()
+                .unwrap(),
+        );
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["state"], "CANCELLED");
+    assert_eq!(report["error_kind"], "cancelled");
+    assert_eq!(report["exit_signal"], 15);
+    assert!(report["exit_code"].is_null());
+    assert_tree_stopped(&tree);
+    let run = fabric_store::Store::open(fixture.0.join("storage/fabric.db"))
+        .unwrap()
+        .run(&report["run_id"].as_str().unwrap().parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, fabric_domain::RunState::Cancelled);
+    assert_eq!(run.error_kind.as_deref(), Some("cancelled"));
+    assert_eq!(run.exit_signal, Some(15));
+}
+
+#[test]
+fn api_cancellation_is_idempotent_and_escalates_term_ignoring_child() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let prompt = fixture.0.join("api-cancel.json");
+    fs::write(&prompt, r#"{"process_tree":{"ignore_child_term":true}}"#).unwrap();
+    let options = fabric_core::run::RunOptions {
+        copy_limit_bytes: 10485760,
+        limits: fabric_runner::ExecutionLimits {
+            timeout: std::time::Duration::from_secs(10),
+            term_grace: std::time::Duration::from_millis(600),
+        },
+        ..fabric_core::run::RunOptions::default()
+    };
+    let harness =
+        fabric_runner::FakeHarness::new(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness")))
+            .unwrap();
+    let report = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            fabric_core::run::foreground(
+                &fixture.0.join("storage"),
+                "test",
+                &prompt,
+                &harness,
+                &options,
+            )
+        });
+        let tree = wait_for_tree(&fixture);
+        options.cancellation.cancel();
+        options.cancellation.cancel();
+        let before = fs::metadata(tree.join("child.heartbeat")).unwrap().len();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            fs::metadata(tree.join("child.heartbeat")).unwrap().len() > before,
+            "fixture did not survive TERM to exercise escalation"
+        );
+        worker.join().unwrap().unwrap()
+    });
+    options.cancellation.cancel(); // Completed tokens never target a stored/reused PID.
+    assert_eq!(report.state, fabric_domain::RunState::Cancelled);
+    assert_eq!(report.error_kind.as_deref(), Some("cancelled"));
+    assert_eq!(report.exit_signal, Some(15));
+    assert_tree_stopped(Path::new(&report.workspace_path));
+}
+
+#[test]
+fn natural_leader_exit_cleans_background_descendant_and_does_not_claim_timeout() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let prompt = fixture.0.join("background.json");
+    fs::write(
+        &prompt,
+        r#"{"process_tree":{"ignore_child_term":true,"leader_exits":true}}"#,
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let out = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--prompt-file"])
+        .arg(prompt)
+        .args([
+            "--timeout-seconds",
+            "2",
+            "--json",
+            "--copy-limit-bytes",
+            "10485760",
+        ])
+        .output()
+        .unwrap();
+    let report = json(&out);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(report["state"], "SUCCEEDED");
+    assert_eq!(report["exit_code"], 0);
+    assert!(report["exit_signal"].is_null());
+    assert!(report["error_kind"].is_null());
+    assert_tree_stopped(Path::new(report["workspace_path"].as_str().unwrap()));
+}
+
+#[test]
+fn batch_ctrl_c_stops_queued_launches_and_keeps_completed_durable_outcomes() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fs::write(fixture.0.join("done.json"), "{}").unwrap();
+    fs::write(
+        fixture.0.join("live.json"),
+        r#"{"process_tree":{"ignore_child_term":true}}"#,
+    )
+    .unwrap();
+    let manifest = fixture.0.join("cancel-batch.json");
+    fs::write(&manifest, r#"[{"id":"done","prompt_file":"done.json"},{"id":"live","prompt_file":"live.json"},{"id":"queued","prompt_file":"live.json"},{"id":"also-queued","prompt_file":"live.json"}]"#).unwrap();
+    let child = batch(&fixture, &manifest, "1")
+        .args(["--timeout-seconds", "10"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let tree = wait_for_tree(&fixture);
+    success(
+        &Command::new("/bin/kill")
+            .args(["-INT", &child.id().to_string()])
+            .output()
+            .unwrap(),
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["tasks"][0]["result"]["state"], "SUCCEEDED");
+    assert_eq!(report["tasks"][1]["result"]["state"], "CANCELLED");
+    assert_eq!(report["succeeded"], false);
+    assert_tree_stopped(&tree);
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let id = report["batch_id"].as_str().unwrap().parse().unwrap();
+    let tasks = store.batch_tasks(&id).unwrap();
+    assert_eq!(store.batch_succeeded(&id).unwrap(), Some(false));
+    for (i, saved) in tasks.iter().enumerate() {
+        if i < 2 {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(saved.result.as_ref().unwrap()).unwrap(),
+                report["tasks"][i]["result"]
+            );
+        } else {
+            assert!(
+                saved
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("Cancelled before launch")
+            );
+            assert_eq!(report["tasks"][i]["error"].as_str(), saved.error.as_deref());
+            assert!(
+                store.run(&saved.run_id).unwrap().is_none(),
+                "queued task was launched"
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_api_applies_wall_timeout_per_worker_without_discarding_other_results() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fs::write(
+        fixture.0.join("slow.json"),
+        r#"{"process_tree":{"ignore_child_term":true}}"#,
+    )
+    .unwrap();
+    fs::write(fixture.0.join("done.json"), "{}").unwrap();
+    let manifest = fixture.0.join("api-batch.json");
+    fs::write(&manifest, r#"[{"id":"timeout","prompt_file":"slow.json"},{"id":"success","prompt_file":"done.json"}]"#).unwrap();
+    let options = fabric_core::run::RunOptions {
+        copy_limit_bytes: 10485760,
+        limits: fabric_runner::ExecutionLimits {
+            timeout: std::time::Duration::from_millis(400),
+            ..fabric_runner::ExecutionLimits::default()
+        },
+        ..fabric_core::run::RunOptions::default()
+    };
+    let harness =
+        fabric_runner::FakeHarness::new(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness")))
+            .unwrap();
+    let report = fabric_core::run::run_many(
+        &fixture.0.join("storage"),
+        "test",
+        &manifest,
+        1,
+        &harness,
+        &options,
+    )
+    .unwrap();
+    assert!(!report.succeeded);
+    let timed = report.tasks[0].result.as_ref().unwrap();
+    assert_eq!(timed.state, fabric_domain::RunState::Failed);
+    assert_eq!(timed.error_kind.as_deref(), Some("timeout"));
+    assert_tree_stopped(Path::new(&timed.workspace_path));
+    assert_eq!(
+        report.tasks[1].result.as_ref().unwrap().state,
+        fabric_domain::RunState::Succeeded
+    );
+}
+
+#[test]
+fn cooperative_zero_exit_after_timeout_still_persists_timeout_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    let executable = fixture.0.join("cooperative-fake");
+    fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'fabric-fake-harness 1'; exit 0; fi\ntrap 'exit 0' TERM\nwhile :; do /bin/sleep 1; done\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let prompt = fixture.0.join("cooperative.json");
+    fs::write(&prompt, "{}").unwrap();
+    let out = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--fake-binary"])
+        .arg(executable)
+        .arg("--prompt-file")
+        .arg(prompt)
+        .args([
+            "--timeout-seconds",
+            "1",
+            "--json",
+            "--copy-limit-bytes",
+            "10485760",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["state"], "FAILED");
+    assert_eq!(report["error_kind"], "timeout");
+    assert_eq!(report["exit_code"], 0);
+    assert!(report["exit_signal"].is_null());
+    let run = fabric_store::Store::open(fixture.0.join("storage/fabric.db"))
+        .unwrap()
+        .run(&report["run_id"].as_str().unwrap().parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, fabric_domain::RunState::Failed);
+    assert_eq!(run.error_kind.as_deref(), Some("timeout"));
+    assert_eq!(run.exit_code, Some(0));
+}
+
+#[test]
 fn foreground_fake_process_records_provenance_exit_and_retains_changes() {
     use fabric_domain::{RunId, RunState, WorkspaceState};
     use fabric_store::Store;
@@ -255,15 +605,16 @@ if [ "$#" = 1 ] && [ "$1" = --version ]; then
     printf 'omp/19.1.0-fixture+exact\n'
     exit 0
 fi
-test "$#" = 7
+test "$#" = 8
 test "$1" = -p
 test "$2" = --mode
 test "$3" = json
 test "$4" = --no-session
 test "$5" = --no-title
-test "$6" = --
+test "$6" = --max-cost=0.25
+test "$7" = --
 test "$(cat .deps/ready)" = ready
-printf '%s' "$7" > received.prompt
+printf '%s' "$8" > received.prompt
 printf 'mock tracked change' > tracked
 printf '{"type":"started","value":42}\r\nnot-json\n\377\n'
 head -c 262144 /dev/zero | tr '\000' x
@@ -289,7 +640,13 @@ printf '\n{"type":"finished"}\n{"last":true}'
             .env("PI_CODING_AGENT_DIR", "/must/not/load")
             .args(["run", "test", "--harness", "omp", "--prompt-file"])
             .arg(prompt_path)
-            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .args([
+                "--json",
+                "--copy-limit-bytes",
+                "10485760",
+                "--max-cost-usd",
+                "0.25",
+            ])
             .output()
             .unwrap();
         let report = json(&out);

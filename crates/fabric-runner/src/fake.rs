@@ -18,7 +18,18 @@ struct Task {
     absent_environment: Vec<String>,
     #[serde(default)]
     exit_code: u8,
+    #[serde(default)]
+    process_tree: Option<ProcessTree>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessTree {
+    #[serde(default)]
+    ignore_child_term: bool,
+    #[serde(default)]
+    leader_exits: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriteFile {
@@ -41,6 +52,16 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     if args == ["--version"] {
         println!("fabric-fake-harness 1");
         return Ok(0);
+    }
+    if args.len() == 2 && args[0] == "--heartbeat-child" {
+        if args[1] == "ignore-term" {
+            // SAFETY: deterministic fixture intentionally exercises KILL escalation.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+        }
+        heartbeat("child.heartbeat")?;
+        unreachable!();
     }
     if args.len() != 2 || args[0] != "--prompt-file" {
         return Err("expected --prompt-file PATH".into());
@@ -73,8 +94,46 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     for value in &task.events {
         event(value)?;
     }
+    if let Some(tree) = task.process_tree {
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--heartbeat-child",
+                if tree.ignore_child_term {
+                    "ignore-term"
+                } else {
+                    "term"
+                },
+            ])
+            .spawn()?;
+        // Wait for the child to install its signal disposition before publishing readiness.
+        let start = std::time::Instant::now();
+        while !Path::new("child.heartbeat").exists() {
+            if child.try_wait()?.is_some() || start.elapsed() > std::time::Duration::from_secs(5) {
+                return Err("heartbeat child did not become ready".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if tree.leader_exits {
+            fs::write("parent.heartbeat", b"leader exited\n")?;
+        } else {
+            heartbeat("parent.heartbeat")?;
+        }
+    }
     event(&serde_json::json!({"type":"finished", "exit_code":task.exit_code}))?;
     Ok(task.exit_code)
+}
+
+fn heartbeat(path: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    writeln!(file, "pid={}", std::process::id())?;
+    loop {
+        file.write_all(b".")?;
+        file.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn validate_path(path: &Path) -> io::Result<()> {

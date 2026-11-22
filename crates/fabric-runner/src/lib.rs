@@ -4,13 +4,19 @@ use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+mod supervision;
+pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, StopReason};
+use supervision::{PipeReader, ProcessGroup};
 
 use capture::Capture;
 use fabric_domain::{ErrorKind, FabricError};
 
 pub struct Execution {
     pub status: ExitStatus,
+    pub stop_reason: Option<StopReason>,
     pub capture: std::io::Result<fabric_domain::CaptureMetadata>,
 }
 
@@ -20,6 +26,7 @@ pub struct HarnessInfo {
 
 pub struct AgentSpec<'a> {
     pub prompt_file: &'a Path,
+    pub max_cost_usd: Option<f64>,
 }
 
 pub struct CommandSpec {
@@ -64,6 +71,9 @@ impl HarnessAdapter for FakeHarness {
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
+        if spec.max_cost_usd.is_some() {
+            return Err(execution_error("Fake harness does not support max cost."));
+        }
         Ok(CommandSpec {
             program: self.binary.clone(),
             args: vec!["--prompt-file".into(), spec.prompt_file.into()],
@@ -78,8 +88,15 @@ pub fn execute(
     spec: &CommandSpec,
     cwd: &Path,
     capture: Capture,
+    limits: &ExecutionLimits,
+    cancellation: &CancellationToken,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
 ) -> Result<Execution, FabricError> {
+    limits.validate()?;
+    if cancellation.is_cancelled() {
+        return Err(execution_error("Cancelled before harness launch."));
+    }
+    let launched = std::time::Instant::now();
     let child = Command::new(&spec.program)
         .args(&spec.args)
         .current_dir(cwd)
@@ -98,17 +115,19 @@ pub fn execute(
                 spec.program.display()
             ))
         })?;
-    let mut group = ProcessGroup { child };
-    let stdout = group.child.stdout.take().expect("piped stdout");
-    let stderr = group.child.stderr.take().expect("piped stderr");
+    let mut group = ProcessGroup::new(child, launched);
+    let stopped = AtomicBool::new(false);
+    let stdout = PipeReader::new(group.child.stdout.take().expect("piped stdout"), &stopped)
+        .map_err(execution_error)?;
+    let stderr = PipeReader::new(group.child.stderr.take().expect("piped stderr"), &stopped)
+        .map_err(execution_error)?;
     let (status, events) = std::thread::scope(|scope| {
         let out = scope.spawn(|| capture.stdout(stdout));
         let err = scope.spawn(|| capture.stderr(stderr));
-        let status =
-            started(group.child.id()).and_then(|()| group.child.wait().map_err(execution_error));
-        // Kill descendants BEFORE joining readers: a background child may hold
-        // inherited pipe descriptors open after the leader has exited.
+        let status = started(group.child.id()).and_then(|()| group.supervise(limits, cancellation));
+        // Stop the owned group before joining drains, including on persistence errors.
         drop(group);
+        stopped.store(true, Ordering::Release);
         let events = out
             .join()
             .map_err(|_| execution_error("Stdout capture panicked."))?;
@@ -118,23 +137,10 @@ pub fn execute(
         Ok::<_, FabricError>((status?, events.and_then(|events| stderr.map(|()| events))))
     })?;
     Ok(Execution {
-        status,
+        status: status.0,
+        stop_reason: status.1,
         capture: events.and_then(|events| capture.finish(events)),
     })
-}
-
-struct ProcessGroup {
-    child: Child,
-}
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        // SAFETY: this owned Child was spawned in its own process group. Never
-        // signal a stale DB PID. Terminate background descendants after leader exit.
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
-        }
-        let _ = self.child.wait();
-    }
 }
 
 fn execution_error(error: impl std::fmt::Display) -> FabricError {
@@ -165,6 +171,11 @@ fn probe_version(
         },
         Path::new("/"),
         capture,
+        &ExecutionLimits {
+            timeout: std::time::Duration::from_secs(5),
+            ..ExecutionLimits::default()
+        },
+        &CancellationToken::default(),
         |_| Ok(()),
     )?;
     let metadata = result.capture.map_err(execution_error)?;

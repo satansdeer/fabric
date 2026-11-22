@@ -89,6 +89,7 @@ pub struct Run {
     /// Opaque supervisor metadata; never sufficient authority to signal a PID.
     pub pid_metadata: Option<String>,
     pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
     pub created_at: i64,
     pub updated_at: i64,
     pub started_at: Option<i64>,
@@ -166,7 +167,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=3 => {}
+            1..=4 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -201,6 +202,10 @@ impl Store {
                  BEGIN SELECT RAISE(ABORT, 'run requires matching batch task and prepared state'); END;",
             )?;
             transaction.pragma_update(None, "user_version", 3)?;
+        }
+        if version < 4 {
+            transaction.execute_batch("ALTER TABLE runs ADD COLUMN exit_signal INTEGER;")?;
+            transaction.pragma_update(None, "user_version", 4)?;
         }
         transaction.commit()?;
         Ok(Self { connection })
@@ -441,12 +446,23 @@ impl Store {
     }
 
     /// Persist the observed wait result before finalization. Signals have no exit code.
-    pub fn observe_run_exit(&self, id: &RunId, exit: Option<i32>, now: i64) -> Result<()> {
+    pub fn observe_run_exit(
+        &self,
+        id: &RunId,
+        exit: Option<i32>,
+        signal: Option<i32>,
+        reason: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        if !matches!(reason, None | Some("timeout" | "cancelled")) {
+            return Err(StoreError::InvalidRecord("Invalid supervision reason"));
+        }
         let count = self.connection.execute(
             "UPDATE runs SET state = 'FINALIZING', exit_code = ?1, updated_at = ?2,
-             error_kind = CASE WHEN ?1 = 0 THEN NULL ELSE 'harness_exit' END
+             exit_signal = ?4,
+             error_kind = COALESCE(?5, CASE WHEN ?1 = 0 THEN NULL ELSE 'harness_exit' END)
              WHERE run_id = ?3 AND state = 'RUNNING' AND ?2 >= updated_at",
-            params![exit, now, id.as_str()],
+            params![exit, now, id.as_str(), signal, reason],
         )?;
         if count != 1 {
             return Err(StoreError::Conflict);
@@ -463,7 +479,9 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count = transaction.execute(
-            "UPDATE runs SET state = CASE WHEN exit_code = 0 THEN 'SUCCEEDED' ELSE 'FAILED' END,
+            "UPDATE runs SET state = CASE WHEN error_kind = 'cancelled' THEN 'CANCELLED'
+             WHEN error_kind = 'timeout' THEN 'FAILED'
+             WHEN exit_code = 0 THEN 'SUCCEEDED' ELSE 'FAILED' END,
              updated_at = ?1, finished_at = ?1, capture_metadata = ?3
              WHERE run_id = ?2 AND state = 'FINALIZING' AND ?1 >= updated_at",
             params![now, id.as_str(), encoded],
@@ -491,6 +509,7 @@ impl Store {
         version: &str,
         reason: &str,
         now: i64,
+        cancelled: bool,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -501,11 +520,15 @@ impl Store {
             params![now, id.as_str()],
         )?;
         let count = transaction.execute(
-            "UPDATE runs SET state = 'NEEDS_ATTENTION', harness_version = ?1,
-             updated_at = ?2, finished_at = ?2, error_kind = 'harness_execution'
+            "UPDATE runs SET state = CASE WHEN state = 'PREPARING' AND ?4 THEN 'CANCELLED'
+             ELSE 'NEEDS_ATTENTION' END, harness_version = ?1,
+             updated_at = ?2, finished_at = ?2,
+             error_kind = CASE WHEN state = 'PREPARING' AND ?4 THEN 'cancelled'
+               WHEN error_kind IN ('timeout', 'cancelled') THEN error_kind
+               ELSE 'harness_execution' END
              WHERE run_id = ?3 AND state IN ('PREPARING', 'FINALIZING')
              AND ?2 >= updated_at",
-            params![version, now, id.as_str()],
+            params![version, now, id.as_str(), cancelled],
         )?;
         if count != 1 {
             return Err(StoreError::Conflict);
@@ -568,6 +591,7 @@ impl Store {
         if run.state != RunState::Queued
             || workspace.state != WorkspaceState::Active
             || run.capture.is_some()
+            || run.exit_signal.is_some()
         {
             return Err(StoreError::InvalidRecord(
                 "new run/workspace must be QUEUED/ACTIVE without capture metadata",
@@ -612,7 +636,7 @@ impl Store {
                 "SELECT run_id, batch_id, project_id, prepared_state_id, base_commit_sha, harness,
              harness_version, prompt_digest, state, workspace_id, pid_metadata, exit_code,
              created_at, updated_at, started_at, finished_at, error_kind, artifact_manifest_id,
-             capture_metadata
+             capture_metadata, exit_signal
              FROM runs WHERE run_id = ?1",
                 [id.as_str()],
                 |r| {
@@ -629,6 +653,7 @@ impl Store {
                         workspace_id: read_id(r, 9)?,
                         pid_metadata: r.get(10)?,
                         exit_code: r.get(11)?,
+                        exit_signal: r.get(19)?,
                         created_at: r.get(12)?,
                         updated_at: r.get(13)?,
                         started_at: r.get(14)?,

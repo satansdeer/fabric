@@ -555,8 +555,10 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
             "fixture",
             &prompt,
             &harness,
-            fixture.state.size_bytes,
-            fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
+            &fabric_core::run::RunOptions {
+                copy_limit_bytes: fixture.state.size_bytes,
+                ..fabric_core::run::RunOptions::default()
+            },
         )
         .is_err()
     );
@@ -602,7 +604,7 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
             .is_err()
     );
     store
-        .observe_run_exit(&request.run_id, Some(7), time + 1)
+        .observe_run_exit(&request.run_id, Some(7), None, None, time + 1)
         .unwrap();
     let finalizing = fixture.store().run(&request.run_id).unwrap().unwrap();
     assert_eq!(finalizing.state, RunState::Finalizing);
@@ -633,7 +635,7 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
     assert_eq!(done.capture, Some(capture));
     assert!(
         store
-            .observe_run_exit(&request.run_id, Some(0), time + 3)
+            .observe_run_exit(&request.run_id, Some(0), None, None, time + 3)
             .is_err()
     );
     assert_eq!(fixture.store().run(&request.run_id).unwrap().unwrap(), done);

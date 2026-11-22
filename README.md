@@ -2,7 +2,7 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-13
+## Implemented: FAB-01 through FAB-14
 
 The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground fake/OMP harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Durable artifact capture and cleanup commands are not implemented yet.
 
@@ -130,9 +130,9 @@ The fake harness is an actual separate `fabric-fake-harness` executable beside `
 {"required_files":[".deps/ready"],"writes":[{"path":"tracked","content":"changed"},{"path":"new.txt","content":"untracked"}],"events":[{"type":"fixture","value":42}],"exit_code":7}
 ```
 
-The core persists PREPARING before fork work, RUNNING with the actual child PID/version/start time after spawn, FINALIZING with the observed exit, and finally SUCCEEDED or FAILED with a completion timestamp. Prompt identity is SHA-256 of the exact copied input bytes. JSON stdout reports IDs, source SHA, prompt digest, harness version, terminal state, exit and times; nonzero child exit also makes the CLI fail. Launch/supervision uncertainty instead records NEEDS_ATTENTION and retains recovery evidence without inventing exit metadata. Child processes have a private process group; remaining group descendants are killed and the leader reaped when their leader exits. There is no execution timeout or cancellation API yet.
+The core persists PREPARING before fork work, RUNNING with the actual child PID/version/start time after spawn, FINALIZING with the observed exit, and finally SUCCEEDED, FAILED or CANCELLED with a completion timestamp. Prompt identity is SHA-256 of the exact copied input bytes. JSON stdout reports IDs, source SHA, prompt digest, harness version, terminal state, observed exit code/signal, stop reason (`error_kind`) and times. A timeout is FAILED with `timeout`; cancellation is CANCELLED with `cancelled`, even if a cooperative harness exits zero. Non-success makes the CLI fail after emitting its durable report. Launch/supervision/capture uncertainty instead records NEEDS_ATTENTION and retains recovery evidence without inventing exit metadata. SQLite schema v4 adds nullable observed exit signals without rewriting older runs.
 
-**No source artifacts are claimed.** Tracked/untracked edits, exact `prompt.input`, capped raw logs and `events.jsonl` remain in the owner-only workspace/container with an explicit capture-pending retention reason; artifact-manifest ID stays null. FAB-14 adds cancellation/timeouts and FAB-15–17 durable source artifacts/cleanup. No GC or deletion path exists; startup reservations are not renewed execution leases and expiry never authorizes deleting retained work. Use finite trusted workloads: capped output does not bound run duration, workspace writes or model spending.
+**No source artifacts are claimed.** Tracked/untracked edits, exact `prompt.input`, capped raw logs and `events.jsonl` remain in the owner-only workspace/container with an explicit capture-pending retention reason; artifact-manifest ID stays null. FAB-15–17 add durable source artifacts/cleanup. No GC or deletion path exists; startup reservations are not renewed execution leases and expiry never authorizes deleting retained work. Output and wall-time bounds do not impose workspace, memory or spending quotas.
 
 ### Run a bounded task batch
 
@@ -153,7 +153,17 @@ A pool of at most `min(N, task_count)` threads admits external workers through t
 
 Before admission, SQLite schema v3 records the Batch ID, pinned prepared-state ID, ordered task IDs, resolved prompt paths and assigned Run IDs. Each task durably records its ordinary Run report or a prelaunch error; launched Runs also carry their Batch ID and separate Workspace ID. A missing/unreadable prompt remains a reported task error with its assigned Run ID even though no workspace was created. One task's failure does not stop independent tasks. JSON stdout contains ordered `tasks` with `id`, `run_id`, `result` or `error`, plus `batch_id` and `succeeded`; it remains available when the command exits nonzero. Completed aggregate success/failure is also persisted. A zero CLI exit requires every task to succeed. Infrastructure errors can leave durable pending task records; this story does not resume or reconcile interrupted batches.
 
-Cancellation and execution timeouts remain FAB-14. Batches do not authorize deletion, artifact capture or GC; all existing retention and startup-reservation limitations still apply.
+Batches share the cancellation/timeout controls below. Batches do not authorize deletion, artifact capture or GC; all existing retention and startup-reservation limitations still apply.
+
+### Timeout and cancellation (macOS)
+
+Both `run` and `run-many` accept `--timeout-seconds N` (positive integer, default 3600). This is a **per-worker wall-clock deadline from launch**, not an aggregate batch deadline and not a model-spending quota. Version probes separately have a five-second deadline. Ctrl-C cancels the foreground invocation: active owned groups stop, completed batch results stay durable, and queued tasks become durable `Cancelled before launch` errors without allocating a Run/workspace. Repeating cancellation is harmless. There is deliberately no command to kill a stored PID or adopt a process from SQLite.
+
+The existing runner owns each child's private macOS process group. Timeout, cancellation and natural leader exit send group TERM, wait a bounded grace (250 ms by default), then send group KILL and reap the owned leader. The leader remains unreaped through the final signal (`waitid` with `WNOWAIT`), preventing PID reuse from redirecting a later group signal. Remaining same-credential group descendants are killed, with orphan reaping handled by macOS. Darwin's zombie-only group EPERM is accepted only after observing the owned leader's exit. Nonblocking capture drains have a bounded post-termination deadline; an inherited pipe that stays open yields an explicit incomplete-capture error/NEEDS_ATTENTION rather than a hang or fabricated complete capture. This is trusted local supervision, not a sandbox: intentionally escaped groups or processes that change credentials beyond the runner's signal permissions are not contained. SIGKILL/crash reconciliation remains unimplemented.
+
+Library callers pass `fabric_core::run::RunOptions` to `foreground`/`run_many`, setting `limits: fabric_runner::ExecutionLimits { timeout, term_grace }` and a cloneable `fabric_runner::CancellationToken`. Calling `cancel()` on that live token is idempotent and contains no PID. API deadlines may use subsecond `Duration` values; timeout must be positive/representable and TERM grace at most 30 seconds. `ForegroundInterrupt` is an opt-in scoped SIGINT handler used by the CLI, not automatically installed by library execution.
+
+For OMP only, `--max-cost-usd USD` (API `RunOptions::max_cost_usd`) passes its supported `--max-cost=USD` request-budget flag. Values must be finite and positive. OMP stops admitting new model requests once its reported spend reaches this budget; in-flight calls can overshoot, so it is **best effort, not an exact billing cap**. Unsupported installed OMP versions can reject the flag as an ordinary observed harness failure. Fabric enforces its own wall timeout; it does not depend on OMP `--max-time`, promise exact provider accounting, or make unapproved paid calls.
 
 ### Installed OMP adapter (manual execution requires spending approval)
 

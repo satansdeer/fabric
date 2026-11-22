@@ -238,7 +238,7 @@
       "acceptance_tests": [
         "AT-08"
       ],
-      "status": "todo"
+      "status": "verified"
     },
     {
       "id": "FAB-15",

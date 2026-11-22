@@ -33,7 +33,7 @@ impl RunState {
             || matches!(
                 (*self, next),
                 (Queued, Preparing)
-                    | (Preparing, Running | NeedsAttention)
+                    | (Preparing, Running | Cancelled | NeedsAttention)
                     | (Running, Finalizing)
                     | (Finalizing, Succeeded | Failed | Cancelled | NeedsAttention)
             )

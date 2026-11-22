@@ -56,17 +56,23 @@ impl HarnessAdapter for OmpHarness {
                 "OMP prompt cannot contain NUL in an argv value.",
             ));
         }
+        let mut args = vec![
+            "-p".into(),
+            "--mode".into(),
+            "json".into(),
+            "--no-session".into(),
+            "--no-title".into(),
+        ];
+        if let Some(cost) = spec.max_cost_usd {
+            if !cost.is_finite() || cost <= 0.0 {
+                return Err(execution_error("OMP max cost must be finite and positive."));
+            }
+            args.push(format!("--max-cost={cost}").into());
+        }
+        args.extend(["--".into(), prompt.into()]);
         Ok(CommandSpec {
             program: self.binary.clone(),
-            args: vec![
-                "-p".into(),
-                "--mode".into(),
-                "json".into(),
-                "--no-session".into(),
-                "--no-title".into(),
-                "--".into(),
-                prompt.into(),
-            ],
+            args,
             environment: self.environment.clone(),
         })
     }
@@ -111,7 +117,8 @@ mod tests {
             assert!(
                 harness
                     .command(&AgentSpec {
-                        prompt_file: &prompt
+                        prompt_file: &prompt,
+                        max_cost_usd: None,
                     })
                     .is_err()
             );

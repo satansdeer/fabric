@@ -72,6 +72,12 @@ struct WorkerArgs {
     #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
         value_parser = clap::value_parser!(u64).range(fabric_runner::capture::TRUNCATION_MARKER.len() as u64..))]
     max_log_bytes: u64,
+    /// Per-worker wall-clock limit, enforced by Fabric (not a spending quota).
+    #[arg(long, default_value = "3600")]
+    timeout_seconds: std::num::NonZeroU64,
+    /// Best-effort OMP request budget; in-flight requests can exceed it.
+    #[arg(long)]
+    max_cost_usd: Option<f64>,
     #[arg(long)]
     json: bool,
 }
@@ -161,15 +167,10 @@ fn main() -> ExitCode {
 
 fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let interrupt = fabric_runner::ForegroundInterrupt::install()?;
+    let options = run_options(&args.options, interrupt.token());
     let report = with_harness(&args.options, |harness| {
-        fabric_core::run::foreground(
-            &root,
-            &args.name,
-            &args.prompt_file,
-            harness,
-            args.options.copy_limit_bytes,
-            args.options.max_log_bytes,
-        )
+        fabric_core::run::foreground(&root, &args.name, &args.prompt_file, harness, &options)
     })?;
     let mut stdout = io::stdout().lock();
     if args.options.json {
@@ -191,6 +192,22 @@ fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
         )));
     }
     Ok(())
+}
+
+fn run_options(
+    args: &WorkerArgs,
+    cancellation: fabric_runner::CancellationToken,
+) -> fabric_core::run::RunOptions {
+    fabric_core::run::RunOptions {
+        copy_limit_bytes: args.copy_limit_bytes,
+        max_log_bytes: args.max_log_bytes,
+        limits: fabric_runner::ExecutionLimits {
+            timeout: std::time::Duration::from_secs(args.timeout_seconds.get()),
+            ..fabric_runner::ExecutionLimits::default()
+        },
+        cancellation,
+        max_cost_usd: args.max_cost_usd,
+    }
 }
 
 fn with_harness<T>(
@@ -221,6 +238,8 @@ fn with_harness<T>(
 
 fn write_run_many(root: Option<PathBuf>, args: RunManyArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let interrupt = fabric_runner::ForegroundInterrupt::install()?;
+    let options = run_options(&args.options, interrupt.token());
     let report = with_harness(&args.options, |harness| {
         fabric_core::run::run_many(
             &root,
@@ -228,8 +247,7 @@ fn write_run_many(root: Option<PathBuf>, args: RunManyArgs) -> Result<(), Fabric
             &args.tasks,
             args.concurrency.get(),
             harness,
-            args.options.copy_limit_bytes,
-            args.options.max_log_bytes,
+            &options,
         )
     })?;
     let mut stdout = io::stdout().lock();

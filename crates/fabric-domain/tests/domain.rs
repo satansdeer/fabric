@@ -57,7 +57,7 @@ fn run_transitions_follow_the_spec_and_reject_terminal_rewrites() {
                 || matches!(
                     (from, to),
                     (Queued, Preparing)
-                        | (Preparing, Running | NeedsAttention)
+                        | (Preparing, Running | Cancelled | NeedsAttention)
                         | (Running, Finalizing)
                         | (Finalizing, Succeeded | Failed | Cancelled | NeedsAttention)
                 );

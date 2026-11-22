@@ -79,6 +79,7 @@ pub fn create_workspace(
         workspace_id: request.workspace_id.clone(),
         pid_metadata: None,
         exit_code: None,
+        exit_signal: None,
         created_at: request.created_at,
         updated_at: request.created_at,
         started_at: None,
