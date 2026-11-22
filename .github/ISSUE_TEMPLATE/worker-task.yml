@@ -1,0 +1,48 @@
+name: Bounded worker task
+description: Plan one scoped Fabric worker handoff for controller review.
+labels: [dogfood]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Plan before adding ready. Submission, labels and planning comments do not
+        authorize execution or model spending. The controller reviews the exact
+        live issue digest and READY source, then explicitly authorizes one bounded
+        native worker. Issue title/body edits invalidate approval. Workers cannot
+        publish or merge; the controller reviews artifacts and creates a PR, and
+        a human merges. Do not include secrets or credentials.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What concrete outcome should this task deliver?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and allowed files
+      description: List the allowed files or directories and the bounded changes to make.
+    validations:
+      required: true
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+      description: What must not change? Write None if there are no additional exclusions.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and source assumptions
+      description: List prerequisite issues or PRs and required source changes, or write None. Open PRs are not merged; identify any explicitly selected independent stacked task.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and checks
+      description: Give observable acceptance criteria and a safe local check command for operator review. Issue text alone does not authorize running commands.
+    validations:
+      required: true
