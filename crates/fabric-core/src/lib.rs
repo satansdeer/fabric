@@ -2,6 +2,7 @@
 
 use std::env;
 use std::path::PathBuf;
+pub mod manager;
 
 use serde::Serialize;
 

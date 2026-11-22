@@ -72,6 +72,50 @@ enum Commands {
         #[arg(long)]
         fake_binary: Option<PathBuf>,
     },
+    /// Durably accept a version-1 task batch without waiting for its workers.
+    Submit {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
+        #[arg(long)]
+        fake_binary: Option<PathBuf>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Reconnect to durable batch or run lifecycle events.
+    Status {
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
+    /// Inspect independently captured results and durable artifact metadata.
+    Results {
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Cancel queued tasks or workers owned by the live local manager.
+    Cancel {
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Wait for completion, bounded by the supplied timeout.
+    Wait {
+        id: String,
+        #[arg(long)]
+        timeout_seconds: u64,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Operate the single trusted-local durable worker manager.
+    Manager {
+        #[command(subcommand)]
+        command: ManagerCommands,
+    },
     /// Inspect durable run and artifact metadata, including reclaimed workspaces.
     Runs {
         #[arg(long, global = true)]
@@ -85,6 +129,18 @@ enum Commands {
         json: bool,
         #[command(subcommand)]
         command: StorageCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManagerCommands {
+    Serve {
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    Stop {
+        #[arg(long, required = true)]
+        json: bool,
     },
 }
 
@@ -327,6 +383,59 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Commands::Submit {
+            request,
+            json,
+            fake_binary,
+            idempotency_key,
+        } => (
+            json,
+            write_submit(cli.root, request, fake_binary, idempotency_key),
+        ),
+        Commands::Status { id, json, after } => (
+            json,
+            write_worker(
+                cli.root,
+                fabric_core::manager::Request::Status { id, after },
+            ),
+        ),
+        Commands::Results { id, json } => (
+            json,
+            write_worker(cli.root, fabric_core::manager::Request::Results { id }),
+        ),
+        Commands::Cancel { id, json } => (
+            json,
+            write_worker(cli.root, fabric_core::manager::Request::Cancel { id }),
+        ),
+        Commands::Wait {
+            id,
+            json,
+            timeout_seconds,
+        } => (
+            json,
+            write_worker(
+                cli.root,
+                fabric_core::manager::Request::Wait {
+                    id,
+                    timeout_seconds,
+                },
+            ),
+        ),
+        Commands::Manager {
+            command: ManagerCommands::Stop { json },
+        } => (
+            json,
+            write_worker(cli.root, fabric_core::manager::Request::Stop),
+        ),
+        Commands::Manager {
+            command: ManagerCommands::Serve { json },
+        } => (
+            json,
+            (|| {
+                let root = cli.root.map_or_else(fabric_project::default_root, Ok)?;
+                fabric_core::manager::serve(&root, |ready| write_inspection(&ready, true))
+            })(),
+        ),
         Commands::Runs { command, json } => (json, write_runs(cli.root, command, json)),
         Commands::Storage { command, json } => (json, write_storage(cli.root, command, json)),
     };
@@ -337,6 +446,42 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn write_worker(
+    root: Option<PathBuf>,
+    request: fabric_core::manager::Request,
+) -> Result<(), FabricError> {
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let report = fabric_core::manager::request(&root, request)?;
+    write_inspection(&report, true)
+}
+
+fn write_submit(
+    root: Option<PathBuf>,
+    path: PathBuf,
+    fake_binary: Option<PathBuf>,
+    idempotency_key: Option<String>,
+) -> Result<(), FabricError> {
+    let file = std::fs::File::open(path).map_err(|_| FabricError {
+        kind: ErrorKind::InvalidArguments,
+        message: "Cannot open API request JSON file.".into(),
+    })?;
+    if !file.metadata().map_err(output_error)?.is_file() {
+        return Err(FabricError {
+            kind: ErrorKind::InvalidArguments,
+            message: "API request must be a regular file.".into(),
+        });
+    }
+    let request = fabric_core::api::read_request(file)?;
+    write_worker(
+        root,
+        fabric_core::manager::Request::Submit {
+            request,
+            fake_binary,
+            idempotency_key,
+        },
+    )
 }
 
 fn write_api(

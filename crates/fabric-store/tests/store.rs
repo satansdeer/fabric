@@ -96,7 +96,24 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
     }
 }
 
+fn remove_async_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS async_task_accepted;
+             DROP TRIGGER IF EXISTS async_task_changed;
+             DROP TRIGGER IF EXISTS async_run_changed;
+             DROP TRIGGER IF EXISTS async_event_bound;
+             DROP TRIGGER IF EXISTS immutable_async_admission;
+             DROP TRIGGER IF EXISTS immutable_async_task;
+             DROP TABLE IF EXISTS async_events;
+             DROP TABLE IF EXISTS async_tasks;
+             DROP TABLE IF EXISTS async_batches;",
+        )
+        .unwrap();
+}
+
 fn remove_cleanup_schema(connection: &Connection) {
+    remove_async_schema(connection);
     connection
         .execute_batch(
             "DROP TABLE IF EXISTS worker_attempts;
@@ -213,7 +230,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -244,6 +261,7 @@ fn v8_database_adds_attempt_storage_without_rewriting_legacy_evidence() {
     let artifacts = store.artifacts(&run.run_id).unwrap();
     drop(store);
     let db = Connection::open(&path).unwrap();
+    remove_async_schema(&db);
     db.execute_batch("DROP TABLE IF EXISTS worker_attempts; PRAGMA user_version=8;")
         .unwrap();
     drop(db);
@@ -268,8 +286,8 @@ fn v8_database_adds_attempt_storage_without_rewriting_legacy_evidence() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        9,
-        "HN-01 must migrate v8 storage additively"
+        10,
+        "C-02 must preserve earlier additive migrations"
     );
     let attempts: i64 = db
         .query_row("SELECT count(*) FROM worker_attempts", [], |row| row.get(0))
@@ -307,7 +325,7 @@ fn v1_database_upgrades_without_losing_existing_run_ownership() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -417,6 +435,162 @@ fn batch_registration_and_results_are_atomic_and_one_shot() {
     let saved = reopened.batch_tasks(&id).unwrap();
     assert_eq!(saved[0].result.as_deref(), Some("{\"exit_code\":0}"));
     assert_eq!(saved[1].error.as_deref(), Some("prelaunch failure"));
+}
+
+fn async_admission() -> (fabric_store::AsyncBatch, Vec<fabric_store::NewAsyncTask>) {
+    let batch = fabric_store::AsyncBatch {
+        batch_id: "async-batch".parse().unwrap(),
+        prepared_state_id: prepared().state_id,
+        request_digest: "a".repeat(64),
+        concurrency: 1,
+        options_json: "{}".into(),
+        fake_binary: Some("/private/fake-harness".into()),
+    };
+    let tasks = (0..2)
+        .map(|index| fabric_store::NewAsyncTask {
+            task: fabric_store::BatchTask {
+                task_id: format!("task-{index}"),
+                run_id: format!("async-run-{index}").parse().unwrap(),
+                prompt_file: "durable-input".into(),
+                result: None,
+                error: None,
+            },
+            prompt: format!("private prompt {index}").into_bytes(),
+            harness: "fake".into(),
+            plan_json: format!("frozen plan {index}"),
+            consent_stamp: Some(format!("frozen consent {index}")),
+        })
+        .collect();
+    (batch, tasks)
+}
+
+#[test]
+fn async_admission_is_atomic_idempotent_and_pins_exact_prepared_state() {
+    let (root, mut store) = fixture();
+    let (batch, mut tasks) = async_admission();
+    tasks[1].task.task_id = tasks[0].task.task_id.clone();
+    assert!(
+        store
+            .accept_async_batch(&batch, Some("stable-key"), &tasks, 200)
+            .is_err()
+    );
+    assert!(store.async_idempotency("stable-key").unwrap().is_none());
+    assert!(store.batch_tasks(&batch.batch_id).unwrap().is_empty());
+    tasks[1].task.task_id = "task-1".into();
+    assert_eq!(
+        store
+            .accept_async_batch(&batch, Some("stable-key"), &tasks, 200)
+            .unwrap(),
+        batch.batch_id
+    );
+    assert_eq!(
+        store
+            .cache_retention(&batch.prepared_state_id)
+            .unwrap()
+            .as_deref(),
+        Some("historical_reference")
+    );
+    let mut duplicate = batch.clone();
+    duplicate.batch_id = "different-allocation".parse().unwrap();
+    assert_eq!(
+        store
+            .accept_async_batch(&duplicate, Some("stable-key"), &tasks, 201)
+            .unwrap(),
+        batch.batch_id
+    );
+    assert!(store.async_batch(&duplicate.batch_id).unwrap().is_none());
+    duplicate.request_digest = "b".repeat(64);
+    assert!(matches!(
+        store.accept_async_batch(&duplicate, Some("stable-key"), &tasks, 201),
+        Err(StoreError::Conflict)
+    ));
+    drop(store);
+    let store = Store::open(root.path().join("fabric.sqlite3")).unwrap();
+    let accepted = store.async_task(&tasks[0].task.run_id).unwrap();
+    assert_eq!(accepted.prompt, tasks[0].prompt);
+    assert_eq!(accepted.plan_json, tasks[0].plan_json);
+    assert_eq!(accepted.consent_stamp, tasks[0].consent_stamp);
+    let events = store.async_events(&batch.batch_id, None, 0).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].cursor < events[1].cursor);
+}
+
+#[test]
+fn async_claim_and_queued_cancellation_survive_restart_without_requeue() {
+    let (root, mut store) = fixture();
+    let (batch, tasks) = async_admission();
+    store.accept_async_batch(&batch, None, &tasks, 200).unwrap();
+    let first = &tasks[0].task.run_id;
+    let second = &tasks[1].task.run_id;
+    assert!(store.claim_async_task(first).unwrap());
+    assert!(!store.claim_async_task(first).unwrap());
+    assert!(
+        !store
+            .complete_async_task(first, RunState::Cancelled, Err("not queued"), true)
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_async_task(
+                second,
+                RunState::Cancelled,
+                Err("cancelled while queued"),
+                true
+            )
+            .unwrap()
+    );
+    drop(store);
+    let mut store = Store::open(root.path().join("fabric.sqlite3")).unwrap();
+    assert!(!store.claim_async_task(first).unwrap());
+    assert!(!store.claim_async_task(second).unwrap());
+    assert!(
+        store
+            .complete_async_task(
+                first,
+                RunState::NeedsAttention,
+                Err("ownership lost"),
+                false
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_async_task(first, RunState::Succeeded, Ok("{}"), false)
+            .unwrap()
+    );
+    assert_eq!(store.batch_succeeded(&batch.batch_id).unwrap(), Some(false));
+    let states = store.async_tasks(&batch.batch_id).unwrap();
+    assert_eq!(states[0].state, RunState::NeedsAttention);
+    assert_eq!(states[1].state, RunState::Cancelled);
+}
+
+#[test]
+fn v9_migration_adds_queue_without_rewriting_completed_run_evidence() {
+    let (root, mut store) = fixture();
+    let (run, workspace) = finalized_pair(&mut store, 1);
+    let artifacts = store.artifacts(&run.run_id).unwrap();
+    drop(store);
+    let path = root.path().join("fabric.sqlite3");
+    let db = Connection::open(&path).unwrap();
+    remove_async_schema(&db);
+    db.pragma_update(None, "user_version", 9).unwrap();
+    drop(db);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.run(&run.run_id).unwrap(), Some(run.clone()));
+    assert_eq!(
+        store.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+    assert_eq!(store.artifacts(&run.run_id).unwrap(), artifacts);
+    let (batch, tasks) = async_admission();
+    store.accept_async_batch(&batch, None, &tasks, 300).unwrap();
+    assert_eq!(store.async_tasks(&batch.batch_id).unwrap().len(), 2);
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        10
+    );
 }
 
 #[test]
@@ -1038,8 +1212,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [9, 8, 7, 6, 5] {
+    for version in [10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
+        if version == 9 {
+            remove_async_schema(&db);
+            db.pragma_update(None, "user_version", 9).unwrap();
+        }
         if version == 8 {
             db.execute_batch("DROP TABLE worker_attempts; PRAGMA user_version=8;")
                 .unwrap();

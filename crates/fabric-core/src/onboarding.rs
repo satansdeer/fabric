@@ -452,6 +452,26 @@ mod tests {
     }
 
     #[test]
+    fn serialized_queued_plan_keeps_original_grant_after_reconnect() {
+        let (_temporary, root, adapter, info, profile) = fixture();
+        seed(&root, &adapter, &info, &profile);
+        let accepted = plan(&root, &adapter, HarnessRequest::default(), &info).unwrap();
+        let durable = serde_json::to_vec(&accepted).unwrap();
+        revoke(&root, &adapter.id()).unwrap();
+        let (queued, stamp): (HarnessPlan, Option<String>) =
+            serde_json::from_slice(&durable).unwrap();
+        assert!(revalidate(&root, &queued, stamp.as_deref()).is_err());
+        let path = seed(&root, &adapter, &info, &profile);
+        let mut new_selection: Selection =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        new_selection.grant = "replacement-grant".into();
+        std::fs::write(path, json(&new_selection).unwrap()).unwrap();
+        let fresh = plan(&root, &adapter, HarnessRequest::default(), &info).unwrap();
+        revalidate(&root, &fresh.0, fresh.1.as_deref()).unwrap();
+        assert!(revalidate(&root, &queued, stamp.as_deref()).is_err());
+    }
+
+    #[test]
     fn replacement_and_fingerprint_changes_require_new_consent() {
         let (_temporary, root, adapter, info, profile) = fixture();
         let path = seed(&root, &adapter, &info, &profile);

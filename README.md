@@ -4,7 +4,7 @@ A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:
 
 ## Implemented: FAB-01 through FAB-20 (automated scope)
 
-The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground fake/OMP harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup.
+The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground or detached local harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 
@@ -222,6 +222,31 @@ A pool of at most `min(N, task_count)` threads admits external workers through t
 Before admission, SQLite schema v3 records the Batch ID, pinned prepared-state ID, ordered task IDs, resolved prompt paths and assigned Run IDs. Each task durably records its ordinary Run report or a prelaunch error; launched Runs also carry their Batch ID and separate Workspace ID. A missing/unreadable prompt remains a reported task error with its assigned Run ID even though no workspace was created. One task's failure does not stop independent tasks. JSON stdout contains ordered `tasks` with `id`, `run_id`, `result` or `error`, plus `batch_id` and `succeeded`; it remains available when the command exits nonzero. Completed aggregate success/failure is also persisted. A zero CLI exit requires every task to succeed. Infrastructure errors can leave durable pending task records; this story does not resume or reconcile interrupted batches.
 
 Batches share the same verified tracked/untracked capture-before-finalization pipeline, lease-aware automatic reclaim and cancellation/timeout controls as single runs, including artifacts for failed exits and stopped workers. Crash reconciliation does not invent missing task reports or aggregate batch success.
+
+### Submit durable background workers
+
+`submit` accepts the same strict v1 inline-prompt `spawn_many` request as `api`, but returns `{accepted,batch_id,run_ids}` after atomic durable admission, not worker completion. The existing `api`, `run` and `run-many` remain foreground operations.
+
+```sh
+fabric --root /private/path/to/fabric submit --request request.json \
+  --idempotency-key review-1 --json
+# Use returned batch/run IDs:
+fabric --root /private/path/to/fabric status BATCH_ID --json
+fabric --root /private/path/to/fabric status BATCH_ID --after CURSOR --json
+fabric --root /private/path/to/fabric wait BATCH_ID --timeout-seconds 30 --json
+fabric --root /private/path/to/fabric results BATCH_ID --json
+fabric --root /private/path/to/fabric cancel RUN_ID --json
+fabric --root /private/path/to/fabric cancel BATCH_ID --json
+fabric --root /private/path/to/fabric manager stop --json
+```
+
+The first client starts a detached owner-only Unix-socket manager. Exiting the submitter does not cancel accepted work. One batch at a time uses the bounded pool; later accepted batches wait durably. `manager serve --json` runs an owned foreground manager for supervision/debugging. Stop refuses active or queued work.
+
+Prompts, exact plans, consent stamps, source IDs and task IDs are persisted together in schema v10. Reusing an idempotency key with the same logical request returns the original handles; changing that request is an error. A failed reply is not automatically retried because admission may already have committed.
+
+Fresh clients can read retained results and artifacts after workspace reclamation. Status events are cursor-ordered and bounded (256 per reply; 1,024 recent events per batch). `wait` uses manager notifications and a bounded timeout, not controller hot-polling. Cancellation only signals live manager-owned workers; queued cancellation never launches a worker. After manager failure, only unclaimed queued work resumes. Claimed work becomes `NEEDS_ATTENTION`, remains protected, and cannot be cancelled using persisted PIDs.
+
+Native consent is revalidated immediately before launch. Async environment-backed connection profiles are rejected rather than persisting secret environment values or silently changing credentials after restart; use durable native configuration or the foreground API.
 
 ### Timeout and cancellation (macOS)
 

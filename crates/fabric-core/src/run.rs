@@ -163,6 +163,20 @@ fn foreground_prepared(
     planned: &(HarnessPlan, Option<String>),
     run_id: RunId,
 ) -> Result<RunReport, FabricError> {
+    let prompt = std::fs::read(prompt_file)
+        .map_err(|failure| error(format!("Prompt {}: {failure}", prompt_file.display())))?;
+    execute_prepared(root, state, &prompt, harness, options, planned, run_id)
+}
+
+pub(crate) fn execute_prepared(
+    root: &Path,
+    state: &PreparedState,
+    prompt: &[u8],
+    harness: &dyn HarnessAdapter,
+    options: &RunOptions,
+    planned: &(HarnessPlan, Option<String>),
+    run_id: RunId,
+) -> Result<RunReport, FabricError> {
     let (plan, consent) = planned;
     crate::onboarding::revalidate(root, plan, consent.as_deref())?;
     if options.cancellation.is_cancelled() {
@@ -172,10 +186,7 @@ fn foreground_prepared(
     storage.policy.max_log_bytes_per_run = options.max_log_bytes;
     storage.policy.max_artifact_bytes_per_run = options.max_artifact_bytes;
     let mut reservation = crate::workspace::storage::admit(root, &storage, state, run_id.as_str())?;
-    // Snapshot once: digest and child input cannot disagree after this point.
-    let prompt = std::fs::read(prompt_file)
-        .map_err(|failure| error(format!("Prompt {}: {failure}", prompt_file.display())))?;
-    let prompt_digest = format!("{:x}", Sha256::digest(&prompt));
+    let prompt_digest = format!("{:x}", Sha256::digest(prompt));
     let (root, mut store) = open_store(root)?;
     let created_at = now()?;
     let workspace_id = WorkspaceId::try_from(format!("w-{}", run_id.as_str()))?;
@@ -220,7 +231,7 @@ fn foreground_prepared(
             .ok_or_else(|| error("Missing workspace container"))?;
         let prompt_path = container.join("prompt.input");
         let mut input = private_output(&prompt_path)?;
-        input.write_all(&prompt).map_err(error)?;
+        input.write_all(prompt).map_err(error)?;
         input.sync_all().map_err(error)?;
         drop(input);
         let stdout = private_output(&container.join("stdout.log"))?;
@@ -269,7 +280,8 @@ fn foreground_prepared(
                     reservation.started(&store, pid)?;
                     store
                         .start_run(&run_id, &plan.manifest.exact_version, pid, started_at)
-                        .map_err(error)
+                        .map_err(error)?;
+                    Ok(())
                 },
             );
             done.store(true, std::sync::atomic::Ordering::Release);
@@ -479,6 +491,88 @@ pub fn spawn_many(
     harnesses: &BatchHarnesses<'_>,
     options: &RunOptions,
 ) -> Result<BatchReport, FabricError> {
+    let PreparedBatch {
+        root,
+        state,
+        tasks,
+        plans,
+        adapters,
+    } = prepare_batch(root, project_name, inputs, concurrency, harnesses, options)?;
+    let batch_id = BatchId::try_from(format!("b-{}", new_run_id()?.as_str()))?;
+    let (_, mut store) = open_store(&root)?;
+    store
+        .create_batch(&batch_id, &state.state_id, &tasks)
+        .map_err(error)?;
+    run_pool(tasks.len(), concurrency, |index| {
+        let (_, store) = open_store(&root)?;
+        let task = &tasks[index];
+        let (harness_id, plan) = &plans[index];
+        let outcome = foreground_prepared(
+            &root,
+            &state,
+            Path::new(&task.prompt_file),
+            adapters[harness_id].0.as_ref(),
+            options,
+            plan,
+            task.run_id.clone(),
+        )
+        .and_then(|report| serde_json::to_string(&report).map_err(error));
+        store
+            .finish_batch_task(
+                &task.run_id,
+                outcome
+                    .as_deref()
+                    .map_err(|failure| failure.message.as_str()),
+            )
+            .map_err(error)
+    })?;
+    let tasks = store
+        .batch_tasks(&batch_id)
+        .map_err(error)?
+        .into_iter()
+        .map(|task| {
+            Ok(TaskReport {
+                id: task.task_id,
+                run_id: task.run_id,
+                result: task
+                    .result
+                    .map(|value| serde_json::from_str(&value).map_err(error))
+                    .transpose()?,
+                error: task.error,
+            })
+        })
+        .collect::<Result<Vec<_>, FabricError>>()?;
+    let succeeded = tasks.iter().all(|task| {
+        task.error.is_none()
+            && task
+                .result
+                .as_ref()
+                .is_some_and(|run| run.state == RunState::Succeeded)
+    });
+    store.finish_batch(&batch_id, succeeded).map_err(error)?;
+    Ok(BatchReport {
+        batch_id,
+        succeeded,
+        tasks,
+    })
+}
+
+pub(crate) struct PreparedBatch {
+    pub root: PathBuf,
+    pub state: PreparedState,
+    pub tasks: Vec<BatchTask>,
+    pub plans: Vec<(HarnessId, (HarnessPlan, Option<String>))>,
+    pub adapters: HashMap<HarnessId, (Box<dyn HarnessAdapter>, fabric_runner::HarnessInfo)>,
+}
+
+pub(crate) fn prepare_batch(
+    root: &Path,
+    project_name: &str,
+    inputs: Vec<TaskInput>,
+    concurrency: usize,
+    harnesses: &BatchHarnesses<'_>,
+    options: &RunOptions,
+) -> Result<PreparedBatch, FabricError> {
     if concurrency == 0 {
         return Err(error("Concurrency must be positive."));
     }
@@ -535,44 +629,36 @@ pub fn spawn_many(
         plans.push((id, plan));
     }
     let (root, state) = select_prepared(root, project_name)?;
-    let batch_id = BatchId::try_from(format!("b-{}", new_run_id()?.as_str()))?;
-    let (_, mut store) = open_store(&root)?;
-    store
-        .create_batch(&batch_id, &state.state_id, &tasks)
-        .map_err(error)?;
+    Ok(PreparedBatch {
+        root,
+        state,
+        tasks,
+        plans,
+        adapters,
+    })
+}
+
+/// Both foreground and durable batches use this bounded, independent-task pool.
+pub(crate) fn run_pool(
+    count: usize,
+    concurrency: usize,
+    execute: impl Fn(usize) -> Result<(), FabricError> + Sync,
+) -> Result<(), FabricError> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(concurrency.min(tasks.len()));
-        for _ in 0..concurrency.min(tasks.len()) {
+        let mut workers = Vec::with_capacity(concurrency.min(count));
+        for _ in 0..concurrency.min(count) {
             workers.push(scope.spawn(|| {
-                let (_, store) = open_store(&root)?;
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(task) = tasks.get(index) else { break };
-                    let (harness_id, plan) = &plans[index];
-                    let outcome = foreground_prepared(
-                        &root,
-                        &state,
-                        Path::new(&task.prompt_file),
-                        adapters[harness_id].0.as_ref(),
-                        options,
-                        plan,
-                        task.run_id.clone(),
-                    )
-                    .and_then(|report| serde_json::to_string(&report).map_err(error));
-                    store
-                        .finish_batch_task(
-                            &task.run_id,
-                            outcome
-                                .as_deref()
-                                .map_err(|failure| failure.message.as_str()),
-                        )
-                        .map_err(error)?;
+                    if index >= count {
+                        break;
+                    }
+                    execute(index)?;
                 }
                 Ok::<_, FabricError>(())
             }));
         }
-        // Join every worker even if one reports an error; independent work must finish.
         let mut failure = None;
         for worker in workers {
             if let Err(error) = worker.join().unwrap_or_else(|_| {
@@ -584,35 +670,6 @@ pub fn spawn_many(
             }
         }
         failure.map_or(Ok(()), Err)
-    })?;
-    let tasks = store
-        .batch_tasks(&batch_id)
-        .map_err(error)?
-        .into_iter()
-        .map(|task| {
-            Ok(TaskReport {
-                id: task.task_id,
-                run_id: task.run_id,
-                result: task
-                    .result
-                    .map(|value| serde_json::from_str(&value).map_err(error))
-                    .transpose()?,
-                error: task.error,
-            })
-        })
-        .collect::<Result<Vec<_>, FabricError>>()?;
-    let succeeded = tasks.iter().all(|task| {
-        task.error.is_none()
-            && task
-                .result
-                .as_ref()
-                .is_some_and(|run| run.state == RunState::Succeeded)
-    });
-    store.finish_batch(&batch_id, succeeded).map_err(error)?;
-    Ok(BatchReport {
-        batch_id,
-        succeeded,
-        tasks,
     })
 }
 
@@ -623,7 +680,7 @@ fn validate_capture_limit(max_log_bytes: u64) -> Result<(), FabricError> {
     Ok(())
 }
 
-fn new_run_id() -> Result<RunId, FabricError> {
+pub(crate) fn new_run_id() -> Result<RunId, FabricError> {
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(error)?;

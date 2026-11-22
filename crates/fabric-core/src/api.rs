@@ -80,44 +80,8 @@ pub fn spawn_many(
     registry_options: &RegistryOptions,
     cancellation: CancellationToken,
 ) -> Result<BatchResponse, FabricError> {
-    if request.version != 1 || request.op != "spawn_many" {
-        return Err(invalid("API requires version 1 and op spawn_many."));
-    }
-    if request.project.trim().is_empty() || request.concurrency == 0 {
-        return Err(invalid(
-            "API requires a nonempty project and positive concurrency.",
-        ));
-    }
-    if request.tasks.is_empty()
-        || request.tasks.len() > MAX_TASKS
-        || request
-            .tasks
-            .iter()
-            .any(|task| task.prompt.len() > MAX_PROMPT_BYTES)
-    {
-        return Err(invalid(
-            "API requires 1–128 tasks with at most 64 KiB per prompt.",
-        ));
-    }
-    // Count without allocating another copy; typed callers obey the transport bound too.
-    serde_json::to_writer(RequestBudget(MAX_REQUEST_BYTES), &request)
-        .map_err(|_| invalid("API request exceeds 1 MiB."))?;
-    let mut options = RunOptions {
-        cancellation,
-        ..RunOptions::default()
-    };
-    if let Some(seconds) = request.options.timeout_seconds {
-        options.limits.timeout = Duration::from_secs(seconds);
-    }
-    if let Some(limit) = request.options.copy_limit_bytes {
-        options.copy_limit_bytes = limit;
-    }
-    if let Some(limit) = request.options.max_log_bytes {
-        options.max_log_bytes = limit;
-    }
-    if let Some(limit) = request.options.max_artifact_bytes {
-        options.max_artifact_bytes = limit;
-    }
+    validate_request(&request)?;
+    let options = run_options(&request.options, cancellation)?;
     let prompts = PromptDirectory::new()?;
     let mut inputs = Vec::with_capacity(request.tasks.len());
     for (index, task) in request.tasks.into_iter().enumerate() {
@@ -155,6 +119,56 @@ pub fn spawn_many(
         op: "spawn_many".into(),
         batch,
     })
+}
+
+pub(crate) fn validate_request(request: &BatchRequest) -> Result<(), FabricError> {
+    if request.version != 1 || request.op != "spawn_many" {
+        return Err(invalid("API requires version 1 and op spawn_many."));
+    }
+    if request.project.trim().is_empty() || request.concurrency == 0 {
+        return Err(invalid(
+            "API requires a nonempty project and positive concurrency.",
+        ));
+    }
+    if request.tasks.is_empty()
+        || request.tasks.len() > MAX_TASKS
+        || request
+            .tasks
+            .iter()
+            .any(|task| task.prompt.len() > MAX_PROMPT_BYTES)
+    {
+        return Err(invalid(
+            "API requires 1–128 tasks with at most 64 KiB per prompt.",
+        ));
+    }
+    // Count without allocating another copy; typed callers obey the transport bound too.
+    serde_json::to_writer(RequestBudget(MAX_REQUEST_BYTES), &request)
+        .map_err(|_| invalid("API request exceeds 1 MiB."))?;
+    Ok(())
+}
+
+pub(crate) fn run_options(
+    request: &Options,
+    cancellation: CancellationToken,
+) -> Result<RunOptions, FabricError> {
+    let mut options = RunOptions {
+        cancellation,
+        ..RunOptions::default()
+    };
+    if let Some(seconds) = request.timeout_seconds {
+        options.limits.timeout = Duration::from_secs(seconds);
+    }
+    if let Some(limit) = request.copy_limit_bytes {
+        options.copy_limit_bytes = limit;
+    }
+    if let Some(limit) = request.max_log_bytes {
+        options.max_log_bytes = limit;
+    }
+    if let Some(limit) = request.max_artifact_bytes {
+        options.max_artifact_bytes = limit;
+    }
+    options.limits.validate()?;
+    Ok(options)
 }
 
 struct RequestBudget(usize);

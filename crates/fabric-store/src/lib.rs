@@ -8,6 +8,9 @@ use fabric_domain::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
+mod queue;
+pub use queue::{AsyncBatch, AsyncEvent, AsyncTask, AsyncTaskStatus, NewAsyncTask};
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlite(rusqlite::Error),
@@ -222,7 +225,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=9 => {}
+            1..=10 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -367,6 +370,10 @@ impl Store {
             transaction.execute_batch(include_str!("worker_attempts.sql"))?;
             transaction.pragma_update(None, "user_version", 9)?;
         }
+        if version < 10 {
+            transaction.execute_batch(include_str!("async_queue.sql"))?;
+            transaction.pragma_update(None, "user_version", 10)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -439,7 +446,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=9) {
+        if !matches!(version, 5..=10) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })

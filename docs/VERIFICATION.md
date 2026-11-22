@@ -6,7 +6,7 @@
 
 | Gate | Current status | Evidence |
 |---|---|---|
-| LOCAL_WORKER_API_READY | NOT_VERIFIED | Baseline v1 API is synchronous. C02–04 pending. |
+| LOCAL_WORKER_API_READY | NOT_VERIFIED | Async lifecycle acceptance passed; generic worker API and immutable source selection (C03–04) remain pending. |
 | PSTACK_LOCAL_SWARM_READY | NOT_VERIFIED | Existing pstack skill routes native tasks; explicit Fabric bridge pending. |
 | LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
 
@@ -106,3 +106,21 @@ Full suite: **190 passed, 31 suites**, 135.13 seconds; full gate 165.99 seconds.
 Coverage includes default/overridden native roots, unreadable credential contents with metadata-only discovery, auth symlink/hardlink aliases excluded from fingerprints, private bounded consent storage, malformed/oversized/nonregular/linked selection refusal, missing-auth no-mutation, revocation after command construction, foreground/batch launch through the shared path, and independently authorized explicit profiles.
 
 Actual installed OMP 19.1.0 human CLI smoke: environment-cleared `fabric --root <absent-private-fixture> init --harness omp --check` exited 0, displayed the canonical native directory, source commit/dirty/READY state, metadata-only authentication availability, exposure and next actions. The supplied storage root remained absent. **This proves discovery, not successful authentication or native worker execution.** No provider/model call was attempted.
+
+## C-02 durable async lifecycle
+
+Eight actual-CLI acceptance scenarios passed: four detached workers with artifact verification and reclaim; partial failure isolation; owned run/batch cancellation; one bounded pool across concurrent submissions; bounded wait and ordered reconnect cursors; concurrent idempotent admission; queued-only restart replay; and continued worker heartbeat after manager loss, without persisted-PID signalling.
+
+Focused storage/core checks passed for atomic admission and immutable prepared references, queued cancellation/restart, v9-to-v10 evidence preservation, oversized frame rejection before allocation, and preservation of the original queued native-consent stamp after reconnect.
+
+```sh
+cargo test --offline -p fabric-cli --test async_workers
+cargo test --offline -p fabric-store --test store async_
+cargo test --offline -p fabric-store --test store v9_migration_adds_queue_without_rewriting_completed_run_evidence -- --exact
+cargo test --offline -p fabric-core manager::tests
+cargo test --offline -p fabric-core serialized_queued_plan_keeps_original_grant_after_reconnect
+```
+
+macOS-specific regression: accepted Unix sockets inherited listener nonblocking mode. A foreground-manager probe showed small status replies succeeded while larger terminal-result replies truncated. Accepted streams now explicitly become blocking before bounded read/write timeouts; the four-worker terminal-result/artifact scenario passed afterward. The owned probe and its completed workspaces were removed.
+
+C-02 final compatibility gate passed: formatting; offline workspace Clippy with warnings denied; all 203 tests across 32 suites (128.95s); offline workspace binary build; and Bun real-CLI/OMP-extension conformance. Both corrected v1/v2 migration fixtures also passed their focused rerun. Combined command completed in 149.71s; raw evidence `local://303.log`. No provider/model calls. Generic worker requests, source selection and native pstack routing remain separate unverified gates.
