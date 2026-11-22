@@ -69,7 +69,7 @@ impl HarnessAdapter for FakeAHarness {
     ) -> Result<HarnessPlan, FabricError> {
         let mut plan = crate::negotiate(request, self.capabilities(info)?, false)?;
         plan.model_resolved = Some(
-            request
+            plan.request
                 .model
                 .as_deref()
                 .unwrap_or(Self::DEFAULT_MODEL)
@@ -79,7 +79,7 @@ impl HarnessAdapter for FakeAHarness {
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
-        spec.request.validate()?;
+        let plan = crate::profile::revalidate(self, spec, Self::VERSION)?;
         Ok(CommandSpec {
             program: self.binary.clone(),
             args: vec![
@@ -87,7 +87,7 @@ impl HarnessAdapter for FakeAHarness {
                 "--input".into(),
                 spec.prompt_file.into(),
                 "--model".into(),
-                spec.request
+                plan.request
                     .model
                     .as_deref()
                     .unwrap_or(Self::DEFAULT_MODEL)
@@ -184,13 +184,7 @@ impl HarnessAdapter for FakeBHarness {
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
-        spec.request.validate()?;
-        if spec.request.model.is_some() || spec.request.resume.is_some() {
-            return Err(FabricError {
-                kind: fabric_domain::ErrorKind::UnsupportedCapability,
-                message: "fake-b does not support model selection or session resume.".into(),
-            });
-        }
+        crate::profile::revalidate(self, spec, Self::VERSION)?;
         Ok(CommandSpec {
             program: self.binary.clone(),
             args: vec![
@@ -252,6 +246,7 @@ mod tests {
         let plan = a.plan(&request, &info).unwrap();
         assert_eq!(plan.model_resolved.as_deref(), Some("literal-model"));
         let spec = AgentSpec {
+            profile: &plan.profile,
             prompt_file: std::path::Path::new("/task"),
             request: &request,
             max_cost_usd: None,
@@ -272,7 +267,16 @@ mod tests {
             fabric_domain::ErrorKind::UnsupportedCapability
         );
         let request = HarnessRequest::default();
+        let plan = b
+            .plan(
+                &request,
+                &HarnessInfo {
+                    version: FakeBHarness::VERSION.into(),
+                },
+            )
+            .unwrap();
         let spec = AgentSpec {
+            profile: &plan.profile,
             prompt_file: std::path::Path::new("/task"),
             request: &request,
             max_cost_usd: None,

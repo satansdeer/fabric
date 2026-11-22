@@ -257,3 +257,11 @@
 - Shared normalized events retain native evidence and bounded framing. Foreground lifecycle emits Started/Completed, detects terminal native failure independently of OS status and capture truncation, and preserves unknown usage. Pinned OMP normalization distinguishes terminal agent errors from recoverable tool/message failures.
 - Parent GREEN exposed capture-schema drift in the strict artifact verifier; fixed the shared verifier, migrated store fixtures/adapter expectations, and applied anchored formatting corrections. Formatting, strict workspace/all-target Clippy and all 162 tests across 26 suites passed (`local://226.log`).
 - Status: HN-03 done. No paid live validation or profile/credential isolation claim; HN-04 follows.
+
+## HN-04 — externally verified
+
+- Implementers: Hn04Profiles (domain/runner) and Hn04Admission (core/CLI). Observed RED: unauthorized native runs allocated workers and ambient profile state reached version probes (`/tmp/fabric-hn04-admission-red.log`, `/tmp/fabric-hn04-runner-red.log`).
+- Explicit version-bound profiles, native config references and credential connections now govern launch. Private HOME/XDG and environment clearing apply to probes and workers; selected credentials are resolved at launch, never copied into profile evidence. Bounded non-auth config fingerprints are rechecked before launch and bound to durable attempts/sealed manifests.
+- Parent fixed legacy fixture authorization and a serde unit-variant loophole that ignored unexpected native-default model-policy fields. Existing legacy artifact verification remains compatible.
+- Parent GREEN: formatting, strict workspace/all-target Clippy and all 171 tests across 28 suites passed (`local://262.log`). Actual CLI help exposes `--profile`; installed OMP doctor reports `omp/19.1.0` with no credential/model request (`local://258.log`).
+- Status: HN-04 done. Native roots remain trusted-local/opaque; availability checks are not provider-auth validation, and fingerprints are not atomic HOME snapshots.

@@ -1,5 +1,4 @@
-//! Installed OMP print-mode adapter. No shell, config copying or credential discovery.
-use std::ffi::OsString;
+//! Pinned OMP print-mode adapter with explicit trusted-local profile authorization.
 use std::path::PathBuf;
 
 use fabric_domain::{
@@ -11,9 +10,11 @@ use crate::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo, NativeEvent, ex
 
 const SUPPORTED_VERSION: &str = "omp/19.1.0";
 
+#[path = "omp_profile.rs"]
+mod profile;
+
 pub struct OmpHarness {
     binary: PathBuf,
-    environment: Vec<(OsString, OsString)>,
 }
 
 impl OmpHarness {
@@ -22,16 +23,7 @@ impl OmpHarness {
         let binary = crate::discover_executable("omp", &path).ok_or_else(|| {
             execution_error("OMP executable not found on PATH. Install OMP and add its executable directory to PATH; use fabric doctor to inspect discovery.")
         })?;
-        // HOME/XDG enable OMP's normal local config/auth mechanism without copying
-        // credentials. No API keys, runtime injection or arbitrary OMP overrides.
-        let environment = ["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "TMPDIR"]
-            .into_iter()
-            .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
-            .collect();
-        Ok(Self {
-            binary,
-            environment,
-        })
+        Ok(Self { binary })
     }
 }
 
@@ -41,7 +33,10 @@ impl HarnessAdapter for OmpHarness {
     }
 
     fn probe(&self) -> Result<HarnessInfo, FabricError> {
-        let version = crate::probe_version(&self.binary, self.environment.clone())?;
+        let version = crate::probe_version(
+            &self.binary,
+            crate::profile::runtime_environment(&self.binary)?,
+        )?;
         crate::planning::check_version("omp", &version, SUPPORTED_VERSION)?;
         Ok(HarnessInfo { version })
     }
@@ -62,6 +57,14 @@ impl HarnessAdapter for OmpHarness {
         usage.reason.code = "tested_message_end_usage".into();
         usage.reason.message = "Pinned print-mode assistant message_end reports token usage when available; absent usage/pricing remains unknown.".into();
         usage.minimum_version = Some(SUPPORTED_VERSION.into());
+        let profile = manifest
+            .capabilities
+            .iter_mut()
+            .find(|status| status.capability == Capability::ProfileImport)
+            .expect("complete manifest");
+        profile.support = CapabilitySupport::RequiresConfiguration;
+        profile.reason.code = "explicit_native_profile_required".into();
+        profile.reason.message = "Only explicit supported trusted-local native roots are importable; doctor does not inspect config or credentials.".into();
         Ok(manifest)
     }
 
@@ -70,10 +73,39 @@ impl HarnessAdapter for OmpHarness {
         request: &HarnessRequest,
         info: &HarnessInfo,
     ) -> Result<HarnessPlan, FabricError> {
-        crate::negotiate(request, self.capabilities(info)?, true)
+        let mut manifest = self.capabilities(info)?;
+        let request = crate::profile::effective_request(request, &manifest)?;
+        let (profile, _) = profile::resolve(&request, &manifest, false)?;
+        if !request
+            .profile
+            .as_ref()
+            .expect("resolved profile")
+            .native_config_refs
+            .is_empty()
+        {
+            let status = manifest
+                .capabilities
+                .iter_mut()
+                .find(|status| status.capability == Capability::ProfileImport)
+                .expect("complete manifest");
+            status.support = CapabilitySupport::Native;
+            status.reason.code = "explicit_native_trusted_local".into();
+            status.reason.message =
+                "Explicit supported native roots selected; trusted-local, not a portable snapshot."
+                    .into();
+        }
+        crate::planning::negotiate_profile(&request, manifest, true, profile)
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
+        let plan = crate::profile::revalidate(self, spec, SUPPORTED_VERSION)?;
+        let (profile, mut environment) = profile::resolve(&plan.request, &plan.manifest, true)?;
+        if profile.digest != spec.profile.digest {
+            return Err(crate::profile::invalid(
+                "OMP native config changed while constructing the command; plan again.",
+            ));
+        }
+        environment.extend(crate::profile::runtime_environment(&self.binary)?);
         let prompt = std::fs::read_to_string(spec.prompt_file)
             .map_err(|_| execution_error("OMP prompt must be a readable UTF-8 file."))?;
         if prompt.contains('\0') {
@@ -95,7 +127,7 @@ impl HarnessAdapter for OmpHarness {
         Ok(CommandSpec {
             program: self.binary.clone(),
             args,
-            environment: self.environment.clone(),
+            environment,
         })
     }
 
@@ -165,6 +197,7 @@ impl HarnessAdapter for OmpHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -174,10 +207,7 @@ mod tests {
         let binary = temp.path().join("omp");
         fs::write(&binary, "#!/bin/sh\nprintf 'omp/99.0.0\\n'\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let harness = OmpHarness {
-            binary,
-            environment: Vec::new(),
-        };
+        let harness = OmpHarness { binary };
         assert!(matches!(
             harness.probe(),
             Err(FabricError {
@@ -193,16 +223,35 @@ mod tests {
         let binary = temp.path().join("omp");
         fs::write(&binary, "#!/bin/sh\nprintf 'omp/19.1.0\\n'\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let harness = OmpHarness {
-            binary,
-            environment: vec![("HOME".into(), "/trusted/local/home".into())],
-        };
+        let harness = OmpHarness { binary };
         let info = harness.probe().unwrap();
         assert_eq!(info.version, "omp/19.1.0");
         let request = HarnessRequest {
             max_cost_usd: Some(0.25),
+            profile: Some(fabric_domain::AgentProfile {
+                harness_id: harness.id(),
+                harness_version: SUPPORTED_VERSION.into(),
+                native_config_refs: vec![fabric_domain::NativeConfigRef {
+                    kind: "native-home".into(),
+                    path: temp.path().to_owned(),
+                }],
+                model_policy: Default::default(),
+                skills: Vec::new(),
+                plugins: Vec::new(),
+                mcp: Vec::new(),
+                connection_refs: vec![fabric_domain::CredentialConnectionRef {
+                    kind: "native-auth".into(),
+                    name: "native-home".into(),
+                }],
+            }),
             ..HarnessRequest::default()
         };
+        fs::create_dir_all(temp.path().join(".omp/agent")).unwrap();
+        fs::write(
+            temp.path().join(".omp/agent/agent.db"),
+            "opaque-native-auth",
+        )
+        .unwrap();
         let plan = harness.plan(&request, &info).unwrap();
         assert_eq!(plan.manifest.capabilities.len(), 13);
         assert_eq!(plan.manifest.supported_versions, "omp/19.1.0");
@@ -211,6 +260,7 @@ mod tests {
         fs::write(&prompt, "literal --prompt").unwrap();
         let command = harness
             .command(&AgentSpec {
+                profile: &plan.profile,
                 prompt_file: &prompt,
                 request: &request,
                 max_cost_usd: plan.request.max_cost_usd,
@@ -230,15 +280,20 @@ mod tests {
             ]
             .map(OsString::from)
         );
-        assert_eq!(command.environment, harness.environment);
+        assert!(
+            command
+                .environment
+                .iter()
+                .any(|(name, value)| name == "HOME" && value == temp.path().as_os_str())
+        );
         for request in [
             HarnessRequest {
                 model: Some("requested".into()),
-                ..HarnessRequest::default()
+                ..request.clone()
             },
             HarnessRequest {
                 resume: Some("session-ref".into()),
-                ..HarnessRequest::default()
+                ..request.clone()
             },
         ] {
             assert_eq!(
@@ -275,18 +330,22 @@ mod tests {
         let binary = temp.path().join("omp");
         let harness = OmpHarness {
             binary: binary.clone(),
-            environment: Vec::new(),
         };
         for body in [
             "printf 'omp/19.1.0\\n'; exit 7",
             "printf 'other/19.1.0\\n'",
             "printf 'omp/19.1.0\\nextra\\n'",
-            "printf 'omp/'; head -c 5000 /dev/zero | tr '\\000' x",
         ] {
             fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
             assert!(harness.probe().is_err(), "{body}");
         }
+        fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf '{}\\n'\n", "x".repeat(5000)),
+        )
+        .unwrap();
+        assert!(harness.probe().is_err());
     }
 
     #[test]
@@ -295,16 +354,45 @@ mod tests {
         let prompt = temp.path().join("prompt");
         let harness = OmpHarness {
             binary: "/must/not/run".into(),
-            environment: Vec::new(),
         };
+        fs::create_dir_all(temp.path().join(".omp/agent")).unwrap();
+        fs::write(temp.path().join(".omp/agent/agent.db"), "opaque-auth").unwrap();
+        let request = HarnessRequest {
+            profile: Some(fabric_domain::AgentProfile {
+                harness_id: harness.id(),
+                harness_version: SUPPORTED_VERSION.into(),
+                native_config_refs: vec![fabric_domain::NativeConfigRef {
+                    kind: "native-home".into(),
+                    path: temp.path().to_owned(),
+                }],
+                model_policy: Default::default(),
+                skills: Vec::new(),
+                plugins: Vec::new(),
+                mcp: Vec::new(),
+                connection_refs: vec![fabric_domain::CredentialConnectionRef {
+                    kind: "native-auth".into(),
+                    name: "native-home".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let plan = harness
+            .plan(
+                &request,
+                &HarnessInfo {
+                    version: SUPPORTED_VERSION.into(),
+                },
+            )
+            .unwrap();
         for bytes in [b"invalid \xff".as_slice(), b"nul \0".as_slice()] {
             fs::write(&prompt, bytes).unwrap();
             assert!(
                 harness
                     .command(&AgentSpec {
-                        prompt_file: &prompt,
-                        request: &HarnessRequest::default(),
+                        profile: &plan.profile,
                         max_cost_usd: None,
+                        prompt_file: &prompt,
+                        request: &request,
                     })
                     .is_err()
             );
@@ -315,7 +403,6 @@ mod tests {
     fn pinned_print_events_preserve_unknown_usage_and_only_terminal_errors_are_fatal() {
         let harness = OmpHarness {
             binary: "/unused".into(),
-            environment: Vec::new(),
         };
         let normalize =
             |value: serde_json::Value| harness.normalize_event(NativeEvent::Json(&value));
@@ -328,7 +415,6 @@ mod tests {
                 text: "hello".into()
             })
         );
-        assert!(normalize(serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"error","reason":"error"}})).is_none());
         assert!(matches!(
             normalize(
                 serde_json::json!({"type":"tool_execution_end","toolName":"bash","isError":true})
@@ -369,5 +455,110 @@ mod tests {
             normalize(serde_json::json!({"type":"unrecognized","error":"not a fatal event"}))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn profile_binding_fingerprints_and_authorization_are_enforced_before_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join(".omp/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("agent.db"), "secret-auth-sentinel").unwrap();
+        fs::write(agent.join("config.yml"), "model: native\n").unwrap();
+        let harness = OmpHarness {
+            binary: "/must/not/run".into(),
+        };
+        let info = HarnessInfo {
+            version: SUPPORTED_VERSION.into(),
+        };
+        assert_eq!(
+            harness
+                .plan(&HarnessRequest::default(), &info)
+                .unwrap_err()
+                .kind,
+            fabric_domain::ErrorKind::AuthorizationRequired
+        );
+        let mut request = HarnessRequest {
+            profile: Some(fabric_domain::AgentProfile {
+                harness_id: harness.id(),
+                harness_version: SUPPORTED_VERSION.into(),
+                native_config_refs: vec![fabric_domain::NativeConfigRef {
+                    kind: "native-home".into(),
+                    path: root.path().to_owned(),
+                }],
+                model_policy: Default::default(),
+                skills: Vec::new(),
+                plugins: Vec::new(),
+                mcp: Vec::new(),
+                connection_refs: vec![fabric_domain::CredentialConnectionRef {
+                    kind: "native-auth".into(),
+                    name: "native-home".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let plan = harness.plan(&request, &info).unwrap();
+        assert!(!plan.profile.portable);
+        assert!(
+            !serde_json::to_string(&plan.profile)
+                .unwrap()
+                .contains("secret-auth-sentinel")
+        );
+        fs::write(agent.join("agent.db"), "different-secret-auth").unwrap();
+        assert_eq!(
+            harness.plan(&request, &info).unwrap().profile.digest,
+            plan.profile.digest
+        );
+        let prompt = root.path().join("prompt");
+        fs::write(&prompt, "test").unwrap();
+        let spec = AgentSpec {
+            request: &request,
+            profile: &plan.profile,
+            prompt_file: &prompt,
+            max_cost_usd: None,
+        };
+        assert!(harness.command(&spec).is_ok());
+        fs::write(agent.join("config.yml"), "model: changed\n").unwrap();
+        assert_ne!(
+            harness
+                .plan(&request, &info)
+                .unwrap()
+                .profile
+                .native_config_fingerprint,
+            plan.profile.native_config_fingerprint
+        );
+        assert!(harness.command(&spec).is_err());
+        for mutation in 0..7 {
+            let mut rejected = request.clone();
+            let profile = rejected.profile.as_mut().unwrap();
+            match mutation {
+                0 => profile.harness_id = "fake-a".parse().unwrap(),
+                1 => profile.harness_version = "omp/19.1.1".into(),
+                2 => profile.native_config_refs[0].kind = "unknown-native-ref".into(),
+                3 => profile.connection_refs[0].name = "unknown-connection".into(),
+                4 => profile.skills.push("required-skill".into()),
+                5 => profile.mcp.push("required-server".into()),
+                _ => profile.plugins.push("required-plugin".into()),
+            }
+            assert!(harness.plan(&rejected, &info).is_err());
+        }
+        request.profile.as_mut().unwrap().connection_refs.clear();
+        assert_eq!(
+            harness.plan(&request, &info).unwrap_err().kind,
+            fabric_domain::ErrorKind::AuthorizationRequired
+        );
+        request.profile.as_mut().unwrap().connection_refs.push(
+            fabric_domain::CredentialConnectionRef {
+                kind: "env".into(),
+                name: "FABRIC_UNSUPPORTED_SECRET_ENV".into(),
+            },
+        );
+        assert!(harness.plan(&request, &info).is_err());
+        fs::write(agent.join("models.yml"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        request.profile.as_mut().unwrap().connection_refs =
+            vec![fabric_domain::CredentialConnectionRef {
+                kind: "native-auth".into(),
+                name: "native-home".into(),
+            }];
+        assert!(harness.plan(&request, &info).is_err());
     }
 }

@@ -85,7 +85,7 @@ impl Fixture {
             "required_files": [".deps/ready"],
             "writes": [{"path":"tracked", "content":"worker tracked"}, {"path":"new source ; literal", "content":"worker untracked"}],
             "events": [{"type":"fixture", "value":42, "payload":"x".repeat(128 * 1024)}], "exit_code":exit,
-            "absent_environment": ["HOME", "UNSELECTED_SECRET"],
+            "absent_environment": ["UNSELECTED_SECRET"],
         })).unwrap()).unwrap();
         self.cli()
             .args(["run", "test", "--harness", "fake", "--prompt-file"])
@@ -102,6 +102,85 @@ impl Fixture {
         )).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         executable
+    }
+    fn native_profile(&self) -> serde_json::Value {
+        use std::os::unix::fs::PermissionsExt;
+        let home = self.0.join("selected-home");
+        let agent = home.join(".omp/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("config.yml"),
+            "theme: dark\napiKey: config-secret-sentinel\n",
+        )
+        .unwrap();
+        fs::write(agent.join("agent.db"), "opaque-auth-secret-sentinel").unwrap();
+        let binary = self.0.join("omp");
+        fs::write(&binary, r#"#!/bin/sh
+set -eu
+test -n "$HOME"
+test -d "$HOME"
+test -n "$XDG_CONFIG_HOME"
+test -n "$XDG_DATA_HOME"
+test -n "$XDG_STATE_HOME"
+test -n "$XDG_CACHE_HOME"
+test -z "${UNSELECTED_SECRET-}${OMP_PROFILE-}${PI_PROFILE-}${PI_CONFIG_FILES-}${CLAUDE_CONFIG_DIR-}${HTTPS_PROXY-}"
+if [ "$1" = --version ]; then
+    test ! -e "$HOME/.omp"
+    test -z "${OPENAI_API_KEY-}"
+    printf 'omp/19.1.0\n'
+    exit 0
+fi
+test -f "$HOME/.omp/agent/config.yml"
+test -f "$HOME/.omp/agent/agent.db"
+if [ -n "${OPENAI_API_KEY-}" ]; then
+    test "$OPENAI_API_KEY" = authorized-key-secret-sentinel
+fi
+printf 'native fixture changed source' > tracked
+printf '{"type":"message_end"}\n'
+"#).unwrap();
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+        serde_json::json!({
+            "harness_id":"omp", "harness_version":"omp/19.1.0",
+            "native_config_refs":[{"kind":"native-home","path":home}],
+            "connection_refs":[{"kind":"native-auth","name":"native-home"}]
+        })
+    }
+    fn native_cli(&self) -> Command {
+        let mut command = self.cli();
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", self.0.display()))
+            .env("OPENAI_API_KEY", "authorized-key-secret-sentinel")
+            .env("XDG_CONFIG_HOME", self.0.join("hostile-config"))
+            .env("XDG_DATA_HOME", self.0.join("hostile-data"))
+            .env("XDG_STATE_HOME", self.0.join("hostile-state"))
+            .env("XDG_CACHE_HOME", self.0.join("hostile-cache"))
+            .env("OMP_PROFILE", "hostile-profile")
+            .env("PI_PROFILE", "hostile-profile")
+            .env("PI_CONFIG_FILES", "hostile-files")
+            .env("CLAUDE_CONFIG_DIR", "hostile-foreign")
+            .env("HTTPS_PROXY", "hostile-proxy");
+        command
+    }
+    fn inventory(&self) -> Vec<i64> {
+        let db = rusqlite::Connection::open_with_flags(
+            self.0.join("storage/fabric.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        [
+            "runs",
+            "workspaces",
+            "batches",
+            "batch_tasks",
+            "worker_attempts",
+        ]
+        .map(|table| {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        })
+        .to_vec()
     }
 }
 impl Drop for Fixture {
@@ -128,6 +207,76 @@ fn json(out: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn native_profile_authorization_is_required_before_batch_allocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    let binary = fixture.0.join("omp");
+    fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/19.1.0\\n'; exit 0; fi\nprintf '{\"type\":\"message_end\"}\\n'\n").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        fixture.0.join("native-prompt"),
+        "No model invocation: fixture only",
+    )
+    .unwrap();
+    let tasks = fixture.0.join("native-tasks.json");
+    fs::write(
+        &tasks,
+        r#"[{"id":"native","prompt_file":"native-prompt","harness":"omp"}]"#,
+    )
+    .unwrap();
+    let output = fixture
+        .cli()
+        .env("PATH", format!("{}:/usr/bin:/bin", fixture.0.display()))
+        .args(["run-many", "test", "--tasks"])
+        .arg(&tasks)
+        .args([
+            "--concurrency",
+            "1",
+            "--json",
+            "--copy-limit-bytes",
+            "10485760",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "Unauthorized native execution succeeded: {output:?}"
+    );
+    let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("profile")
+            || failure["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("credential"),
+        "{failure}"
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        fixture.0.join("storage/fabric.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for table in [
+        "runs",
+        "workspaces",
+        "batches",
+        "batch_tasks",
+        "worker_attempts",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} allocated before authorization");
+    }
+}
+
+#[test]
 fn mixed_harness_batch_normalizes_events_and_rejects_late_unsupported_requests_atomically() {
     let fixture = Fixture::new();
     let (repo, base) = fixture.setup();
@@ -139,7 +288,7 @@ fn mixed_harness_batch_normalizes_events_and_rejects_late_unsupported_requests_a
             serde_json::to_vec(&serde_json::json!({
                 "required_files": [".deps/ready"],
                 "writes": [{"path":"tracked","content":name}],
-                "absent_environment": ["HOME", "UNSELECTED_SECRET"]
+                "absent_environment": ["UNSELECTED_SECRET"]
             }))
             .unwrap(),
         )
@@ -584,7 +733,7 @@ fn harness_registry_unknown_id_and_neutral_core_preserve_attempt_evidence() {
     assert!(attempt["event_cursor"].as_u64().unwrap() > 0);
     assert!(attempt["model_requested"].is_null());
     assert!(attempt["model_resolved"].is_null());
-    assert!(attempt["profile_digest"].is_null());
+    assert_eq!(attempt["profile_digest"], report["profile"]["digest"]);
     let shown = json(
         &fixture
             .cli()
@@ -1267,6 +1416,7 @@ fn verified_manifest(fixture: &Fixture, report: &serde_json::Value) -> serde_jso
     assert_eq!(manifest["base_commit_sha"], report["base_commit_sha"]);
     assert_eq!(manifest["prompt_digest"], report["prompt_digest"]);
     assert_eq!(manifest["harness_version"], report["harness_version"]);
+    assert_eq!(manifest["profile"], report["profile"]);
     assert_eq!(manifest["exit_code"], report["exit_code"]);
     assert_eq!(manifest["exit_signal"], report["exit_signal"]);
     assert_eq!(manifest["capture"], report["capture"]);
@@ -1781,6 +1931,8 @@ fn omp_mock_receives_literal_prompt_parses_bounded_jsonl_and_records_observed_ve
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let (repo, base) = fixture.setup();
+    let profile = fixture.0.join("env-profile.json");
+    fs::write(&profile, r#"{"harness_id":"omp","harness_version":"omp/19.1.0","connection_refs":[{"kind":"env","name":"GROQ_API_KEY"}]}"#).unwrap();
     let bin = fixture.0.join("bin");
     fs::create_dir(&bin).unwrap();
     let executable = bin.join("omp");
@@ -1798,6 +1950,7 @@ if [ "$#" = 1 ] && [ "$1" = --version ]; then
     printf 'omp/19.1.0\n'
     exit 0
 fi
+test "$GROQ_API_KEY" = explicitly-authorized-fixture-key
 test "$#" = 8
 test "$1" = -p
 test "$2" = --mode
@@ -1827,12 +1980,15 @@ printf '\n{"type":"finished"}\n{"last":true}'
         let out = fixture
             .cli()
             .env("PATH", &path)
+            .env("GROQ_API_KEY", "explicitly-authorized-fixture-key")
             .env("OPENAI_API_KEY", "must-not-leak")
             .env("AWS_SECRET_ACCESS_KEY", "must-not-leak")
             .env("BASH_ENV", "/must/not/load")
             .env("PI_CODING_AGENT_DIR", "/must/not/load")
             .args(["run", "test", "--harness", "omp", "--prompt-file"])
             .arg(prompt_path)
+            .arg("--profile")
+            .arg(&profile)
             .args([
                 "--json",
                 "--copy-limit-bytes",
@@ -2099,7 +2255,9 @@ rmdir "$lock"
     let tasks: Vec<_> = (0..4)
         .map(|i| {
             fs::write(prompts.join(format!("{i}.txt")), format!("task-{i}")).unwrap();
-            serde_json::json!({"id":format!("task-{i}"), "prompt_file":format!("{i}.txt")})
+            serde_json::json!({"id":format!("task-{i}"), "prompt_file":format!("{i}.txt"),
+                "request":{"profile":{"harness_id":"omp","harness_version":"omp/19.1.0",
+                    "connection_refs":[{"kind":"env","name":"GROQ_API_KEY"}]}}})
         })
         .collect();
     let manifest = prompts.join("tasks.json");
@@ -2107,6 +2265,7 @@ rmdir "$lock"
     let out = fixture
         .cli()
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("GROQ_API_KEY", "explicitly-authorized-fixture-key")
         .args(["run-many", "test", "--harness", "omp", "--tasks"])
         .arg(&manifest)
         .args([
@@ -3347,4 +3506,293 @@ fn inspection_reads_live_wal_without_migration_or_logical_writes() {
         fs::read(tree.join("new source ; literal")).unwrap(),
         b"worker untracked"
     );
+}
+
+#[test]
+fn native_profiles_record_immutable_nonsecret_evidence_through_single_and_batch_paths() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let profile = fixture.native_profile();
+    let profile_file = fixture.0.join("profile.json");
+    let prompt = fixture.0.join("native-prompt");
+    fs::write(&prompt, "Fixture only; never call a model").unwrap();
+    let tasks = fixture.0.join("native-tasks.json");
+    let mut previous = None;
+    for mode in ["inline", "single", "batch-default", "changed-config"] {
+        let mut selected = profile.clone();
+        if mode == "single" {
+            selected["connection_refs"] = serde_json::json!([{"kind":"native-auth","name":"native-home"},{"kind":"env","name":"OPENAI_API_KEY"}]);
+        }
+        if mode == "changed-config" {
+            fs::write(
+                fixture.0.join("selected-home/.omp/agent/config.yml"),
+                "theme: light\napiKey: config-secret-sentinel\n",
+            )
+            .unwrap();
+        }
+        fs::write(&profile_file, serde_json::to_vec(&selected).unwrap()).unwrap();
+        let mut command = fixture.native_cli();
+        if mode == "single" {
+            command
+                .args(["run", "test", "--harness", "omp", "--prompt-file"])
+                .arg(&prompt)
+                .arg("--profile")
+                .arg(&profile_file);
+        } else {
+            let mut task =
+                serde_json::json!({"id":"native","prompt_file":"native-prompt","harness":"omp"});
+            if mode != "batch-default" {
+                task["request"] = serde_json::json!({"profile":selected});
+            }
+            fs::write(&tasks, serde_json::to_vec(&vec![task]).unwrap()).unwrap();
+            command
+                .args(["run-many", "test", "--tasks"])
+                .arg(&tasks)
+                .args(["--concurrency", "1"]);
+            if mode == "batch-default" {
+                command.arg("--profile").arg(&profile_file);
+            }
+        }
+        let output = command
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap();
+        let report = json(&output);
+        let run = if mode == "single" {
+            &report
+        } else {
+            &report["tasks"][0]["result"]
+        };
+        let evidence = &run["profile"];
+        let digest = evidence["digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            evidence["native_config_fingerprint"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(evidence["portable"], false);
+        assert!(!evidence["diagnostics"].as_array().unwrap().is_empty());
+        assert_eq!(run["worker_attempts"][0]["profile_digest"], digest);
+        assert_eq!(verified_manifest(&fixture, run)["profile"], *evidence);
+        if mode == "inline" {
+            previous = Some(digest.to_owned());
+        }
+        if mode == "batch-default" {
+            assert_eq!(previous.as_deref(), Some(digest));
+        }
+        if mode == "changed-config" {
+            assert_ne!(previous.as_deref(), Some(digest));
+        }
+        for secret in [
+            "authorized-key-secret-sentinel",
+            "opaque-auth-secret-sentinel",
+            "config-secret-sentinel",
+        ] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+            for file in fs::read_dir(artifact_container(&fixture, run)).unwrap() {
+                assert!(
+                    !String::from_utf8_lossy(&fs::read(file.unwrap().path()).unwrap())
+                        .contains(secret)
+                );
+            }
+            assert!(
+                !String::from_utf8_lossy(&fs::read(fixture.0.join("storage/fabric.db")).unwrap())
+                    .contains(secret)
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_profiles_and_late_batch_requirements_are_secret_safe_and_atomic() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let base = fixture.native_profile();
+    let profile_file = fixture.0.join("profile.json");
+    let prompt = fixture.0.join("native-prompt");
+    fs::write(&prompt, "fixture only").unwrap();
+    let before = fixture.inventory();
+    let mut invalid = Vec::new();
+    for (field, value) in [
+        ("harness_id", serde_json::json!("fake-a")),
+        ("harness_version", serde_json::json!("omp/0.0.0")),
+        ("skills", serde_json::json!(["unsupported-skill"])),
+        ("plugins", serde_json::json!(["unsupported-plugin"])),
+        ("mcp", serde_json::json!(["unsupported-mcp"])),
+        ("connection_refs", serde_json::json!([])),
+        (
+            "native_config_refs",
+            serde_json::json!([{"kind":"unknown","path":fixture.0}]),
+        ),
+        (
+            "connection_refs",
+            serde_json::json!([{"kind":"unknown","name":"unknown"}]),
+        ),
+        (
+            "connection_refs",
+            serde_json::json!([{"kind":"env","name":"NOT_APPROVED"}]),
+        ),
+        (
+            "connection_refs",
+            serde_json::json!([{"kind":"env","name":"ANTHROPIC_API_KEY"}]),
+        ),
+        ("raw_credential", serde_json::json!("parse-secret-sentinel")),
+        ("parse-secret-sentinel", serde_json::json!("unknown")),
+        (
+            "native_config_refs",
+            serde_json::json!([{"kind":"native-home","path":fixture.0,"secret":"parse-secret-sentinel"}]),
+        ),
+        (
+            "connection_refs",
+            serde_json::json!([{"kind":"env","name":"OPENAI_API_KEY","secret":"parse-secret-sentinel"}]),
+        ),
+        (
+            "model_policy",
+            serde_json::json!({"kind":"exact","model":"profile-model"}),
+        ),
+    ] {
+        let mut selected = base.clone();
+        selected[field] = value;
+        invalid.push(selected);
+    }
+    for selected in invalid {
+        fs::write(&profile_file, serde_json::to_vec(&selected).unwrap()).unwrap();
+        for many in [false, true] {
+            let mut command = fixture.native_cli();
+            if many {
+                let tasks = fixture.0.join("invalid-tasks.json");
+                fs::write(&tasks, serde_json::to_vec(&serde_json::json!([
+                    {"id":"valid-first","prompt_file":"native-prompt","harness":"fake-a","request":{}},
+                    {"id":"invalid-late","prompt_file":"native-prompt","harness":"omp",
+                        "request":{"profile":selected,"model":"request-model"}}
+                ])).unwrap()).unwrap();
+                command
+                    .args(["run-many", "test", "--tasks"])
+                    .arg(tasks)
+                    .args(["--concurrency", "2"]);
+            } else {
+                command
+                    .args(["run", "test", "--harness", "omp", "--prompt-file"])
+                    .arg(&prompt)
+                    .arg("--profile")
+                    .arg(&profile_file)
+                    .args(["--model", "request-model"]);
+            }
+            let output = command
+                .args(["--json", "--copy-limit-bytes", "10485760"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{selected}: {output:?}");
+            assert!(output.stdout.is_empty());
+            let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert!(failure["error"]["kind"].is_string(), "{failure}");
+            for secret in [
+                "authorized-key-secret-sentinel",
+                "parse-secret-sentinel",
+                "config-secret-sentinel",
+            ] {
+                assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+            }
+            assert_eq!(fixture.inventory(), before);
+        }
+    }
+    for bytes in [
+        vec![b'x'; 64 * 1024 + 1],
+        b"{\"secret\":\"parse-secret-sentinel\"".to_vec(),
+    ] {
+        fs::write(&profile_file, bytes).unwrap();
+        let output = fixture
+            .native_cli()
+            .args(["run", "test", "--harness", "omp", "--prompt-file"])
+            .arg(&prompt)
+            .arg("--profile")
+            .arg(&profile_file)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("parse-secret-sentinel"));
+        assert_eq!(fixture.inventory(), before);
+    }
+    for directory in [
+        "workspaces",
+        "fork-staging",
+        "artifact-staging",
+        "artifacts",
+    ] {
+        let path = fixture.0.join("storage").join(directory);
+        assert!(!path.exists() || fs::read_dir(path).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compatible() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    for case in [
+        "legacy",
+        "missing-evidence",
+        "missing-digest",
+        "changed-digest",
+    ] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        let report = pending_workspace(&fixture);
+        let path = artifact_container(&fixture, &report).join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+        db.execute_batch("DROP TRIGGER worker_attempt_immutable_evidence; DROP TRIGGER immutable_artifact_update;").unwrap();
+        if matches!(case, "legacy" | "missing-evidence") {
+            manifest.as_object_mut().unwrap().remove("profile");
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            db.execute(
+                "UPDATE artifacts SET sha256=?1, size_bytes=?2 WHERE run_id=?3 AND kind='manifest'",
+                rusqlite::params![
+                    format!("{:x}", Sha256::digest(&bytes)),
+                    bytes.len() as i64,
+                    report["run_id"].as_str().unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        if matches!(case, "legacy" | "missing-digest") {
+            db.execute("UPDATE worker_attempts SET profile_digest=NULL", [])
+                .unwrap();
+        }
+        if case == "changed-digest" {
+            db.execute(
+                "UPDATE worker_attempts SET profile_digest=?1",
+                ["f".repeat(64)],
+            )
+            .unwrap();
+        }
+        drop(db);
+        if case == "legacy" {
+            let mut old_report = report.clone();
+            old_report.as_object_mut().unwrap().remove("profile");
+            let decoded: fabric_core::run::RunReport = serde_json::from_value(old_report).unwrap();
+            assert!(decoded.profile.is_none());
+        }
+        let result = gc(&fixture, "--apply");
+        assert_eq!(
+            result["items"][0]["action"],
+            if case == "legacy" {
+                "reclaimed"
+            } else {
+                "refused"
+            },
+            "{case}: {result}"
+        );
+        if case != "legacy" {
+            assert!(Path::new(report["workspace_path"].as_str().unwrap()).exists());
+        }
+    }
 }

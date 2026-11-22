@@ -341,7 +341,7 @@ After dependencies have been cached, add `--offline` to Cargo build/test/clippy 
 
 ## Harness-neutral amendment
 
-The supplied v0.2.1 amendment is tracked separately in `PRD_HARNESS_NEUTRAL.json`. HN-01/02/03 are complete: registry-owned adapters, durable worker-attempt evidence, exact version probes, fail-closed capability planning and mixed-harness batches. Existing v0.1 commands and storage remain compatible.
+The supplied v0.2.1 amendment is tracked separately in `PRD_HARNESS_NEUTRAL.json`. HN-01–04 implement registry-owned adapters, durable worker-attempt evidence, exact version probes, fail-closed capability planning, mixed-harness batches and explicit native-profile/credential boundaries. Existing v0.1 commands and storage remain compatible.
 
 ```sh
 fabric harnesses list --json
@@ -365,4 +365,20 @@ Doctors are bounded, version-only probes, not provider/authentication or model c
 fabric run-many PROJECT --tasks tasks.json --concurrency 2 --json
 ```
 
-Both distinct fixture protocols use the same pool, attempt records, isolated forks, bounded capture and safe reclaim. `events.jsonl` retains raw native records and adds normalized Started/Output/Tool/Usage/Completed/Failure events with sequence numbers; malformed or oversized frames remain bounded. Native fatal errors fail the run even when the process exits zero or the capture cap is exhausted. Recoverable native tool/message errors do not imply terminal failure. OMP event conformance uses pinned protocol fixtures, not paid live validation. Native profile/credential boundaries remain the next story.
+Both distinct fixture protocols use the same pool, attempt records, isolated forks, bounded capture and safe reclaim. `events.jsonl` retains raw native records and adds normalized Started/Output/Tool/Usage/Completed/Failure events with sequence numbers; malformed or oversized frames remain bounded. Native fatal errors fail the run even when the process exits zero or the capture cap is exhausted. Recoverable native tool/message errors do not imply terminal failure. OMP event conformance uses pinned protocol fixtures, not paid live validation.
+
+### Explicit profiles
+
+Workers and version probes clear the inherited environment and use private HOME/XDG directories. Real OMP runs require `--profile PATH` (or a task request's `profile`), bound to `omp` / `omp/19.1.0`, with explicit nonsecret connection references. For an already configured environment credential:
+
+```json
+{
+  "harness_id":"omp",
+  "harness_version":"omp/19.1.0",
+  "connection_refs":[{"kind":"env","name":"OPENAI_API_KEY"}]
+}
+```
+
+Only approved OMP provider variable names may be selected; unselected keys, profile selectors and proxies are not inherited. The referenced value must already exist in the launching process; never put credentials in profile JSON. Native config references accept absolute existing `native-home` and `native-agent-dir` directories. A selected native `agent.db` requires explicit `{"kind":"native-auth","name":"native-home"}` authorization; Fabric checks metadata without opening or hashing the auth database.
+
+Reports and sealed manifests retain an opaque profile digest, bounded non-auth config fingerprint and scope diagnostics. Legacy manifests without profiles remain readable. Native config is trusted-local, not a sandbox or atomic reproducible HOME snapshot; fingerprints exclude auth, plugin/skill trees and external services. Explicit skill/plugin/MCP imports that cannot be enforced fail before allocation.

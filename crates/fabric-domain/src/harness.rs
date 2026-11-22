@@ -214,6 +214,8 @@ impl HarnessCapabilityManifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedHarnessRequest")]
 pub struct HarnessRequest {
+    #[serde(default)]
+    pub profile: Option<crate::AgentProfile>,
     pub model: Option<String>,
     pub required_capabilities: Vec<Capability>,
     pub placement: String,
@@ -226,6 +228,7 @@ pub struct HarnessRequest {
 impl Default for HarnessRequest {
     fn default() -> Self {
         Self {
+            profile: None,
             model: None,
             required_capabilities: Vec::new(),
             placement: "local".into(),
@@ -239,6 +242,9 @@ impl Default for HarnessRequest {
 
 impl HarnessRequest {
     pub fn validate(&self) -> Result<(), FabricError> {
+        if let Some(profile) = &self.profile {
+            profile.validate()?;
+        }
         let invalid = |message: &str| FabricError {
             kind: ErrorKind::InvalidArguments,
             message: message.into(),
@@ -274,6 +280,7 @@ impl HarnessRequest {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct UncheckedHarnessRequest {
+    profile: Option<crate::AgentProfile>,
     model: Option<String>,
     required_capabilities: Vec<Capability>,
     #[serde(default = "local_placement")]
@@ -298,6 +305,7 @@ impl TryFrom<UncheckedHarnessRequest> for HarnessRequest {
 
     fn try_from(value: UncheckedHarnessRequest) -> Result<Self, Self::Error> {
         let request = Self {
+            profile: value.profile,
             model: value.model,
             required_capabilities: value.required_capabilities,
             placement: value.placement,
@@ -316,4 +324,6 @@ pub struct HarnessPlan {
     pub request: HarnessRequest,
     pub manifest: HarnessCapabilityManifest,
     pub model_resolved: Option<String>,
+    #[serde(default)]
+    pub profile: crate::ProfileEvidence,
 }

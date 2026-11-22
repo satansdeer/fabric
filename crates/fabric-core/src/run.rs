@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{
-    BatchId, ErrorKind, FabricError, HarnessId, HarnessPlan, HarnessRequest, RunId, RunState,
-    WorkspaceId,
+    BatchId, ErrorKind, FabricError, HarnessId, HarnessPlan, HarnessRequest, ProfileEvidence,
+    RunId, RunState, WorkspaceId,
 };
 use fabric_runner::{AgentSpec, HarnessAdapter, HarnessRegistry, RegistryOptions};
 use fabric_store::{BatchTask, PreparedState, WorkerAttempt};
@@ -31,6 +31,8 @@ pub struct RunReport {
     pub prompt_digest: String,
     pub harness: String,
     pub harness_version: Option<String>,
+    #[serde(default)]
+    pub profile: Option<ProfileEvidence>,
     pub state: RunState,
     pub exit_code: Option<i32>,
     #[serde(default)]
@@ -198,7 +200,7 @@ fn foreground_prepared(
         harness_version: plan.manifest.exact_version.clone(),
         model_requested: plan.request.model.clone(),
         model_resolved: plan.model_resolved.clone(),
-        profile_digest: None,
+        profile_digest: Some(plan.profile.digest.clone()),
         backend_id: "trusted-local".into(),
         event_cursor: 0,
         created_at,
@@ -237,6 +239,7 @@ fn foreground_prepared(
             prompt_file: &prompt_path,
             request: &plan.request,
             max_cost_usd: plan.request.max_cost_usd,
+            profile: &plan.profile,
         })?;
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
@@ -315,6 +318,7 @@ fn foreground_prepared(
             &run_id,
             state,
             &capture,
+            &plan.profile,
             options.max_artifact_bytes,
         )?;
         store
@@ -380,6 +384,7 @@ fn foreground_prepared(
         prompt_digest: run.prompt_digest,
         harness: run.harness,
         harness_version: run.harness_version,
+        profile: Some(plan.profile.clone()),
         state: run.state,
         exit_code: run.exit_code,
         exit_signal: run.exit_signal,
@@ -441,8 +446,13 @@ pub fn run_many(
     options: &RunOptions,
 ) -> Result<BatchReport, FabricError> {
     let mut inputs: Vec<TaskInput> =
-        serde_json::from_slice(&std::fs::read(manifest).map_err(error)?)
-            .map_err(|failure| error(format!("Invalid task manifest: {failure}")))?;
+        serde_json::from_slice(&std::fs::read(manifest).map_err(error)?).map_err(|_| {
+            FabricError {
+                kind: ErrorKind::InvalidArguments,
+                message: "Invalid task manifest; check the supported task and profile fields."
+                    .into(),
+            }
+        })?;
     let parent = std::path::absolute(manifest)
         .map_err(error)?
         .parent()

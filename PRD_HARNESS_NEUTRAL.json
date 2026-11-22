@@ -51,7 +51,7 @@
         "HN-05"
       ],
       "objective": "Per-adapter config discovery and secret-safe launch; no arbitrary env/Home propagation to remote.",
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "HN-05",

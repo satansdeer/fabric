@@ -10,7 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use fabric_domain::{
-    ArtifactManifestId, CaptureMetadata, CapturedFile, ErrorKind, FabricError, RunId,
+    ArtifactManifestId, CaptureMetadata, CapturedFile, ErrorKind, FabricError, ProfileEvidence,
+    RunId,
 };
 use fabric_runner::{CancellationToken, CommandSpec, ExecutionLimits};
 use fabric_store::{Artifact, PreparedState, Store};
@@ -31,6 +32,7 @@ struct Manifest<'a> {
     prompt_digest: &'a str,
     harness: &'a str,
     harness_version: Option<&'a str>,
+    profile: Option<&'a ProfileEvidence>,
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
     stop_reason: Option<&'a str>,
@@ -53,6 +55,8 @@ struct RegisteredManifest {
     prompt_digest: String,
     harness: String,
     harness_version: Option<String>,
+    #[serde(default)]
+    profile: Option<ProfileEvidence>,
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
     stop_reason: Option<String>,
@@ -180,6 +184,22 @@ pub(super) fn verify_registered(
         open(&root.join(&manifest_file.relative_path))?.take(manifest_file.size_bytes),
     );
     let manifest: RegisteredManifest = serde_json::from_reader(reader).map_err(error)?;
+    let attempts = store.worker_attempts(&run.run_id).map_err(error)?;
+    let profile_digest = manifest
+        .profile
+        .as_ref()
+        .map(|profile| profile.digest.as_str());
+    if profile_digest.is_some_and(|digest| {
+        digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) || (profile_digest.is_some() && attempts.is_empty())
+        || attempts
+            .iter()
+            .any(|attempt| attempt.profile_digest.as_deref() != profile_digest)
+    {
+        return Err(error(
+            "Manifest profile does not match the registered worker attempt",
+        ));
+    }
     let prepared = store
         .prepared_state(&run.prepared_state_id)
         .map_err(error)?
@@ -276,6 +296,7 @@ pub(super) fn capture(
     id: &RunId,
     prepared: &PreparedState,
     output: &CaptureMetadata,
+    profile: &ProfileEvidence,
     limit: u64,
 ) -> Result<(ArtifactManifestId, Vec<Artifact>), FabricError> {
     let workspace = capture_workspace(root, id)?;
@@ -510,6 +531,7 @@ pub(super) fn capture(
         prompt_digest: &run.prompt_digest,
         harness: &run.harness,
         harness_version: run.harness_version.as_deref(),
+        profile: Some(profile),
         exit_code: run.exit_code,
         exit_signal: run.exit_signal,
         stop_reason: run

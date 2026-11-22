@@ -8,6 +8,7 @@ mod capture;
 mod harness;
 mod ids;
 mod policy;
+mod profile;
 mod state;
 
 pub use capture::{AgentEvent, CaptureMetadata, CapturedFile, EventCounts};
@@ -17,6 +18,9 @@ pub use harness::{
 };
 pub use ids::*;
 pub use policy::{RetentionMode, RetentionPolicy, StoragePolicy};
+pub use profile::{
+    AgentProfile, CredentialConnectionRef, ModelPolicy, NativeConfigRef, ProfileEvidence,
+};
 pub use state::{PreparedStateStatus, RunState, WorkspaceState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

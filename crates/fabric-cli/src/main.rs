@@ -1,10 +1,11 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use fabric_domain::{
-    Capability, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId, HarnessRequest,
+    AgentProfile, Capability, ErrorKind, FabricError, HarnessCapabilityManifest, HarnessId,
+    HarnessRequest,
 };
 use serde::Serialize;
 
@@ -95,6 +96,9 @@ struct WorkerArgs {
     fake_binary: Option<PathBuf>,
     #[arg(long)]
     model: Option<String>,
+    /// Nonsecret profile manifest; native configuration and credentials require explicit references.
+    #[arg(long)]
+    profile: Option<PathBuf>,
     #[arg(long = "require-capability")]
     required_capabilities: Vec<Capability>,
     #[arg(long, default_value = "local")]
@@ -288,7 +292,7 @@ fn main() -> ExitCode {
 fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let interrupt = fabric_runner::ForegroundInterrupt::install()?;
-    let options = run_options(&args.options, interrupt.token());
+    let options = run_options(&args.options, interrupt.token())?;
     let id = &args.harness;
     let harness = fabric_runner::HarnessRegistry::default().resolve(
         id,
@@ -335,8 +339,8 @@ fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
 fn run_options(
     args: &WorkerArgs,
     cancellation: fabric_runner::CancellationToken,
-) -> fabric_core::run::RunOptions {
-    fabric_core::run::RunOptions {
+) -> Result<fabric_core::run::RunOptions, FabricError> {
+    Ok(fabric_core::run::RunOptions {
         copy_limit_bytes: args.copy_limit_bytes,
         max_log_bytes: args.max_log_bytes,
         max_artifact_bytes: args.max_artifact_bytes,
@@ -355,13 +359,36 @@ fn run_options(
             hard_read_only: args.hard_read_only,
             resume: args.resume.clone(),
             max_cost_usd: None,
+            profile: args.profile.as_deref().map(read_profile).transpose()?,
         },
+    })
+}
+
+fn read_profile(path: &std::path::Path) -> Result<AgentProfile, FabricError> {
+    const MAX_PROFILE_BYTES: u64 = 64 * 1024;
+    let invalid = || FabricError {
+        kind: ErrorKind::InvalidArguments,
+        message:
+            "Cannot load profile manifest: use valid nonsecret profile JSON of at most 64 KiB."
+                .into(),
+    };
+    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    if !file.metadata().map_err(|_| invalid())?.is_file() {
+        return Err(invalid());
     }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROFILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() as u64 > MAX_PROFILE_BYTES {
+        return Err(invalid());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
 }
 fn write_run_many(root: Option<PathBuf>, args: RunManyArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let interrupt = fabric_runner::ForegroundInterrupt::install()?;
-    let options = run_options(&args.options, interrupt.token());
+    let options = run_options(&args.options, interrupt.token())?;
     let registry = fabric_runner::HarnessRegistry::default();
     let registry_options = fabric_runner::RegistryOptions {
         fake_binary: args.options.fake_binary.clone(),

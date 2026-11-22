@@ -12,6 +12,17 @@ pub fn negotiate(
     manifest: HarnessCapabilityManifest,
     supports_cost_limit: bool,
 ) -> Result<HarnessPlan, FabricError> {
+    let effective = crate::profile::effective_request(request, &manifest)?;
+    let profile = crate::profile::managed_evidence(&effective, &manifest)?;
+    negotiate_profile(&effective, manifest, supports_cost_limit, profile)
+}
+
+pub(crate) fn negotiate_profile(
+    request: &HarnessRequest,
+    manifest: HarnessCapabilityManifest,
+    supports_cost_limit: bool,
+    profile: fabric_domain::ProfileEvidence,
+) -> Result<HarnessPlan, FabricError> {
     request.validate()?;
     if request.placement != "local" {
         return Err(FabricError {
@@ -74,6 +85,7 @@ pub fn negotiate(
         request: request.clone(),
         manifest,
         model_resolved: None,
+        profile,
     })
 }
 
@@ -87,7 +99,7 @@ pub(crate) fn check_version(
         return Err(FabricError {
             kind: ErrorKind::UnsupportedVersion,
             message: format!(
-                "Harness {harness_id} version {version:?} is unsupported; tested exact version: {supported_version}."
+                "Harness {harness_id} version is unsupported; tested exact version: {supported_version}."
             ),
         });
     }

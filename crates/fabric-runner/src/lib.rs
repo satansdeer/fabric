@@ -31,6 +31,7 @@ pub struct HarnessInfo {
 }
 
 pub struct AgentSpec<'a> {
+    pub profile: &'a fabric_domain::ProfileEvidence,
     pub prompt_file: &'a Path,
     pub max_cost_usd: Option<f64>,
     pub request: &'a HarnessRequest,
@@ -119,6 +120,7 @@ impl HarnessAdapter for FakeHarness {
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
+        profile::revalidate(self, spec, Self::SUPPORTED_VERSION)?;
         Ok(CommandSpec {
             program: self.binary.clone(),
             args: vec!["--prompt-file".into(), spec.prompt_file.into()],
@@ -166,7 +168,10 @@ pub fn execute(
         .current_dir(cwd)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("LC_ALL", "C")
+        .env("LC_ALL", "C");
+    // Keep private discovery roots alive through supervised termination and reap.
+    let _runtime_home = profile::private_environment(&mut command)?;
+    command
         .envs(spec.environment.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -317,4 +322,5 @@ mod registry;
 pub use registry::{HarnessRegistration, HarnessRegistry, RegistryOptions};
 
 mod planning;
+mod profile;
 pub use planning::negotiate;
