@@ -23,6 +23,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage explicitly selected, owner-installed external plugins.
+    Plugins {
+        /// Existing canonical private directory outside every checkout.
+        #[arg(long)]
+        registry: PathBuf,
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
     /// Inspect this checkout and explicitly connect its native harness context.
     Init {
         #[arg(long)]
@@ -143,6 +151,71 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    List,
+    Install {
+        manifest: PathBuf,
+    },
+    Upgrade {
+        manifest: PathBuf,
+    },
+    Revoke {
+        id: HarnessId,
+    },
+    /// Perform a nonbilling startup, health and typed planning/evidence exchange.
+    Check {
+        id: HarnessId,
+    },
+}
+
+fn plugins(root: PathBuf, command: PluginCommands) -> Result<(), FabricError> {
+    use fabric_runner::plugin::{PluginHost, PluginKind, PluginManifest, PluginRegistry};
+    let mut registry = PluginRegistry::load(&root)?;
+    let upgrade = matches!(&command, PluginCommands::Upgrade { .. });
+    match command {
+        PluginCommands::List => return write_inspection(&registry.reports(), true),
+        PluginCommands::Install { manifest } | PluginCommands::Upgrade { manifest } => {
+            let manifest = PluginManifest::load(&manifest)?;
+            registry.install(manifest, upgrade)?;
+        }
+        PluginCommands::Revoke { id } => registry.revoke(&id)?,
+        PluginCommands::Check { id } => {
+            let kind = registry
+                .plugins
+                .iter()
+                .find(|p| p.manifest.id == id)
+                .ok_or_else(plugin_input_error)?
+                .manifest
+                .kind;
+            let manifest = registry.select(&id, kind)?;
+            let token = fabric_runner::ForegroundInterrupt::install()?;
+            let host = PluginHost::default();
+            match kind {
+                PluginKind::Harness => {
+                    host.harness_info(&manifest, &token.token())?;
+                }
+                PluginKind::Target => {
+                    host.target_plan(&manifest, &token.token())?;
+                }
+                PluginKind::Connector => {
+                    host.connector_evidence(&manifest, &token.token())?;
+                }
+            }
+            return write_inspection(&serde_json::json!({"compatible":true,"healthy":true}), true);
+        }
+    }
+    registry.save(&root)?;
+    write_inspection(&registry.reports(), true)
+}
+
+fn plugin_input_error() -> FabricError {
+    FabricError {
+        kind: ErrorKind::InvalidArguments,
+        message: "Invalid plugin input.".into(),
+    }
 }
 
 #[derive(Subcommand)]
@@ -433,6 +506,7 @@ fn main() -> ExitCode {
             (json, onboarding::harness(cli.root, command))
         }
         Commands::Doctor { json } => (json, write_doctor(json)),
+        Commands::Plugins { registry, command } => (true, plugins(registry, command)),
         Commands::Harnesses { command, json } => (json, write_harnesses(command, json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run(args) => (args.options.json, write_run(cli.root, args)),

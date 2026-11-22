@@ -336,6 +336,7 @@ pub mod fake;
 mod fake_adapters;
 pub use fake_adapters::{FakeAHarness, FakeBHarness};
 
+pub mod plugin;
 mod registry;
 pub use registry::{HarnessRegistration, HarnessRegistry, RegistryOptions};
 
