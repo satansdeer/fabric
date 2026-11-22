@@ -44,12 +44,14 @@ pub struct AsyncEvent {
     pub created_at: i64,
 }
 
+pub type AsyncLogIdentity = (ProjectId, BatchId, RunState, String, i64, i64);
+
 impl Store {
     /// Content-free identity for observers; never loads prompts, plans or results.
     pub fn async_log_identity(
         &self,
         run: &RunId,
-    ) -> Result<Option<(ProjectId, BatchId, RunState, String, i64, i64)>> {
+    ) -> Result<Option<AsyncLogIdentity>> {
         Ok(self
             .connection
             .query_row(
