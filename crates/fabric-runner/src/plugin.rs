@@ -464,7 +464,7 @@ impl PluginHost {
             term_grace: Duration::from_millis(10),
         };
         let (status, reason) = group
-            .supervise(&limits, cancel)
+            .supervise(&limits, cancel, || {})
             .map_err(|_| failure("shutdown_failed"))?;
         if reason.is_some() || !status.success() {
             return Err(failure("shutdown_failed"));
