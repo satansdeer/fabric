@@ -78,7 +78,7 @@
         "HN-09"
       ],
       "objective": "OMP extension and CLI share one run API; mixed-harness pstack scenario without harness-specific scripts.",
-      "status": "todo"
+      "status": "done"
     }
   ]
 }

@@ -45,6 +45,16 @@ enum Commands {
     Run(RunArgs),
     /// Execute a task manifest through a bounded foreground worker pool.
     RunMany(RunManyArgs),
+    /// Execute one versioned foreground API request.
+    Api {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
+        /// Deterministic fixture executable; not a production harness override.
+        #[arg(long)]
+        fake_binary: Option<PathBuf>,
+    },
     /// Inspect durable run and artifact metadata, including reclaimed workspaces.
     Runs {
         #[arg(long, global = true)]
@@ -277,6 +287,20 @@ fn main() -> ExitCode {
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run(args) => (args.options.json, write_run(cli.root, args)),
         Commands::RunMany(args) => (args.options.json, write_run_many(cli.root, args)),
+        Commands::Api {
+            request,
+            json,
+            fake_binary,
+        } => {
+            return match write_api(cli.root, request, fake_binary) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(error) => {
+                    report_error(&error, json);
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Commands::Runs { command, json } => (json, write_runs(cli.root, command, json)),
         Commands::Storage { command, json } => (json, write_storage(cli.root, command, json)),
     };
@@ -287,6 +311,33 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn write_api(
+    root: Option<PathBuf>,
+    request: PathBuf,
+    fake_binary: Option<PathBuf>,
+) -> Result<bool, FabricError> {
+    let invalid = || FabricError {
+        kind: ErrorKind::InvalidArguments,
+        message: "Cannot open API request JSON file.".into(),
+    };
+    let file = std::fs::File::open(request).map_err(|_| invalid())?;
+    if !file.metadata().map_err(|_| invalid())?.is_file() {
+        return Err(invalid());
+    }
+    let request = fabric_core::api::read_request(file)?;
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let interrupt = fabric_runner::ForegroundInterrupt::install()?;
+    let response = fabric_core::api::spawn_many(
+        &root,
+        request,
+        &fabric_runner::HarnessRegistry::default(),
+        &fabric_runner::RegistryOptions { fake_binary },
+        interrupt.token(),
+    )?;
+    write_inspection(&response, true)?;
+    Ok(response.batch.succeeded)
 }
 
 fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {

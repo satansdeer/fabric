@@ -272,3 +272,11 @@
 - Mixed Codex/fake-b fixture batches retain harness/profile identities, normalized usage, sealed artifacts and verified reclaim. Native fatal errors remain observable after capture truncation; missing cost and unverified resolved model remain unknown/unsupported.
 - Parent corrected raw-versus-normalized capture assertions and the old registry ID expectation. Formatting and strict workspace/all-target Clippy passed; workspace tests passed across `local://270.log` and `local://271.log` after those fixes.
 - Status: HN-05 done. Actual discovery includes Codex but no executable is installed. `scripts/smoke-codex.sh` defaults to `NOT_VERIFIED`; live Codex/model/provider validation remains unperformed. HN-06 follows.
+
+## HN-06 — shared API, native OMP extension and pstack compatibility
+
+- Shared strict `version:1`/`spawn_many` request API delegates to the existing batch lifecycle; CLI `api --request ... --json` returns one durable response, including accepted failed batches. Private inline prompts are removed after completion; unsupported requests fail before lifecycle allocation.
+- SIGINT/SIGTERM share the foreground cancellation token and existing worker process-group supervision. Native OMP tool and `/fabric` command use private request files, literal argv and no hard-kill exec timeout; interruption/protocol errors never fabricate a completed batch.
+- Added provider-free Bun conformance and documented native setup, mixed-harness pstack consumption, unchanged native task schemas, controller-loss limits and design-only MCP mapping. No second scheduler, daemon or automatic retry/resume was added.
+- Parent GREEN: fmt, workspace clippy `-D warnings`, 181 tests/29 suites, workspace binary build and Bun CLI/tool/slash conformance. Corrected the fixture's macOS read-only WAL inspection and the throwaway RPC proof's acknowledgement/completion distinction.
+- Actual installed OMP 19.1.0 `/fabric` RPC completed fake-a/fake-b runs with `prompt_result.agentInvoked=false`, verified all 28 artifact hashes/sizes and sealed profiles, reclaimed both workspaces and exited 0. No model/provider call; live OMP/Codex workers remain NOT_VERIFIED. Missing predecessor AC/RC gates and original AT-15 are not claimed.

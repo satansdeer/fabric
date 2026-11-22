@@ -3992,3 +3992,272 @@ fn codex_cli_mixed_batch_preserves_profile_artifacts_and_atomic_admission() {
         assert!(!String::from_utf8_lossy(&failure.stderr).contains("secret"));
     }
 }
+
+fn api_request() -> serde_json::Value {
+    serde_json::json!({
+        "version":1, "op":"spawn_many", "project":"test", "concurrency":2,
+        "default_harness":"fake-a",
+        "tasks":[
+            {"id":"implement","prompt":"{}", "request":{"model":"literal-api-model"}},
+            {"id":"review","prompt":"{}", "harness":"fake-b", "request":null}
+        ],
+        "options":{"copy_limit_bytes":10485760, "timeout_seconds":10}
+    })
+}
+
+fn api_command(fixture: &Fixture, request: &serde_json::Value) -> Command {
+    let path = fixture.0.join("request.json");
+    fs::write(&path, serde_json::to_vec(request).unwrap()).unwrap();
+    let mut command = fixture.cli();
+    command.args(["api", "--request"]).arg(path).arg("--json");
+    command
+}
+
+#[test]
+fn api_control_surface_preserves_mixed_durable_identities_and_one_failed_response() {
+    let fixture = Fixture::new();
+    let (_, base) = fixture.setup();
+    let mut request = api_request();
+    for fail in [false, true] {
+        request["tasks"][1]["prompt"] =
+            serde_json::json!(serde_json::json!({"exit_code":if fail {7} else {0}}).to_string());
+        let output = api_command(&fixture, &request).output().unwrap();
+        assert_eq!(output.status.success(), !fail, "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["version"], 1);
+        assert_eq!(response["op"], "spawn_many");
+        assert_eq!(response["batch"]["succeeded"], !fail);
+        let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+        let batch_id = response["batch"]["batch_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(store.batch_succeeded(&batch_id).unwrap(), Some(!fail));
+        let saved = store.batch_tasks(&batch_id).unwrap();
+        for (index, task) in response["batch"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let run = &task["result"];
+            let harness = ["fake-a", "fake-b"][index];
+            assert_eq!(run["harness"], harness);
+            assert_eq!(run["prepared_state_id"], base["state_id"]);
+            assert_eq!(run["worker_attempts"][0]["harness_requested"], harness);
+            assert_eq!(run["worker_attempts"][0]["harness_resolved"], harness);
+            assert_eq!(
+                run["state"],
+                if fail && index == 1 {
+                    "FAILED"
+                } else {
+                    "SUCCEEDED"
+                }
+            );
+            verified_manifest(&fixture, run);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(saved[index].result.as_ref().unwrap())
+                    .unwrap(),
+                *run
+            );
+            assert!(!Path::new(&saved[index].prompt_file).exists());
+            assert!(
+                !Path::new(&saved[index].prompt_file)
+                    .parent()
+                    .unwrap()
+                    .exists()
+            );
+        }
+        assert_eq!(
+            response["batch"]["tasks"][0]["result"]["worker_attempts"][0]["model_requested"],
+            "literal-api-model"
+        );
+        assert!(
+            response["batch"]["tasks"][1]["result"]["worker_attempts"][0]["model_requested"]
+                .is_null()
+        );
+    }
+}
+
+#[test]
+fn api_invalid_requests_reject_atomically_without_echoing_secrets() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let before = fixture.inventory();
+    let valid = api_request();
+    let mut cases = Vec::new();
+    for (key, value) in [
+        ("version", serde_json::json!(2)),
+        ("op", serde_json::json!("unsupported")),
+        ("project", serde_json::json!(" ")),
+        ("concurrency", serde_json::json!(0)),
+        ("tasks", serde_json::json!([])),
+        (
+            "tasks",
+            serde_json::json!(vec![valid["tasks"][0].clone(); 129]),
+        ),
+        ("credentials", serde_json::json!("raw-secret-sentinel")),
+        ("options", serde_json::json!({"max_cost_usd":1})),
+        ("options", serde_json::json!({"timeout_seconds":0})),
+        ("options", serde_json::json!({"max_log_bytes":0})),
+        ("options", serde_json::json!({"max_artifact_bytes":0})),
+    ] {
+        let mut request = valid.clone();
+        request[key] = value;
+        cases.push(request);
+    }
+    for task in [
+        serde_json::json!({"id":"review","prompt":"{}","harness":"fake-b","request":{"model":"unsupported"}}),
+        serde_json::json!({"id":"review","prompt":"{}","harness":"fake-b","request":{"resume":"prior"}}),
+        serde_json::json!({"id":"review","prompt":"{}","harness":"unknown-harness"}),
+        serde_json::json!({"id":"review","prompt":"{}","request":{"profile":{"harness_id":"fake-b","harness_version":"fabric-fake-b 1"}}}),
+        serde_json::json!({"id":"review","prompt":"{}","request":{"profile":{"harness_id":"fake-a","harness_version":"fabric-fake-a 1","api_key":"raw-secret-sentinel"}}}),
+        serde_json::json!({"id":"review","prompt":"{}","request":{"profile":{"harness_id":"fake-a","harness_version":"fabric-fake-a 1","native_config_refs":[{"kind":"native-home","path":"relative"}]}}}),
+        serde_json::json!({"id":"review","prompt":"x".repeat(65537)}),
+        serde_json::json!({"id":"implement","prompt":"{}"}),
+    ] {
+        let mut request = valid.clone();
+        request["tasks"][1] = task;
+        cases.push(request);
+    }
+    let mut oversized = valid.clone();
+    oversized["tasks"][0]["prompt"] = serde_json::json!("raw-secret-sentinel".repeat(65536));
+    cases.push(oversized);
+    for request in cases {
+        let output = api_command(&fixture, &request).output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["error"]["kind"].is_string());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("raw-secret-sentinel"));
+        assert_eq!(fixture.inventory(), before);
+    }
+    let path = fixture.0.join("request.json");
+    fs::write(&path, b"{\"raw-secret-sentinel\":").unwrap();
+    let output = fixture
+        .cli()
+        .args(["api", "--request"])
+        .arg(path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("raw-secret-sentinel"));
+    assert_eq!(fixture.inventory(), before);
+}
+
+#[test]
+fn api_sigterm_cancels_owned_worker_seals_evidence_and_reclaims() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    let request = serde_json::json!({
+        "version":1, "op":"spawn_many", "project":"test", "concurrency":1,
+        "default_harness":"fake",
+        "tasks":[{"id":"blocking","prompt":r#"{"process_tree":{"ignore_child_term":true}}"#}],
+        "options":{"copy_limit_bytes":10485760,"timeout_seconds":10}
+    });
+    let child = api_command(&fixture, &request)
+        .arg("--fake-binary")
+        .arg(env!("CARGO_BIN_EXE_fabric-fake-harness"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let tree = wait_for_tree(&fixture);
+    let parent_pid: i32 = fs::read_to_string(tree.join("parent.heartbeat"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("pid=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        fixture.0.join("storage/fabric.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let prompt: String = db
+        .query_row("SELECT prompt_file FROM batch_tasks", [], |row| row.get(0))
+        .unwrap();
+    let prompt = PathBuf::from(prompt);
+    assert_eq!(
+        fs::metadata(&prompt).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(prompt.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    success(
+        &Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .output()
+            .unwrap(),
+    );
+    let output = child.wait_with_output().unwrap();
+    // A regressed signal handler must not leave this blocking fixture running.
+    if output.stdout.is_empty() {
+        unsafe {
+            libc::kill(-parent_pid, libc::SIGKILL);
+        }
+        let _ = fs::remove_dir_all(prompt.parent().unwrap());
+    }
+    assert!(!output.status.success(), "{output:?}");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!("SIGTERM must return one durable API batch response: {output:?}")
+    });
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(response["version"], 1);
+    assert_eq!(response["op"], "spawn_many");
+    assert_eq!(response["batch"]["succeeded"], false);
+    let report = &response["batch"]["tasks"][0]["result"];
+    assert_eq!(report["state"], "CANCELLED");
+    assert_eq!(report["error_kind"], "cancelled");
+    assert_eq!(
+        report["worker_attempts"][0]["termination_reason"],
+        "cancelled"
+    );
+    assert_eq!(report["exit_signal"], 15);
+    assert_eq!(
+        verified_manifest(&fixture, report)["stop_reason"],
+        "cancelled"
+    );
+    assert_tree_stopped(&fixture, report);
+    let parent = Command::new("/bin/ps")
+        .args(["-p", &parent_pid.to_string(), "-o", "stat="])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(parent.stdout).unwrap().trim().is_empty(),
+        "owned child was not reaped"
+    );
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let batch_id = response["batch"]["batch_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(store.batch_succeeded(&batch_id).unwrap(), Some(false));
+    let task = store.batch_tasks(&batch_id).unwrap().pop().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(task.result.as_ref().unwrap()).unwrap(),
+        *report
+    );
+    let run = store.run(&task.run_id).unwrap().unwrap();
+    assert_eq!(run.state, fabric_domain::RunState::Cancelled);
+    assert_eq!(run.error_kind.as_deref(), Some("cancelled"));
+    assert_eq!(
+        store.workspace(&run.workspace_id).unwrap().unwrap().state,
+        fabric_domain::WorkspaceState::Reclaimed
+    );
+    assert!(!prompt.parent().unwrap().exists());
+}

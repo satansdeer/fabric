@@ -422,7 +422,7 @@ pub struct BatchHarnesses<'a> {
     pub default: Option<&'a HarnessId>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TaskReport {
     pub id: String,
     pub run_id: RunId,
@@ -430,7 +430,7 @@ pub struct TaskReport {
     pub error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct BatchReport {
     pub batch_id: BatchId,
     pub succeeded: bool,

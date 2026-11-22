@@ -116,9 +116,10 @@ extern "C" fn interrupt(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Release);
 }
 
-/// Scope to the foreground CLI invocation; restore the caller's SIGINT disposition.
+/// Scope to the foreground CLI invocation; restore the caller's signal dispositions.
 pub struct ForegroundInterrupt {
-    previous: libc::sigaction,
+    previous_sigint: libc::sigaction,
+    previous_sigterm: libc::sigaction,
     token: CancellationToken,
 }
 impl ForegroundInterrupt {
@@ -130,17 +131,28 @@ impl ForegroundInterrupt {
         let generation = HANDLER_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
         // SAFETY: initialized structures, valid pointers; the handler only stores an atomic flag.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        let mut previous = action;
+        let mut previous_sigint = action;
+        let mut previous_sigterm = action;
         action.sa_sigaction = interrupt as *const () as usize;
         unsafe {
             libc::sigemptyset(&mut action.sa_mask);
         }
-        if unsafe { libc::sigaction(libc::SIGINT, &action, &mut previous) } == -1 {
+        if unsafe { libc::sigaction(libc::SIGINT, &action, &mut previous_sigint) } == -1 {
             HANDLER_ACTIVE.store(false, Ordering::Release);
             return Err(execution_error(io::Error::last_os_error()));
         }
+        if unsafe { libc::sigaction(libc::SIGTERM, &action, &mut previous_sigterm) } == -1 {
+            let failure = io::Error::last_os_error();
+            // SAFETY: SIGINT was installed above; roll it back before releasing exclusivity.
+            unsafe {
+                libc::sigaction(libc::SIGINT, &previous_sigint, std::ptr::null_mut());
+            }
+            HANDLER_ACTIVE.store(false, Ordering::Release);
+            return Err(execution_error(failure));
+        }
         Ok(Self {
-            previous,
+            previous_sigint,
+            previous_sigterm,
             token: CancellationToken {
                 foreground_generation: generation,
                 ..CancellationToken::default()
@@ -159,7 +171,8 @@ impl Drop for ForegroundInterrupt {
         }
         // SAFETY: restore the disposition captured by this exclusive live guard.
         unsafe {
-            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &self.previous_sigterm, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &self.previous_sigint, std::ptr::null_mut());
         }
         HANDLER_ACTIVE.store(false, Ordering::Release);
     }
