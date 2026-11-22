@@ -224,3 +224,7 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
   Partial/corrupt evidence and live or unverifiable ownership remain retained.
   No provider/model calls were made; live OMP/Codex and model-selected routing
   remain `BLOCKED` / `NOT_VERIFIED`.
+- `cargo fmt --all -- --check` passed. The store integration run passed 26 checks
+  and exposed an outdated cleanup contract: verified recovered
+  `NEEDS_ATTENTION` / `CLEANUP_PENDING` is now eligible. The corrected test still
+  refuses `RECOVERY_REQUIRED` and passed its focused rerun (0.02s).

@@ -1209,7 +1209,7 @@ fn cleanup_requires_terminal_capture_and_expiry_alone_does_not_authorize_it() {
     let db = Connection::open(root.path().join("fabric.sqlite3")).unwrap();
     for (run_state, workspace_state, retention, lease) in [
         ("RUNNING", "CLEANUP_PENDING", None, None),
-        ("NEEDS_ATTENTION", "CLEANUP_PENDING", None, None),
+        ("NEEDS_ATTENTION", "RECOVERY_REQUIRED", None, None),
         ("SUCCEEDED", "ACTIVE", None, Some(0)),
         ("SUCCEEDED", "RETAINED", None, None),
         ("SUCCEEDED", "RECOVERY_REQUIRED", None, None),
