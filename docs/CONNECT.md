@@ -53,7 +53,24 @@ For signed-webhook development, a [Cloudflare Quick Tunnel](https://developers.c
 
 In [#20](https://github.com/satansdeer/fabric/issues/20), real GitHub opened/ready-label events survived receiver restart, reused one actual completed Core admission, and produced 14 artifacts whose bytes, sizes and SHA-256 digests were verified. GitHub's exact signed redelivery returned `completed` with `duplicate: true`; a subsequent consumer invocation was idle. Unsigned ingress and unauthenticated worker requests returned 401. The temporary hook, tunnel and receiver were removed/stopped after verification. No model calls were made.
 
-The stable Cloudflare path is [Workers on `workers.dev`](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/) with a [SQLite-backed Durable Object](https://developers.cloudflare.com/durable-objects/platform/pricing/) for transactional inbox state. It needs neither a custom domain nor Netlify; deployment requires renewed Cloudflare Workers authorization. This adapter is not implemented or deployed yet. Preserve the current authentication, durable lease/replay rules and explicit local approval/spend gates; do not substitute in-memory or eventually consistent storage.
+The permanent Cloudflare adapter is in [`integrations/connect/cloudflare/`](../integrations/connect/cloudflare/): [Workers on `workers.dev`](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/) forwards the single configured route to one [SQLite-backed Durable Object](https://developers.cloudflare.com/durable-objects/platform/pricing/). Conditional writes use synchronous SQLite transactions; the route's bounded 512 KiB JSON is SQL TEXT, not a single 128 KiB Durable Object KV value. Authentication, leases/replay and explicit local approval/spend gates reuse the existing service. No custom domain, Netlify account or paid-plan upgrade is required.
+
+```sh
+cd integrations/connect/cloudflare
+npm ci
+npm test
+npx wrangler deploy --dry-run --outdir /tmp/fabric-connect-cloudflare
+# Deployment requires authorized access to the intended Cloudflare account:
+npx wrangler login
+npx wrangler secret put FABRIC_CONNECT_WEBHOOK_SECRET
+npx wrangler secret put FABRIC_CONNECT_WORKER_TOKEN_SHA256
+npx wrangler secret put FABRIC_CONNECT_WORKER_ID
+npm run deploy
+```
+
+Provision all three bindings privately; upload only the bearer token's SHA-256 digest, never its raw value or a GitHub token. Use the actual deployed `https://fabric-connect.<account-subdomain>.workers.dev` origin for the private local connection and append the existing ingress path for the GitHub webhook. Keep credentials outside the checkout.
+
+The real local workerd/Miniflare SQLite check and Wrangler deployment dry-run passed. The check covers unauthorized requests, signed admission, competing conditional writes/leases, replay-safe completion, and lifecycle-generated state larger than 128 KiB surviving disposal/restart against the same disk. **No Worker has been deployed.** Saved Workers authorization is expired and the local browser relay is unavailable; renewing Cloudflare authorization is the remaining deployment gate. Hosted health/authentication, real queued GitHub delivery while the local consumer is offline, redeploy persistence and the subsequent local Core run remain required by [#21](https://github.com/satansdeer/fabric/issues/21).
 
 ## Deployment
 
@@ -82,4 +99,6 @@ node --test integrations/connect/service.test.mjs
 python3 scripts/test-fabric-connect.py --fabric "$PWD/target/debug/fabric"
 ```
 
-These checks use signed fixture events, a durable local test-server store and real Fabric/fake-harness processes. All 19 ingress tests and the outbound real-Core/fake-harness check pass locally, including 14 verified artifacts, restart recovery and duplicate-admission prevention. `netlify functions:build --src netlify/functions --functions .netlify/functions` also successfully bundles the production adapter. Actual signed GitHub delivery is separately proven by #20, not by those fixtures. Neither proof establishes permanent hosted-runtime/redeploy durability or model-backed issue-to-PR dogfooding. The [macOS CI run](https://github.com/satansdeer/fabric/actions/runs/45035376872) failed before the Connect gates in `api_sigterm_cancels_owned_worker_seals_evidence_and_reclaims` with an empty-integer parse at `crates/fabric-cli/tests/run.rs:4185`; its cause remains unverified. Launch blockers and remaining acceptance gates are recorded in #18; #15 remains the real model-backed acceptance gate.
+These checks use signed fixture events, a durable local test-server store and real Fabric/fake-harness processes. All 19 ingress tests and the outbound real-Core/fake-harness check passed locally, including 14 verified artifacts, restart recovery and duplicate-admission prevention. `netlify functions:build --src netlify/functions --functions .netlify/functions` also successfully bundled the Netlify adapter. Actual signed GitHub delivery is separately proven by #20, not by those fixtures. Neither proof establishes permanent hosted-runtime/redeploy durability or model-backed issue-to-PR dogfooding.
+
+The observed [SIGTERM CI failure](https://github.com/satansdeer/fabric/actions/runs/45035376872) was a partial heartbeat PID record (#22); shared tree readiness now requires complete parent/child records. A later [typed-conformance CI failure](https://github.com/satansdeer/fabric/actions/runs/45036747038) exposed a manager startup SQLite handle retained across shutdown (#24); that startup-only handle now closes before readiness. The deterministic readiness regression, actual SIGTERM lifecycle test, binary build and actual typed conformance all passed locally after these fixes. The conformance fixture owns/reaps the foreground manager and prints PASS only after successful resource cleanup. This is not a claim that remote CI is green. Launch blockers remain in #18; #15 remains the real model-backed issue-to-PR acceptance gate.

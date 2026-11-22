@@ -40,6 +40,13 @@ jobs:
         run: python3 scripts/test-fabric-issue.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
       - name: Connect signed ingress and durable inbox (provider-free)
         run: node --test integrations/connect/service.test.mjs
+      - name: Cloudflare SQLite inbox (local workerd, provider-free)
+        timeout-minutes: 5
+        working-directory: integrations/connect/cloudflare
+        run: |
+          npm ci
+          npm test
+          npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/fabric-connect-cloudflare"
       - name: Connect outbound local worker (provider-free)
         timeout-minutes: 5
         run: python3 scripts/test-fabric-connect.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"

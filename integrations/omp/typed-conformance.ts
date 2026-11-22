@@ -49,6 +49,9 @@ const batches: string[] = [];
 const requestPaths: string[] = [];
 let canned: ExecResult | "throw" | undefined;
 const calls: { args: string[]; signal?: AbortSignal; done: boolean }[] = [];
+const managerOutput = join(fixture, "manager.stdout");
+const managerErrors = join(fixture, "manager.stderr");
+let managerExit: Promise<number> | undefined;
 
 async function exec(command: string, args: string[], signal?: AbortSignal) {
 	const child = Bun.spawn([command, ...args], { cwd: repo, env: environment, signal, stdout: "pipe", stderr: "pipe" });
@@ -178,6 +181,19 @@ try {
 	const recipe = join(fixture, "prepare.toml");
 	await writeFile(recipe, "version=1\n[[steps]]\nargv=['/bin/sh','-c','mkdir .deps; printf ready > .deps/ready']\n");
 	const prepared = await cli(["project", "prepare", "demo", "--recipe", recipe, "--json"]);
+	const manager = Bun.spawn([binary, "--root", root, "manager", "serve", "--json"], {
+		cwd: repo, env: environment, stdout: Bun.file(managerOutput), stderr: Bun.file(managerErrors),
+	});
+	managerExit = manager.exited;
+	await eventually(async () => {
+		assert.equal(manager.exitCode, null, `manager exited: ${await Bun.file(managerErrors).text()}`);
+		const output = await Bun.file(managerOutput).text();
+		const end = output.indexOf("\n");
+		return end >= 0 && object(JSON.parse(output.slice(0, end))).manager_ready === true;
+	}, "manager never became ready");
+	for (const suffix of ["-wal", "-shm"]) {
+		assert.equal(await Bun.file(join(root, `fabric.db${suffix}`)).exists(), false, "idle manager retained its startup SQLite connection");
+	}
 	const fake = join(dirname(binary), "fabric-fake-harness");
 	await writeFile(join(fixture, "gated-fake"), `#!/bin/sh
 set -eu
@@ -315,17 +331,25 @@ done
 		const timeout = Number(call.args[call.args.indexOf("--timeout-seconds") + 1]);
 		assert.ok(timeout >= 0 && timeout <= 10, "unbounded CLI wait");
 	}
-	console.log("PASS: typed OMP tools, early durable four-worker handles, ordinary context progress, bounded wait, independent failure/artifacts/reclaim, reconnect/cancel, remote rejection and safe transport (in-process host; no provider calls)");
 } finally {
 	canned = undefined;
 	for (const controller of controllers) { await controller.event("session_shutdown"); controller.clear(); }
+	await eventually(() => calls.every(call => call.done), "cleanup left a client running");
 	if (previous.binary === undefined) delete process.env.FABRIC_BINARY; else process.env.FABRIC_BINARY = previous.binary;
 	if (previous.root === undefined) delete process.env.FABRIC_ROOT; else process.env.FABRIC_ROOT = previous.root;
 	if (await Bun.file(join(root, "fabric.db")).exists()) {
 		await writeFile(join(fixture, "release-all"), "");
-		for (const batch of batches) await cli(["cancel", batch, "--json"]);
+		for (const batch of batches) {
+			await cli(["cancel", batch, "--json"]);
+			assert.equal((await cli(["wait", batch, "--timeout-seconds", "60", "--json"])).terminal, true, "cleanup left workers running");
+		}
 		await cli(["manager", "stop", "--json"]);
+	}
+	if (managerExit) assert.equal(await managerExit, 0, await Bun.file(managerErrors).text());
+	for (const suffix of ["-wal", "-shm"]) {
+		assert.equal(await Bun.file(join(root, `fabric.db${suffix}`)).exists(), false, "cleanup left SQLite resources open");
 	}
 	await writable(fixture);
 	await rm(fixture, { recursive: true, force: true });
 }
+console.log("PASS: typed OMP tools, early durable four-worker handles, ordinary context progress, bounded wait, independent failure/artifacts/reclaim, reconnect/cancel, remote rejection and safe transport (in-process host; no provider calls)");

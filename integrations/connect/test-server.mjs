@@ -1,4 +1,4 @@
-// Loopback-only integration fixture. Production always uses the Netlify store.
+// Loopback-only integration fixture; production uses a hosted durable adapter.
 import { createServer } from "node:http";
 import { constants } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
