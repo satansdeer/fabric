@@ -298,3 +298,10 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
   owner-approved model-backed run. These checks do not claim public npm
   publication, sandbox isolation, real provider-plugin execution or completion
   of harness/target/connector extraction (#4–#6).
+- Pre-merge review found the push CI run failed in typed OMP conformance with
+  `SQLITE_BUSY` while reading workspace state from the live manager database;
+  the pull-request CI run on the same commit passed. The shared test query
+  connection now sets SQLite's bounded `busy_timeout = 5000` instead of failing
+  immediately during a concurrent manager write. The unchanged typed conformance
+  scenario passed locally after that fix; no provider call or automatic retry
+  was used.

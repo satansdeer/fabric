@@ -65,7 +65,10 @@ async function cli(args: string[]) {
 }
 function query(sql: string, ...params: string[]) {
 	const database = new Database(join(root, "fabric.db"));
-	try { return database.query<Document, string[]>(sql).all(...params); } finally { database.close(); }
+	try {
+		database.exec("PRAGMA busy_timeout = 5000");
+		return database.query<Document, string[]>(sql).all(...params);
+	} finally { database.close(); }
 }
 function inventory() {
 	return ["runs", "workspaces", "batches", "batch_tasks", "worker_attempts"].map(table => query(`SELECT COUNT(*) AS n FROM ${table}`)[0].n);
