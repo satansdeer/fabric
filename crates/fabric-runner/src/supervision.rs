@@ -15,6 +15,7 @@ pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
     foreground_generation: u64,
     storage_stop: Arc<std::sync::atomic::AtomicU8>,
+    deadline: Option<Instant>,
 }
 impl CancellationToken {
     /// Shares user cancellation but keeps storage termination private to one worker.
@@ -23,6 +24,7 @@ impl CancellationToken {
             cancelled: Arc::clone(&self.cancelled),
             foreground_generation: self.foreground_generation,
             storage_stop: Arc::default(),
+            deadline: self.deadline,
         }
     }
 
@@ -46,6 +48,19 @@ impl CancellationToken {
             _ => None,
         }
     }
+    /// Bounds only this clone; deadline expiry never cancels sibling workers.
+    pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn deadline_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -58,7 +73,7 @@ impl CancellationToken {
         {
             self.cancel();
         }
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire) || self.deadline_expired()
     }
 }
 

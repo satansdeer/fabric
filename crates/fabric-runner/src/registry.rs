@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use fabric_domain::{ErrorKind, FabricError, HarnessId};
 
-use crate::{CodexHarness, FakeAHarness, FakeBHarness, FakeHarness, HarnessAdapter, OmpHarness};
+use crate::{FakeAHarness, FakeBHarness, FakeHarness, HarnessAdapter};
 
 #[derive(Default)]
 pub struct RegistryOptions {
@@ -46,18 +46,21 @@ impl HarnessRegistry {
     ) -> Result<Box<dyn HarnessAdapter>, FabricError> {
         if !self.entries.contains_key(id) {
             if options.fake_binary.is_some() {
-                return Err(crate::execution_error(
-                    "External plugins do not accept --fake-binary.",
-                ));
+                return Err(FabricError {
+                    kind: ErrorKind::InvalidArguments,
+                    message: "External plugins do not accept --fake-binary.".into(),
+                });
             }
             if let Some(registry) = crate::plugin::configured_registry()? {
-                let manifest = registry.select(id, crate::plugin::PluginKind::Harness)?;
-                return Ok(Box::new(crate::plugin::PluginHarness::new(manifest)?));
+                if registry.plugins.iter().any(|p| p.manifest.id == *id) {
+                    let manifest = registry.select(id, crate::plugin::PluginKind::Harness)?;
+                    return Ok(Box::new(crate::plugin::PluginHarness::new(manifest)?));
+                }
             }
         }
         let registration = self.entries.get(id).ok_or_else(|| FabricError {
             kind: ErrorKind::UnknownHarness,
-            message: format!("Unknown harness {id}; no adapter is registered."),
+            message: format!("Unknown harness {id}; explicitly install a content-pinned harness plugin and set FABRIC_PLUGIN_REGISTRY."),
         })?;
         let adapter = (registration.create)(options)?;
         if adapter.id() != *id {
@@ -69,21 +72,40 @@ impl HarnessRegistry {
         Ok(adapter)
     }
 
-    pub fn ids(&self) -> Vec<HarnessId> {
+    pub fn ids(&self) -> Result<Vec<HarnessId>, FabricError> {
         let mut ids: Vec<_> = self.entries.keys().cloned().collect();
+        if let Some(registry) = crate::plugin::configured_registry()? {
+            ids.extend(
+                registry
+                    .plugins
+                    .into_iter()
+                    .filter(|p| !p.revoked && p.manifest.kind == crate::plugin::PluginKind::Harness)
+                    .map(|p| p.manifest.id),
+            );
+        }
         ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        ids
+        ids.dedup();
+        Ok(ids)
     }
 
-    pub fn doctor_executables(&self) -> Vec<&'static str> {
+    pub fn doctor_executables(&self) -> Result<Vec<String>, FabricError> {
         let mut names: Vec<_> = self
             .entries
             .values()
-            .filter_map(|entry| entry.doctor_executable)
+            .filter_map(|entry| entry.doctor_executable.map(str::to_owned))
             .collect();
+        if let Some(registry) = crate::plugin::configured_registry()? {
+            names.extend(
+                registry
+                    .plugins
+                    .into_iter()
+                    .filter(|p| !p.revoked && p.manifest.kind == crate::plugin::PluginKind::Harness)
+                    .filter_map(|p| p.manifest.native.map(|n| n.executable)),
+            );
+        }
         names.sort_unstable();
         names.dedup();
-        names
+        Ok(names)
     }
 }
 
@@ -91,21 +113,6 @@ impl Default for HarnessRegistry {
     fn default() -> Self {
         let mut registry = Self::new();
         for registration in [
-            HarnessRegistration {
-                id: "codex".parse().expect("registered harness ID"),
-                doctor_executable: Some("codex"),
-                create: |options| {
-                    if options.fake_binary.is_some() {
-                        return Err(FabricError {
-                            kind: ErrorKind::InvalidArguments,
-                            message:
-                                "--fake-binary is only valid with --harness fake, fake-a or fake-b."
-                                    .into(),
-                        });
-                    }
-                    Ok(Box::new(CodexHarness::discover()?))
-                },
-            },
             HarnessRegistration {
                 id: "fake".parse().expect("registered harness ID"),
                 doctor_executable: None,
@@ -143,21 +150,6 @@ impl Default for HarnessRegistry {
                             .with_file_name("fabric-fake-harness"),
                     };
                     Ok(Box::new(FakeBHarness::new(binary)?))
-                },
-            },
-            HarnessRegistration {
-                id: "omp".parse().expect("registered harness ID"),
-                doctor_executable: Some("omp"),
-                create: |options| {
-                    if options.fake_binary.is_some() {
-                        return Err(FabricError {
-                            kind: ErrorKind::InvalidArguments,
-                            message:
-                                "--fake-binary is only valid with --harness fake, fake-a or fake-b."
-                                    .into(),
-                        });
-                    }
-                    Ok(Box::new(OmpHarness::discover()?))
                 },
             },
         ] {
@@ -208,6 +200,6 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(failure.kind, ErrorKind::UnknownHarness);
-        assert_eq!(registry.doctor_executables(), ["codex", "omp"]);
+        assert!(registry.doctor_executables().unwrap().is_empty());
     }
 }

@@ -1,7 +1,9 @@
 use std::process::Command;
+#[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
+mod reference_plugins;
 
 #[test]
-fn codex_discovery_is_registered_without_allocating_storage() {
+fn missing_install_does_not_register_vendor_harnesses() {
     let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
         .args(["harnesses", "list", "--json"])
         .env_clear()
@@ -9,10 +11,7 @@ fn codex_discovery_is_registered_without_allocating_storage() {
         .unwrap();
     assert!(output.status.success());
     let ids: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(
-        ids.as_array().unwrap().iter().any(|id| id == "codex"),
-        "{ids}"
-    );
+    assert_eq!(ids, serde_json::json!(["fake", "fake-a", "fake-b"]));
 }
 
 #[test]
@@ -26,7 +25,7 @@ fn doctor_json_without_path_reports_platform_and_missing_tools() {
     assert!(output.status.success(), "{:?}", output);
     assert!(output.stderr.is_empty());
     let expected = format!(
-        "{{\"platform\":{{\"os\":\"{}\",\"arch\":\"{}\",\"supported\":{},\"primary_supported_os\":\"macos\"}},\"tools\":[{{\"name\":\"git\",\"path\":null}},{{\"name\":\"codex\",\"path\":null}},{{\"name\":\"omp\",\"path\":null}}]}}\n",
+        "{{\"platform\":{{\"os\":\"{}\",\"arch\":\"{}\",\"supported\":{},\"primary_supported_os\":\"macos\"}},\"tools\":[{{\"name\":\"git\",\"path\":null}}]}}\n",
         std::env::consts::OS,
         std::env::consts::ARCH,
         cfg!(target_os = "macos"),
@@ -74,7 +73,7 @@ fn help_version_and_human_doctor_are_available() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("primary supported OS: macOS"));
     assert!(text.contains("git: not found on PATH"));
-    assert!(text.contains("omp: not found on PATH"));
+    assert!(!text.contains("omp:"));
 }
 
 #[cfg(unix)]
@@ -101,6 +100,7 @@ mod unix {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
+            reference_plugins::install(&path);
             Self(path)
         }
     }
@@ -129,6 +129,10 @@ mod unix {
         let invoke = |args: &[&str]| {
             Command::new(env!("CARGO_BIN_EXE_fabric"))
                 .env_clear()
+                .env(
+                    "FABRIC_PLUGIN_REGISTRY",
+                    fixture.0.canonicalize().unwrap().join("plugin-registry"),
+                )
                 .arg("--root")
                 .arg(&root)
                 .args(args)
@@ -222,6 +226,10 @@ mod unix {
             Command::new(env!("CARGO_BIN_EXE_fabric"))
                 .args(["doctor", "--json"])
                 .env_clear()
+                .env(
+                    "FABRIC_PLUGIN_REGISTRY",
+                    fixture.0.canonicalize().unwrap().join("plugin-registry"),
+                )
                 .env("PATH", &path)
                 .env("HOME", fixture.0.join("home"))
                 .current_dir(fixture.0.join("cwd"))
@@ -258,6 +266,10 @@ mod unix {
         let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
             .args(["doctor", "--json"])
             .env_clear()
+            .env(
+                "FABRIC_PLUGIN_REGISTRY",
+                fixture.0.canonicalize().unwrap().join("plugin-registry"),
+            )
             .env("PATH", ".")
             .current_dir(&fixture.0)
             .output()
@@ -280,6 +292,7 @@ fn codex_doctor_is_authfree_exact_pinned_and_preallocation() {
     use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("fabric-codex-doctor-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
+    let registry = reference_plugins::install(&root);
     let binary = root.join("codex");
     for (version, supported) in [("codex-cli 0.171.0", true), ("codex-cli 0.171.1", false)] {
         std::fs::write(&binary, format!(
@@ -288,6 +301,7 @@ fn codex_doctor_is_authfree_exact_pinned_and_preallocation() {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
             .env_clear()
+            .env("FABRIC_PLUGIN_REGISTRY", &registry)
             .env("PATH", &root)
             .env("CODEX_API_KEY", "must-not-forward")
             .env("OPENAI_API_KEY", "must-not-forward")

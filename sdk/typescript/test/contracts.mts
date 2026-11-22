@@ -17,3 +17,9 @@ const invalid: ControlResponse<null> = { jsonrpc: '2.0', id: 1, result: null, er
 const manifest: PluginManifest = { id: 'typed-target', version: '1.0.0', kind: 'target', protocol: { min: 1, max: 1 }, executable: '/node', args: ['/plugin.ts'], capabilities: ['target.plan'], integrity: { root: '/package', sha256: 'pin' } };
 void invalid;
 void manifest;
+import type { NativeControlRequest, NativeCommand } from '../index.mjs';
+const native: NativeControlRequest = { jsonrpc: '2.0', id: 3, method: 'harness.normalize', params: { text: 'fixture' } };
+const command: NativeCommand = { program: '/fixture', args: ['--', { prompt: true }], environment: [] };
+// @ts-expect-error Native IPC receives availability booleans, never credential strings.
+const secret: NativeControlRequest = { jsonrpc: '2.0', id: 3, method: 'harness.probe', params: { context: { environment: {}, credentials: { KEY: 'secret' } } } };
+void native; void command; void secret;

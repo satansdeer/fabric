@@ -96,6 +96,13 @@ pub trait HarnessAdapter: Sync {
     fn normalize_event(&self, _event: NativeEvent<'_>) -> Option<AgentEvent> {
         None
     }
+    fn try_normalize_event(
+        &self,
+        event: NativeEvent<'_>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<AgentEvent>, FabricError> {
+        Ok(self.normalize_event(event))
+    }
 }
 
 pub struct FakeHarness {
@@ -178,6 +185,7 @@ pub fn execute(
         return Err(execution_error("Cancelled before harness launch."));
     }
     let launched = std::time::Instant::now();
+    let capture = capture.with_cancellation(cancellation.with_deadline(launched + limits.timeout));
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -222,7 +230,7 @@ pub fn execute(
         .map_err(execution_error)?;
     let stderr = PipeReader::new(group.child.stderr.take().expect("piped stderr"), &stopped)
         .map_err(execution_error)?;
-    let (status, events) = std::thread::scope(|scope| {
+    let (mut status, events) = std::thread::scope(|scope| {
         let out = scope.spawn(|| capture.stdout(stdout));
         let err = scope.spawn(|| capture.stderr(stderr));
         let status = started(group.child.id())
@@ -238,6 +246,9 @@ pub fn execute(
             .map_err(|_| execution_error("Stderr capture panicked."))?;
         Ok::<_, FabricError>((status?, events.and_then(|events| stderr.map(|()| events))))
     })?;
+    if status.1.is_none() && capture.normalization_timed_out() {
+        status.1 = Some(StopReason::Timeout);
+    }
     capture.completed(
         status.0.code(),
         status.0.signal(),
@@ -250,14 +261,14 @@ pub fn execute(
     })
 }
 
-fn execution_error(error: impl std::fmt::Display) -> FabricError {
+pub fn execution_error(error: impl std::fmt::Display) -> FabricError {
     FabricError {
         kind: ErrorKind::Output,
         message: error.to_string(),
     }
 }
 
-fn probe_version(
+pub fn probe_version(
     binary: &Path,
     environment: Vec<(OsString, OsString)>,
 ) -> Result<String, FabricError> {
@@ -329,10 +340,6 @@ pub fn discover_executable(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf
 pub mod activity;
 pub mod capture;
 pub mod jsonl;
-pub mod omp;
-pub use omp::OmpHarness;
-pub mod codex;
-pub use codex::CodexHarness;
 
 pub mod fake;
 mod fake_adapters;
@@ -342,6 +349,7 @@ pub mod plugin;
 mod registry;
 pub use registry::{HarnessRegistration, HarnessRegistry, RegistryOptions};
 
-mod planning;
-mod profile;
+pub mod native_plugin;
+pub mod planning;
+pub mod profile;
 pub use planning::negotiate;

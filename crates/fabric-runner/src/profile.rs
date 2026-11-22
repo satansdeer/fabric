@@ -7,17 +7,14 @@ use fabric_domain::{
 };
 use sha2::{Digest, Sha256};
 
-pub(crate) fn invalid(message: &str) -> FabricError {
+pub fn invalid(message: &str) -> FabricError {
     FabricError {
         kind: ErrorKind::InvalidProfile,
         message: message.into(),
     }
 }
 
-pub(crate) fn native_root(
-    variable: &str,
-    default: &str,
-) -> Result<std::path::PathBuf, FabricError> {
+pub fn native_root(variable: &str, default: &str) -> Result<std::path::PathBuf, FabricError> {
     let path = match std::env::var_os(variable) {
         Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
         Some(_) => {
@@ -51,7 +48,7 @@ pub(crate) fn native_root(
     }
 }
 
-pub(crate) fn effective_request(
+pub fn effective_request(
     request: &HarnessRequest,
     manifest: &HarnessCapabilityManifest,
 ) -> Result<HarnessRequest, FabricError> {
@@ -81,7 +78,7 @@ pub(crate) fn effective_request(
     Ok(effective)
 }
 
-pub(crate) fn evidence(
+pub fn evidence(
     request: &HarnessRequest,
     manifest: &HarnessCapabilityManifest,
     fingerprint: String,
@@ -124,7 +121,7 @@ pub(crate) fn evidence(
     })
 }
 
-pub(crate) fn managed_evidence(
+pub fn managed_evidence(
     request: &HarnessRequest,
     manifest: &HarnessCapabilityManifest,
 ) -> Result<ProfileEvidence, FabricError> {
@@ -140,7 +137,7 @@ pub(crate) fn managed_evidence(
     }])
 }
 
-pub(crate) fn revalidate(
+pub fn revalidate(
     adapter: &dyn crate::HarnessAdapter,
     spec: &crate::AgentSpec<'_>,
     version: &str,
@@ -181,7 +178,7 @@ pub(crate) fn private_environment(
     Ok(root)
 }
 
-pub(crate) fn runtime_environment(binary: &Path) -> Result<Vec<(OsString, OsString)>, FabricError> {
+pub fn runtime_environment(binary: &Path) -> Result<Vec<(OsString, OsString)>, FabricError> {
     let mut paths = vec![std::path::PathBuf::from("/usr/bin"), "/bin".into()];
     if let Some(parent) = binary.parent() {
         paths.push(parent.to_owned());
@@ -200,7 +197,7 @@ pub(crate) fn runtime_environment(binary: &Path) -> Result<Vec<(OsString, OsStri
 }
 
 /// Hash only the adapter's finite non-auth file list, with bounded streaming reads.
-pub(crate) fn native_fingerprint(
+pub fn native_fingerprint(
     root: Option<&Path>,
     domain: &[u8],
     files: &[&str],

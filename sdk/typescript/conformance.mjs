@@ -1,19 +1,19 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { directory } from './package.mjs';
-import { exact, frame, frames, resultFor, fail } from './protocol.mjs';
+import { exact, frame, frames, resultFor, fail, NATIVE_MAX_FRAME } from './protocol.mjs';
 
 export const FIXTURE_PROMPT = 'Fabric provider-free fixture';
 function kill(child) { if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } }
-async function processFixture(entry, args, operation, timeout) {
+async function processFixture(entry, args, operation, timeout, native = false) {
   const home = mkdtempSync(join(tmpdir(), 'fabric-plugin-'));
   let child;
   let timer;
   let timedOut = false;
   try {
-    child = spawn(process.execPath, [entry, ...args(home)], {
+    child = spawn(native ? entry : process.execPath, native ? args(home) : [entry, ...args(home)], {
       cwd: '/', env: { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, XDG_DATA_HOME: home, LC_ALL: 'C' },
       stdio: ['pipe', 'pipe', 'ignore'], detached: true,
     });
@@ -22,7 +22,7 @@ async function processFixture(entry, args, operation, timeout) {
     child.on('error', () => {});
     timer = setTimeout(() => { timedOut = true; kill(child); }, timeout);
     try {
-      await operation(child);
+      await operation(child, home);
       const status = await closed;
       if (timedOut) fail('timeout');
       if (status.code !== 0 || status.signal) fail('unsuccessful_exit');
@@ -38,10 +38,66 @@ async function processFixture(entry, args, operation, timeout) {
     rmSync(home, { recursive: true, force: true });
   }
 }
+// Reference-only CLI doubles: never discover or execute an installed provider CLI.
+async function nativeConformance(info, entry, timeout) {
+  const versions = { omp: 'omp/19.1.0', codex: 'codex-cli 0.171.0' };
+  if (!versions[info.id]) fail('native_fixture_required');
+  let result;
+  const events = [];
+  await processFixture(entry, () => [...(info.args ?? []), '--fabric-plugin-stdio'], async (child, home) => {
+    const binary = join(home, info.native.executable);
+    writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' '${versions[info.id]}'\n`, { mode: 0o700 });
+    const root = join(home, 'native');
+    mkdirSync(root);
+    // Fixture metadata only. No authentication store is read or copied.
+    writeFileSync(join(root, info.id === 'omp' ? 'agent.db' : 'auth.json'), 'provider-free fixture');
+    const context = { binary, environment: { HOME: home, PATH: '/usr/bin:/bin', [info.native.root_environment[0]]: root }, credentials: {} };
+    const responses = frames(child.stdout, NATIVE_MAX_FRAME)[Symbol.asyncIterator]();
+    let id = 0;
+    async function rpc(method, params) {
+      child.stdin.write(frame({ jsonrpc: '2.0', id: ++id, method, params }, NATIVE_MAX_FRAME));
+      const next = await responses.next();
+      if (next.done || !exact(next.value, ['jsonrpc', 'id', 'result']) || next.value.jsonrpc !== '2.0' || next.value.id !== id) fail('invalid_response');
+      return next.value.result;
+    }
+    const hello = await rpc('initialize', { protocol: 1 });
+    if (!exact(hello, ['protocol', 'id', 'version', 'kind']) || hello.protocol !== 1 || ['id', 'version', 'kind'].some(k => hello[k] !== info[k])) fail('negotiation_failed');
+    if ((await rpc('health', {})).ready !== true) fail('invalid_readiness');
+    async function native(method, params) {
+      const reply = await rpc(method, params);
+      if (!exact(reply, ['result', 'failure']) || reply.failure !== null || reply.result === null) fail('native_fixture_failed');
+      return reply.result;
+    }
+    const probe = await native('harness.probe', { context });
+    const discovery = await native('harness.native_context', { context });
+    if (probe.version !== versions[info.id] || discovery.profile.harness_id !== info.id || !discovery.credential_available) fail('invalid_native_discovery');
+    const manifest = await native('harness.capabilities', { version: probe.version });
+    if (manifest.harness_id !== info.id || manifest.exact_version !== probe.version) fail('invalid_native_capabilities');
+    const request = { profile: discovery.profile };
+    result = await native('harness.plan', { request, version: probe.version, context });
+    const prompt_file = join(home, 'prompt.txt');
+    writeFileSync(prompt_file, FIXTURE_PROMPT);
+    const command = await native('harness.command', { request, profile: result.plan.profile, prompt_file, context });
+    if (command.program !== binary || !command.args.some(a => a?.prompt === true)) fail('invalid_native_command');
+    for (let i = 0; i < 2; i++) {
+      const event = info.id === 'omp'
+        ? { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: FIXTURE_PROMPT } }
+        : { type: 'item.completed', item: { type: 'agent_message', text: FIXTURE_PROMPT } };
+      const normalized = await native('harness.normalize', { event });
+      if (normalized.event?.type !== 'output' || normalized.event.text !== FIXTURE_PROMPT) fail('invalid_native_event');
+      events.push(normalized.event);
+    }
+    if ((await rpc('shutdown', {})).ready !== true) fail('invalid_readiness');
+    child.stdin.end();
+    if (!(await responses.next()).done) fail('extra_response');
+  }, timeout, info.runtime === 'native');
+  return { id: info.id, kind: info.kind, protocol: 1, result, events };
+}
 export async function conformance(path, { timeout = 5000 } = {}) {
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60_000) fail('invalid_timeout');
   const { info } = directory(path); // Negotiation metadata is checked before any plugin code runs.
   const entry = resolve(path, info.entry);
+  if (info.native) return nativeConformance(info, entry, timeout);
   const method = info.kind === 'connector' ? 'connector.evidence' : `${info.kind}.plan`;
   let result;
   await processFixture(entry, () => ['--fabric-plugin-stdio'], async child => {

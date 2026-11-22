@@ -23,6 +23,7 @@ fn manifest(kind: PluginKind, mode: &str, dir: &Path) -> PluginManifest {
             dir.join("pid").display().to_string(),
         ],
         integrity: None,
+        native: None,
         capabilities: vec![
             match kind {
                 PluginKind::Harness => "harness.run",
@@ -381,5 +382,197 @@ fn typescript_scaffolds_use_existing_native_host() {
                 assert!(!host.connector_evidence(&plugin, &cancel).unwrap().available);
             }
         }
+    }
+}
+
+fn native_normalizer(mode: &str, dir: &Path) -> PluginHarness {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let package = dir.canonicalize().unwrap().join("package");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = std::fs::read(format!(
+        "{}/tests/fixtures/plugin.py",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    std::fs::write(package.join("plugin.py"), &source).unwrap();
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(format!("plugin.py\0{:x}\n", Sha256::digest(source)))
+    );
+    let mut plugin = manifest(PluginKind::Harness, mode, dir);
+    plugin.args[0] = package.join("plugin.py").display().to_string();
+    plugin.integrity = Some(PluginIntegrity {
+        root: package,
+        sha256: hash,
+    });
+    plugin.native = Some(fabric_runner::native_plugin::NativePluginMetadata {
+        executable: "fixture".into(),
+        root_environment: Vec::new(),
+        fingerprint: fabric_runner::native_plugin::NativeFingerprint {
+            domain: "fixture".into(),
+            files: Vec::new(),
+            roots: Vec::new(),
+        },
+    });
+    PluginHarness::new(plugin).unwrap()
+}
+
+#[test]
+fn native_normalization_reuses_one_process_and_rejects_lifecycle_or_unknown_fields() {
+    for mode in ["ok", "normalize-spoof", "normalize-extra"] {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = native_normalizer(mode, dir.path());
+        let output = dir.path().join("output");
+        let events = dir.path().join("events");
+        let capture = fabric_runner::capture::Capture::new(
+            std::fs::File::create(&output).unwrap(),
+            tempfile::tempfile().unwrap(),
+            Some(std::fs::File::create(&events).unwrap()),
+            8192,
+        )
+        .unwrap()
+        .with_harness(&adapter);
+        let result = fabric_runner::execute(
+            &fabric_runner::CommandSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '{\"fixture\":1}\\n{\"fixture\":2}\\n'".into(),
+                ],
+                environment: Vec::new(),
+            },
+            dir.path(),
+            capture,
+            &fabric_runner::ExecutionLimits::default(),
+            &CancellationToken::default(),
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let metadata = result.capture.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "{\"fixture\":1}\n{\"fixture\":2}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pid.starts")).unwrap(),
+            "start\n"
+        );
+        let captured = std::fs::read_to_string(events).unwrap();
+        assert!(!captured.contains("SECRET_CANARY"));
+        if mode == "ok" {
+            assert!(metadata.native_failure.is_none());
+            assert_eq!(captured.matches("normalized fixture").count(), 2);
+        } else {
+            assert_eq!(
+                metadata.native_failure.unwrap(),
+                "external-plugin-normalization"
+            );
+            assert!(captured.contains("\"success\":false"));
+        }
+        drop(adapter);
+        reaped(dir.path());
+    }
+}
+
+#[test]
+fn cancellation_interrupts_a_live_native_normalizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = native_normalizer("normalize-hang", dir.path());
+    let cancel = CancellationToken::default();
+    let start = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            adapter.try_normalize_event(fabric_runner::NativeEvent::Text("fixture"), &cancel)
+        });
+        while !dir.path().join("pid").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        cancel.cancel();
+        assert!(running.join().unwrap().is_err());
+    });
+    assert!(start.elapsed() < Duration::from_secs(2));
+    reaped(dir.path());
+}
+
+#[test]
+fn native_capture_respects_the_execution_deadline_and_preserves_cancellation() {
+    for cancel_during_normalize in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = if cancel_during_normalize {
+            "normalize-hang"
+        } else {
+            "normalize-slow"
+        };
+        let adapter = native_normalizer(mode, dir.path());
+        let output = dir.path().join("output");
+        let events = dir.path().join("events");
+        let capture = fabric_runner::capture::Capture::new(
+            std::fs::File::create(&output).unwrap(),
+            tempfile::tempfile().unwrap(),
+            Some(std::fs::File::create(&events).unwrap()),
+            8192,
+        )
+        .unwrap()
+        .with_harness(&adapter);
+        let cancel = CancellationToken::default();
+        let start = std::time::Instant::now();
+        let mut script = "printf '{\"fixture\":1}\\n{\"fixture\":2}\\n{\"fixture\":3}\\n{\"fixture\":4}\\n{\"fixture\":5}\\n{\"fixture\":6}\\n'".to_string();
+        if cancel_during_normalize {
+            script.push_str("; exec /bin/sleep 60");
+        }
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                if cancel_during_normalize {
+                    while !dir.path().join("pid.normalizing").exists() {
+                        assert!(
+                            start.elapsed() < Duration::from_secs(5),
+                            "normalizer did not start"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    cancel.cancel();
+                }
+            });
+            fabric_runner::execute(
+                &fabric_runner::CommandSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    environment: Vec::new(),
+                },
+                dir.path(),
+                capture,
+                &fabric_runner::ExecutionLimits {
+                    timeout: Duration::from_secs(if cancel_during_normalize { 10 } else { 1 }),
+                    term_grace: Duration::from_millis(10),
+                },
+                &cancel,
+                None,
+                |_| Ok(()),
+            )
+            .unwrap()
+        });
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            result.stop_reason,
+            Some(if cancel_during_normalize {
+                fabric_runner::StopReason::Cancelled
+            } else {
+                fabric_runner::StopReason::Timeout
+            }),
+        );
+        assert_eq!(cancel.is_cancelled(), cancel_during_normalize);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "{\"fixture\":1}\n{\"fixture\":2}\n{\"fixture\":3}\n{\"fixture\":4}\n{\"fixture\":5}\n{\"fixture\":6}\n",
+        );
+        assert!(result.capture.unwrap().native_failure.is_none());
+        let captured = std::fs::read_to_string(events).unwrap();
+        assert!(!captured.contains("external-plugin-normalization"));
+        assert!(captured.contains("\"success\":false"));
+        drop(adapter);
+        reaped(dir.path());
     }
 }

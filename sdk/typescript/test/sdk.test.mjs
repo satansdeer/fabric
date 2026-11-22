@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, realpathSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, lstatSync, readdirSync, chmodSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { create, install } from '../cli.mjs';
+import { create, install, reference } from '../cli.mjs';
 import { directory, archive, pack, loadPackage } from '../package.mjs';
 import { conformance, FIXTURE_PROMPT } from '../conformance.mjs';
 import { validVersion, validId, safePath, MAX_FRAME } from '../protocol.mjs';
@@ -15,7 +15,15 @@ const sdk = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const cli = join(sdk, 'cli.mjs');
 function temporary(t) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'fabric-sdk-test-')));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.after(() => {
+    function writable(path) {
+      if (!lstatSync(path).isDirectory()) return;
+      chmodSync(path, 0o700);
+      for (const name of readdirSync(path)) writable(join(path, name));
+    }
+    writable(root);
+    rmSync(root, { recursive: true, force: true });
+  });
   return root;
 }
 function environment(root) {
@@ -174,7 +182,8 @@ test('archive/path/file boundaries reject traversal, links, duplicate/truncated/
 test('identity/version/path validation matches protocol syntax including newline and numeric prerelease edges', () => {
   for (const v of ['0.0.0', '1.2.3-alpha.1+build.007', '1.0.0+000', '1.0.0-0']) assert.equal(validVersion(v), true);
   for (const v of ['01.0.0', '1.0', '1.0.0-01', '1.0.0+', '1.0.0\n', '1.0.0-a..b']) assert.equal(validVersion(v), false);
-  for (const v of ['omp', 'fake-a', 'bad\n', '../bad', 'A']) assert.equal(validId(v), false);
+  for (const v of ['fake-a', 'bad\n', '../bad', 'A']) assert.equal(validId(v), false);
+  for (const v of ['omp', 'codex', 'third-fake']) assert.equal(validId(v), true);
   for (const v of ['', '../a', '/a', 'a//b', 'a\n', 'a\\b']) assert.equal(safePath(v), false);
 });
 
@@ -244,6 +253,65 @@ test('actual Core: scaffold -> conformance -> local package install/check, tampe
   }
 });
 
+test('third SDK fake harness executes through Core without vendor registration', { skip: hostSkip }, async t => {
+  const root = temporary(t), registry = join(root, 'registry'), repo = join(root, 'repo');
+  mkdirSync(registry, { mode: 0o700 }); mkdirSync(repo);
+  const env = { ...environment(root), FABRIC_PLUGIN_REGISTRY: registry, UNSELECTED_SECRET: 'SECRET_CANARY' };
+  const project = create('harness', join(root, 'third-fake'));
+  rawPlugin(project, readFileSync(join(project, 'plugin.ts'), 'utf8').replace("await emit({ type: 'text'", "if (Object.hasOwn(process.env, 'UNSELECTED_SECRET')) throw new Error('ambient environment leaked');\n    await emit({ type: 'text'"));
+  const snapshot = directory(project);
+  install(project, { registry, fabric: host, version: '1.0.0', sha256: snapshot.hash, trust: true });
+  function invoke(program, args, cwd = root) {
+    const r = spawnSync(program, args, { cwd, env, encoding: 'utf8', timeout: 30_000 });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  }
+  invoke('/usr/bin/git', ['init', '--quiet'], repo);
+  writeFileSync(join(repo, 'tracked'), 'original');
+  invoke('/usr/bin/git', ['add', '.'], repo);
+  invoke('/usr/bin/git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'fixture'], repo);
+  const fabric = args => invoke(host, ['--root', join(root, 'storage'), ...args]);
+  fabric(['project', 'add', '--name', 'fixture', '--path', repo]);
+  const recipe = join(root, 'recipe.toml'), prompt = join(root, 'prompt.txt');
+  writeFileSync(recipe, "version=1\n[[steps]]\nargv=['/usr/bin/true']\n");
+  writeFileSync(prompt, FIXTURE_PROMPT);
+  fabric(['project', 'prepare', 'fixture', '--recipe', recipe, '--json']);
+  try {
+    const report = JSON.parse(fabric(['run', 'fixture', '--harness', 'third-fake', '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--json']));
+    assert.equal(report.state, 'SUCCEEDED');
+    assert.ok(report.artifact_manifest_id);
+  } finally {
+    fabric(['manager', 'stop', '--json']);
+  }
+});
+
+test('pinned OMP and Codex reference packages exercise the complete native contract without providers', { skip: !process.env.FABRIC_REFERENCE_PLUGIN_BINARY && 'Set FABRIC_REFERENCE_PLUGIN_BINARY' }, async t => {
+  const root = temporary(t);
+  const bin = join(root, 'bin');
+  mkdirSync(bin, { mode: 0o700 });
+  for (const id of ['omp', 'codex']) {
+    const project = reference(id, join(root, id), process.env.FABRIC_REFERENCE_PLUGIN_BINARY);
+    const proof = await conformance(project);
+    assert.equal(proof.result.plan.manifest.harness_id, id);
+    assert.deepEqual(proof.events.map(e => e.text), [FIXTURE_PROMPT, FIXTURE_PROMPT]);
+    assert.equal(archive(pack(directory(project))).hash, directory(project).hash);
+    if (!hostSkip) {
+      const registry = join(root, `registry-${id}`);
+      mkdirSync(registry, { mode: 0o700 });
+      install(project, { registry, fabric: host, version: '0.1.0', sha256: directory(project).hash, trust: true });
+      const version = id === 'omp' ? 'omp/19.1.0' : 'codex-cli 0.171.0';
+      writeFileSync(join(bin, id), '#!/bin/sh\n[ -z "${SECRET_CANARY+x}" ] || exit 17\n[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 18\n' + `printf '%s\\n' '${version}'\n`, { mode: 0o700 });
+      const checked = spawnSync(host, ['plugins', '--registry', registry, 'check', id], {
+        env: { ...environment(root), PATH: `${bin}:${environment(root).PATH}`, SECRET_CANARY: 'must-not-reach-native-cli' },
+        encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+      });
+      assert.equal(checked.error, undefined);
+      assert.equal(checked.status, 0, checked.stderr + checked.stdout);
+      assert.deepEqual(JSON.parse(checked.stdout), { compatible: true, healthy: true });
+    }
+  }
+});
+
 test('dev watches the explicit project and re-runs actual conformance after an edit', { skip: process.platform !== 'darwin' && 'Node --watch-path is macOS-first' }, async t => {
   const root = temporary(t);
   const project = create('connector', join(root, 'watched'));
@@ -274,4 +342,38 @@ test('dev watches the explicit project and re-runs actual conformance after an e
     try { process.kill(-child.pid, 'SIGKILL'); } catch {}
     await closed;
   }
+});
+
+test('native SDK keeps one session and returns only typed sanitized rejections', async t => {
+  const root = temporary(t);
+  const project = create('harness', join(root, 'native-sdk'));
+  rawPlugin(project, `import { defineNativeHarness, serve, rejectNative } from './sdk/index.mjs';
+let count = 0;
+const unavailable = () => { throw new Error('SECRET_CANARY'); };
+await serve(defineNativeHarness({
+  id: 'native-sdk', version: '1.0.0',
+  probe: ({ context }) => { if (context.credentials?.SELECTED === true) return { version: 'fixture/1.0.0' }; rejectNative('authorization_required'); },
+  nativeContext: unavailable, capabilities: unavailable, plan: unavailable, command: unavailable,
+  normalize: () => ({ event: { type: 'output', stream: 'stdout', text: String(++count) } }),
+}));`);
+  const operations = [
+    ['initialize', { protocol: 1 }], ['health', {}],
+    ['harness.probe', { context: { binary: null, environment: {}, credentials: { SELECTED: true } } }],
+    ['harness.probe', { context: { binary: null, environment: {}, credentials: {} } }],
+    ['harness.plan', { request: {}, version: 'fixture/1.0.0', context: {} }],
+    ['harness.normalize', { text: 'one' }], ['harness.normalize', { text: 'two' }], ['shutdown', {}],
+  ];
+  const result = spawnSync(process.execPath, [join(project, 'plugin.ts'), '--fabric-plugin-stdio'], {
+    env: environment(root), encoding: 'utf8', timeout: 5000,
+    input: operations.map(([method, params], i) => JSON.stringify({ jsonrpc: '2.0', id: i + 1, method, params }) + '\n').join(''),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const replies = result.stdout.trim().split('\n').map(JSON.parse);
+  assert.deepEqual(replies[2].result, { result: { version: 'fixture/1.0.0' }, failure: null });
+  assert.deepEqual(replies[3].result, { result: null, failure: 'authorization_required' });
+  assert.deepEqual(replies[4].result, { result: null, failure: 'invalid_arguments' });
+  assert.equal(replies[5].result.result.event.text, '1');
+  assert.equal(replies[6].result.result.event.text, '2');
+  assert.ok(!result.stdout.includes('SECRET_CANARY'));
+  assert.ok(!result.stderr.includes('SECRET_CANARY'));
 });

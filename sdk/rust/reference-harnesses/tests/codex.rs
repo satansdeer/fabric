@@ -7,16 +7,28 @@ use fabric_domain::{
     AgentEvent, AgentProfile, Capability, CapabilitySupport, CredentialConnectionRef, ErrorKind,
     HarnessRequest, ModelPolicy, NativeConfigRef,
 };
+use fabric_reference_harnesses::CodexHarness;
 use fabric_runner::{
-    AgentSpec, CodexHarness, HarnessAdapter, HarnessRegistry, NativeEvent, RegistryOptions,
-    capture::Capture,
+    AgentSpec, HarnessAdapter, HarnessRegistry, NativeEvent, RegistryOptions, capture::Capture,
 };
 
 #[test]
-fn codex_is_registered_with_auth_free_doctor_discovery() {
+fn native_vendors_require_explicit_external_installation() {
     let registry = HarnessRegistry::default();
-    assert!(registry.ids().iter().any(|id| id.as_str() == "codex"));
-    assert!(registry.doctor_executables().contains(&"codex"));
+    assert!(
+        !registry
+            .ids()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == "codex")
+    );
+    assert!(
+        !registry
+            .doctor_executables()
+            .unwrap()
+            .iter()
+            .any(|name| name == "codex")
+    );
 }
 
 const VERSION: &str = "codex-cli 0.171.0";

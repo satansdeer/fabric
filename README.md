@@ -4,7 +4,7 @@ Fabric is a macOS-first, harness-neutral local worker layer: durable asynchronou
 
 ## Implemented: FAB-01 through FAB-20 (automated scope)
 
-The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground or detached local harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup.
+The Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground or detached local harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup. Separately installable reference harness executables live in the SDK, not Core registration.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 
@@ -40,12 +40,12 @@ cargo build --locked -p fabric-cli
 cargo run --locked --bin fabric -- doctor --json
 ```
 
-`doctor` reads the current platform and searches `PATH` for executable `git` and `omp` files (including executable symlinks). It does not execute either tool, probe versions, invoke a model, access the network, read credentials, or create/change Fabric storage or user data. Missing tools are diagnostics, not a command failure. A missing `PATH` discovers no tools; relative or empty entries in an explicitly set `PATH` refer to the current directory.
+`doctor` reads the current platform and searches `PATH` for executable `git` and explicitly installed native plugins' declared CLI names (including executable symlinks). It does not execute tools/plugins, probe versions, invoke a model, access the network, read credentials, or create/change Fabric storage or user data. Missing tools are diagnostics, not a command failure; an invalid explicitly selected plugin registry fails closed. A missing `PATH` discovers no tools; relative or empty entries in an explicitly set `PATH` refer to the current directory.
 
 The JSON report has stable field names and tool ordering:
 
 ```json
-{"platform":{"os":"macos","arch":"aarch64","supported":true,"primary_supported_os":"macos"},"tools":[{"name":"git","path":"/usr/bin/git"},{"name":"omp","path":null}]}
+{"platform":{"os":"macos","arch":"aarch64","supported":true,"primary_supported_os":"macos"},"tools":[{"name":"git","path":"/usr/bin/git"}]}
 ```
 
 `platform.supported` describes the current OS against the macOS target, not readiness of unimplemented lifecycle features. Tool paths are executable candidates, not a guarantee that launching the tool will succeed; `null` means no executable candidate was found. Paths and architecture vary with the host. Diagnostics produce identical output for identical platform and filesystem/PATH inputs. Unsupported platforms still receive a diagnostic report with `supported: false`.
@@ -54,7 +54,7 @@ Successful reports go to stdout with exit status 0. Invalid arguments with `--js
 
 ### Discover and connect a native harness
 
-Run from the project's Git checkout:
+First explicitly install the reviewed, content-pinned OMP/Codex reference packages using the [SDK instructions](sdk/typescript/README.md#native-reference-harness-plugins), and set `FABRIC_PLUGIN_REGISTRY` in both controller and manager environments. Neither CLI is a built-in fallback. Their existing `omp`/`codex` identities, exact CLI versions, profiles and revocable native-context consent remain unchanged. Then run from the project's Git checkout:
 
 ```sh
 fabric --root /private/path/to/fabric init --harness omp --check

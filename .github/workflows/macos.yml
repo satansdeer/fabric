@@ -11,6 +11,8 @@ jobs:
   acceptance:
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      FABRIC_REFERENCE_PLUGIN_BINARY: ${{ github.workspace }}/target/release/fabric-reference-harnesses
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -28,13 +30,15 @@ jobs:
         run: cargo fmt --all --check
       - name: Strict lint
         run: cargo clippy --offline --locked --workspace --all-targets -- -D warnings
+      - name: Build actual Fabric binaries
+        run: cargo build --offline --locked --bins
+      - name: Build separately installed native reference plugins
+        run: cargo build --offline --locked --release -p fabric-reference-harnesses --bin fabric-reference-harnesses
       - name: Workspace acceptance (local fake harnesses only)
         env:
           # Each case launches processes; bound suite-level runner contention.
           RUST_TEST_THREADS: "4"
-        run: cargo test --offline --locked --workspace
-      - name: Build actual Fabric binaries
-        run: cargo build --offline --locked --bins
+        run: FABRIC_PLUGIN_TEST_NODE="$(command -v node)" cargo test --offline --locked --workspace
       - name: TypeScript SDK and generated plugins (provider-free)
         working-directory: sdk/typescript
         env:

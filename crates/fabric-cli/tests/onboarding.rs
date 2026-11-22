@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
+mod reference_plugins;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -17,6 +19,7 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         let path = path.canonicalize().unwrap();
+        reference_plugins::install(&path);
         for dir in ["home", "bin", "source", "native"] {
             fs::create_dir(path.join(dir)).unwrap();
         }
@@ -61,6 +64,7 @@ impl Fixture {
             .current_dir(self.0.join("source"))
             .env_clear()
             .env("HOME", self.0.join("home"))
+            .env("FABRIC_PLUGIN_REGISTRY", self.0.join("plugin-registry"))
             .env("CODEX_HOME", self.0.join("native"))
             .env(
                 "PATH",

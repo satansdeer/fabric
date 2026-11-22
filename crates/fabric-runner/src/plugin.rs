@@ -13,10 +13,13 @@ use fabric_domain::{ErrorKind, FabricError, HarnessId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[path = "plugin_session.rs"]
+mod session;
+pub(crate) use session::PluginSession;
 
 pub const MAX_FRAME: usize = 65536;
 const MAX_REGISTRY: u64 = 1024 * 1024;
-fn failure(code: &'static str) -> FabricError {
+pub(crate) fn failure(code: &'static str) -> FabricError {
     FabricError {
         kind: ErrorKind::Output,
         message: format!("Plugin: {code}."),
@@ -57,6 +60,8 @@ pub struct PluginManifest {
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity: Option<PluginIntegrity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::native_plugin::NativePluginMetadata>,
 }
 impl PluginManifest {
     pub fn load(path: &Path) -> Result<Self, FabricError> {
@@ -103,6 +108,12 @@ impl PluginManifest {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         }) {
             return Err(failure("invalid_integrity"));
+        }
+        if let Some(native) = &self.native {
+            native.validate()?;
+            if self.kind != PluginKind::Harness || self.integrity.is_none() {
+                return Err(failure("native_plugin_requires_content_pin"));
+            }
         }
         let allowed = match self.kind {
             PluginKind::Harness => "harness.run",
@@ -425,7 +436,7 @@ impl PluginRegistry {
     }
 }
 fn builtin(id: &HarnessId) -> bool {
-    matches!(id.as_str(), "fake" | "fake-a" | "fake-b" | "omp" | "codex")
+    matches!(id.as_str(), "fake" | "fake-a" | "fake-b")
 }
 fn private_root(root: &Path) -> Result<(), FabricError> {
     if !root.is_absolute() {
@@ -508,103 +519,17 @@ impl Default for PluginHost {
     }
 }
 impl PluginHost {
-    fn invoke<T: serde::de::DeserializeOwned>(
+    pub(crate) fn invoke<T: serde::de::DeserializeOwned>(
         &self,
         manifest: &PluginManifest,
         method: &str,
         params: Value,
         cancel: &CancellationToken,
     ) -> Result<T, FabricError> {
-        manifest.validate()?;
-        if !manifest.compatible() {
-            return Err(failure("unsupported_protocol"));
-        }
-        manifest.verify_integrity()?;
-        if cancel.is_cancelled() {
-            return Err(failure("cancelled"));
-        }
-        if self.timeout.is_zero() || self.timeout > Duration::from_secs(60) {
-            return Err(failure("invalid_timeout"));
-        }
-        let start = Instant::now();
-        let mut command = Command::new(&manifest.executable);
-        command
-            .args(&manifest.args)
-            .arg("--fabric-plugin-stdio")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("LC_ALL", "C")
-            .current_dir("/")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let _home = crate::profile::private_environment(&mut command)
-            .map_err(|_| failure("private_environment"))?;
-        let child = command.spawn().map_err(|_| failure("spawn_failed"))?;
-        let mut group = crate::supervision::ProcessGroup::new(child, start);
-        let mut input = group
-            .child
-            .stdin
-            .take()
-            .ok_or_else(|| failure("pipe_failed"))?;
-        let output = group
-            .child
-            .stdout
-            .take()
-            .ok_or_else(|| failure("pipe_failed"))?;
-        for fd in [input.as_raw_fd(), output.as_raw_fd()] {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            {
-                return Err(failure("pipe_failed"));
-            }
-        }
-        let mut output = BufReader::new(output);
-        let deadline = start + self.timeout;
-        let mut rpc = |id, method, params| {
-            exchange(
-                &mut input,
-                &mut output,
-                id,
-                method,
-                params,
-                deadline,
-                cancel,
-            )
-        };
-        let hello: Hello = serde_json::from_value(rpc(1, "initialize", json!({"protocol":1}))?)
-            .map_err(|_| failure("invalid_hello"))?;
-        if hello.protocol != 1
-            || hello.id != manifest.id
-            || hello.version != manifest.version
-            || hello.kind != manifest.kind
-        {
-            return Err(failure("negotiation_failed"));
-        }
-        let health: Ready = serde_json::from_value(rpc(2, "health", json!({}))?)
-            .map_err(|_| failure("invalid_health"))?;
-        if !health.ready {
-            return Err(failure("unhealthy"));
-        }
-        let result = serde_json::from_value(rpc(3, method, params)?)
+        let mut session = PluginSession::open(manifest, self.timeout, cancel)?;
+        let result = serde_json::from_value(session.call(method, params)?)
             .map_err(|_| failure("invalid_result"))?;
-        let shutdown: Ready = serde_json::from_value(rpc(4, "shutdown", json!({}))?)
-            .map_err(|_| failure("invalid_shutdown"))?;
-        if !shutdown.ready {
-            return Err(failure("invalid_shutdown"));
-        }
-        drop(input);
-        let limits = crate::ExecutionLimits {
-            timeout: self.timeout,
-            term_grace: Duration::from_millis(10),
-        };
-        let (status, reason) = group
-            .supervise(&limits, cancel, || {})
-            .map_err(|_| failure("shutdown_failed"))?;
-        if reason.is_some() || !status.success() {
-            return Err(failure("shutdown_failed"));
-        }
+        session.finish()?;
         Ok(result)
     }
     pub fn harness_info(
@@ -614,6 +539,24 @@ impl PluginHost {
     ) -> Result<HarnessInfo, FabricError> {
         if manifest.kind != PluginKind::Harness {
             return Err(failure("wrong_kind"));
+        }
+        if manifest.native.is_some() {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Probed {
+                version: String,
+            }
+            let reply: crate::native_plugin::NativeReply<Probed> = self.invoke(
+                manifest,
+                "harness.probe",
+                json!({"context":crate::native_plugin::context(manifest, None, false)?}),
+                cancel,
+            )?;
+            let info = crate::native_plugin::resolve_reply(reply)?;
+            fabric_domain::HarnessVersion::validate(&info.version)?;
+            return Ok(HarnessInfo {
+                version: info.version,
+            });
         }
         let ready: Ready = self.invoke(manifest, "harness.plan", json!({}), cancel)?;
         if !ready.ready {
@@ -653,20 +596,20 @@ impl PluginHost {
         self.invoke(manifest, "connector.evidence", json!({}), cancel)
     }
 }
-fn exchange(
-    input: &mut impl Write,
-    output: &mut impl Read,
+fn exchange_bounded(
+    (input, output): (&mut impl Write, &mut impl Read),
     id: u64,
     method: &str,
     params: Value,
     deadline: Instant,
     cancel: &CancellationToken,
+    frame_limit: usize,
 ) -> Result<Value, FabricError> {
     let mut request =
         serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .map_err(|_| failure("invalid_request"))?;
     request.push(b'\n');
-    if request.len() > MAX_FRAME {
+    if request.len() > frame_limit {
         return Err(failure("request_too_large"));
     }
     let mut sent = 0;
@@ -698,7 +641,7 @@ fn exchange(
                     if byte[0] == b'\n' {
                         break;
                     }
-                    if frame.len() >= MAX_FRAME - 1 {
+                    if frame.len() >= frame_limit - 1 {
                         return Err(failure("frame_too_large"));
                     }
                     frame.push(byte[0]);
@@ -731,6 +674,16 @@ fn exchange(
 
 pub struct PluginHarness {
     manifest: PluginManifest,
+    normalizer: std::sync::Mutex<Option<PluginSession>>,
+}
+impl Drop for PluginHarness {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.normalizer.get_mut() {
+            if let Some(session) = slot.take() {
+                let _ = session.finish();
+            }
+        }
+    }
 }
 impl PluginHarness {
     pub fn new(manifest: PluginManifest) -> Result<Self, FabricError> {
@@ -738,7 +691,10 @@ impl PluginHarness {
         if manifest.kind != PluginKind::Harness || !manifest.compatible() {
             return Err(failure("incompatible_harness"));
         }
-        Ok(Self { manifest })
+        Ok(Self {
+            manifest,
+            normalizer: std::sync::Mutex::new(None),
+        })
     }
 }
 impl HarnessAdapter for PluginHarness {
@@ -748,10 +704,60 @@ impl HarnessAdapter for PluginHarness {
     fn probe(&self) -> Result<HarnessInfo, FabricError> {
         PluginHost::default().harness_info(&self.manifest, &CancellationToken::default())
     }
+    fn native_context(&self) -> Result<crate::NativeContext, FabricError> {
+        if self.manifest.native.is_some() {
+            crate::native_plugin::native_context(&self.manifest)
+        } else {
+            Err(FabricError {
+                kind: ErrorKind::UnsupportedCapability,
+                message: "This plugin does not provide native-context onboarding.".into(),
+            })
+        }
+    }
+    fn plan(
+        &self,
+        request: &fabric_domain::HarnessRequest,
+        info: &HarnessInfo,
+    ) -> Result<fabric_domain::HarnessPlan, FabricError> {
+        if self.manifest.native.is_some() {
+            crate::native_plugin::plan(&self.manifest, request, info)
+        } else {
+            crate::negotiate(request, self.capabilities(info)?, false)
+        }
+    }
+    fn try_normalize_event(
+        &self,
+        event: crate::NativeEvent<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<fabric_domain::AgentEvent>, FabricError> {
+        if self.manifest.native.is_none() {
+            return Ok(None);
+        }
+        let mut slot = self
+            .normalizer
+            .lock()
+            .map_err(|_| failure("normalizer_poisoned"))?;
+        if slot.is_none() {
+            *slot = Some(PluginSession::open(
+                &self.manifest,
+                Duration::from_secs(5),
+                cancellation,
+            )?);
+        }
+        slot.as_mut().unwrap().set_cancellation(cancellation);
+        let result = crate::native_plugin::normalize(slot.as_mut().unwrap(), event);
+        if result.is_err() {
+            slot.take();
+        }
+        result
+    }
     fn capabilities(
         &self,
         info: &HarnessInfo,
     ) -> Result<fabric_domain::HarnessCapabilityManifest, FabricError> {
+        if self.manifest.native.is_some() {
+            return crate::native_plugin::capabilities(&self.manifest, info);
+        }
         crate::planning::local_manifest(
             self.id(),
             info,
@@ -761,6 +767,9 @@ impl HarnessAdapter for PluginHarness {
     }
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
         self.manifest.verify_integrity()?;
+        if self.manifest.native.is_some() {
+            return crate::native_plugin::command(&self.manifest, spec);
+        }
         crate::profile::revalidate(self, spec, &self.manifest.version)?;
         // No plugin-supplied argv, cwd, environment or deletion request enters Core.
         let mut args: Vec<_> = self
@@ -797,14 +806,14 @@ mod tests {
         }
         let mut output = input.try_clone().unwrap();
         let start = Instant::now();
-        let error = exchange(
-            &mut input,
-            &mut output,
+        let error = exchange_bounded(
+            (&mut input, &mut output),
             1,
             "initialize",
             json!({}),
             start + Duration::from_millis(50),
             &CancellationToken::default(),
+            MAX_FRAME,
         )
         .unwrap_err();
         assert!(error.message.contains("timeout"));

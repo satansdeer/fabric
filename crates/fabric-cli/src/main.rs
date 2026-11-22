@@ -1153,7 +1153,7 @@ fn write_storage(
 fn write_harnesses(command: HarnessesCommands, json: bool) -> Result<(), FabricError> {
     let registry = fabric_runner::HarnessRegistry::default();
     match command {
-        HarnessesCommands::List => write_inspection(&registry.ids(), json),
+        HarnessesCommands::List => write_inspection(&registry.ids()?, json),
         HarnessesCommands::Doctor { id, fake_binary } => {
             let harness = registry.resolve(&id, &fabric_runner::RegistryOptions { fake_binary })?;
             let info = harness.probe()?;
@@ -1171,7 +1171,7 @@ fn write_harnesses(command: HarnessesCommands, json: bool) -> Result<(), FabricE
 }
 
 fn write_doctor(json: bool) -> Result<(), FabricError> {
-    let report = fabric_core::doctor();
+    let report = fabric_core::doctor()?;
     let mut stdout = io::stdout().lock();
     if json {
         serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;

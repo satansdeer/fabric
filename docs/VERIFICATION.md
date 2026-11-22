@@ -305,3 +305,55 @@ cargo test --offline --locked -p fabric-store recovery_tests:: --lib -- --nocapt
   immediately during a concurrent manager write. The unchanged typed conformance
   scenario passed locally after that fix; no provider call or automatic retry
   was used.
+
+## Issue #4 — extracted native plugins, provider-free worker evidence
+
+Implementation evidence only; human review and external-plugin provider acceptance remain separate.
+
+- Rust 1.91.0, Node 24.7.0, offline dependency caches, `RUST_TEST_THREADS=4`.
+- `cargo build --offline --release -p fabric-reference-harnesses --bin fabric-reference-harnesses`: PASS.
+- `cargo build --offline -p fabric-cli --bins`: PASS.
+- Rust fixtures used `FABRIC_REFERENCE_PLUGIN_BINARY` pointing to that release executable and `FABRIC_PLUGIN_TEST_NODE` pointing to Node. Each native fixture explicitly installed a private, content-pinned reference package.
+
+| Local check | Observed result |
+| --- | --- |
+| `cargo test --offline -p fabric-runner -p fabric-reference-harnesses` | 47 passed across 11 suites |
+| `cargo test --offline -p fabric-core onboarding` | 6 passed |
+| `cargo test --offline -p fabric-core --test workspace` | 11 passed |
+| `cargo test --offline -p fabric-cli --test doctor --test onboarding --test run --test workers` | doctor 8 passed; onboarding 3 passed; run 47 passed; workers 15 passed, 1 failed |
+| `cargo test --offline -p fabric-cli --test workers unverifiable_native_model_rejects_before_manager_admission` after the diagnostic fix | 1 passed, 15 filtered; 3.91 seconds |
+| `npm test` in `sdk/typescript`, with canonical `FABRIC_PLUGIN_TEST_HOST` and `FABRIC_REFERENCE_PLUGIN_BINARY` paths | typed contracts passed; 15 tests passed, zero skipped |
+
+The worker failure was loss of the existing `MODEL_UNVERIFIED` diagnostic across sanitized plugin errors. Core now reuses required-capability validation on an unsupported-capability planning response; the original consumer-visible assertion passes without forwarding plugin exception text. The combined CLI command was not rerun after this focused fix.
+
+Earlier check failures also identified and corrected external `--fake-binary` rejection classification, missing installed-ID classification, the SDK's vendor-event conformance fixture, and SDK temporary-directory cleanup after artifact/source sealing. Initial SDK setup needed the existing offline TypeScript cache and canonical executable paths. No contract assertions were weakened.
+
+Passing checks exercise explicit OMP/Codex installs, native-context consent and fingerprints, literal prompts and native argv, typed event normalization, malformed/lifecycle-spoofed event rejection, persistent normalization and cancellation/reaping, artifact hashes and storage/reclaim, existing v1 behavior, mixed fake harness batches, and third-party SDK harness execution without Core registration changes. Control-message tests check credential availability rather than credential values and reject ambient-secret leakage.
+
+Actual CLI checks: `fabric harnesses list` with no plugin registry lists only `fake`, `fake-a`, `fake-b`; `fabric init --harness omp --check --json` fails clearly with `unknown_harness` and explicit-install guidance. No silent native fallback.
+
+No live OMP/Codex model-provider turn, service connection, credential change, deployment, source commit, push or GitHub mutation was performed. Full-workspace lint/test gates were not run in this worker. Provider-backed plugin execution remains **NOT_VERIFIED**; these results do not declare issue acceptance.
+
+### Controller review and acceptance
+
+- One approved Fabric/native OMP 19.1.0 worker completed from merged source `858c844ae4356c8ea673de61df52694dee52c4da`: run `r-1795387683252776000-51206-0`, `SUCCEEDED`, exit 0, workspace `RECLAIMED`. All 14 retained artifacts were size/SHA-256 verified before importing source changes. The 64 MiB raw capture is **TRUNCATED**; private native logs were not published. This is implementation-worker evidence, not a provider-backed extracted-plugin acceptance run.
+- Distribution review added real Core `plugins check` calls against both installed reference packages with local native CLI doubles and ambient-secret rejection; CI now builds the separate release executable before tests and exports its exact path. The SDK guide documents the private explicit install, reviewed content pin, native CLI prerequisite and manager upgrade boundary.
+- Runtime review fixed execution-deadline propagation into persistent normalization, including initialization and each RPC. Deadline expiry disables further normalization and reports `Timeout` even after a successful native process exit, without cancelling the caller's token or sibling workers. Cancellation no longer creates a synthetic plugin failure. Raw capture continues in both cases.
+- Strict lint exposed an eight-argument control helper; grouped its duplex streams rather than suppressing the lint.
+
+| Controller check | Observed result |
+| --- | --- |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | PASS |
+| `cargo build --offline --locked --bins` | PASS |
+| `cargo build --offline --locked --release -p fabric-reference-harnesses --bin fabric-reference-harnesses` | PASS |
+| `cargo test --offline --locked -p fabric-runner --test plugins native_capture_respects_the_execution_deadline_and_preserves_cancellation` | 1 passed, 9 filtered; 1.99 seconds |
+| `python3 scripts/test-fabric-issue.py --fabric ABS_BINARY` | PASS; actual provider-free issue/worker/artifact workflow |
+| `bun integrations/omp/conformance.ts ABS_BINARY` | PASS; fake OMP host, no provider call |
+| `bun integrations/omp/typed-conformance.ts ABS_BINARY` | PASS; in-process host, no provider call |
+| `cargo test --offline --locked --workspace` | PASS; full workspace, including migrated native fixtures, worker admission and the new deadline/cancellation regression |
+| `npm test` in `sdk/typescript`, with actual Core host and release reference executable | typed contracts PASS; 15 passed, zero failed, zero skipped |
+
+The combined full-workspace and SDK command completed in 392.52 seconds. The SDK run exercised both installed native reference executables through real Core `plugins check` and executed a third-party fake harness through Core without vendor registration changes. These provider-free results satisfy the issue's local fixture gates, not live model-provider or remote-target acceptance.
+
+Controller: macOS arm64, Node 22.23.2, `RUST_TEST_THREADS=4`, explicit release reference executable and actual debug Core host. No separate live-provider smoke, credential change, service deployment or npm publication.

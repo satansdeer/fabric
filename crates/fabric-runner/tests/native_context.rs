@@ -2,6 +2,8 @@ use fabric_domain::{HarnessId, HarnessRequest, ModelPolicy};
 use fabric_runner::{HarnessRegistry, RegistryOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+#[path = "support/reference_plugins.rs"]
+mod reference_plugins;
 
 #[test]
 fn discovery_is_metadata_only_exact_and_uses_private_worker_home() {
@@ -114,6 +116,10 @@ fn discovery_is_metadata_only_exact_and_uses_private_worker_home() {
             ])
             .env_clear()
             .env("FABRIC_NATIVE_CONTEXT_CHILD", "1")
+            .env(
+                "FABRIC_PLUGIN_REGISTRY",
+                reference_plugins::install(temporary.path()),
+            )
             .env("HOME", &home)
             .env("PATH", &binaries)
             .env("OPENAI_API_KEY", "unapproved-fixture")

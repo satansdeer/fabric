@@ -18,6 +18,9 @@ pub struct CodexHarness {
 }
 
 impl CodexHarness {
+    pub fn new(binary: PathBuf) -> Self {
+        Self { binary }
+    }
     pub fn discover() -> Result<Self, FabricError> {
         let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
         let binary = crate::discover_executable("codex", &path).ok_or_else(|| {
