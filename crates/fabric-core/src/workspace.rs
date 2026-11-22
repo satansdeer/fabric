@@ -83,6 +83,7 @@ pub fn create_workspace(
         finished_at: None,
         error_kind: None,
         artifact_manifest_id: None,
+        capture: None,
     };
     let workspace = Workspace {
         workspace_id: request.workspace_id.clone(),

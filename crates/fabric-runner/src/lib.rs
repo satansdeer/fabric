@@ -1,14 +1,18 @@
-//! Literal-argv local harness execution with bounded JSONL decoding.
-//! Total log caps and cancellation are later stories.
+//! Literal-argv local harness execution with bounded, checksummed capture.
 
 use std::ffi::OsString;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
+use capture::Capture;
 use fabric_domain::{ErrorKind, FabricError};
+
+pub struct Execution {
+    pub status: ExitStatus,
+    pub capture: std::io::Result<fabric_domain::CaptureMetadata>,
+}
 
 pub struct HarnessInfo {
     pub version: String,
@@ -73,10 +77,9 @@ impl HarnessAdapter for FakeHarness {
 pub fn execute(
     spec: &CommandSpec,
     cwd: &Path,
-    stdout: File,
-    stderr: File,
+    capture: Capture,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
-) -> Result<ExitStatus, FabricError> {
+) -> Result<Execution, FabricError> {
     let child = Command::new(&spec.program)
         .args(&spec.args)
         .current_dir(cwd)
@@ -85,8 +88,8 @@ pub fn execute(
         .env("LC_ALL", "C")
         .envs(spec.environment.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .map_err(|error| {
@@ -96,8 +99,28 @@ pub fn execute(
             ))
         })?;
     let mut group = ProcessGroup { child };
-    started(group.child.id())?;
-    group.child.wait().map_err(execution_error)
+    let stdout = group.child.stdout.take().expect("piped stdout");
+    let stderr = group.child.stderr.take().expect("piped stderr");
+    let (status, events) = std::thread::scope(|scope| {
+        let out = scope.spawn(|| capture.stdout(stdout));
+        let err = scope.spawn(|| capture.stderr(stderr));
+        let status =
+            started(group.child.id()).and_then(|()| group.child.wait().map_err(execution_error));
+        // Kill descendants BEFORE joining readers: a background child may hold
+        // inherited pipe descriptors open after the leader has exited.
+        drop(group);
+        let events = out
+            .join()
+            .map_err(|_| execution_error("Stdout capture panicked."))?;
+        let stderr = err
+            .join()
+            .map_err(|_| execution_error("Stderr capture panicked."))?;
+        Ok::<_, FabricError>((status?, events.and_then(|events| stderr.map(|()| events))))
+    })?;
+    Ok(Execution {
+        status,
+        capture: events.and_then(|events| capture.finish(events)),
+    })
 }
 
 struct ProcessGroup {
@@ -125,23 +148,27 @@ fn probe_version(
     binary: &Path,
     environment: Vec<(OsString, OsString)>,
 ) -> Result<String, FabricError> {
-    // Regular files avoid undrained pipes; retained bytes are capped in FAB-12.
+    // Version probes use the same concurrent bounded draining path as runs.
     let mut output = tempfile::tempfile().map_err(execution_error)?;
-    let status = execute(
+    let capture = Capture::new(
+        output.try_clone().map_err(execution_error)?,
+        tempfile::tempfile().map_err(execution_error)?,
+        None,
+        4096 + capture::TRUNCATION_MARKER.len() as u64,
+    )
+    .map_err(execution_error)?;
+    let result = execute(
         &CommandSpec {
             program: binary.to_owned(),
             args: vec!["--version".into()],
             environment,
         },
         Path::new("/"),
-        output.try_clone().map_err(execution_error)?,
-        File::options()
-            .write(true)
-            .open("/dev/null")
-            .map_err(execution_error)?,
+        capture,
         |_| Ok(()),
     )?;
-    if !status.success() || output.metadata().map_err(execution_error)?.len() > 4096 {
+    let metadata = result.capture.map_err(execution_error)?;
+    if !result.status.success() || metadata.truncated || metadata.stdout_bytes_seen > 4096 {
         return Err(execution_error(
             "Harness version probe failed or exceeded 4 KiB.",
         ));
@@ -172,6 +199,7 @@ pub fn discover_executable(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf
     })
 }
 
+pub mod capture;
 pub mod jsonl;
 pub mod omp;
 pub use omp::OmpHarness;

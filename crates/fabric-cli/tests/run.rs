@@ -301,6 +301,28 @@ printf '\n{"type":"finished"}\n{"last":true}'
         assert_eq!(report["events"]["invalid"], 2);
         assert_eq!(report["events"]["oversized"], 1);
         let tree = Path::new(report["workspace_path"].as_str().unwrap());
+        let container = tree.parent().unwrap();
+        let records: Vec<serde_json::Value> = fs::read_to_string(container.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 6);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["line_number"], index + 1);
+        }
+        assert_eq!(records[0]["status"], "parsed");
+        assert_eq!(records[0]["value"]["value"], 42);
+        assert_eq!(records[1]["status"], "invalid");
+        assert_eq!(records[1]["line_bytes"], 8);
+        assert_eq!(records[2]["status"], "invalid");
+        assert_eq!(records[2]["line_bytes"], 1);
+        assert_eq!(records[3]["status"], "oversized");
+        assert_eq!(records[3]["line_bytes"], 262144);
+        assert!(records[3].get("value").is_none());
+        assert_eq!(records[4]["value"]["type"], "finished");
+        assert_eq!(records[5]["value"]["last"], true);
+        assert_eq!(report["capture"]["truncated"], false);
         assert_eq!(
             fs::read(tree.join("received.prompt")).unwrap(),
             prompt.as_bytes()
@@ -317,6 +339,10 @@ printf '\n{"type":"finished"}\n{"last":true}'
             .unwrap();
         assert_eq!(run.harness_version, Some("omp/19.1.0-fixture+exact".into()));
         assert_eq!(run.exit_code, Some(0));
+        assert_eq!(
+            serde_json::to_value(run.capture.unwrap()).unwrap(),
+            report["capture"]
+        );
         assert_eq!(
             fs::read_to_string(repo.join("tracked")).unwrap(),
             "original"
@@ -349,4 +375,86 @@ fn missing_omp_is_actionable_and_does_not_allocate_a_run() {
             .contains("OMP executable not found on PATH")
     );
     assert!(!fixture.0.join("storage/fork-staging").exists());
+}
+
+#[test]
+fn hundred_mib_concurrent_fake_output_has_one_durable_capture_budget() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    let binary = fixture.0.join("noisy-fake");
+    fs::write(
+        &binary,
+        r#"#!/bin/sh
+set -eu
+if [ "$1" = --version ]; then printf 'fabric-fake-harness 1\n'; exit 0; fi
+printf '{"type":"before","value":42}\nnot-json\n'
+head -c 52428800 /dev/zero >&2 &
+head -c 52428800 /dev/zero
+printf '\n{"type":"after"}\n'
+wait
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let prompt = fixture.0.join("noise.prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let report = json(
+        &fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(binary)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap(),
+    );
+    let container = Path::new(report["workspace_path"].as_str().unwrap())
+        .parent()
+        .unwrap();
+    let total: u64 = ["stdout.log", "stderr.log", "events.jsonl"]
+        .iter()
+        .filter_map(|name| fs::metadata(container.join(name)).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    assert!(total <= 10 * 1024 * 1024, "persisted {total} capture bytes");
+    let capture = &report["capture"];
+    assert_eq!(capture["limit_bytes"], 10 * 1024 * 1024);
+    assert_eq!(capture["persisted_bytes"], total);
+    assert_eq!(capture["truncated"], true);
+    assert!(capture["stdout_bytes_seen"].as_u64().unwrap() >= 50 * 1024 * 1024);
+    assert_eq!(capture["stderr_bytes_seen"], 50 * 1024 * 1024);
+    assert_eq!(report["events"]["parsed"], 2);
+    assert_eq!(report["events"]["invalid"], 1);
+    assert_eq!(report["events"]["oversized"], 1);
+    assert!(
+        fs::read(container.join("stdout.log"))
+            .unwrap()
+            .ends_with(b"\n[FABRIC CAPTURE TRUNCATED]\n")
+    );
+    for (field, name) in [
+        ("stdout", "stdout.log"),
+        ("stderr", "stderr.log"),
+        ("events", "events.jsonl"),
+    ] {
+        let bytes = fs::read(container.join(name)).unwrap();
+        assert_eq!(capture[field]["size_bytes"], bytes.len());
+        assert_eq!(
+            capture[field]["sha256"],
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+    }
+    // Open a separate connection after the foreground command has exited.
+    let reopened = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    let run = reopened
+        .run(&report["run_id"].as_str().unwrap().parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, fabric_domain::RunState::Succeeded);
+    assert_eq!(
+        serde_json::to_value(run.capture.unwrap()).unwrap(),
+        *capture
+    );
 }

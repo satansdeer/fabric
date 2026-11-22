@@ -246,6 +246,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -255,6 +256,7 @@ version = "0.1.0"
 dependencies = [
  "fabric-domain",
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

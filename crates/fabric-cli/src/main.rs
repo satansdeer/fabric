@@ -32,21 +32,28 @@ enum Commands {
         command: ProjectCommands,
     },
     /// Execute one harness worker in a private prepared-tree fork.
-    Run {
-        name: String,
-        #[arg(long, value_parser = ["fake", "omp"])]
-        harness: String,
-        #[arg(long)]
-        prompt_file: PathBuf,
-        /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
-        #[arg(long)]
-        fake_binary: Option<PathBuf>,
-        /// Explicit whole-tree allowance for ordinary-copy fallback (not a quota).
-        #[arg(long, default_value_t = 0)]
-        copy_limit_bytes: u64,
-        #[arg(long)]
-        json: bool,
-    },
+    Run(RunArgs),
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    name: String,
+    #[arg(long, value_parser = ["fake", "omp"])]
+    harness: String,
+    #[arg(long)]
+    prompt_file: PathBuf,
+    /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
+    #[arg(long)]
+    fake_binary: Option<PathBuf>,
+    /// Explicit whole-tree allowance for ordinary-copy fallback (not a quota).
+    #[arg(long, default_value_t = 0)]
+    copy_limit_bytes: u64,
+    /// Combined stdout/stderr/events limit, including the reserved truncation marker.
+    #[arg(long, default_value_t = fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
+        value_parser = clap::value_parser!(u64).range(fabric_runner::capture::TRUNCATION_MARKER.len() as u64..))]
+    max_log_bytes: u64,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -120,25 +127,7 @@ fn main() -> ExitCode {
     let (json, result) = match cli.command {
         Commands::Doctor { json } => (json, write_doctor(json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
-        Commands::Run {
-            name,
-            harness,
-            prompt_file,
-            fake_binary,
-            copy_limit_bytes,
-            json,
-        } => (
-            json,
-            write_run(
-                cli.root,
-                &name,
-                &prompt_file,
-                &harness,
-                fake_binary,
-                copy_limit_bytes,
-                json,
-            ),
-        ),
+        Commands::Run(args) => (args.json, write_run(cli.root, args)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -149,23 +138,31 @@ fn main() -> ExitCode {
     }
 }
 
-fn write_run(
-    root: Option<PathBuf>,
-    name: &str,
-    prompt_file: &std::path::Path,
-    harness_name: &str,
-    fake_binary: Option<PathBuf>,
-    copy_limit_bytes: u64,
-    json: bool,
-) -> Result<(), FabricError> {
+fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
+    let RunArgs {
+        name,
+        prompt_file,
+        harness: harness_name,
+        fake_binary,
+        copy_limit_bytes,
+        max_log_bytes,
+        json,
+    } = args;
     let root = match root {
         Some(root) => root,
         None => fabric_project::default_root()?,
     };
     let run = |harness: &dyn fabric_runner::HarnessAdapter| {
-        fabric_core::run::foreground(&root, name, prompt_file, harness, copy_limit_bytes)
+        fabric_core::run::foreground(
+            &root,
+            &name,
+            &prompt_file,
+            harness,
+            copy_limit_bytes,
+            max_log_bytes,
+        )
     };
-    let report = match harness_name {
+    let report = match harness_name.as_str() {
         "omp" => {
             if fake_binary.is_some() {
                 return Err(FabricError {

@@ -1,7 +1,7 @@
 //! Streaming JSONL decoding: one bounded line/event, never the whole output.
 use std::io::{self, BufRead};
 
-use serde::Serialize;
+pub use fabric_domain::EventCounts as Summary;
 use serde_json::Value;
 
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -13,18 +13,13 @@ pub enum Event {
     Oversized,
 }
 
-#[derive(Default, Serialize)]
-pub struct Summary {
-    pub parsed: u64,
-    pub invalid: u64,
-    pub oversized: u64,
-}
-
 /// Oversized lines are drained through the next newline before decoding resumes.
 /// serde_json's default recursion limit also bounds deeply nested event parsing.
 pub struct Events<R> {
     reader: R,
     line: Vec<u8>,
+    line_number: u64,
+    line_bytes: u64,
 }
 
 impl<R: BufRead> Events<R> {
@@ -32,7 +27,18 @@ impl<R: BufRead> Events<R> {
         Self {
             reader,
             line: Vec::with_capacity(MAX_LINE_BYTES),
+            line_number: 0,
+            line_bytes: 0,
         }
+    }
+
+    pub fn line_number(&self) -> u64 {
+        self.line_number
+    }
+
+    /// Raw line bytes, excluding LF but including a possible CR.
+    pub fn line_bytes(&self) -> u64 {
+        self.line_bytes
     }
 
     pub fn summarize(self) -> io::Result<Summary> {
@@ -53,6 +59,7 @@ impl<R: BufRead> Iterator for Events<R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.line.clear();
+        self.line_bytes = 0;
         let mut oversized = false;
         loop {
             let chunk = match self.reader.fill_buf() {
@@ -67,6 +74,7 @@ impl<R: BufRead> Iterator for Events<R> {
             }
             let newline = chunk.iter().position(|byte| *byte == b'\n');
             let length = newline.unwrap_or(chunk.len());
+            self.line_bytes += length as u64;
             if !oversized {
                 if length > MAX_LINE_BYTES - self.line.len() {
                     oversized = true;
@@ -80,6 +88,7 @@ impl<R: BufRead> Iterator for Events<R> {
                 break;
             }
         }
+        self.line_number += 1;
         Some(Ok(if oversized {
             Event::Oversized
         } else {

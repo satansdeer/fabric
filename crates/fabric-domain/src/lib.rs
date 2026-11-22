@@ -4,10 +4,12 @@ use std::fmt;
 
 use serde::Serialize;
 
+mod capture;
 mod ids;
 mod policy;
 mod state;
 
+pub use capture::{CaptureMetadata, CapturedFile, EventCounts};
 pub use ids::*;
 pub use policy::{RetentionMode, RetentionPolicy, StoragePolicy};
 pub use state::{PreparedStateStatus, RunState, WorkspaceState};

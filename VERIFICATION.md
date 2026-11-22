@@ -85,3 +85,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independently ran both OMP CLI regressions: passed, including offline JSONL/argv fixture and missing-executable refusal before allocation. Initial nonexistent `omp` test-target selection was corrected to the existing `run` target.
 - Implementer final gates passed (73 tests), after disclosed test-only startup-budget and unique-fixture corrections.
 - Real OMP help/version only; paid model smoke AT-15 remains unverified.
+
+## FAB-12
+
+- Reviewed shared capture budget, reserved truncation marker, concurrent stream draining, bounded event serialization and streamed checksums.
+- Independently ran all five CLI worker tests: passed. The 100 MiB concurrent-output regression verifies combined persisted logs/events stay within 10 MiB and reopened metadata/checksums.
+- Implementer fmt/clippy/workspace gates passed (79 tests). Output limits do not claim workspace quotas or artifact completion.

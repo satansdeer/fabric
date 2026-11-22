@@ -3,8 +3,8 @@
 use std::{fmt, fs::OpenOptions, path::Path, str::FromStr, time::Duration};
 
 use fabric_domain::{
-    ArtifactManifestId, BatchId, FabricError, PreparedStateId, PreparedStateStatus, ProjectId,
-    RunId, RunState, WorkspaceId, WorkspaceState,
+    ArtifactManifestId, BatchId, CaptureMetadata, FabricError, PreparedStateId,
+    PreparedStateStatus, ProjectId, RunId, RunState, WorkspaceId, WorkspaceState,
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
@@ -95,6 +95,7 @@ pub struct Run {
     pub finished_at: Option<i64>,
     pub error_kind: Option<String>,
     pub artifact_manifest_id: Option<ArtifactManifestId>,
+    pub capture: Option<CaptureMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,12 +156,13 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
-            0 => {
-                transaction.execute_batch(include_str!("schema.sql"))?;
-                transaction.pragma_update(None, "user_version", 1)?;
-            }
-            1 => {}
+            0 => transaction.execute_batch(include_str!("schema.sql"))?,
+            1 | 2 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
+        }
+        if version < 2 {
+            transaction.execute_batch("ALTER TABLE runs ADD COLUMN capture_metadata TEXT;")?;
+            transaction.pragma_update(None, "user_version", 2)?;
         }
         transaction.commit()?;
         Ok(Self { connection })
@@ -306,17 +308,19 @@ impl Store {
         Ok(())
     }
 
-    /// No artifact capture exists yet: every completed workspace is retained,
-    /// with no manifest or cleanup eligibility invented.
-    pub fn finish_run(&mut self, id: &RunId, now: i64) -> Result<()> {
+    /// Publish synced capture metadata atomically with terminal completion.
+    /// No source manifest or cleanup eligibility is invented.
+    pub fn finish_run(&mut self, id: &RunId, capture: &CaptureMetadata, now: i64) -> Result<()> {
+        let encoded = serde_json::to_string(capture)
+            .map_err(|_| StoreError::InvalidRecord("Cannot encode capture metadata"))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count = transaction.execute(
             "UPDATE runs SET state = CASE WHEN exit_code = 0 THEN 'SUCCEEDED' ELSE 'FAILED' END,
-             updated_at = ?1, finished_at = ?1 WHERE run_id = ?2 AND state = 'FINALIZING'
-             AND ?1 >= updated_at",
-            params![now, id.as_str()],
+             updated_at = ?1, finished_at = ?1, capture_metadata = ?3
+             WHERE run_id = ?2 AND state = 'FINALIZING' AND ?1 >= updated_at",
+            params![now, id.as_str(), encoded],
         )?;
         if count != 1 {
             return Err(StoreError::Conflict);
@@ -415,9 +419,12 @@ impl Store {
     /// Both rows commit together, including deferred, reciprocal ownership constraints.
     /// No filesystem operation is performed or authorized by this method.
     pub fn create_run_workspace(&mut self, run: &Run, workspace: &Workspace) -> Result<()> {
-        if run.state != RunState::Queued || workspace.state != WorkspaceState::Active {
+        if run.state != RunState::Queued
+            || workspace.state != WorkspaceState::Active
+            || run.capture.is_some()
+        {
             return Err(StoreError::InvalidRecord(
-                "new run/workspace must be QUEUED/ACTIVE",
+                "new run/workspace must be QUEUED/ACTIVE without capture metadata",
             ));
         }
         let transaction = self
@@ -458,7 +465,8 @@ impl Store {
             .query_row(
                 "SELECT run_id, batch_id, project_id, prepared_state_id, base_commit_sha, harness,
              harness_version, prompt_digest, state, workspace_id, pid_metadata, exit_code,
-             created_at, updated_at, started_at, finished_at, error_kind, artifact_manifest_id
+             created_at, updated_at, started_at, finished_at, error_kind, artifact_manifest_id,
+             capture_metadata
              FROM runs WHERE run_id = ?1",
                 [id.as_str()],
                 |r| {
@@ -481,6 +489,13 @@ impl Store {
                         finished_at: r.get(15)?,
                         error_kind: r.get(16)?,
                         artifact_manifest_id: read_optional_id(r, 17)?,
+                        capture: r
+                            .get::<_, Option<String>>(18)?
+                            .map(|value| {
+                                serde_json::from_str(&value)
+                                    .map_err(|error| conversion_error(18, error))
+                            })
+                            .transpose()?,
                     })
                 },
             )

@@ -555,7 +555,8 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
             "fixture",
             &prompt,
             &harness,
-            fixture.state.size_bytes
+            fixture.state.size_bytes,
+            fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
         )
         .is_err()
     );
@@ -607,11 +608,29 @@ fn process_lifecycle_is_durable_before_each_following_phase() {
     assert_eq!(finalizing.state, RunState::Finalizing);
     assert_eq!(finalizing.exit_code, Some(7));
     assert_eq!(finalizing.finished_at, None);
-    store.finish_run(&request.run_id, time + 2).unwrap();
+    let empty = fabric_domain::CapturedFile {
+        size_bytes: 0,
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    };
+    let capture = fabric_domain::CaptureMetadata {
+        limit_bytes: fabric_domain::StoragePolicy::default().max_log_bytes_per_run,
+        persisted_bytes: 0,
+        truncated: false,
+        stdout_bytes_seen: 0,
+        stderr_bytes_seen: 0,
+        stdout: empty.clone(),
+        stderr: empty.clone(),
+        events: empty,
+        event_counts: fabric_domain::EventCounts::default(),
+    };
+    store
+        .finish_run(&request.run_id, &capture, time + 2)
+        .unwrap();
     let done = fixture.store().run(&request.run_id).unwrap().unwrap();
     assert_eq!(done.state, RunState::Failed);
     assert_eq!(done.finished_at, Some(time + 2));
     assert_eq!(done.error_kind.as_deref(), Some("harness_exit"));
+    assert_eq!(done.capture, Some(capture));
     assert!(
         store
             .observe_run_exit(&request.run_id, Some(0), time + 3)

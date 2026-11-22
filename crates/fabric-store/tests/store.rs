@@ -53,6 +53,7 @@ fn pair(index: usize) -> (Run, Workspace) {
         finished_at: None,
         error_kind: None,
         artifact_manifest_id: None,
+        capture: None,
     };
     let workspace = Workspace {
         workspace_id: run.workspace_id.clone(),
@@ -128,7 +129,7 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     let violations: i64 = connection
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -143,6 +144,32 @@ fn sqlite_store_opens_and_reopens_a_durable_database() {
             0o600
         );
     }
+}
+
+#[test]
+fn v1_database_upgrades_without_losing_existing_run_ownership() {
+    let (root, mut store) = fixture();
+    let path = root.path().join("fabric.sqlite3");
+    let (run, workspace) = pair(1);
+    store.create_run_workspace(&run, &workspace).unwrap();
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("ALTER TABLE runs DROP COLUMN capture_metadata; PRAGMA user_version=1;")
+        .unwrap();
+    drop(connection);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.run(&run.run_id).unwrap(), Some(run));
+    assert_eq!(
+        reopened.workspace(&workspace.workspace_id).unwrap(),
+        Some(workspace)
+    );
+    drop(reopened);
+    let connection = Connection::open(path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
 }
 
 #[test]

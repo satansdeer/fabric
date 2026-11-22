@@ -1,6 +1,6 @@
 //! One foreground worker; no batch scheduling, durable artifacts or cleanup.
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,7 @@ pub struct RunReport {
     pub finished_at: Option<i64>,
     pub workspace_path: String,
     pub events: fabric_runner::jsonl::Summary,
+    pub capture: fabric_domain::CaptureMetadata,
 }
 
 pub fn foreground(
@@ -40,7 +41,11 @@ pub fn foreground(
     prompt_file: &Path,
     harness: &(impl HarnessAdapter + ?Sized),
     copy_limit_bytes: u64,
+    max_log_bytes: u64,
 ) -> Result<RunReport, FabricError> {
+    if max_log_bytes < fabric_runner::capture::TRUNCATION_MARKER.len() as u64 {
+        return Err(error("Capture limit must fit the truncation marker."));
+    }
     // Snapshot the exact prompt once: digest and child input cannot disagree if
     // the caller changes its file after this point.
     let prompt = std::fs::read(prompt_file).map_err(error)?;
@@ -101,6 +106,10 @@ pub fn foreground(
         drop(input);
         let stdout = private_output(&container.join("stdout.log"))?;
         let stderr = private_output(&container.join("stderr.log"))?;
+        let events = private_output(&container.join("events.jsonl"))?;
+        let capture =
+            fabric_runner::capture::Capture::new(stdout, stderr, Some(events), max_log_bytes)
+                .map_err(error)?;
         File::open(container)
             .and_then(|file| file.sync_all())
             .map_err(error)?;
@@ -109,24 +118,20 @@ pub fn foreground(
         })?;
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
-        let status = fabric_runner::execute(&command, fresh.path(), stdout, stderr, |pid| {
+        let result = fabric_runner::execute(&command, fresh.path(), capture, |pid| {
             store
                 .start_run(&run_id, &info.version, pid, now()?)
                 .map_err(error)
         })?;
         store
-            .observe_run_exit(&run_id, status.code(), now()?)
+            .observe_run_exit(&run_id, result.status.code(), now()?)
             .map_err(error)?;
-        let events = fabric_runner::jsonl::Events::new(BufReader::new(
-            File::open(container.join("stdout.log")).map_err(error)?,
-        ))
-        .summarize()
-        .map_err(error)?;
-        store.finish_run(&run_id, now()?).map_err(error)?;
-        Ok::<_, FabricError>(events)
+        let capture = result.capture.map_err(error)?;
+        store.finish_run(&run_id, &capture, now()?).map_err(error)?;
+        Ok::<_, FabricError>(capture)
     })();
-    let events = match execution {
-        Ok(events) => events,
+    let capture = match execution {
+        Ok(capture) => capture,
         Err(failure) => {
             store
                 .fail_run_execution(&run_id, &info.version, &failure.message, now()?)
@@ -156,7 +161,8 @@ pub fn foreground(
         harness_version: run.harness_version,
         state: run.state,
         exit_code: run.exit_code,
-        events,
+        events: capture.event_counts.clone(),
+        capture,
         created_at: run.created_at,
         started_at: run.started_at,
         finished_at: run.finished_at,
