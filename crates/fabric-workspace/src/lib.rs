@@ -39,6 +39,13 @@ pub trait WorkspaceBackend: Send + Sync {
     ) -> Result<PreparedFork, FabricError>;
 }
 
+/// The sole local fork layout, shared with durable ownership orchestration.
+pub fn fork_path(root: &Path, fork_id: &WorkspaceId) -> PathBuf {
+    root.join("fork-staging")
+        .join(fork_id.as_str())
+        .join("tree")
+}
+
 pub struct LocalWorkspaceBackend {
     root: PathBuf,
     strategy: ForkStrategy,
@@ -195,14 +202,14 @@ impl WorkspaceBackend for LocalWorkspaceBackend {
         private_directory(&container)?;
         // No .fabric-owner: an unregistered staging fork is never GC authority.
         let mut fork = PreparedFork {
-            path: container.join("tree"),
+            path: fork_path(&self.root, fork_id),
             size_bytes: 0,
             cloned_files: 0,
             copied_files: 0,
         };
         self.fork_tree(
             Path::new(&state.prepared_path),
-            &container.join("tree"),
+            &fork_path(&self.root, fork_id),
             copy_admitted,
             &mut fork,
         )?;

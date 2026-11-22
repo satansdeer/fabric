@@ -1,9 +1,11 @@
-//! Read-only local diagnostics. Discovery never executes the discovered tools.
+//! Local diagnostics and durable workspace ownership orchestration.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+pub mod workspace;
 
 #[derive(Debug, Serialize)]
 pub struct PlatformReport {

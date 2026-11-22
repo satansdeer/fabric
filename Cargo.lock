@@ -203,7 +203,14 @@ dependencies = [
 name = "fabric-core"
 version = "0.1.0"
 dependencies = [
+ "fabric-domain",
+ "fabric-project",
+ "fabric-store",
+ "fabric-workspace",
+ "libc",
+ "rusqlite",
  "serde",
+ "tempfile",
 ]
 
 [[package]]

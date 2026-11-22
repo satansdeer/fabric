@@ -393,6 +393,58 @@ impl Store {
             .optional()?)
     }
 
+    /// Finish the ownership-only fork phase. Failure preserves both rows and
+    /// the reservation lease; neither outcome grants permission to delete.
+    pub fn finish_workspace_fork(
+        &mut self,
+        id: &RunId,
+        outcome: std::result::Result<u64, &str>,
+        updated_at: i64,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (run, workspace): (RunState, WorkspaceState) = transaction
+            .query_row(
+                "SELECT r.state, w.state FROM runs r JOIN workspaces w
+                 ON w.workspace_id = r.workspace_id WHERE r.run_id = ?1",
+                [id.as_str()],
+                |r| Ok((read_state(r, 0)?, read_state(r, 1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        if (run, workspace) != (RunState::Preparing, WorkspaceState::Active) {
+            return Err(StoreError::Conflict);
+        }
+        match outcome {
+            Ok(bytes) => {
+                transaction.execute(
+                    "UPDATE workspaces SET usage_bytes = ?1, retention_reason = NULL
+                     WHERE run_id = ?2",
+                    params![bytes, id.as_str()],
+                )?;
+            }
+            Err(reason) => {
+                let mut next = run;
+                next.transition(RunState::NeedsAttention)?;
+                let mut next = workspace;
+                next.transition(WorkspaceState::RecoveryRequired)?;
+                transaction.execute(
+                    "UPDATE runs SET state = 'NEEDS_ATTENTION', updated_at = ?1,
+                     finished_at = ?1, error_kind = 'workspace_fork' WHERE run_id = ?2",
+                    params![updated_at, id.as_str()],
+                )?;
+                transaction.execute(
+                    "UPDATE workspaces SET state = 'RECOVERY_REQUIRED', retention_reason = ?1
+                     WHERE run_id = ?2",
+                    params![reason, id.as_str()],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Atomic compare-and-set. Exact state replay is a no-op; stale competing intent fails.
     /// Workspace lifecycle changes never grant cleanup authorization.
     pub fn transition_run_workspace(

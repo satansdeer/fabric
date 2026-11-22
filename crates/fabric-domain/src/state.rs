@@ -4,6 +4,8 @@ use crate::{ErrorKind, FabricError};
 
 /// Repeating the current state is an idempotent no-op, including terminal states.
 /// These pure transitions do not replace transactional persistence or capture checks.
+/// A failed workspace fork can enter NEEDS_ATTENTION directly from PREPARING;
+/// it must not fabricate RUNNING/FINALIZING for a process that never started.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RunState {
@@ -31,7 +33,7 @@ impl RunState {
             || matches!(
                 (*self, next),
                 (Queued, Preparing)
-                    | (Preparing, Running)
+                    | (Preparing, Running | NeedsAttention)
                     | (Running, Finalizing)
                     | (Finalizing, Succeeded | Failed | Cancelled | NeedsAttention)
             )

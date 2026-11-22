@@ -6,3 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
+fabric-domain.workspace = true
+fabric-project = { path = "../fabric-project" }
+fabric-store = { path = "../fabric-store" }
+fabric-workspace = { path = "../fabric-workspace" }
+libc = "0.2"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"

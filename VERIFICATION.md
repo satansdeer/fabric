@@ -64,3 +64,10 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independently ran workspace tests: six passed, including forced-copy dependencies/symlinks, distinct inodes and base/sibling isolation.
 - Fork staging has no cleanup authority; run ownership is the next story.
 - Implementer final fmt/clippy/workspace gates passed (55 tests).
+
+## FAB-09
+
+- Reviewed durable ownership-before-backend ordering, marker binding, fresh runner validation and retained failure handling.
+- Independently ran eight core ownership/isolation tests: all passed.
+- Safety clarification: a fork that never starts a process may transition PREPARING directly to NEEDS_ATTENTION, rather than falsely recording RUNNING. Normal execution retains the specified lifecycle.
+- Implementer final fmt/clippy/workspace gates passed (63 tests).
