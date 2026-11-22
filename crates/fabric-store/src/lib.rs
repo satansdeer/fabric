@@ -11,7 +11,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 mod queue;
 use queue::insert_task_source;
-pub use queue::{AsyncBatch, AsyncEvent, AsyncLogIdentity, AsyncTask, AsyncTaskStatus, NewAsyncTask};
+pub use queue::{
+    AsyncBatch, AsyncEvent, AsyncLogIdentity, AsyncTask, AsyncTaskStatus, NewAsyncTask,
+};
 
 #[derive(Debug)]
 pub enum StoreError {

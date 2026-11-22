@@ -48,10 +48,7 @@ pub type AsyncLogIdentity = (ProjectId, BatchId, RunState, String, i64, i64);
 
 impl Store {
     /// Content-free identity for observers; never loads prompts, plans or results.
-    pub fn async_log_identity(
-        &self,
-        run: &RunId,
-    ) -> Result<Option<AsyncLogIdentity>> {
+    pub fn async_log_identity(&self, run: &RunId) -> Result<Option<AsyncLogIdentity>> {
         Ok(self
             .connection
             .query_row(
