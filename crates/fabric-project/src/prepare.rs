@@ -118,34 +118,7 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
                 "Cached preparation path or provenance does not match the requested managed state.",
             ));
         }
-        validate_container(&container, &state.state_id)?;
-        if fs::symlink_metadata(&container)
-            .map_err(storage_error)?
-            .mode()
-            & 0o200
-            != 0
-            || fs::symlink_metadata(container.join(".fabric-owner"))
-                .map_err(storage_error)?
-                .mode()
-                & 0o200
-                != 0
-        {
-            return Err(storage_error(
-                "Cached READY ownership must remain read-only.",
-            ));
-        }
-        private_git(&tree)?;
-        if verify_tree(&tree, &tree, deadline, false)? != state.size_bytes {
-            return Err(storage_error(
-                "Cached READY tree size does not match its record.",
-            ));
-        }
-        let head = git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
-        if git_text(&head)? != state.source_commit_sha {
-            return Err(source_error(
-                "Cached READY HEAD does not match its recorded source.",
-            ));
-        }
+        verify_ready(&root, &state, deadline)?;
         return Ok(state);
     }
     let now = SystemTime::now()
@@ -298,6 +271,92 @@ pub fn prepare(root: &Path, name: &str, recipe_path: &Path) -> Result<PreparedSt
             )))
         }
     }
+}
+
+/// Revalidate a persisted READY base without changing its tree or metadata.
+/// This is a fork prerequisite, not workspace ownership or deletion authority.
+pub fn validate_ready(root: &Path, state: &PreparedState) -> Result<(), FabricError> {
+    private_directory(root)?;
+    let root = root.canonicalize().map_err(storage_error)?;
+    let database = fs::symlink_metadata(root.join("fabric.db")).map_err(storage_error)?;
+    // SAFETY: geteuid has no preconditions.
+    if !database.is_file()
+        || database.uid() != unsafe { libc::geteuid() }
+        || database.nlink() != 1
+        || database.mode() & 0o077 != 0
+    {
+        return Err(storage_error(
+            "READY validation requires a private existing database.",
+        ));
+    }
+    let store = open_store(&root, false)?;
+    if store
+        .prepared_state(&state.state_id)
+        .map_err(storage_error)?
+        .as_ref()
+        != Some(state)
+    {
+        return Err(storage_error(
+            "Prepared state does not match its persisted record.",
+        ));
+    }
+    verify_ready(&root, state, Instant::now() + Duration::from_secs(1200))
+}
+
+fn verify_ready(root: &Path, state: &PreparedState, deadline: Instant) -> Result<(), FabricError> {
+    if state.status != PreparedStateStatus::Ready || state.verified_at.is_none() {
+        return Err(storage_error(
+            "Forking requires a verified READY prepared state.",
+        ));
+    }
+    if state.preparation_key.len() != 64
+        || !state
+            .preparation_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(storage_error(
+            "READY preparation key is not a safe fingerprint.",
+        ));
+    }
+    let prepared = root.join("prepared");
+    private_directory(&prepared)?;
+    let container = prepared.join(format!("{}-{}", state.project_id, state.preparation_key));
+    let tree = container.join("tree");
+    if Path::new(&state.prepared_path) != tree {
+        return Err(storage_error(
+            "READY path does not match its managed preparation.",
+        ));
+    }
+    validate_container(&container, &state.state_id)?;
+    if fs::symlink_metadata(&container)
+        .map_err(storage_error)?
+        .mode()
+        & 0o200
+        != 0
+        || fs::symlink_metadata(container.join(".fabric-owner"))
+            .map_err(storage_error)?
+            .mode()
+            & 0o200
+            != 0
+    {
+        return Err(storage_error(
+            "Cached READY ownership must remain read-only.",
+        ));
+    }
+    if verify_tree(&tree, &tree, deadline, false)? != state.size_bytes {
+        return Err(storage_error(
+            "Cached READY tree size does not match its record.",
+        ));
+    }
+    private_git(&tree)?;
+    let head = git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
+    if git_text(&head)? != state.source_commit_sha {
+        return Err(source_error(
+            "Cached READY HEAD does not match its recorded source.",
+        ));
+    }
+    Ok(())
 }
 
 fn preparation_lock(root: &Path, key: &str, deadline: Instant) -> Result<File, FabricError> {

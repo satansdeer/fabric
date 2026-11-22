@@ -243,6 +243,12 @@ dependencies = [
 [[package]]
 name = "fabric-workspace"
 version = "0.1.0"
+dependencies = [
+ "fabric-domain",
+ "fabric-project",
+ "fabric-store",
+ "libc",
+]
 
 [[package]]
 name = "fallible-iterator"

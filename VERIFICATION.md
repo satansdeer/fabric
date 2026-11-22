@@ -57,3 +57,10 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Actual CLI repeated the operator fixture preparation and returned the original state ID unchanged.
 - Operator decision: uncertain FAILED keys retain evidence and refuse same-key retry; changing fingerprint inputs permits a new attempt.
 - Implementer final fmt/clippy/workspace gates passed (49 tests).
+
+## FAB-08
+
+- Reviewed full-tree copying, macOS `fclonefileat`, no-follow source checks, whole-tree copy admission and independent writable fork permissions.
+- Independently ran workspace tests: six passed, including forced-copy dependencies/symlinks, distinct inodes and base/sibling isolation.
+- Fork staging has no cleanup authority; run ownership is the next story.
+- Implementer final fmt/clippy/workspace gates passed (55 tests).
