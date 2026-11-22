@@ -1,6 +1,8 @@
 //! Local-only Git source registration. The persisted default_ref is an exact commit,
 //! never a moving branch; preparation must use that pin, not the current checkout.
 
+pub mod recipe;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

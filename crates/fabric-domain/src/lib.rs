@@ -20,6 +20,7 @@ pub enum ErrorKind {
     InvalidId,
     InvalidTransition,
     InvalidPolicy,
+    InvalidRecipe,
     Source,
     Storage,
     NotFound,

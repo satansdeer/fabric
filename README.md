@@ -2,9 +2,9 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-04
+## Implemented: FAB-01 through FAB-05
 
-The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence and pinned local Git project registration: validated typed IDs, idempotent lifecycle transitions with typed errors, immutable READY prepared states, validated storage/retention policies, and atomic durable run/workspace ownership. Project preparation, execution and cleanup commands are not implemented yet.
+The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, and validated preparation recipes/fingerprints: validated typed IDs, idempotent lifecycle transitions with typed errors, immutable READY prepared states, validated storage/retention policies, and atomic durable run/workspace ownership. Project preparation execution and cleanup commands are not implemented yet.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 
@@ -42,7 +42,28 @@ Registration accepts a working tree or its subdirectory, including detached HEAD
 
 Tracked, staged or non-ignored untracked edits produce a stderr warning: only committed HEAD is pinned; uncommitted changes are not imported. Ignored files are not imported either. Registration copies no source files, changes no checkout/index, runs no recipe and makes no network request. Git uses argument vectors with inherited Git/config/credential environment removed, fsmonitor disabled, optional index writes disabled and lazy fetching disabled. Source paths must be valid UTF-8 for SQLite storage. Missing/non-Git/bare paths and unborn HEAD fail with actionable errors. `--json` works for add/status and structured failures (`source`, `storage`, `not_found`); successful dirty add still emits its warning on stderr.
 
-Keep the source repository and pinned commit available for later preparation: registration records identity only, not a durable source snapshot. It does not protect unreachable commits from external Git garbage collection. Recipe/preparation behavior is not implemented in this story.
+Keep the source repository and pinned commit available for later preparation: registration records identity only, not a durable source snapshot. It does not protect unreachable commits from external Git garbage collection.
+
+### Preparation recipe contract (library only)
+
+`fabric_project::recipe::Recipe::parse` accepts trusted version-1 TOML. It performs no I/O and starts no command; `project prepare` is not implemented yet.
+
+```toml
+version = 1
+environment = ["TOOLCHAIN", "BUILD_TOKEN"] # optional fingerprint inputs; names only
+[[steps]]
+argv = ["sh", "-c", "printf ready > .prepared-marker"]
+[limits]
+max_duration_seconds = 1200
+```
+
+At least one step and a nonblank executable are required. Arguments remain separate and literal (including empty arguments); NUL bytes are rejected. Shell syntax works only when a recipe explicitly invokes a shell. Unknown fields at every level, unsupported versions, wrong shapes/types, duplicate/invalid environment names and nonpositive/out-of-range duration values fail with `invalid_recipe` before any execution. Environment names use `[A-Za-z_][A-Za-z0-9_]*`. Omitted environment defaults to empty; omitted limits or duration defaults to 1200 seconds.
+
+`Recipe::fingerprint(full_commit_sha, &environment_snapshot)` uses only explicitly declared names from the caller-supplied UTF-8 string map, never the ambient environment. Unset differs from an empty value. Both 40- and 64-digit Git SHAs are accepted and normalized to lowercase. Undeclared environment changes do not invalidate the key; changing commit, argv (including boundaries/order), limits, declared names or their values does. Comments, TOML key order, declaration order and explicitly supplied defaults do not change semantic identity.
+
+Fingerprint format 1 hashes compact UTF-8 JSON directly into SHA-256, prefixed by a domain string and NUL: recipe domain `fabric.recipe.v1` serializes fields in order `version`, `steps` (each `argv`), `limits` (`max_duration_seconds`), `environment` (sorted names); environment domain `fabric.environment.v1` serializes the sorted selected name-to-value/null map; preparation domain `fabric.preparation.v1` serializes `[format_version, lowercase_commit_sha, recipe_digest, environment_digest]`. Digests are lowercase hexadecimal. A layout/encoding change requires a format-version bump.
+
+Only commit, format version and digests are returned as persistable/displayable fingerprint metadata; raw environment values are streamed to the hasher without a serialized buffer. Parser errors omit TOML source excerpts. Do not place secrets in recipe argv or literal recipe content; recipes remain trusted code, not a secret store. External dependencies outside declared inputs are not automatically invalidated. This story does not capture environment values into the database, launch preparation, or implement cache reuse.
 
 `fabric-domain` uses opaque caller-supplied IDs (1–128 ASCII letters, digits, `_` or `-`); it does not generate IDs or perform filesystem operations. State wire names follow the specification. Run transitions follow its queued/preparing/running/finalizing graph; terminal states cannot be rewritten. Repeating a state is a no-op. Workspace transitions never authorize deletion: the future storage/cleanup layers must still verify ownership, leases and durable recovery artifacts.
 
@@ -61,6 +82,7 @@ cargo test --locked -p fabric-domain --test domain
 cargo test --locked -p fabric-cli --test doctor
 cargo test --locked -p fabric-store --test store
 cargo test --locked -p fabric-cli --test project
+cargo test --locked -p fabric-project --test recipe
 cargo fmt --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace

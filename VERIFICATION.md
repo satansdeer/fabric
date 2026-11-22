@@ -35,3 +35,9 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independently ran seven project CLI tests: all passed.
 - Actual CLI registered the independently prepared dirty fixture, warned without importing edits, and returned the committed SHA `ed5d65262395a2dc5f95c457ca223c62956c2295` in add/status JSON.
 - Implementer supplied RED evidence and passing fmt/clippy/workspace checks (30 tests).
+
+## FAB-05
+
+- Reviewed strict recipe validation and streaming domain-separated SHA-256 identity; selected environment values are not returned as metadata.
+- Independently ran all four recipe tests: passed (canonical ordering/defaults, invalidation, argv boundaries and invalid-input rejection).
+- Implementer supplied RED evidence and passing fmt/clippy/workspace checks (34 tests).
