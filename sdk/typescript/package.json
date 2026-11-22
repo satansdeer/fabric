@@ -1,0 +1,13 @@
+{
+  "name": "@fabric/plugin-sdk",
+  "version": "0.1.0",
+  "description": "Typed protocol v1 adapters and provider-free local tooling for Fabric plugins",
+  "type": "module",
+  "engines": { "node": ">=22.18.0" },
+  "exports": { ".": { "types": "./index.d.mts", "default": "./index.mjs" } },
+  "bin": { "fabric-plugin": "./cli.mjs" },
+  "files": ["*.mjs", "*.d.mts", "samples", "README.md"],
+  "scripts": { "test": "tsc --project test/tsconfig.json && node --test test/*.test.mjs" },
+  "devDependencies": { "typescript": "5.9.3" },
+  "license": "UNLICENSED"
+}
