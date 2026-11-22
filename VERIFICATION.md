@@ -71,3 +71,10 @@ Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.9
 - Independently ran eight core ownership/isolation tests: all passed.
 - Safety clarification: a fork that never starts a process may transition PREPARING directly to NEEDS_ATTENTION, rather than falsely recording RUNNING. Normal execution retains the specified lifecycle.
 - Implementer final fmt/clippy/workspace gates passed (63 tests).
+
+## FAB-10
+
+- Reviewed foreground prompt snapshot/provenance, current committed-HEAD selection, launch ordering and retained failures.
+- Independently ran both CLI worker regression tests: passed, including nonzero exit and unprepared-HEAD refusal.
+- Actual operator fixture CLI launched external fake worker, read ignored `.deps/ready`, returned SUCCEEDED/exit 0 and exact committed SHA. Run: `r-1795309396406779000-25375-0`.
+- Implementer final fmt/clippy/workspace gates passed (67 tests). No cleanup eligibility or artifact claim yet.

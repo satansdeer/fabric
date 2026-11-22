@@ -252,6 +252,123 @@ impl Store {
             .optional()?)
     }
 
+    /// Latest verified preparation for the source's current committed HEAD.
+    pub fn ready_state_for_commit(
+        &self,
+        project_id: &ProjectId,
+        commit: &str,
+    ) -> Result<Option<PreparedState>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT state_id, project_id, preparation_key, source_commit_sha, recipe_digest,
+             harness_environment_digest, prepared_path, status, created_at, verified_at, size_bytes
+             FROM prepared_states WHERE project_id = ?1 AND source_commit_sha = ?2
+             AND status = 'READY' ORDER BY verified_at DESC, state_id DESC LIMIT 1",
+                params![project_id.as_str(), commit],
+                read_prepared_state,
+            )
+            .optional()?)
+    }
+
+    /// Called only after a child was actually spawned. A stale supervisor cannot
+    /// start the same run twice; PID metadata alone never authorizes signalling.
+    pub fn start_run(&self, id: &RunId, version: &str, pid: u32, now: i64) -> Result<()> {
+        let count = self.connection.execute(
+            "UPDATE runs SET state = 'RUNNING', harness_version = ?1, pid_metadata = ?2,
+             started_at = ?3, updated_at = ?3 WHERE run_id = ?4 AND state = 'PREPARING'
+             AND ?3 >= updated_at AND EXISTS (SELECT 1 FROM workspaces w
+             WHERE w.run_id = runs.run_id AND w.state = 'ACTIVE' AND w.retention_reason IS NULL)",
+            params![
+                version,
+                format!("local-process-group:{pid}"),
+                now,
+                id.as_str()
+            ],
+        )?;
+        if count != 1 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    /// Persist the observed wait result before finalization. Signals have no exit code.
+    pub fn observe_run_exit(&self, id: &RunId, exit: Option<i32>, now: i64) -> Result<()> {
+        let count = self.connection.execute(
+            "UPDATE runs SET state = 'FINALIZING', exit_code = ?1, updated_at = ?2,
+             error_kind = CASE WHEN ?1 = 0 THEN NULL ELSE 'harness_exit' END
+             WHERE run_id = ?3 AND state = 'RUNNING' AND ?2 >= updated_at",
+            params![exit, now, id.as_str()],
+        )?;
+        if count != 1 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    /// No artifact capture exists yet: every completed workspace is retained,
+    /// with no manifest or cleanup eligibility invented.
+    pub fn finish_run(&mut self, id: &RunId, now: i64) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count = transaction.execute(
+            "UPDATE runs SET state = CASE WHEN exit_code = 0 THEN 'SUCCEEDED' ELSE 'FAILED' END,
+             updated_at = ?1, finished_at = ?1 WHERE run_id = ?2 AND state = 'FINALIZING'
+             AND ?1 >= updated_at",
+            params![now, id.as_str()],
+        )?;
+        if count != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let count = transaction.execute(
+            "UPDATE workspaces SET state = 'RETAINED', lease_expires_at = NULL,
+             retention_reason = 'Source capture not implemented; workspace and raw output retained'
+             WHERE run_id = ?1 AND state = 'ACTIVE'",
+            [id.as_str()],
+        )?;
+        if count != 1 {
+            return Err(StoreError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Setup/launch/supervision errors are uncertain, never invented process exits.
+    pub fn fail_run_execution(
+        &mut self,
+        id: &RunId,
+        version: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE runs SET state = 'FINALIZING', updated_at = ?1
+             WHERE run_id = ?2 AND state = 'RUNNING' AND ?1 >= updated_at",
+            params![now, id.as_str()],
+        )?;
+        let count = transaction.execute(
+            "UPDATE runs SET state = 'NEEDS_ATTENTION', harness_version = ?1,
+             updated_at = ?2, finished_at = ?2, error_kind = 'harness_execution'
+             WHERE run_id = ?3 AND state IN ('PREPARING', 'FINALIZING')
+             AND ?2 >= updated_at",
+            params![version, now, id.as_str()],
+        )?;
+        if count != 1 {
+            return Err(StoreError::Conflict);
+        }
+        transaction.execute(
+            "UPDATE workspaces SET state = 'RECOVERY_REQUIRED', retention_reason = ?1
+             WHERE run_id = ?2 AND state = 'ACTIVE'",
+            params![reason, id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Publishes completion exactly once; replay must have identical verification metadata.
     pub fn finish_preparation(
         &mut self,

@@ -506,3 +506,115 @@ fn automatic_backend_keeps_the_existing_apfs_or_admitted_copy_path() {
         b"ready"
     );
 }
+
+#[test]
+fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run() {
+    use fabric_runner::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo};
+    struct Tamper<'a> {
+        fixture: &'a Fixture,
+        id: std::cell::RefCell<Option<RunId>>,
+    }
+    impl HarnessAdapter for Tamper<'_> {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn probe(&self) -> Result<HarnessInfo, FabricError> {
+            Ok(HarnessInfo {
+                version: "tamper-test".into(),
+            })
+        }
+        fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
+            let marker = spec.prompt_file.parent().unwrap().join(".fabric-owner");
+            let text = fs::read_to_string(&marker).unwrap();
+            self.id
+                .replace(Some(text.lines().nth(2).unwrap().parse().unwrap()));
+            fs::remove_file(marker).unwrap();
+            Ok(CommandSpec {
+                program: "/usr/bin/touch".into(),
+                args: vec![
+                    self.fixture
+                        .temp
+                        .path()
+                        .join("MUST_NOT_RUN")
+                        .into_os_string(),
+                ],
+            })
+        }
+    }
+    let fixture = Fixture::new();
+    let harness = Tamper {
+        fixture: &fixture,
+        id: std::cell::RefCell::new(None),
+    };
+    let prompt = fixture.temp.path().join("prompt");
+    fs::write(&prompt, "literal prompt").unwrap();
+    assert!(
+        fabric_core::run::foreground(
+            &fixture.root,
+            "fixture",
+            &prompt,
+            &harness,
+            fixture.state.size_bytes
+        )
+        .is_err()
+    );
+    assert!(!fixture.temp.path().join("MUST_NOT_RUN").exists());
+    let store = fixture.store();
+    let run = store
+        .run(harness.id.borrow().as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::NeedsAttention);
+    assert_eq!(run.harness_version.as_deref(), Some("tamper-test"));
+    assert_eq!(run.exit_code, None);
+    assert_eq!(run.started_at, None);
+    assert_eq!(run.pid_metadata, None);
+    let workspace = store.workspace(&run.workspace_id).unwrap().unwrap();
+    assert_eq!(workspace.state, WorkspaceState::RecoveryRequired);
+    assert!(Path::new(&workspace.managed_path).exists());
+}
+
+#[test]
+fn process_lifecycle_is_durable_before_each_following_phase() {
+    let fixture = Fixture::new();
+    let request = fixture.request("lifecycle");
+    create_workspace(
+        &fixture.root,
+        &fixture.backend(),
+        &request,
+        fixture.state.size_bytes,
+    )
+    .unwrap();
+    let mut store = fixture.store();
+    let time = request.created_at;
+    store
+        .start_run(&request.run_id, "observed-version", 123, time)
+        .unwrap();
+    let running = fixture.store().run(&request.run_id).unwrap().unwrap();
+    assert_eq!(running.state, RunState::Running);
+    assert_eq!(running.started_at, Some(time));
+    assert_eq!(running.exit_code, None);
+    assert!(
+        store
+            .start_run(&request.run_id, "duplicate", 456, time)
+            .is_err()
+    );
+    store
+        .observe_run_exit(&request.run_id, Some(7), time + 1)
+        .unwrap();
+    let finalizing = fixture.store().run(&request.run_id).unwrap().unwrap();
+    assert_eq!(finalizing.state, RunState::Finalizing);
+    assert_eq!(finalizing.exit_code, Some(7));
+    assert_eq!(finalizing.finished_at, None);
+    store.finish_run(&request.run_id, time + 2).unwrap();
+    let done = fixture.store().run(&request.run_id).unwrap().unwrap();
+    assert_eq!(done.state, RunState::Failed);
+    assert_eq!(done.finished_at, Some(time + 2));
+    assert_eq!(done.error_kind.as_deref(), Some("harness_exit"));
+    assert!(
+        store
+            .observe_run_exit(&request.run_id, Some(0), time + 3)
+            .is_err()
+    );
+    assert_eq!(fixture.store().run(&request.run_id).unwrap().unwrap(), done);
+}

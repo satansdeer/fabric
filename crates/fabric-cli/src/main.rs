@@ -31,6 +31,22 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
+    /// Execute one fake harness worker in a private prepared-tree fork.
+    Run {
+        name: String,
+        #[arg(long, value_parser = ["fake"])]
+        harness: String,
+        #[arg(long)]
+        prompt_file: PathBuf,
+        /// Absolute fake executable; defaults to fabric-fake-harness beside fabric.
+        #[arg(long)]
+        fake_binary: Option<PathBuf>,
+        /// Explicit whole-tree allowance for ordinary-copy fallback (not a quota).
+        #[arg(long, default_value_t = 0)]
+        copy_limit_bytes: u64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,6 +120,24 @@ fn main() -> ExitCode {
     let (json, result) = match cli.command {
         Commands::Doctor { json } => (json, write_doctor(json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
+        Commands::Run {
+            name,
+            harness: _,
+            prompt_file,
+            fake_binary,
+            copy_limit_bytes,
+            json,
+        } => (
+            json,
+            write_run(
+                cli.root,
+                &name,
+                &prompt_file,
+                fake_binary,
+                copy_limit_bytes,
+                json,
+            ),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -112,6 +146,49 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn write_run(
+    root: Option<PathBuf>,
+    name: &str,
+    prompt_file: &std::path::Path,
+    fake_binary: Option<PathBuf>,
+    copy_limit_bytes: u64,
+    json: bool,
+) -> Result<(), FabricError> {
+    let root = match root {
+        Some(root) => root,
+        None => fabric_project::default_root()?,
+    };
+    let binary = match fake_binary {
+        Some(binary) => binary,
+        None => std::env::current_exe()
+            .map_err(output_error)?
+            .with_file_name("fabric-fake-harness"),
+    };
+    let harness = fabric_runner::FakeHarness::new(binary)?;
+    let report =
+        fabric_core::run::foreground(&root, name, prompt_file, &harness, copy_limit_bytes)?;
+    let mut stdout = io::stdout().lock();
+    if json {
+        serde_json::to_writer(&mut stdout, &report).map_err(output_error)?;
+        writeln!(stdout).map_err(output_error)?;
+    } else {
+        writeln!(
+            stdout,
+            "Run: {}\nState: {:?}\nExit: {:?}\nRetained workspace: {}",
+            report.run_id, report.state, report.exit_code, report.workspace_path
+        )
+        .map_err(output_error)?;
+    }
+    stdout.flush().map_err(output_error)?;
+    if report.state != fabric_domain::RunState::Succeeded {
+        return Err(output_error(format!(
+            "Run {} failed (exit {:?}); workspace retained.",
+            report.run_id, report.exit_code
+        )));
+    }
+    Ok(())
 }
 
 fn write_project(

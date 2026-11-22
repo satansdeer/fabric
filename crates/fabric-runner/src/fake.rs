@@ -1,0 +1,103 @@
+//! Deterministic external fixture protocol, not a mocked process result.
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Component, Path};
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Task {
+    #[serde(default)]
+    required_files: Vec<String>,
+    #[serde(default)]
+    writes: Vec<WriteFile>,
+    #[serde(default)]
+    events: Vec<serde_json::Value>,
+    #[serde(default)]
+    absent_environment: Vec<String>,
+    #[serde(default)]
+    exit_code: u8,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteFile {
+    path: String,
+    content: String,
+}
+
+pub fn main() -> u8 {
+    match run() {
+        Ok(exit) => exit,
+        Err(error) => {
+            eprintln!("fake harness: {error}");
+            2
+        }
+    }
+}
+
+fn run() -> Result<u8, Box<dyn std::error::Error>> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args == ["--version"] {
+        println!("fabric-fake-harness 1");
+        return Ok(0);
+    }
+    if args.len() != 2 || args[0] != "--prompt-file" {
+        return Err("expected --prompt-file PATH".into());
+    }
+    let task: Task = serde_json::from_slice(&fs::read(&args[1])?)?;
+    for name in &task.absent_environment {
+        if std::env::var_os(name).is_some() {
+            return Err("unexpected inherited environment".into());
+        }
+    }
+    for path in &task.required_files {
+        validate_path(Path::new(path))?;
+        fs::read(path)?;
+    }
+    let mut stdout = io::stdout().lock();
+    let mut event = |value: &serde_json::Value| -> io::Result<()> {
+        serde_json::to_writer(&mut stdout, value)?;
+        writeln!(stdout)?;
+        stdout.flush()
+    };
+    event(&serde_json::json!({"type":"started"}))?;
+    for write in &task.writes {
+        let path = Path::new(&write.path);
+        validate_path(path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &write.content)?;
+    }
+    for value in &task.events {
+        event(value)?;
+    }
+    event(&serde_json::json!({"type":"finished", "exit_code":task.exit_code}))?;
+    Ok(task.exit_code)
+}
+
+fn validate_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(io::Error::other(
+            "fixture paths must be relative normal components",
+        ));
+    }
+    let mut current = std::path::PathBuf::new();
+    for part in path.components() {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::other("fixture path contains symlink"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}

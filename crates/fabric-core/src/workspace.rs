@@ -261,7 +261,7 @@ fn marker_contents(root: &Path, workspace: &Workspace) -> String {
     )
 }
 
-fn open_store(root: &Path) -> Result<(PathBuf, Store), FabricError> {
+pub(super) fn open_store(root: &Path) -> Result<(PathBuf, Store), FabricError> {
     // Never create a database in an unknown root or follow a root/database link.
     private_directory(root)?;
     let root = root.canonicalize().map_err(storage_error)?;

@@ -194,9 +194,11 @@ dependencies = [
  "fabric-core",
  "fabric-domain",
  "fabric-project",
+ "fabric-runner",
  "fabric-store",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -205,11 +207,13 @@ version = "0.1.0"
 dependencies = [
  "fabric-domain",
  "fabric-project",
+ "fabric-runner",
  "fabric-store",
  "fabric-workspace",
  "libc",
  "rusqlite",
  "serde",
+ "sha2",
  "tempfile",
 ]
 
@@ -237,6 +241,13 @@ dependencies = [
 [[package]]
 name = "fabric-runner"
 version = "0.1.0"
+dependencies = [
+ "fabric-domain",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "fabric-store"

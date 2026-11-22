@@ -8,6 +8,10 @@ rust-version.workspace = true
 name = "fabric"
 path = "src/main.rs"
 
+[[bin]]
+name = "fabric-fake-harness"
+path = "src/fake.rs"
+
 [dependencies]
 clap.workspace = true
 serde.workspace = true
@@ -15,6 +19,8 @@ serde_json.workspace = true
 fabric-domain.workspace = true
 fabric-core.workspace = true
 fabric-project = { path = "../fabric-project" }
+fabric-runner = { path = "../fabric-runner" }
 
 [dev-dependencies]
 fabric-store = { path = "../fabric-store" }
+sha2 = "0.10"

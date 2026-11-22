@@ -2,9 +2,9 @@
 
 A local-first Rust PoC for reusable agent workspaces. **Trusted local code only:** Fabric is not a sandbox or multi-tenant security boundary. macOS is the primary supported platform; Linux and other platforms are not currently claimed as supported.
 
-## Implemented: FAB-01 through FAB-09
+## Implemented: FAB-01 through FAB-10
 
-The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks and durable run-owned workspace orchestration. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Worker execution and cleanup commands are not implemented yet.
+The seven-package Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and one foreground fake-harness worker. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. OMP execution, artifact capture and cleanup commands are not implemented yet.
 
 Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
 
@@ -13,7 +13,7 @@ cargo build --locked -p fabric-cli
 ./target/debug/fabric doctor
 ./target/debug/fabric doctor --json
 # Or run directly from the workspace:
-cargo run --locked -- doctor --json
+cargo run --locked --bin fabric -- doctor --json
 ```
 
 `doctor` reads the current platform and searches `PATH` for executable `git` and `omp` files (including executable symlinks). It does not execute either tool, probe versions, invoke a model, access the network, read credentials, or create/change Fabric storage or user data. Missing tools are diagnostics, not a command failure. A missing `PATH` discovers no tools; relative or empty entries in an explicitly set `PATH` refer to the current directory.
@@ -114,6 +114,26 @@ Fork failures atomically retain the stable Run as NEEDS_ATTENTION with `workspac
 
 The store itself does not resolve Git, prepare files, launch processes, validate canonical filesystem ownership, authorize deletion, or reconcile interrupted workers. Project registration, prepared-tree forks and core ownership orchestration validate private roots and managed ownership at their boundaries; deletion authorization remains unimplemented. Stored managed-path uniqueness is textual; core additionally requires the exact canonical managed descendant and matching private marker. Lease expiry and lifecycle state alone never authorize cleanup. Byte counts must fit SQLite's signed 64-bit integer range. No artifact registration or cloud adapters are implemented.
 
+### Run one deterministic external worker
+
+```sh
+cargo build --locked -p fabric-cli --bins
+./target/debug/fabric --root /private/path/to/fabric run my-project \
+  --harness fake --prompt-file ./task.json --copy-limit-bytes 104857600 --json
+```
+
+The fake harness is an actual separate `fabric-fake-harness` executable beside `fabric`, not a mocked return value. `--fake-binary /absolute/path` selects another compatible fixture executable. Fabric probes its actual `--version`, then passes the private prompt snapshot as literal `--prompt-file PATH` argv without a shell. The process gets only fixed `PATH=/usr/bin:/bin` and `LC_ALL=C`, no inherited HOME/credentials. Its cwd is freshly revalidated owned fork, never the registered source or prepared base. Current committed source HEAD selects the most recently verified READY state for that commit (state ID breaks timestamp ties); historical registration pins and dirty working edits are not execution inputs. There is no recipe selector; cached preparation reuse does not change verification order. A missing READY state refuses with a prepare-first diagnostic.
+
+`task.json` is a UTF-8 JSON object with optional `required_files` (relative paths to readable prepared files), `writes` (`{"path":"tracked","content":"new text"}` entries), `events` (JSON values emitted as JSONL), `absent_environment` (environment names that must be absent), and `exit_code` (0–255, default 0). Unknown fields and unsafe/absolute/parent/symlink fixture paths fail. For example:
+
+```json
+{"required_files":[".deps/ready"],"writes":[{"path":"tracked","content":"changed"},{"path":"new.txt","content":"untracked"}],"events":[{"type":"fixture","value":42}],"exit_code":7}
+```
+
+The core persists PREPARING before fork work, RUNNING with the actual child PID/version/start time after spawn, FINALIZING with the observed exit, and finally SUCCEEDED or FAILED with a completion timestamp. Prompt identity is SHA-256 of the exact copied input bytes. JSON stdout reports IDs, source SHA, prompt digest, harness version, terminal state, exit and times; nonzero child exit also makes the CLI fail. Launch/supervision uncertainty instead records NEEDS_ATTENTION and retains recovery evidence without inventing exit metadata. Child processes have a private process group; remaining group descendants are killed and the leader reaped when their leader exits. There is no execution timeout or cancellation API yet.
+
+**No source artifacts are claimed.** Tracked/untracked edits, exact `prompt.input`, `stdout.log` and `stderr.log` remain in the owner-only workspace/container with an explicit capture-pending retention reason; artifact-manifest ID stays null. Child output writes directly to files, never undrained pipes. These raw logs are currently unbounded; FAB-12 adds caps/event capture, FAB-14 cancellation, and FAB-15–17 durable artifacts/cleanup. Run only trusted bounded fixture workloads until those controls land. No GC or deletion path exists; startup reservations are not renewed execution leases and expiry never authorizes deleting retained work.
+
 ## Checks
 
 Tests run without network access, credentials, or an installed OMP. The discovery tests use executable marker scripts to ensure no discovered tool runs and check that fixture user data remains unchanged.
@@ -127,6 +147,7 @@ cargo test --locked -p fabric-project --test recipe
 cargo test --locked -p fabric-cli --test prepare
 cargo test --locked -p fabric-workspace --test fork
 cargo test --locked -p fabric-core --test workspace
+cargo test --locked -p fabric-cli --test run
 cargo fmt --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace

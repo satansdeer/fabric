@@ -11,6 +11,8 @@ fabric-project = { path = "../fabric-project" }
 fabric-store = { path = "../fabric-store" }
 fabric-workspace = { path = "../fabric-workspace" }
 libc = "0.2"
+fabric-runner = { path = "../fabric-runner" }
+sha2 = "0.10"
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
