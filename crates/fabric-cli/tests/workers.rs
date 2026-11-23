@@ -448,6 +448,170 @@ fn generic_fake_protocols_return_early_handles_and_persist_results() {
     assert!(!fixture.path.join("INJECTED").exists());
 }
 
+#[test]
+fn managed_parent_waits_for_same_root_children_before_terminating() {
+    let mut fixture = Fixture::new();
+    let tasks = ["first", "second", "third", "fourth"].map(|id| fixture.task(id, "fake-a"));
+    let children = fixture.request(&json!({
+        "project":"test","max_concurrency":2,
+        "tasks":tasks
+    }));
+    let controller = fixture.path.join("controller-fake");
+    fs::write(
+        &controller,
+        format!(
+            r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys, time
+root = pathlib.Path({root})
+binary = {binary}
+fake = {fake}
+if "--version" in sys.argv:
+    os.execv(fake, [fake, *sys.argv[1:]])
+def cli(*args):
+    result = subprocess.run(
+        [binary, "--root", str(root / "storage"), *args],
+        env=dict(PATH="/usr/bin:/bin", HOME=str(root),
+                 FABRIC_PLUGIN_REGISTRY=str(root / "plugin-registry")),
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=65, check=True)
+    return json.loads(result.stdout)
+def record(name, value):
+    path = root / name
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value))
+    temporary.rename(path)
+def failed(kind, value, tb):
+    import traceback
+    (root / "controller-error").write_text(
+        "".join(traceback.format_exception(kind, value, tb)) +
+        repr(getattr(value, "stderr", None)))
+sys.excepthook = failed
+accepted = cli("workers", "spawn", "--request", {children},
+               "--fake-binary", str(root / "gated-fake"), "--json")
+record("children-accepted.json", accepted)
+batch = accepted["batch_id"]
+status = cli("wait", batch, "--timeout-seconds", "60", "--json")
+assert status["terminal"], status
+results = cli("results", batch, "--json")
+assert results["terminal"] and results["succeeded"], results
+record("children-observed.json", results)
+deadline = time.monotonic() + 20
+while not (root / "release.parent").exists() and not (root / "release-all").exists():
+    assert time.monotonic() < deadline, "parent release timed out"
+    time.sleep(0.02)
+os.execv(fake, [fake, *sys.argv[1:]])
+"#,
+            root = serde_json::to_string(&fixture.path).unwrap(),
+            binary = serde_json::to_string(env!("CARGO_BIN_EXE_fabric")).unwrap(),
+            fake = serde_json::to_string(env!("CARGO_BIN_EXE_fabric-fake-harness")).unwrap(),
+            children = serde_json::to_string(&children).unwrap(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&controller, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut task = fixture.task("parent", "fake-a");
+    task["limits"] = json!({"timeout_seconds":90});
+    let parent_request = fixture.request(&json!({"project":"test","tasks":[task]}));
+    let mut command = fixture.cli();
+    command
+        .args(["workers", "spawn", "--request"])
+        .arg(parent_request)
+        .arg("--fake-binary")
+        .arg(controller)
+        .arg("--json");
+    fixture.submitted = true;
+    let parent = parsed(&fixture.run(command));
+    let parent_batch = parent["batch_id"].as_str().unwrap();
+    fixture.batches.push(parent_batch.to_owned());
+    let marker = |fixture: &Fixture, name: &str| {
+        let path = fixture.path.join(name);
+        eventually(|| path.exists() || fixture.query("status", parent_batch)["terminal"] == true);
+        assert!(
+            path.exists(),
+            "missing {name}; controller error: {:?}; results: {}",
+            fs::read_to_string(fixture.path.join("controller-error")),
+            fixture.query("results", parent_batch)
+        );
+    };
+    marker(&fixture, "children-accepted.json");
+    let accepted: Value =
+        serde_json::from_slice(&fs::read(fixture.path.join("children-accepted.json")).unwrap())
+            .unwrap();
+    let child_batch = accepted["batch_id"].as_str().unwrap();
+    fixture.batches.push(child_batch.to_owned());
+    assert_ne!(parent_batch, child_batch);
+
+    // Two children occupy this batch's pool while the parent's own pool stays live.
+    for id in ["first", "second"] {
+        marker(&fixture, &format!("started.{id}"));
+    }
+    assert_eq!(fixture.query("status", parent_batch)["state"], "RUNNING");
+    let status = fixture.query("status", child_batch);
+    for index in [2, 3] {
+        assert_eq!(status["tasks"][index]["state"], "QUEUED", "{status}");
+    }
+    fs::write(fixture.path.join("release.first"), "").unwrap();
+    fixture.terminal(accepted["tasks"][0]["run_id"].as_str().unwrap());
+    marker(&fixture, "started.third");
+    assert!(!fixture.path.join("started.fourth").exists());
+    assert_eq!(
+        fixture.query("status", child_batch)["tasks"][3]["state"],
+        "QUEUED"
+    );
+    for id in ["second", "third", "fourth"] {
+        fs::write(fixture.path.join(format!("release.{id}")), "").unwrap();
+    }
+    fixture.terminal(child_batch);
+    marker(&fixture, "children-observed.json");
+    let observed: Value =
+        serde_json::from_slice(&fs::read(fixture.path.join("children-observed.json")).unwrap())
+            .unwrap();
+    assert_eq!(observed, fixture.query("results", child_batch));
+    assert_eq!(observed["terminal"], true);
+    assert_eq!(observed["succeeded"], true);
+    for task in observed["tasks"].as_array().unwrap() {
+        assert_eq!(task["state"], "SUCCEEDED");
+        let run = &task["result"];
+        assert_eq!(run["prepared_state_id"], fixture.base["state_id"]);
+        assert!(!Path::new(run["workspace_path"].as_str().unwrap()).exists());
+        let artifacts = task["artifacts"].as_array().unwrap();
+        assert!(!artifacts.is_empty());
+        for artifact in artifacts {
+            let bytes = fs::read(
+                fixture
+                    .path
+                    .join("storage")
+                    .join(artifact["relative_path"].as_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(artifact["size_bytes"], bytes.len() as u64);
+            assert_eq!(artifact["sha256"], format!("{:x}", Sha256::digest(bytes)));
+        }
+    }
+    assert_eq!(fixture.query("status", parent_batch)["state"], "RUNNING");
+    assert_eq!(fixture.query("results", parent_batch)["terminal"], false);
+    let mut stop = fixture.cli();
+    stop.args(["manager", "stop", "--json"]);
+    assert!(!fixture.run(stop).status.success(), "parent is still owned");
+    fs::write(fixture.path.join("release.parent"), "").unwrap();
+    fixture.terminal(parent_batch);
+    let result = fixture.query("results", parent_batch);
+    assert_eq!(result["succeeded"], true, "{result}");
+    assert!(
+        !Path::new(
+            result["tasks"][0]["result"]["workspace_path"]
+                .as_str()
+                .unwrap()
+        )
+        .exists()
+    );
+    let path = fixture.path.clone();
+    drop(fixture);
+    assert!(
+        !path.exists(),
+        "fixture failed to stop manager and remove workspaces"
+    );
+}
+
 impl Fixture {
     fn inventory(&self) -> Vec<i64> {
         let db = rusqlite::Connection::open_with_flags(

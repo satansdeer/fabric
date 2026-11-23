@@ -523,38 +523,48 @@ fn owned_run_and_batch_cancellation_never_launches_cancelled_queued_tasks() {
 }
 
 #[test]
-fn concurrent_batches_share_one_bounded_worker_pool() {
+fn concurrent_batches_keep_independent_bounded_worker_pools() {
     let mut fixture = Fixture::new();
-    let first_request = fixture.request(&[0, 1], 2, None);
+    let first_request = fixture.request(&[0, 1], 1, None);
     let first = fixture.accept(&first_request, None);
     fixture.started(0);
-    fixture.started(1);
-    let next_request = fixture.request(&[10, 11], 2, None);
+    let next_request = fixture.request(&[10, 11, 12], 2, None);
     let next = fixture.accept(&next_request, None);
-    fixture.release(0);
-    fixture.terminal(first["run_ids"][0].as_str().unwrap());
-    let next_id = next["batch_id"].as_str().unwrap();
-    let mut wait = fixture.cli();
-    wait.args(["wait", next_id, "--timeout-seconds", "1", "--json"]);
-    let queued = parsed(&fixture.run(wait));
-    assert_eq!(queued["terminal"], false);
-    for task in queued["tasks"].as_array().unwrap() {
-        assert_eq!(
-            task["state"], "QUEUED",
-            "the first batch still owns the pool"
-        );
-    }
-    for label in [10, 11] {
-        assert!(!fixture.path.join(format!("started.{label}")).exists());
-    }
-    fixture.release(1);
-    fixture.terminal(first["batch_id"].as_str().unwrap());
     for label in [10, 11] {
         fixture.started(label);
+    }
+    assert!(!fixture.path.join("started.1").exists());
+    assert!(!fixture.path.join("started.12").exists());
+    assert_eq!(
+        fixture.query("status", first["batch_id"].as_str().unwrap())["tasks"][1]["state"],
+        "QUEUED"
+    );
+    let next_id = next["batch_id"].as_str().unwrap();
+    assert_eq!(
+        fixture.query("status", next_id)["tasks"][2]["state"],
+        "QUEUED"
+    );
+    fixture.release(10);
+    fixture.terminal(next["run_ids"][0].as_str().unwrap());
+    fixture.started(12);
+    assert!(!fixture.path.join("started.1").exists());
+    for label in [11, 12] {
         fixture.release(label);
     }
     fixture.terminal(next_id);
     assert_eq!(fixture.query("results", next_id)["succeeded"], true);
+    assert_eq!(
+        fixture.query("status", first["batch_id"].as_str().unwrap())["terminal"],
+        false
+    );
+    fixture.release(0);
+    fixture.started(1);
+    fixture.release(1);
+    fixture.terminal(first["batch_id"].as_str().unwrap());
+    assert_eq!(
+        fixture.query("results", first["batch_id"].as_str().unwrap())["succeeded"],
+        true
+    );
 }
 
 fn cursor(value: &Value) -> u64 {
