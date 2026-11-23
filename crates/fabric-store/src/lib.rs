@@ -2079,7 +2079,8 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_targets;
+            "DROP TABLE connector_deliveries;
+             DROP TABLE run_targets;
              DROP TABLE run_observations;
              DROP TABLE run_capture_contexts;
              DROP TRIGGER immutable_manifest;
