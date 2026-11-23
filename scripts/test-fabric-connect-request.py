@@ -52,16 +52,34 @@ class RequestTest(unittest.TestCase):
                         connection=str(connection), allow_loopback_http=True))
                     self.assertEqual(client.request("/status"), {"ok": True})
                     self.assertEqual(client.request("/poll", {"issue": 23}), {"ok": True})
+                    migrated = json.loads(connection.read_text())
+                    self.assertEqual(migrated, {
+                        "schema_version": 2, "endpoint": f"http://127.0.0.1:{server.server_port}",
+                        "identity": connect.LEGACY_IDENTITY, "worker_id": worker, "token": token,
+                    })
+                    # Reopen the migrated connection, then select a different claimed route.
+                    reopened = connect.Client(argparse.Namespace(
+                        connection=str(connection), allow_loopback_http=True))
+                    self.assertEqual(reopened.prefix, client.prefix)
+                    migrated["identity"] = {"account": "team-b", "project": "other", "automation": "triage"}
+                    connection.write_text(json.dumps(migrated))
+                    scoped = connect.Client(argparse.Namespace(
+                        connection=str(connection), allow_loopback_http=True))
+                    self.assertEqual(scoped.request("/status"), {"ok": True})
+                    self.assertEqual(scoped.request("/poll", {"issue": 23}), {"ok": True})
                 finally:
                     server.shutdown()
                     thread.join()
 
-        self.assertEqual(len(observed), 2)
-        for (method, path, headers, body), (expected_method, suffix) in zip(
-                observed, [("GET", "/status"), ("POST", "/poll")]):
-            with self.subTest(method=expected_method):
+        self.assertEqual(len(observed), 4)
+        expected = [("GET", "/status", "/v1/projects/satansdeer/fabric/automations/issues"),
+                    ("POST", "/poll", "/v1/projects/satansdeer/fabric/automations/issues"),
+                    ("GET", "/status", "/v1/projects/team-b/other/automations/triage"),
+                    ("POST", "/poll", "/v1/projects/team-b/other/automations/triage")]
+        for (method, path, headers, body), (expected_method, suffix, prefix) in zip(observed, expected):
+            with self.subTest(method=expected_method, prefix=prefix):
                 self.assertEqual(method, expected_method)
-                self.assertEqual(path, connect.PREFIX + suffix)
+                self.assertEqual(path, prefix + suffix)
                 self.assertEqual(headers["User-Agent"],
                                  "Fabric-Connect (+https://github.com/satansdeer/fabric)")
                 self.assertEqual(headers["Authorization"], "Bearer " + token)

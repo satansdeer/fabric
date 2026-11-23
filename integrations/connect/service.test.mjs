@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createHash, createHmac } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler, PREFIX } from "./service.mjs";
@@ -20,19 +20,28 @@ class MemoryStore {
   version = 0;
   writes = 0;
   failures = 0;
+  records = new Map();
   async getWithMetadata(key, options) {
-    assert.equal(key, "satansdeer/fabric/issues");
+    assert.ok(["satansdeer/fabric/issues", "account:satansdeer", "project:satansdeer/fabric"].includes(key));
     assert.deepEqual(options, { type: "json", consistency: "strong" });
+    if (key !== "satansdeer/fabric/issues") return clone(this.records.get(key) || null);
     return this.data && { data: clone(this.data), etag: String(this.version), metadata: {} };
   }
   async setJSON(key, data, options) {
-    assert.equal(key, "satansdeer/fabric/issues");
+    assert.ok(["satansdeer/fabric/issues", "account:satansdeer", "project:satansdeer/fabric"].includes(key));
     this.writes++;
     assert.equal(Object.keys(options).length, 1);
     assert.ok(options.onlyIfNew === true || typeof options.onlyIfMatch === "string");
-    if (this.failures-- > 0 || (this.data ? options.onlyIfMatch !== String(this.version) : !options.onlyIfNew)) return { modified: false };
-    this.data = clone(data);
-    return { modified: true, etag: String(++this.version) };
+    const primary = key === "satansdeer/fabric/issues";
+    const current = primary ? this.data && { data: this.data, etag: String(this.version) } : this.records.get(key);
+    if (this.failures-- > 0 || (current ? options.onlyIfMatch !== current.etag : !options.onlyIfNew)) return { modified: false };
+    if (primary) {
+      this.data = clone(data);
+      return { modified: true, etag: String(++this.version) };
+    }
+    const etag = String(Number(current?.etag || 0) + 1);
+    this.records.set(key, { data: clone(data), etag });
+    return { modified: true, etag };
   }
 }
 function fixture(store = new MemoryStore()) {
@@ -60,8 +69,10 @@ function fixture(store = new MemoryStore()) {
   }
   function webhook(body = payload(), headers = {}) {
     const raw = typeof body === "string" ? body : JSON.stringify(body);
+    const digest = createHash("sha256").update(raw).digest("hex");
+    const delivery = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
     return send(`${PREFIX}/github`, { method: "POST", body: raw, auth: false, headers: {
-      "x-github-event": "issues", "x-github-delivery": "12345678-1234-4234-8234-123456789abc",
+      "x-github-event": "issues", "x-github-delivery": delivery,
       "x-hub-signature-256": `sha256=${createHmac("sha256", ENV.FABRIC_CONNECT_WEBHOOK_SECRET).update(raw).digest("hex")}`,
       ...headers,
     } });
@@ -130,6 +141,11 @@ test("persist-before-ack, bounded CAS failures and duplicate header replay", asy
   assert.equal((await f.webhook()).code, 503);
   assert.equal(f.store.writes, 8);
   assert.equal(f.store.data, null);
+  assert.equal((await f.status()).code, 200);
+  const before = clone(f.store.data);
+  f.store.failures = 8;
+  assert.equal((await f.webhook()).code, 503);
+  assert.deepEqual(f.store.data, before);
   const accepted = await f.webhook();
   assert.equal(accepted.code, 202);
   const duplicate = await f.webhook(f.payload(), { "x-github-delivery": "87654321-4321-4321-8321-cba987654321" });
@@ -280,6 +296,12 @@ test("file-backed fixture persists acknowledged events and running mappings acro
     assert.equal((await first.webhook()).code, 202);
     const event = (await first.poll()).data.event;
     assert.equal((await first.ack(event, "running", HANDLES)).code, 200);
+    // Recreate the deployed fixture's old single-record file from an actual acknowledged event.
+    const record = JSON.parse(await readFile(path, "utf8")).records["satansdeer/fabric/issues"];
+    const old = clone(record.data);
+    old.schema_version = 1;
+    for (const key of ["identity", "principal_id", "policy", "webhook_secret", "legacy_token_sha256"]) delete old[key];
+    await writeFile(path, JSON.stringify({ key: "satansdeer/fabric/issues", etag: record.etag, data: old }), { mode: 0o600 });
     const restarted = fixture(new FileStore(path));
     const resumed = (await restarted.poll()).data.event;
     assert.equal(resumed.status, "running");
@@ -292,7 +314,7 @@ test("file-backed fixture persists acknowledged events and running mappings acro
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("configured worker rotation cannot silently reassign an existing running mapping", async () => {
+test("migrated worker identity and authentication survive changed bootstrap bindings without reassignment", async () => {
   const f = fixture();
   await f.webhook();
   const event = (await f.poll()).data.event;
@@ -302,7 +324,7 @@ test("configured worker rotation cannot silently reassign an existing running ma
     method: "POST", headers: { authorization: `Bearer ${TOKEN}` },
     body: JSON.stringify({ worker_id: "replacement_worker", issue_number: 1 }),
   }));
-  assert.equal(response.status, 503);
+  assert.equal(response.status, 403);
   assert.equal(f.store.data.events[0].run_id, HANDLES.run_id);
   assert.equal(f.store.data.worker_id, ENV.FABRIC_CONNECT_WORKER_ID);
 });
@@ -347,4 +369,14 @@ test("competing terminal acknowledgements cannot overwrite the winning outcome",
   assert.deepEqual(results.map(result => result.code).sort(), [200, 409]);
   const accepted = results.find(result => result.code === 200).data.event.status;
   assert.equal((await f.status()).data.events[0].status, accepted);
+});
+
+test("invalid-input work is bounded without persisting unauthorized requests", async () => {
+  const f = fixture();
+  assert.equal((await f.handler(new Request(`http://fixture.invalid${PREFIX}/status`))).status, 400);
+  for (let count = 0; count < 600; count++) assert.equal((await f.send(`${PREFIX}/status`, { auth: false })).code, 401);
+  assert.equal((await f.send(`${PREFIX}/status`, { auth: false })).code, 429);
+  f.advance(60000);
+  assert.equal((await f.send(`${PREFIX}/status`, { auth: false })).code, 401);
+  assert.equal(f.store.writes, 0);
 });

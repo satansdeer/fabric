@@ -1,9 +1,15 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { githubEvent } from "./github.mjs";
+import { githubEvent, validPolicy } from "./github.mjs";
 
 export const PREFIX = "/v1/projects/satansdeer/fabric/automations/issues";
-const KEY = "satansdeer/fabric/issues";
 const BODY_LIMIT = 128 * 1024;
+const LEGACY = { account: "satansdeer", project: "fabric", automation: "issues" };
+const LEGACY_POLICY = { repo: "satansdeer/fabric", author: "satansdeer", sender: "satansdeer", label: "ready" };
+const SEGMENT = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+const segment = value => typeof value === "string" && SEGMENT.test(value);
+const routeKey = identity => `${identity.account}/${identity.project}/${identity.automation}`;
+const routePath = identity => `/v1/projects/${identity.account}/${identity.project}/automations/${identity.automation}`;
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const DAY = 86400000;
 const LEASE = 120000;
 const STATES = ["queued", "delivering", "running", "completed", "failed", "expired"];
@@ -47,16 +53,83 @@ async function readJSON(request) {
   return body;
 }
 
-function initial(id) { return { schema_version: 1, worker_id: id, events: [], rate: [], worker_last_seen_at: null }; }
+function initial(identity, principal, body) {
+  return { schema_version: 2, identity, principal_id: principal.id, worker_id: body.worker_id,
+    policy: { repo: body.policy.repo, author: body.policy.author, sender: body.policy.sender, label: body.policy.label },
+    webhook_secret: body.webhook_secret,
+    events: [], rate: [], worker_last_seen_at: null };
+}
 function validState(state) {
-  return object(state) && state.schema_version === 1 && WORKER_ID.test(state.worker_id || "") && Array.isArray(state.events) &&
+  return object(state) && [1, 2].includes(state.schema_version) && WORKER_ID.test(state.worker_id || "") && Array.isArray(state.events) &&
+    (state.schema_version === 1 || (object(state.identity) &&
+      ["account", "project", "automation"].every(key => segment(state.identity[key])) &&
+      safeID(state.principal_id) && validPolicy(state.policy) && HEX.test(state.webhook_secret || "") &&
+      (state.legacy_token_sha256 === undefined || HEX.test(state.legacy_token_sha256)))) &&
     state.events.length <= 256 && Array.isArray(state.rate) && state.rate.length <= 60 &&
     state.rate.every(Number.isFinite) &&
     (state.worker_last_seen_at === null || Number.isFinite(Date.parse(state.worker_last_seen_at))) &&
     state.events.every(event => object(event) && HEX.test(event.event_id) &&
       STATES.includes(event.status) && Number.isFinite(Date.parse(event.received_at)) &&
       (ACTIVE.has(event.status) || Number.isFinite(Date.parse(event.terminal_at)))) &&
-    Buffer.byteLength(JSON.stringify(state)) <= 512 * 1024;
+    // Reserve bounded identity metadata above the v1 cap; a full old inbox must still migrate.
+    Buffer.byteLength(JSON.stringify(state)) <= 512 * 1024 + (state.schema_version === 2 ? 2048 : 0);
+}
+
+function migrate(state, identity, env) {
+  if (state.schema_version === 2) {
+    if (!same(state.identity, identity)) fail(503);
+    return state;
+  }
+  if (!same(identity, LEGACY) || state.worker_id !== env.FABRIC_CONNECT_WORKER_ID ||
+      !HEX.test(env.FABRIC_CONNECT_WORKER_TOKEN_SHA256 || "") ||
+      !HEX.test(env.FABRIC_CONNECT_WEBHOOK_SECRET || "")) fail(503);
+  // Same key, same URL, one CAS: events, leases, receipts and replay history stay in place.
+  return { ...state, schema_version: 2, identity: LEGACY, principal_id: "satansdeer",
+    policy: LEGACY_POLICY, webhook_secret: env.FABRIC_CONNECT_WEBHOOK_SECRET,
+    legacy_token_sha256: env.FABRIC_CONNECT_WORKER_TOKEN_SHA256 };
+}
+
+function principals(env) {
+  let values;
+  try { values = JSON.parse(env.FABRIC_CONNECT_PRINCIPALS || "[]"); } catch { fail(503); }
+  if (!Array.isArray(values) || values.length > 64) fail(503);
+  const ids = new Map(), tokens = new Set();
+  for (const principal of values) {
+    if (!object(principal) || !safeID(principal.id) || !segment(principal.account) ||
+        !HEX.test(principal.token_sha256 || "") ||
+        (ids.has(principal.id) && ids.get(principal.id) !== principal.account) || tokens.has(principal.token_sha256) ||
+        !Array.isArray(principal.grants) || principal.grants.length > 64) fail(503);
+    ids.set(principal.id, principal.account); tokens.add(principal.token_sha256);
+    for (const grant of principal.grants) {
+      if (!object(grant) || !(grant.project === null || segment(grant.project)) ||
+          !(grant.automation === null || segment(grant.automation)) ||
+          (grant.project === null && grant.automation !== null) ||
+          !Array.isArray(grant.permissions) || !grant.permissions.length ||
+          !grant.permissions.every(p => ["claim", "read", "poll", "ack"].includes(p)) ||
+          (grant.automation === null && grant.permissions.some(p => p !== "claim"))) fail(503);
+    }
+  }
+  return values;
+}
+
+function authenticate(request, configured, state) {
+  const bearer = /^Bearer ([^\s]{1,1024})$/.exec(request.headers.get("authorization") || "");
+  if (!bearer) fail(401);
+  const digest = createHash("sha256").update(bearer[1]).digest();
+  const matches = hash => timingSafeEqual(digest, Buffer.from(hash, "hex"));
+  const principal = configured.find(value => matches(value.token_sha256));
+  if (principal) return principal;
+  if (state?.legacy_token_sha256 && matches(state.legacy_token_sha256)) {
+    return { id: state.principal_id, account: LEGACY.account,
+      grants: [{ project: LEGACY.project, automation: LEGACY.automation, permissions: ["read", "poll", "ack"] }] };
+  }
+  fail(401);
+}
+
+function authorize(principal, identity, permission, state) {
+  if (principal.account !== identity.account || (state && state.principal_id !== principal.id) ||
+      !principal.grants.some(grant => grant.project === (identity.project ?? null) &&
+        grant.automation === (identity.automation ?? null) && grant.permissions.includes(permission))) fail(403);
 }
 
 function maintain(state, time) {
@@ -88,17 +161,21 @@ function maintain(state, time) {
 }
 
 function publicEvent(event) {
-  const { last_ack, ...safe } = event;
-  return safe;
+  // Explicit allowlist: never expose internal acknowledgements or future private fields.
+  return Object.fromEntries(["schema_version", "source", "event_id", "repo", "issue_number", "action",
+    "delivery_id", "status", "received_at", "attempts", "lease_id", "lease_expires_at",
+    "next_attempt_at", "terminal_at", "reason", "batch_id", "run_id", "artifact_manifest_id"]
+    .filter(key => event[key] !== undefined).map(key => [key, event[key]]));
 }
 function worker(state, id, time) {
   return { id, last_seen_at: state.worker_last_seen_at,
     online: state.worker_last_seen_at !== null && time - Date.parse(state.worker_last_seen_at) <= 60000 };
 }
-function status(state, id, time) {
+function status(state, id, time, origin) {
   const counts = Object.fromEntries(STATES.map(name => [name, 0]));
   for (const event of state.events) counts[event.status]++;
-  return { schema_version: 1, owner: "satansdeer", project: "fabric", automation: "issues",
+  return { schema_version: 1, owner: state.identity.account, project: state.identity.project,
+    automation: state.identity.automation, url: origin + routePath(state.identity), policy: state.policy,
     worker: worker(state, id, time), events: state.events.map(publicEvent), counts };
 }
 
@@ -136,63 +213,163 @@ function ackEvent(event, body, time) {
   return true;
 }
 
-// ponytail: one bounded CAS route blob; move to a transactional DB for higher throughput/multiple workers.
+// One existing Durable Object serializes bounded per-route CAS records. No hosted execution.
 export function createHandler({ store, env, now = Date.now }) {
-  async function transaction(operation) {
+  const configured = principals(env);
+  let window = 0, requests = 0;
+
+  async function load(identity) {
+    const stored = await store.getWithMetadata(routeKey(identity), { type: "json", consistency: "strong" });
+    if (stored && (!stored.etag || !validState(stored.data))) fail(503);
+    return stored;
+  }
+
+  function legacyInitial(identity) {
+    if (!same(identity, LEGACY)) fail(404);
+    if (!WORKER_ID.test(env.FABRIC_CONNECT_WORKER_ID || "")) fail(503);
+    return migrate({ schema_version: 1, worker_id: env.FABRIC_CONNECT_WORKER_ID,
+      events: [], rate: [], worker_last_seen_at: null }, identity, env);
+  }
+
+  async function transaction(identity, operation) {
+    const key = routeKey(identity);
     for (let attempt = 0; attempt < 8; attempt++) {
-      const stored = await store.getWithMetadata(KEY, { type: "json", consistency: "strong" });
-      if (stored && (!stored.etag || !validState(stored.data) || stored.data.worker_id !== env.FABRIC_CONNECT_WORKER_ID)) fail(503);
-      const state = stored ? stored.data : initial(env.FABRIC_CONNECT_WORKER_ID);
+      const stored = await load(identity);
+      const state = stored ? migrate(stored.data, identity, env) : legacyInitial(identity);
       const time = Number(now());
-      const changed = maintain(state, time);
+      const migrating = !stored || stored.data.schema_version === 1;
+      const changed = maintain(state, time) || migrating;
       const result = operation(state, time);
       if (!changed && !result.changed) return reply(result.body, result.status);
-      const written = await store.setJSON(KEY, state, stored ? { onlyIfMatch: stored.etag } : { onlyIfNew: true });
+      if (!validState(state)) fail(429);
+      if (migrating) {
+        const principal = { id: state.principal_id };
+        await owner({ account: identity.account }, principal, true);
+        await owner({ account: identity.account, project: identity.project }, principal, true);
+      }
+      const written = await store.setJSON(key, state, stored ? { onlyIfMatch: stored.etag } : { onlyIfNew: true });
       if (written.modified) return reply(result.body, result.status);
+    }
+    fail(503);
+  }
+
+  async function owner(identity, principal, create) {
+    const key = identity.project ? `project:${identity.account}/${identity.project}` : `account:${identity.account}`;
+    // Reserve the deployed namespace even before its first post-upgrade request.
+    const reserved = identity.account === LEGACY.account &&
+      (!identity.project || identity.project === LEGACY.project);
+    if (reserved && principal.id !== "satansdeer") fail(403);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const stored = await store.getWithMetadata(key, { type: "json", consistency: "strong" });
+      if (stored) {
+        if (!stored.etag || stored.data?.schema_version !== 1 || !safeID(stored.data.principal_id)) fail(503);
+        if (stored.data.principal_id !== principal.id) fail(403);
+        return;
+      }
+      if (!create) {
+        if (reserved) return;
+        fail(409);
+      }
+      const written = await store.setJSON(key, { schema_version: 1, principal_id: principal.id }, { onlyIfNew: true });
+      if (written.modified) return;
     }
     fail(503);
   }
 
   return async request => {
     try {
-      const path = new URL(request.url).pathname;
+      const url = new URL(request.url), path = url.pathname;
+      if (url.protocol !== "https:" && !(url.protocol === "http:" &&
+          ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname))) fail(400);
       if (request.method === "GET" && path === "/health") return reply({ service: "fabric-connect", schema_version: 1 });
-      const ingress = request.method === "POST" && path === `${PREFIX}/github`;
-      const view = request.method === "GET" && path === `${PREFIX}/status`;
-      const poll = request.method === "POST" && path === `${PREFIX}/poll`;
-      const ack = request.method === "POST" && path.match(new RegExp(`^${PREFIX}/events/([0-9a-f]{64})/ack$`));
-      if (!ingress && !view && !poll && !ack) return reply({ error: "Not found" }, 404);
-      const id = env.FABRIC_CONNECT_WORKER_ID;
-      if (!WORKER_ID.test(id || "") || !HEX.test(env.FABRIC_CONNECT_WORKER_TOKEN_SHA256 || "") ||
-          !/^[0-9a-f]{64}$/.test(env.FABRIC_CONNECT_WEBHOOK_SECRET || "")) fail(503);
+      // Bounded per-object request work, including invalid signatures and claims. Resets on cold start;
+      // durable authenticated admission limits below remain authoritative across restart.
+      const time = Number(now());
+      if (time - window >= 60000) { window = time; requests = 0; }
+      if (++requests > 600) fail(429);
+      if (url.search) fail(400);
+      const accountClaim = /^\/v1\/accounts\/([^/]+)\/claim$/.exec(path);
+      const projectClaim = /^\/v1\/projects\/([^/]+)\/([^/]+)\/claim$/.exec(path);
+      const route = /^\/v1\/projects\/([^/]+)\/([^/]+)\/automations\/([^/]+)\/(claim|github|status|poll|events\/([0-9a-f]{64})\/ack)$/.exec(path);
+      const identity = accountClaim ? { account: accountClaim[1] } :
+        projectClaim ? { account: projectClaim[1], project: projectClaim[2] } :
+          route ? { account: route[1], project: route[2], automation: route[3] } : null;
+      if (!identity || !Object.values(identity).every(segment)) fail(404);
+      const claim = Boolean(accountClaim || projectClaim || route?.[4] === "claim");
+      const ingress = route?.[4] === "github";
+      const view = route?.[4] === "status";
+      const poll = route?.[4] === "poll";
+      if (request.method !== (view ? "GET" : "POST")) fail(404);
+      const stored = route ? await load(identity) : null;
+      const state = stored ? migrate(stored.data, identity, env) :
+        route && same(identity, LEGACY) ? legacyInitial(identity) : null;
+      let principal;
+      if (!ingress) {
+        principal = authenticate(request, configured, state);
+        authorize(principal, identity, claim ? "claim" : view ? "read" : poll ? "poll" : "ack", state);
+      }
+      if (claim) {
+        const body = await readJSON(request);
+        if (accountClaim) {
+          if (Object.keys(body).length) fail(400);
+          await owner(identity, principal, true);
+        } else {
+          await owner({ account: identity.account }, principal, false);
+          if (projectClaim) {
+            if (Object.keys(body).length) fail(400);
+            await owner(identity, principal, true);
+          } else {
+            await owner({ account: identity.account, project: identity.project }, principal, false);
+            if (Object.keys(body).sort().join(",") !== "policy,webhook_secret,worker_id" ||
+                !WORKER_ID.test(body.worker_id || "") || !HEX.test(body.webhook_secret || "") ||
+                !validPolicy(body.policy)) fail(400);
+            const desired = initial(identity, principal, body);
+            let current = state;
+            if (!current) {
+              const written = await store.setJSON(routeKey(identity), desired, { onlyIfNew: true });
+              if (written.modified) return reply({ identity, url: url.origin + routePath(identity) });
+              const raced = await load(identity);
+              if (!raced) fail(503);
+              current = migrate(raced.data, identity, env);
+              authorize(principal, identity, "claim", current);
+            }
+            if (current.worker_id !== desired.worker_id || !same(current.policy, desired.policy) ||
+                current.webhook_secret !== desired.webhook_secret) fail(409);
+            // Persist a pending v1 migration through the same CAS path.
+            return await transaction(identity, () => ({ body: { identity, url: url.origin + routePath(identity) }, changed: false }));
+          }
+        }
+        return reply({ identity, ...(route ? { url: url.origin + routePath(identity) } : {}) });
+      }
+      if (!state) fail(404);
+      const id = state.worker_id;
       if (ingress) {
-        const parsed = githubEvent(request.headers, await readBody(request), env.FABRIC_CONNECT_WEBHOOK_SECRET, Number(now()));
+        const parsed = githubEvent(request.headers, await readBody(request), state.webhook_secret, time, state.policy);
         if (parsed.error) fail(parsed.error);
         if (parsed.reply) return reply(parsed.reply);
-        return await transaction((state, time) => {
-          const existing = state.events.find(event => event.event_id === parsed.event.event_id);
+        return await transaction(identity, (current, stamp) => {
+          const existing = current.events.find(event => event.event_id === parsed.event.event_id);
           if (existing) return { body: { event_id: existing.event_id, status: existing.status, duplicate: true }, changed: false };
-          if (state.events.length >= 256 || state.events.filter(event => ACTIVE.has(event.status)).length >= 64 || state.rate.length >= 60) fail(429);
-          state.events.push({ ...parsed.event, status: "queued", received_at: iso(time), attempts: 0 });
-          state.rate.push(time);
+          if (parsed.stale) fail(400);
+          // A delivery ID may be retried with identical bytes, never repurposed for other content.
+          if (current.events.some(event => event.delivery_id === parsed.event.delivery_id && event.event_id !== parsed.event.event_id)) fail(409);
+          if (current.events.length >= 256 || current.events.filter(event => ACTIVE.has(event.status)).length >= 64 || current.rate.length >= 60) fail(429);
+          current.events.push({ ...parsed.event, status: "queued", received_at: iso(stamp), attempts: 0 });
+          current.rate.push(stamp);
           return { body: { event_id: parsed.event.event_id, status: "queued" }, status: 202, changed: true };
         });
       }
-      const authorization = request.headers.get("authorization") || "";
-      const bearer = /^Bearer ([^\s]{1,1024})$/.exec(authorization);
-      const supplied = createHash("sha256").update(bearer?.[1] || "").digest();
-      if (!bearer || !timingSafeEqual(supplied, Buffer.from(env.FABRIC_CONNECT_WORKER_TOKEN_SHA256, "hex"))) fail(401);
-      if (view) return await transaction((state, time) => ({ body: status(state, id, time), changed: false }));
+      if (view) return await transaction(identity, (current, stamp) => ({ body: status(current, id, stamp, url.origin), changed: false }));
       const body = await readJSON(request);
       if (body.worker_id !== id) fail(403);
-      if (poll && (!Number.isSafeInteger(body.issue_number) || body.issue_number < 1)) fail(400);
-      if (ack && (typeof body.lease_id !== "string" || !SAFE_ID.test(body.lease_id) || !["running", "completed", "failed"].includes(body.status))) fail(400);
-      return await transaction((state, time) => {
+      if (poll && (!Number.isSafeInteger(body.issue_number) || body.issue_number < 1 || body.issue_number > 2147483647)) fail(400);
+      if (!poll && (typeof body.lease_id !== "string" || !SAFE_ID.test(body.lease_id) || !["running", "completed", "failed"].includes(body.status))) fail(400);
+      return await transaction(identity, (current, stamp) => {
         if (poll) {
-          const matches = state.events.filter(event => event.issue_number === body.issue_number);
+          const matches = current.events.filter(event => event.issue_number === body.issue_number);
           let event = matches.find(event => event.status === "running") || matches.find(event => event.status === "delivering");
           if (!event) {
-            event = matches.find(event => event.status === "queued" && (!event.next_attempt_at || time >= Date.parse(event.next_attempt_at)));
+            event = matches.find(event => event.status === "queued" && (!event.next_attempt_at || stamp >= Date.parse(event.next_attempt_at)));
             if (event) {
               event.status = "delivering";
               event.attempts++;
@@ -200,18 +377,18 @@ export function createHandler({ store, env, now = Date.now }) {
               delete event.next_attempt_at;
             }
           }
-          if (event?.status === "delivering") event.lease_expires_at = iso(time + LEASE);
-          state.worker_last_seen_at = iso(time);
-          return { body: { event: event ? publicEvent(event) : null, worker: worker(state, id, time) }, changed: true };
+          if (event?.status === "delivering") event.lease_expires_at = iso(stamp + LEASE);
+          current.worker_last_seen_at = iso(stamp);
+          return { body: { event: event ? publicEvent(event) : null, worker: worker(current, id, stamp) }, changed: true };
         }
-        const event = state.events.find(event => event.event_id === ack[1]);
-        ackEvent(event, body, time);
-        state.worker_last_seen_at = iso(time);
-        return { body: { event: publicEvent(event), worker: worker(state, id, time) }, changed: true };
+        const event = current.events.find(event => event.event_id === route[5]);
+        ackEvent(event, body, stamp);
+        current.worker_last_seen_at = iso(stamp);
+        return { body: { event: publicEvent(event), worker: worker(current, id, stamp) }, changed: true };
       });
     } catch (error) {
-      const code = [400, 401, 403, 409, 413, 429, 503].includes(error?.status) ? error.status : 503;
-      return reply({ error: code === 503 ? "Service unavailable" : "Request rejected" }, code);
+      const code = [400, 401, 403, 404, 409, 413, 429, 503].includes(error?.status) ? error.status : 503;
+      return reply({ error: code === 503 ? "Service unavailable" : code === 404 ? "Not found" : "Request rejected" }, code);
     }
   };
 }

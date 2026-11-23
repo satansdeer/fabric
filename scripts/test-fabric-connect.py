@@ -197,9 +197,9 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
     server.start()
     require(command("status")["events"] == [] and f.counts() == initial, "status admitted work")
     for path, token, expected in [(PREFIX + "/status", None, 401), (PREFIX + "/status", "invalid", 401),
-                                   ("/v1/projects/other/fabric/automations/issues/status", TOKEN, 404)]:
+                                   ("/v1/projects/other/fabric/automations/issues/status", TOKEN, 401)]:
         code, _ = server.request(path, token=token)
-        require(code == expected, "invalid auth/route was accepted")
+        require(code == expected, f"invalid auth/route status: expected {expected}, got {code}")
     raw = server.webhook(f)
     require(server.request(PREFIX + "/github", raw, signed=True, signature="sha256=" + "0" * 64)[0] == 401,
             "invalid signature was accepted")
@@ -350,8 +350,9 @@ os.execv({str(f.fabric)!r}, [{str(f.fabric)!r}, *args])
             for secret in (TOKEN, SECRET, fixtures.TOKEN):
                 require(secret.encode() not in data, "secret leaked into Core logs/journals/artifacts or local intent")
     hosted = server.state.read_text()
-    require(all(value not in hosted for value in (TOKEN, SECRET, fixtures.BODY, fixtures.PRIVATE_LOG)),
-            "hosted queue retained secrets or raw issue/worker content")
+    require(stat.S_IMODE(server.state.stat().st_mode) == 0o600, "hosted route credentials are not private")
+    require(all(value not in hosted for value in (TOKEN, fixtures.BODY, fixtures.PRIVATE_LOG)),
+            "hosted queue retained bearer credentials or raw issue/worker content")
     report.update(batch_id=batch, run_id=run, artifact_manifest_id=manifest, artifact_count=len(artifacts), event_id=event_id)
     report["checks"].append("replay_and_same_snapshot_reuse_core_admission_without_credentials_in_workers_or_journals")
 

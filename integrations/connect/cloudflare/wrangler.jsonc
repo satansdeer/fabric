@@ -7,10 +7,11 @@
   "workers_dev": true,
   "preview_urls": false,
   "send_metrics": false,
-  // Values are private bindings provisioned with wrangler secret put, never source.
+  // Provision principal hashes/scopes privately. Keep the three existing bootstrap bindings
+  // until the deployed v1 inbox has migrated; its credential is then durably route-scoped.
   // No GitHub token is hosted.
   "secrets": {
-    "required": ["FABRIC_CONNECT_WEBHOOK_SECRET", "FABRIC_CONNECT_WORKER_TOKEN_SHA256", "FABRIC_CONNECT_WORKER_ID"]
+    "required": ["FABRIC_CONNECT_PRINCIPALS"]
   },
   "durable_objects": {
     "bindings": [{ "name": "CONNECT_INBOX", "class_name": "ConnectInbox" }]
