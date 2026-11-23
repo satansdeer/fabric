@@ -179,6 +179,32 @@ pub struct CaptureContext {
     pub artifact_limit_bytes: u64,
 }
 
+/// Manager-pinned checkout and effective recipe output, established while PREPARING.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceEvidence {
+    pub checkout_sha256: String,
+    pub prepared_sha256: String,
+}
+
+/// Retained independently of the writable workspace and captured result artifacts.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchReceipt {
+    pub run_id: RunId,
+    pub attempt_id: String,
+    pub workspace_id: WorkspaceId,
+    pub workspace_path: String,
+    pub workspace_device: u64,
+    pub workspace_inode: u64,
+    pub prepared_state_id: PreparedStateId,
+    pub source_commit_sha: String,
+    pub preparation_key: String,
+    pub recipe_digest: String,
+    pub source: SourceEvidence,
+    pub actual_sha256: String,
+}
+
 impl Store {
     /// Opens a file-backed WAL database. The parent directory must already exist.
     /// New database files are owner-only on Unix; callers own storage-root validation.
@@ -237,7 +263,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=16 => {}
+            1..=17 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -542,6 +568,10 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 16)?;
         }
+        if version < 17 {
+            transaction.execute_batch(include_str!("source_receipts.sql"))?;
+            transaction.pragma_update(None, "user_version", 17)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -614,7 +644,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=16) {
+        if !matches!(version, 5..=17) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -1409,6 +1439,90 @@ impl Store {
                     .map_err(|_| StoreError::InvalidRecord("Invalid capture context"))?;
                 validate_capture_context(&context)?;
                 Ok(context)
+            })
+            .transpose()
+    }
+    /// Pin the checkout before recipes; never derive missing evidence from a READY tree.
+    pub fn pin_checkout(&self, id: &PreparedStateId, digest: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO prepared_source_evidence(state_id, checkout_sha256) VALUES (?1, ?2)",
+            params![id.as_str(), digest],
+        )?;
+        Ok(())
+    }
+
+    pub fn pin_prepared_content(&self, id: &PreparedStateId, digest: &str) -> Result<()> {
+        if self.connection.execute(
+            "UPDATE prepared_source_evidence SET prepared_sha256=?2
+             WHERE state_id=?1 AND prepared_sha256 IS NULL",
+            params![id.as_str(), digest],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub fn source_evidence(&self, id: &PreparedStateId) -> Result<Option<SourceEvidence>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 17 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT checkout_sha256, prepared_sha256 FROM prepared_source_evidence
+             WHERE state_id=?1 AND prepared_sha256 IS NOT NULL",
+                [id.as_str()],
+                |r| {
+                    Ok(SourceEvidence {
+                        checkout_sha256: r.get(0)?,
+                        prepared_sha256: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The launch boundary is checked twice. Only identical repeated evidence is reusable.
+    pub fn record_launch_receipt(&self, receipt: &LaunchReceipt) -> Result<()> {
+        if let Some(existing) = self.launch_receipt(&receipt.run_id)? {
+            return if existing == *receipt {
+                Ok(())
+            } else {
+                Err(StoreError::Conflict)
+            };
+        }
+        let encoded = serde_json::to_string(receipt)
+            .map_err(|_| StoreError::InvalidRecord("Cannot encode launch receipt"))?;
+        self.connection.execute(
+            "INSERT INTO run_launch_receipts(run_id, receipt_json) VALUES (?1, ?2)",
+            params![receipt.run_id.as_str(), encoded],
+        )?;
+        Ok(())
+    }
+
+    pub fn launch_receipt(&self, id: &RunId) -> Result<Option<LaunchReceipt>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 17 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM run_launch_receipts WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid launch receipt"))
             })
             .transpose()
     }
