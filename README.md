@@ -6,7 +6,7 @@ Fabric is a macOS-first, harness-neutral local worker layer: durable asynchronou
 
 The Cargo workspace implements local diagnostics, an I/O-free domain model, SQLite persistence, pinned local Git project registration, validated preparation recipes/fingerprints, reusable private prepared snapshots, full-tree forks, durable run-owned workspaces and foreground or detached local harness workers. Successful preparation publishes a durable read-only READY tree, including ignored dependencies. Runs publish durable tracked and nonignored untracked artifacts before lease-aware, path-safe reclaim; `storage gc` reports and retries eligible cleanup. Separately installable reference harness executables live in the SDK, not Core registration.
 
-Requires Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`.
+Source builds require Rust 1.85 or newer. Resolved dependencies are pinned in `Cargo.lock`. The versioned native archive requires neither Rust/Cargo nor a source checkout.
 
 Native prerequisites: macOS, Xcode Command Line Tools (`xcode-select --install`) for Git/linking, and a Rust toolchain with rustfmt/clippy. CI uses Rust 1.91 on `macos-latest`. APFS supports native `clonefile` full-tree forks; other local filesystems require an explicitly admitted ordinary copy. SQLite is bundled. OMP is optional for deterministic tests and must be installed/configured separately for an approved model run. No Linux support or sandbox isolation is claimed.
 
@@ -51,6 +51,33 @@ The JSON report has stable field names and tool ordering:
 `platform.supported` describes the current OS against the macOS target, not readiness of unimplemented lifecycle features. Tool paths are executable candidates, not a guarantee that launching the tool will succeed; `null` means no executable candidate was found. Paths and architecture vary with the host. Diagnostics produce identical output for identical platform and filesystem/PATH inputs. Unsupported platforms still receive a diagnostic report with `supported: false`.
 
 Successful reports go to stdout with exit status 0. Invalid arguments with `--json` produce a structured `{"error":{"kind":"invalid_arguments","message":"..."}}` on stderr and exit status 2. Output failures use error kind `output` and a nonzero status. Help and version retain standard CLI text output.
+
+### Native macOS arm64 release
+
+The manually dispatched [release workflow](.github/workflows/release-macos.yml) accepts an exact reviewed merged-main SHA and matching `v<workspace-version>` tag after successful main CI. It refuses release/asset overwrite. Publication is not installed-artifact proof.
+
+The archive includes `bin/fabric`, provider-free `bin/fabric-fake-harness`, content-pinned official OMP/Codex native plugins, dependency-free SDK installation tooling, and matching `integrations/omp/{fabric.ts,host-smoke.ts}`. `release.json` records source/version, per-file hashes, plugin pins and public extension provenance. OMP/Codex hosts, user auth/config, logs and build caches are not bundled.
+
+After publication, take `TAG`, `SOURCE_SHA` and `HASH` from the accepted release evidence:
+
+```sh
+: "${TAG:?version tag}" "${SOURCE_SHA:?reviewed merged SHA}" "${HASH:?reviewed archive SHA256}"
+BASE=$(cd "$(mktemp -d)" && pwd -P)
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/satansdeer/fabric/$SOURCE_SHA/scripts/smoke-release.mjs" \
+  -o "$BASE/smoke-release.mjs"
+node "$BASE/smoke-release.mjs" "$TAG" "$HASH" "$SOURCE_SHA" "$BASE/install" \
+  | tee "$BASE/downloaded-proof.json"
+"$BASE/install/fabric-$TAG-macos-arm64/bin/fabric" --version
+```
+
+The installer/smoke uses Node 22.18+, system Git/curl/tar and public network downloads; installed native Core/plugins need neither Node nor Rust. The smoke checks the archive hash, payload/plugin identities, CLI/version, disposable project/preparation and provider-free OMP 19.1.0 discovery with Cargo/Rust absent from runtime PATH. It starts no manager and changes no existing installation or user config.
+
+For actual workers, separately install the supported OMP/Codex host and explicitly trust the selected plugin using the packaged `sdk/cli.mjs install`, `release.json` version/content pins and an owner-private registry outside Git. Set the same registry in controller and manager environments; follow the drain/upgrade rule above.
+
+The bundled extension/fake fixture supports later consumer checks; `host-smoke.ts` additionally needs Bun, pinned OMP and pstack. Neither installed-host checks nor model-driven swarm routing are established by the release smoke. No Apple signing/notarization, Intel/Linux, npm/npx/Homebrew or full [issue #7](https://github.com/satansdeer/fabric/issues/7) claim.
+
+See [publication and evidence](docs/VERIFICATION.md#issue-38-native-release-bootstrap).
 
 ### Discover and connect a native harness
 

@@ -12,7 +12,11 @@ use fabric_domain::{
 use serde::Serialize;
 
 #[derive(Parser)]
-#[command(name = "fabric", version, about = "Trusted-local agent workspaces")]
+#[command(
+    name = "fabric",
+    version = option_env!("FABRIC_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    about = "Trusted-local agent workspaces"
+)]
 struct Cli {
     /// Private Fabric storage root (default: $XDG_DATA_HOME/fabric or ~/.local/share/fabric).
     #[arg(long, global = true)]

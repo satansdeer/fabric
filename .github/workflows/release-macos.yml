@@ -1,0 +1,146 @@
+name: Native macOS arm64 release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full reviewed, merged main commit SHA (never a branch name)
+        required: true
+        type: string
+      tag:
+        description: Existing immutable version tag, e.g. v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require exact version tag, merged PR and successful main CI
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/pulls" \
+            --jq '.[] | select(.merged_at != null and .base.ref == "main") | .merge_commit_sha' | grep -Fxq "$SOURCE_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/macos.yml/runs?head_sha=$SOURCE_SHA&event=push&status=success" \
+            --jq '.total_count > 0' | grep -qx true
+          # Fail closed on an existing release, including a draft. Never clobber assets.
+          RELEASE_TAGS=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[].tag_name')
+          if grep -Fxq "$TAG" <<< "$RELEASE_TAGS"; then echo "Release already exists; refusing overwrite" >&2; exit 1; fi
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Package reviewed source and prove provider-free installation
+        id: package
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Resolve dependencies before offline metadata; Cargo.lock remains authoritative.
+          cargo fetch --locked
+          VERSION=$(cargo metadata --locked --offline --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "fabric-cli") | .version')
+          test "$TAG" = "v$VERSION"
+          node scripts/package-release.mjs "$SOURCE_SHA" "$RUNNER_TEMP/release"
+          ARCHIVE="fabric-$TAG-macos-arm64.tar.gz"
+          HASH=$(cut -d ' ' -f 1 "$RUNNER_TEMP/release/$ARCHIVE.sha256")
+          node scripts/smoke-release.mjs --archive "$RUNNER_TEMP/release/$ARCHIVE" "$HASH" "$SOURCE_SHA" "$RUNNER_TEMP/local-install"
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          # Publish only the archive, public inventory, checksum and release notes, not staging/builds.
+          mkdir "$RUNNER_TEMP/assets"
+          cp "$RUNNER_TEMP/release/$ARCHIVE" "$RUNNER_TEMP/release/$ARCHIVE.sha256" \
+            "$RUNNER_TEMP/release/fabric-$TAG-macos-arm64.json" "$RUNNER_TEMP/release/release-notes.md" "$RUNNER_TEMP/assets/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-release
+          path: ${{ runner.temp }}/assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: package
+    runs-on: macos-15
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-release
+          path: assets
+      - name: Publish once, from the exact existing source tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG: ${{ inputs.tag }}
+          HASH: ${{ needs.package.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          # Recheck the remote tag after the build. Annotated tags are intentionally not accepted.
+          test "$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type')" = commit
+          test "$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.sha')" = "$SOURCE_SHA"
+          RELEASE_TAGS=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq '.[].tag_name')
+          if grep -Fxq "$TAG" <<< "$RELEASE_TAGS"; then echo "Release already exists; refusing overwrite" >&2; exit 1; fi
+          (cd assets && printf '%s  %s\n' "$HASH" "fabric-$TAG-macos-arm64.tar.gz" | shasum -a 256 -c -)
+          gh release create "$TAG" --verify-tag --target "$SOURCE_SHA" --draft \
+            --title "Fabric $TAG — macOS arm64" --notes-file assets/release-notes.md \
+            "assets/fabric-$TAG-macos-arm64.tar.gz" "assets/fabric-$TAG-macos-arm64.tar.gz.sha256" \
+            "assets/fabric-$TAG-macos-arm64.json"
+          gh release edit "$TAG" --draft=false
+
+  downloaded-install:
+    needs: [package, publish]
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Download public asset, verify pinned identity and run without Rust
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG: ${{ inputs.tag }}
+          HASH: ${{ needs.package.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node scripts/smoke-release.mjs "$TAG" "$HASH" "$SOURCE_SHA" "$RUNNER_TEMP/downloaded-install" | tee "$RUNNER_TEMP/downloaded-proof.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-install-proof
+          path: ${{ runner.temp }}/downloaded-proof.json
+          if-no-files-found: error
+          retention-days: 30
