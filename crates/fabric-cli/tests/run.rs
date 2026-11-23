@@ -431,7 +431,6 @@ fn target_failure_after_spawn_preserves_terminal_capture_and_safe_recovery() {
         ));
         let prompt = fixture.0.join("prompt.json");
         fs::write(&prompt, "{}").unwrap();
-        let start = std::time::Instant::now();
         let output = fixture
             .cli()
             .args(["run", "test", "--harness", "fake", "--fake-binary"])
@@ -442,7 +441,6 @@ fn target_failure_after_spawn_preserves_terminal_capture_and_safe_recovery() {
             .output()
             .unwrap();
         assert!(!output.status.success(), "{behavior}: {output:?}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(6));
         let runs = json(
             &fixture
                 .cli()

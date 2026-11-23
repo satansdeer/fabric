@@ -958,3 +958,16 @@ JSON stdout. No CI artifacts survived. The assertion now includes stdout
 without weakening its expected success. A local invocation of only that
 case passed in 15.42 s; this does not explain the CI failure or clear the
 merge gate. A new exact-head CI run must provide the missing diagnostic.
+
+At diagnostic head `ce2a64b85ca7f13a46e722eceb542c48f8f922df`, push CI
+45153521177 passed, including that generated-target case. PR CI45153529797
+instead failed the unrelated whole-CLI six-second timing assertion in the
+post-spawn recovery test. That interval includes CLI startup, project
+preparation, target sessions and evidence persistence, not just a bounded
+RPC. The incidental total timer is removed rather than re-pinned.
+The runner's hung-inspect check still requires a failure within three
+seconds with no host effect and verifies target reaping. All CLI assertions
+for both dead parent/descendant, captured streams, NEEDS_ATTENTION, retained
+workspace, sealed recovery artifacts and unchanged terminal evidence stay.
+The updated focused recovery test passed in 31.63 s on macOS with the
+same released SDK executable environment shown above.
