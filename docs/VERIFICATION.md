@@ -75,6 +75,11 @@ fixture verifies that cancellation reaches and reaps the installer's child and
 prevents subsequent native `up`, even when the interrupted installer exits 0.
 This cancellation fixture is separate from the actual released-native proof.
 
+CI exposed an existing cancellation-test readiness guard that also charged the
+preceding batch task's preparation and durable capture to an eight-second wait.
+The shared heartbeat wait is now bounded at 60 seconds; cancellation, process
+termination, queued-task and durable-result assertions remain unchanged.
+
 Issue 7 remains **OPEN**: observed npm HTTP 401 means no authenticated publishing
 identity; the private candidate namespace is neither asserted owned nor published.
 Real registry publication and clean-machine `npx` proof require an owned package
