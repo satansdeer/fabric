@@ -487,3 +487,38 @@ await serve(defineNativeHarness({
   assert.ok(!result.stdout.includes('SECRET_CANARY'));
   assert.ok(!result.stderr.includes('SECRET_CANARY'));
 });
+
+test('native SDK preserves large normalization payloads without enlarging other frames', t => {
+  const root = temporary(t);
+  const project = create('harness', join(root, 'large-native-sdk'));
+  rawPlugin(project, `import { defineNativeHarness, serve } from './sdk/index.mjs';
+import { createHash } from 'node:crypto';
+const unused = () => { throw new Error('unexpected_method'); };
+await serve(defineNativeHarness({
+  id: 'large-native-sdk', version: '1.0.0',
+  probe: unused, nativeContext: unused, capabilities: unused, plan: unused, command: unused,
+  normalize: ({ text }) => ({ event: { type: 'output', stream: 'stdout',
+    text: text.length + ':' + createHash('sha256').update(text).digest('hex') } }),
+}));`);
+  const request = (id, method, params) => JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+  const handshake = request(1, 'initialize', { protocol: 1 }) + request(2, 'health', {});
+  const invoke = input => spawnSync(process.execPath, [join(project, 'plugin.ts'), '--fabric-plugin-stdio'], {
+    env: environment(root), encoding: 'utf8', timeout: 5000, input,
+  });
+  const payloads = ['x'.repeat(108_091), 'y'.repeat(185_472), '\x01'.repeat(1024 * 1024)];
+  const result = invoke(handshake
+    + payloads.map((text, i) => request(i + 3, 'harness.normalize', { text })).join('')
+    + request(6, 'shutdown', {}));
+  assert.equal(result.status, 0, result.stderr);
+  const replies = result.stdout.trim().split('\n').map(JSON.parse);
+  assert.equal(replies.length, 6);
+  for (const [index, text] of payloads.entries()) {
+    assert.equal(replies[index + 2].result.result.event.text,
+      text.length + ':' + createHash('sha256').update(text).digest('hex'));
+  }
+  const oversized = invoke(handshake + request(3, 'harness.probe', {
+    context: { padding: 'x'.repeat(131_072) },
+  }));
+  assert.notEqual(oversized.status, 0);
+  assert.deepEqual(oversized.stdout.trim().split('\n').map(line => JSON.parse(line).id), [1, 2]);
+});

@@ -858,6 +858,37 @@ fn native_normalization_reuses_one_process_and_rejects_lifecycle_or_unknown_fiel
 }
 
 #[test]
+fn native_normalized_output_and_failure_text_keep_their_64_kib_bound() {
+    for kind in ["output", "failure"] {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = native_normalizer("normalize-text-bound", dir.path());
+        let cancel = CancellationToken::default();
+        for bytes in [64 * 1024, 64 * 1024 + 1] {
+            let value = serde_json::json!({"kind":kind,"bytes":bytes});
+            let result =
+                adapter.try_normalize_event(fabric_runner::NativeEvent::Json(&value), &cancel);
+            if bytes == 64 * 1024 {
+                let event = result.unwrap().unwrap();
+                match event {
+                    fabric_domain::AgentEvent::Output { text, .. } => assert_eq!(text.len(), bytes),
+                    fabric_domain::AgentEvent::Failure { message, .. } => {
+                        assert_eq!(message.len(), bytes)
+                    }
+                    other => panic!("unexpected normalized event: {other:?}"),
+                }
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{kind} must retain its existing text bound"
+                );
+            }
+        }
+        drop(adapter);
+        reaped(dir.path());
+    }
+}
+
+#[test]
 fn cancellation_interrupts_a_live_native_normalizer() {
     let dir = tempfile::tempdir().unwrap();
     let adapter = native_normalizer("normalize-hang", dir.path());

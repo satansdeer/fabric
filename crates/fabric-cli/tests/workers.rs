@@ -248,7 +248,8 @@ done
     }
 
     fn terminal(&self, id: &str) -> Value {
-        let start = Instant::now();
+        let mut progress_at = Instant::now();
+        let mut previous = Value::Null;
         loop {
             let mut wait = self.cli();
             wait.args(["wait", id, "--timeout-seconds", "1", "--json"]);
@@ -256,7 +257,17 @@ done
             if status["terminal"] == true {
                 return status;
             }
-            assert!(start.elapsed() < DEADLINE, "batch did not finish: {status}");
+            // Serial batches may exceed one worker's wait while still making durable progress.
+            if status["next_cursor"] != previous["next_cursor"]
+                || status["state"] != previous["state"]
+            {
+                progress_at = Instant::now();
+            }
+            assert!(
+                progress_at.elapsed() < DEADLINE,
+                "worker or batch made no durable progress: {status}"
+            );
+            previous = status;
         }
     }
 }

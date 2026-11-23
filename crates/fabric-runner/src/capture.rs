@@ -449,7 +449,7 @@ mod tests {
             tempfile::tempfile().unwrap(),
             tempfile::tempfile().unwrap(),
             Some(File::create(&path).unwrap()),
-            1_000_000,
+            4 * 1024 * 1024,
         )
         .unwrap()
         .with_harness(&harness);
@@ -496,20 +496,23 @@ mod tests {
         .unwrap()
         .with_harness(&harness);
         let mut bytes = b"OUTPUT hi\r\nTOOL start fixture-write\nunrecognized\n\xff\n".to_vec();
-        bytes.extend(std::iter::repeat_n(b'x', crate::jsonl::MAX_LINE_BYTES + 1));
+        bytes.extend(std::iter::repeat_n(b'x', 64 * 1024));
+        bytes.push(b'\n');
+        bytes.extend(std::iter::repeat_n(b'x', 64 * 1024 + 1));
         bytes.extend_from_slice(b"\nTOOL end fixture-write");
         let counts = capture.stdout(bytes.as_slice()).unwrap();
         let metadata = capture.finish(counts).unwrap();
         assert_eq!(
             metadata.event_counts,
             EventCounts {
-                parsed: 4,
+                parsed: 5,
                 invalid: 1,
                 oversized: 1
             }
         );
         assert_eq!(metadata.normalized_event_count, 3);
         assert!(metadata.native_failure.is_none());
+        assert!(!metadata.truncated);
     }
 
     #[test]

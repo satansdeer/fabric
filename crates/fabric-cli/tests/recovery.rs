@@ -223,18 +223,27 @@ impl Fixture {
         let mut command = self.cli();
         command.args(["manager", "serve", "--json"]);
         let mut process = self.spawn(command);
-        eventually(|| {
-            assert!(
-                process.child.try_wait().unwrap().is_none(),
-                "manager exited"
-            );
-            fs::read_to_string(&process.stdout)
-                .unwrap()
-                .lines()
-                .next()
-                .and_then(|line| serde_json::from_str::<Value>(line).ok())
-                .is_some_and(|ready| ready["manager_ready"] == true)
-        });
+        eventually(
+            || {
+                assert!(
+                    process.child.try_wait().unwrap().is_none(),
+                    "manager exited"
+                );
+                fs::read_to_string(&process.stdout)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                    .is_some_and(|ready| ready["manager_ready"] == true)
+            },
+            || {
+                format!(
+                    "manager stdout={:?} stderr={:?}",
+                    fs::read_to_string(&process.stdout),
+                    fs::read_to_string(&process.stderr)
+                )
+            },
+        );
         self.manager = Some(process);
     }
 
@@ -336,7 +345,21 @@ exit "$code"
     }
 
     fn started(&self, label: usize) {
-        eventually(|| self.path.join(format!("started.{label}")).exists());
+        eventually(
+            || self.path.join(format!("started.{label}")).exists(),
+            || {
+                format!(
+                    "worker label={label}; runs={:?}; fixture command output={:?}",
+                    self.cli().args(["runs", "list", "--json"]).output(),
+                    fs::read_dir(&self.path)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_name().to_string_lossy().starts_with("command-"))
+                        .map(|entry| (entry.file_name(), fs::read_to_string(entry.path())))
+                        .collect::<Vec<_>>()
+                )
+            },
+        );
     }
 
     fn release(&self, label: usize) {
@@ -407,12 +430,14 @@ fn parsed(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| panic!("{error}: {output:?}"))
 }
 
-fn eventually(mut predicate: impl FnMut() -> bool) {
+#[track_caller]
+fn eventually(mut predicate: impl FnMut() -> bool, diagnostic: impl Fn() -> String) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !predicate() {
         assert!(
             Instant::now() < deadline,
-            "fixture gate did not become ready"
+            "fixture gate did not become ready: {}",
+            diagnostic()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -825,7 +850,15 @@ done
         .as_str()
         .unwrap()
         .to_owned();
-    eventually(|| fixture.query(&["runs", "show", &id])["run"]["state"] == "RUNNING");
+    eventually(
+        || fixture.query(&["runs", "show", &id])["run"]["state"] == "RUNNING",
+        || {
+            format!(
+                "crashed-owner worker label={label} run={id}; shown={}",
+                fixture.query(&["runs", "show", &id])
+            )
+        },
+    );
     let queue = unsafe { libc::kqueue() };
     assert!(queue >= 0);
     let queue = unsafe { fs::File::from_raw_fd(queue) };

@@ -646,7 +646,12 @@ fn exchange_bounded(
         serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .map_err(|_| failure("invalid_request"))?;
     request.push(b'\n');
-    if request.len() > frame_limit {
+    let request_limit = if frame_limit == 2 * MAX_FRAME && method == "harness.normalize" {
+        crate::native_plugin::MAX_NORMALIZE_FRAME
+    } else {
+        frame_limit
+    };
+    if request.len() > request_limit {
         return Err(failure("request_too_large"));
     }
     let mut sent = 0;
@@ -873,5 +878,51 @@ mod tests {
         );
         assert!(error.message.contains("received 0 bytes"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn only_native_normalization_requests_get_the_large_envelope() {
+        let cancel = CancellationToken::default();
+        let params = json!({"text":"\u{1}".repeat(crate::jsonl::MAX_LINE_BYTES)});
+        for (method, limit, accepted) in [
+            ("harness.normalize", 2 * MAX_FRAME, true),
+            ("harness.probe", 2 * MAX_FRAME, false),
+            ("harness.normalize", MAX_FRAME, false),
+        ] {
+            let mut input = Vec::new();
+            let mut output =
+                std::io::Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+            let result = exchange_bounded(
+                (&mut input, &mut output),
+                1,
+                method,
+                params.clone(),
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                limit,
+            );
+            if accepted {
+                assert_eq!(result.unwrap(), json!({}));
+                let request: Value = serde_json::from_slice(&input).unwrap();
+                assert_eq!(request["params"], params);
+                assert!(input.len() <= crate::native_plugin::MAX_NORMALIZE_FRAME);
+            } else {
+                assert!(result.unwrap_err().message.contains("request_too_large"));
+                assert!(input.is_empty());
+            }
+        }
+        let mut input = Vec::new();
+        let mut output = std::io::Cursor::new(vec![b'x'; 2 * MAX_FRAME]);
+        let error = exchange_bounded(
+            (&mut input, &mut output),
+            1,
+            "harness.normalize",
+            json!({"text":"small"}),
+            Instant::now() + Duration::from_secs(5),
+            &cancel,
+            2 * MAX_FRAME,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("frame_too_large"));
     }
 }

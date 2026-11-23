@@ -69,6 +69,12 @@ for line in sys.stdin:
             event = {'type': 'completed', 'exit_code': 0, 'exit_signal': None, 'success': True}
         elif mode == 'normalize-extra':
             event['SECRET_CANARY'] = 'not an event field'
+        elif mode == 'normalize-text-bound':
+            incoming = req['params']['event']
+            text = 'x' * incoming['bytes']
+            event = ({'type': 'output', 'stream': 'stdout', 'text': text}
+                     if incoming['kind'] == 'output'
+                     else {'type': 'failure', 'code': 'fixture', 'message': text})
         result = {'result': {'event': event}, 'failure': None}
     else:
         sys.exit(9)

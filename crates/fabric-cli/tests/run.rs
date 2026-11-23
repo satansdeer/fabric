@@ -2643,7 +2643,7 @@ test "$(cat .deps/ready)" = ready
 printf '%s' "$8" > received.prompt
 printf 'mock tracked change' > tracked
 printf '{"type":"started","value":42}\r\nnot-json\n\377\n'
-head -c 262144 /dev/zero | tr '\000' x
+head -c 1048577 /dev/zero | tr '\000' x
 printf '\n{"type":"finished"}\n{"last":true}'
 "#,
     )
@@ -2731,7 +2731,7 @@ printf '\n{"type":"finished"}\n{"last":true}'
         assert_eq!(records[2]["status"], "invalid");
         assert_eq!(records[2]["line_bytes"], 1);
         assert_eq!(records[3]["status"], "oversized");
-        assert_eq!(records[3]["line_bytes"], 262144);
+        assert_eq!(records[3]["line_bytes"], 1048577);
         assert!(records[3].get("value").is_none());
         assert_eq!(records[4]["value"]["type"], "finished");
         assert_eq!(records[5]["value"]["last"], true);
@@ -2761,6 +2761,186 @@ printf '\n{"type":"finished"}\n{"last":true}'
             "original"
         );
     }
+}
+
+#[test]
+fn omp_large_native_records_survive_capture_normalization_and_sealing() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn padded(mut value: serde_json::Value, pointer: &str, bytes: usize) -> serde_json::Value {
+        let overhead = serde_json::to_vec(&value).unwrap().len();
+        *value.pointer_mut(pointer).unwrap() = serde_json::json!("x".repeat(bytes - overhead));
+        assert_eq!(serde_json::to_vec(&value).unwrap().len(), bytes);
+        value
+    }
+
+    let fixture = Fixture::new();
+    fixture.setup();
+    let turn = serde_json::json!({
+        "type":"turn_end",
+        "message":{"role":"assistant","content":[{"type":"text","text":""}],"stopReason":"stop"},
+        "toolResults":[]
+    });
+    let values = [
+        padded(turn.clone(), "/message/content/0/text", 108_091),
+        serde_json::json!({"type":"message_end","message":{
+            "role":"assistant","usage":{"input":7,"output":11,"cacheRead":3,"cost":{"total":0.01}}
+        }}),
+        padded(
+            serde_json::json!({
+                "type":"agent_end","isTerminal":true,
+                "messages":[{"role":"assistant","content":[{"type":"text","text":""}],"stopReason":"stop"}]
+            }),
+            "/messages/0/content/0/text",
+            185_472,
+        ),
+        padded(turn, "/message/content/0/text", 1024 * 1024),
+        serde_json::json!({
+            "type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after-large"}
+        }),
+    ];
+    let mut raw = Vec::new();
+    let mut lengths = Vec::new();
+    for (index, value) in values[..4].iter().enumerate() {
+        let bytes = serde_json::to_vec(value).unwrap();
+        lengths.push(bytes.len() + usize::from(index == 1));
+        raw.extend_from_slice(&bytes);
+        if index == 1 {
+            raw.push(b'\r');
+        }
+        raw.push(b'\n');
+    }
+    raw.extend_from_slice(&serde_json::to_vec(&values[3]).unwrap());
+    raw.push(b' '); // Valid JSON, one raw byte beyond the fixed record ceiling.
+    raw.extend_from_slice(b"\n\xff\n");
+    lengths.extend([1024 * 1024 + 1, 1]);
+    let final_record = serde_json::to_vec(&values[4]).unwrap();
+    lengths.push(final_record.len());
+    raw.extend_from_slice(&final_record); // Final valid record has no LF.
+    let input = fixture.0.join("native-records.jsonl");
+    fs::write(&input, &raw).unwrap();
+    let bin = fixture.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("omp");
+    fs::write(&executable, format!(
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = --version ]; then printf 'omp/19.1.0\\n'; exit 0; fi\nexec /bin/cat '{}'\n",
+        input.display()
+    )).unwrap();
+    fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = fixture.0.join("env-profile.json");
+    fs::write(&profile, r#"{"harness_id":"omp","harness_version":"omp/19.1.0","connection_refs":[{"kind":"env","name":"GROQ_API_KEY"}]}"#).unwrap();
+    let prompt = fixture.0.join("native.prompt");
+    fs::write(&prompt, "provider-free record capture").unwrap();
+    let report = json(
+        &fixture
+            .cli()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("GROQ_API_KEY", "fixture-key")
+            .args(["run", "test", "--harness", "omp", "--prompt-file"])
+            .arg(prompt)
+            .arg("--profile")
+            .arg(profile)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report["state"], "SUCCEEDED");
+    assert_eq!(report["harness_version"], "omp/19.1.0");
+    assert_eq!(
+        report["events"],
+        serde_json::json!({"parsed":5,"invalid":1,"oversized":1})
+    );
+    let capture = &report["capture"];
+    assert_eq!(capture["event_counts"], report["events"]);
+    assert_eq!(capture["truncated"], false);
+    assert!(capture["native_failure"].is_null());
+    assert_eq!(capture["stdout_bytes_seen"], raw.len());
+    assert_eq!(capture["stderr_bytes_seen"], 0);
+    assert_eq!(capture["normalized_event_count"], 4);
+    assert_eq!(report["worker_attempts"][0]["event_cursor"], 4);
+    let container = artifact_container(&fixture, &report);
+    assert_eq!(fs::read(container.join("stdout.log")).unwrap(), raw);
+    let event_bytes = fs::read(container.join("events.jsonl")).unwrap();
+    assert_eq!(event_bytes.last(), Some(&b'\n'));
+    let records: Vec<serde_json::Value> = event_bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 9);
+    let native: Vec<_> = records
+        .iter()
+        .filter(|record| record["line_number"] != 0)
+        .collect();
+    assert_eq!(native.len(), 7);
+    for (index, record) in native.iter().enumerate() {
+        assert_eq!(record["line_number"], index + 1);
+        assert_eq!(record["line_bytes"], lengths[index]);
+        assert_eq!(
+            record["status"],
+            match index {
+                4 => "oversized",
+                5 => "invalid",
+                _ => "parsed",
+            }
+        );
+    }
+    for index in 0..4 {
+        assert_eq!(native[index]["value"], values[index]);
+    }
+    assert_eq!(native[6]["value"], values[4]);
+    for index in [4, 5] {
+        assert!(native[index].get("value").is_none());
+        assert!(native[index].get("event").is_none());
+    }
+    for index in [0, 2, 3] {
+        assert!(native[index].get("event").is_none()); // Snapshots are not invented output.
+    }
+    let normalized: Vec<_> = records
+        .iter()
+        .filter(|record| record.get("event").is_some())
+        .collect();
+    for (index, record) in normalized.iter().enumerate() {
+        assert_eq!(record["sequence"], index + 1);
+    }
+    assert_eq!(normalized[0]["event"]["type"], "started");
+    assert!(normalized[0]["event"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(
+        normalized[1]["event"],
+        serde_json::json!({
+            "type":"usage","input_tokens":7,"output_tokens":11,"cached_input_tokens":3,"cost_usd":0.01
+        })
+    );
+    assert_eq!(
+        normalized[2]["event"],
+        serde_json::json!({
+            "type":"output","stream":"stdout","text":"after-large"
+        })
+    );
+    assert_eq!(
+        normalized[3]["event"],
+        serde_json::json!({
+            "type":"completed","exit_code":0,"exit_signal":null,"success":true
+        })
+    );
+    let mut total = 0;
+    for (field, name) in [
+        ("stdout", "stdout.log"),
+        ("stderr", "stderr.log"),
+        ("events", "events.jsonl"),
+    ] {
+        let bytes = fs::read(container.join(name)).unwrap();
+        total += bytes.len();
+        assert_eq!(capture[field]["size_bytes"], bytes.len());
+        assert_eq!(
+            capture[field]["sha256"],
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+    }
+    assert_eq!(capture["persisted_bytes"], total);
+    assert!(total as u64 <= capture["limit_bytes"].as_u64().unwrap());
+    assert_eq!(verified_manifest(&fixture, &report)["capture"], *capture);
 }
 
 #[test]

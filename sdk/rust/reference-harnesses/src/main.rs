@@ -136,12 +136,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Read;
         let n = input
             .by_ref()
-            .take((2 * fabric_runner::plugin::MAX_FRAME + 1) as u64)
+            .take((fabric_runner::native_plugin::MAX_NORMALIZE_FRAME + 1) as u64)
             .read_until(b'\n', &mut bytes)?;
         if n == 0 {
             break;
         }
-        if n > 2 * fabric_runner::plugin::MAX_FRAME || bytes.last() != Some(&b'\n') {
+        if n > fabric_runner::native_plugin::MAX_NORMALIZE_FRAME || bytes.last() != Some(&b'\n') {
             return Err("invalid frame".into());
         }
         let request: Value = serde_json::from_slice(&bytes)?;
@@ -149,6 +149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("invalid request".into());
         }
         let method = request["method"].as_str().ok_or("missing method")?;
+        if method != "harness.normalize" && n > 2 * fabric_runner::plugin::MAX_FRAME {
+            return Err("invalid frame".into());
+        }
         if expected == 1 && (method != "initialize" || request["params"] != json!({"protocol":1}))
             || expected == 2 && method != "health"
         {

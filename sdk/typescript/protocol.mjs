@@ -4,6 +4,8 @@ export const SDK_VERSION = '0.1.0';
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME = 65_536;
 export const NATIVE_MAX_FRAME = 2 * MAX_FRAME;
+// Request-only: one 1 MiB record, worst-case JSON expansion and the RPC wrapper.
+export const NATIVE_NORMALIZE_MAX_FRAME = 6 * 1024 * 1024 + NATIVE_MAX_FRAME;
 export const MAX_PACKAGE = 32 * 1024 * 1024;
 export const kinds = Object.freeze({ harness: 'harness.run', target: 'target.execute', connector: 'connector.ingest' });
 export const fail = (code) => { throw new Error(code); };
@@ -64,7 +66,7 @@ export function frame(value, max = MAX_FRAME) {
   if (bytes.length > max) fail('frame_too_large');
   return bytes;
 }
-export async function* frames(stream, max = MAX_FRAME) {
+export async function* frames(stream, max = MAX_FRAME, limitFor = null) {
   let pending = Buffer.alloc(0);
   for await (const chunk of stream) {
     let start = 0;
@@ -72,7 +74,9 @@ export async function* frames(stream, max = MAX_FRAME) {
       if (chunk[i] !== 10) continue;
       if (pending.length + i - start + 1 > max) fail('frame_too_large');
       const bytes = pending.length ? Buffer.concat([pending, chunk.subarray(start, i)]) : chunk.subarray(start, i);
-      yield decode(bytes);
+      const value = decode(bytes);
+      if (limitFor && bytes.length + 1 > limitFor(value)) fail('frame_too_large');
+      yield value;
       pending = Buffer.alloc(0);
       start = i + 1;
     }
