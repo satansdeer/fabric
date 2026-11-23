@@ -51,10 +51,11 @@ try {
     stdio: 'inherit', env: { ...process.env, CARGO_TARGET_DIR: build, FABRIC_BUILD_VERSION: cliVersion },
   });
   const files = {};
-  function copy(from, to, executable = false) {
+  function copy(from, to, executable = false, transform) {
     const destination = join(stage, to);
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    copyFileSync(from, destination);
+    if (transform) writeFileSync(destination, transform(readFileSync(from, 'utf8')));
+    else copyFileSync(from, destination);
     chmodSync(destination, executable ? 0o700 : 0o600);
     files[to] = sha256(readFileSync(destination));
   }
@@ -75,6 +76,13 @@ try {
   for (const kind of ['connector', 'harness', 'target']) copy(join(repo, 'sdk/typescript/samples', `${kind}.ts`), `sdk/samples/${kind}.ts`);
   for (const file of ['fabric.ts', 'host-smoke.ts', 'up-smoke.ts']) copy(join(repo, 'integrations/omp', file), `integrations/omp/${file}`);
   for (const file of ['smoke-release.mjs', 'fabric-webhook.mjs']) copy(join(repo, 'scripts', file), `scripts/${file}`);
+  for (const file of ['bridge.mjs', 'connector.mjs', 'plugin.mjs']) {
+    copy(join(repo, 'integrations/github', file), `integrations/github/${file}`, file === 'bridge.mjs',
+      text => text.replaceAll('../../sdk/typescript/', '../../sdk/'));
+  }
+  copy(join(repo, 'scripts/check-fabric-github.mjs'), 'scripts/check-fabric-github.mjs', true);
+  copy(join(repo, 'docs/GITHUB_CONNECTOR.md'), 'docs/GITHUB_CONNECTOR.md', false,
+    text => text.replaceAll('sdk/typescript/', 'sdk/'));
   // The smoke's SDK imports are dynamic and resolve inside the extracted bundle.
   const manifest = {
     version, tag, source_sha: source, build_kind: buildKind, platform: 'macos-arm64',

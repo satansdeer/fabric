@@ -1,8 +1,10 @@
 # Fabric Connect: stable authenticated automation identities
 
-Connect uses the existing owner-provisioned Cloudflare Worker at `https://fabric-connect.satansdeer.workers.dev` and its SQLite Durable Object. Issue [#9](https://github.com/satansdeer/fabric/issues/9) adds claimed account/project/automation identities; [#10](https://github.com/satansdeer/fabric/issues/10) adds the generic outbound local agent described below. Neither change deploys this source. `polyglo.tv` is optional future custom-hostname work, not a DNS prerequisite. No `usemont.com` changes are involved. External GitHub setup (#11) remains separate.
+Connect uses the existing owner-provisioned Cloudflare Worker at `https://fabric-connect.satansdeer.workers.dev` and its SQLite Durable Object. Issue [#9](https://github.com/satansdeer/fabric/issues/9) adds claimed account/project/automation identities; [#10](https://github.com/satansdeer/fabric/issues/10) adds the generic outbound local agent described below. Neither change deploys this source. `polyglo.tv` is optional future custom-hostname work, not a DNS prerequisite. No `usemont.com` changes are involved. The [external GitHub connector (#11)](GITHUB_CONNECTOR.md) uses a separately provisioned generic route; it does not replace or migrate the deployed legacy GitHub URLs/state described here.
 
 ## Trust and execution
+
+This section describes the existing legacy GitHub ingress/consumer. The external #11 connector instead performs provider verification and approved-snapshot normalization outside Connect; its local receiver and scoped response hooks are documented separately above. Generic delivery semantics remain unchanged.
 
 GitHub signs raw `issues` webhook bodies with a separate, randomly generated secret for each automation. Claimed policy fixes the repository, author, sender and readiness label. Only open, non-PR issues with that exact policy enter the inbox. Supported actions are opened, edited, reopened and addition of the readiness label. SHA-256 of the raw body is the event identity; reusing a GitHub delivery UUID for different bytes is rejected. New events must have a valid issue update timestamp within the preceding 24 hours (at most five minutes in the future). Authenticated exact redeliveries return the retained receipt even after that freshness window.
 

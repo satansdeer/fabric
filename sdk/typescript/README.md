@@ -81,9 +81,11 @@ SDK metadata must be exactly `sdk: "0.1.0", protocol: 1`; mismatch diagnostics e
 
 The generated connector accepts `{event_id,idempotency_key,data}` JSON bodies with HMAC-SHA256 or a scoped bearer-file reference. It advertises no subscribe/reply operations. Another format implements the same typed `verify`/`normalize` callbacks; Core does not gain provider branches.
 
-`fabric-plugin test DIR --connector-fixture FILE` tests an alternate format without rebuilding Core. The JSON fixture is `{body: STRING, expected: NormalizedTrigger}`: a raw body string and the complete version-1 normalized contract. The kit supplies a private deterministic HMAC key reference, trusted policy identities from `expected`, fixture timestamps and a valid signature, then checks the exact normalized result. Fixtures are local test data, not automation approval or provider authentication.
+`fabric-plugin test DIR --connector-fixture FILE` tests an alternate format without rebuilding Core. The JSON fixture is `{body: STRING, expected: NormalizedTrigger, authorization?: STRING}`: a raw body string, the complete version-1 normalized contract and optional format-specific signature (at most 512 characters). The kit supplies a private deterministic HMAC key reference (32 bytes of value 7), trusted policy identities from `expected`, fixture clock/timestamp 1000 and expiry 1060. Without `authorization` it generates the unchanged generic signature; either path checks the exact normalized result. Fixtures are local test data, not automation approval or provider authentication.
 
 See [incoming connector contract](../../docs/PLUGIN_PROTOCOL.md#incoming-connectors-contract-version-1) for explicit private automation files, source/tenant/scope/route checks, signing bytes, durable acknowledgements/replay/rate limits and the stdlib-only loopback HTTP reference. Raw event fields are data, never unrestricted worker instructions. The existing content-pinned external installation below applies unchanged.
+
+The [GitHub issues connector](../../docs/GITHUB_CONNECTOR.md) is an externally packaged example using these callbacks and optional outbound hooks, with provider-free end-to-end and opt-in real-installation checks. It preserves the generic connector and requires separately approved local Automation execution.
 
 
 ## Reproducible local packaging (not public publication)
