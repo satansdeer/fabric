@@ -826,3 +826,15 @@ artifact hashes, including complete `.parity/verification.txt` output in
 Capture was not truncated. Passing local GC checks do not explain the
 historical failure; v0.1.2 remains held pending a proven correction and
 manager-observed exact-main acceptance.
+
+### Issue #5 — timeout test measurement boundary
+Main CI `45124969084`'s unidentified RPC timeout remains UNKNOWN; PR45 added
+method/phase diagnostics, not a root-cause fix. PR45 push CI `45127910773`
+instead failed the six-second total CLI bound; preceding timeout/signal/state
+assertions passed, but later tree/persistence assertions did not execute.
+PR-event CI `45127916146` passed. These are distinct historical failures.
+Removed only the total CLI stopwatch: worker execution timeout does not bound
+CLI startup, source fork/sync, artifact Git capture/publication or reclaim.
+Runner `timeout_escalates_a_term_ignoring_leader_and_reaps_its_observed_status`
+retains 100 ms execution + 50 ms TERM grace, SIGKILL/null exit, Timeout, <2 s
+and capture success; all end-to-end tree, durable evidence and reclaim checks remain.
