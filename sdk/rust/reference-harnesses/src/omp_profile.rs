@@ -87,9 +87,10 @@ pub(super) fn resolve(
         match reference.kind.as_str() {
             "native-home" if home.is_none() => home = Some(&reference.path),
             "native-agent-dir" if agent.is_none() => agent = Some(reference.path.clone()),
+            fabric_runner::controller::REFERENCE => {}
             _ => {
                 return Err(crate::profile::invalid(
-                    "OMP supports one native-home and one native-agent-dir reference only.",
+                    "OMP supports native-home, native-agent-dir and one explicit omp-controller reference only.",
                 ));
             }
         }
@@ -156,6 +157,12 @@ pub(super) fn resolve(
         CONFIG_FILES,
         "Selected OMP native config changed, is unreadable or exceeds the 1 MiB per-file bound.",
     )?;
+    let fingerprint = fabric_runner::controller::fingerprint(profile, fingerprint)?;
+    if launch {
+        if let Some(controller) = fabric_runner::controller::load(profile)? {
+            environment.extend(controller.environment());
+        }
+    }
     let mut diagnostics = vec![CapabilityReason {
         code: "auth_availability_only".into(),
         message: "Explicit credential connection availability checked locally; provider login validity, entitlement and model availability are not validated. No auth refresh, auth-store reads or command-key execution performed by Fabric.".into(),

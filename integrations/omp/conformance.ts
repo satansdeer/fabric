@@ -117,7 +117,7 @@ try {
 		zod: schema,
 		on() {},
 		registerTool(value: FixtureTool) { if (value.name === "fabric") tool = value; },
-		registerCommand(name: string, value: FixtureCommand) { assert.equal(name, "fabric"); command = value; },
+		registerCommand(name: string, value: FixtureCommand) { if (name === "fabric") command = value; },
 		sendMessage(message: FixtureMessage, options: { triggerTurn: boolean }) {
 			assert.equal(message.display, true);
 			assert.deepEqual(options, { triggerTurn: false });

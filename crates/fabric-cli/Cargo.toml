@@ -24,9 +24,10 @@ fabric-domain.workspace = true
 fabric-core.workspace = true
 fabric-project = { path = "../fabric-project" }
 fabric-runner = { path = "../fabric-runner" }
+tempfile = "3"
+sha2 = "0.10"
+libc = "0.2"
 
 [dev-dependencies]
 fabric-store = { path = "../fabric-store" }
 rusqlite = { version = "0.32", features = ["bundled"] }
-sha2 = "0.10"
-libc = "0.2"

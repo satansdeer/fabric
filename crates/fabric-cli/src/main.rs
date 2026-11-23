@@ -1,4 +1,5 @@
 mod onboarding;
+mod up;
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -27,6 +28,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Consent once to local setup, preparation and optional OMP controller tools.
+    Up(up::UpArgs),
+    /// Launch the explicitly connected OMP controller without changing native defaults.
+    Controller {
+        /// Provider-free host protocol mode; never starts a model turn by itself.
+        #[arg(long)]
+        rpc: bool,
+    },
     /// Manage explicitly selected, owner-installed external plugins.
     Plugins {
         /// Existing canonical private directory outside every checkout.
@@ -517,6 +526,8 @@ fn main() -> ExitCode {
         }
     };
     let (json, result) = match cli.command {
+        Commands::Up(args) => (args.json, up::up(cli.root, args)),
+        Commands::Controller { rpc } => (false, up::controller(cli.root, rpc)),
         Commands::Init {
             harness,
             check,

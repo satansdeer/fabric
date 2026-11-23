@@ -127,6 +127,11 @@ impl HarnessAdapter for OmpHarness {
             "--no-session".into(),
             "--no-title".into(),
         ];
+        if let Some(controller) =
+            fabric_runner::controller::load(plan.request.profile.as_ref().unwrap())?
+        {
+            args.extend(controller.args());
+        }
         if let Some(cost) = spec.max_cost_usd {
             args.push(format!("--max-cost={cost}").into());
         }
@@ -329,6 +334,64 @@ mod tests {
                 fabric_domain::ErrorKind::UnsupportedVersion
             );
         }
+        // The opt-in controller uses the same native plan/command path, not a wrapper.
+        let root = temp.path().canonicalize().unwrap();
+        for name in ["storage", "registry", "controller"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let pin = fabric_runner::controller::PinnedFile {
+            path: harness.binary.canonicalize().unwrap(),
+            sha256: fabric_runner::controller::file_sha256(&harness.binary.canonicalize().unwrap())
+                .unwrap(),
+        };
+        let binding = fabric_runner::controller::Controller {
+            binary: pin.clone(),
+            extension: pin,
+            root: root.join("storage"),
+            registry: root.join("registry"),
+            plugin: None,
+        };
+        let config = root.join("controller/controller.json");
+        fs::write(&config, serde_json::to_vec(&binding).unwrap()).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut controller_request = request.clone();
+        controller_request
+            .profile
+            .as_mut()
+            .unwrap()
+            .native_config_refs
+            .push(fabric_domain::NativeConfigRef {
+                kind: fabric_runner::controller::REFERENCE.into(),
+                path: root.join("controller"),
+            });
+        let controller_plan = harness.plan(&controller_request, &info).unwrap();
+        assert_ne!(
+            controller_plan.profile.native_config_fingerprint,
+            plan.profile.native_config_fingerprint
+        );
+        let command = harness
+            .command(&AgentSpec {
+                profile: &controller_plan.profile,
+                prompt_file: &prompt,
+                request: &controller_request,
+                max_cost_usd: controller_plan.request.max_cost_usd,
+            })
+            .unwrap();
+        assert!(command.args.windows(2).any(|args| args
+            == [
+                OsString::from("-e"),
+                binding.extension.path.as_os_str().to_owned()
+            ]));
+        for pair in binding.environment() {
+            assert!(command.environment.contains(&pair));
+        }
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg == "--model" || arg == "--provider" || arg == "--thinking")
+        );
     }
 
     #[test]

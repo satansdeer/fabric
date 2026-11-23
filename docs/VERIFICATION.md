@@ -1007,3 +1007,66 @@ remain unchanged. Neither a passing local check nor a previous green workflow
 replaces exact-head CI.
 The four affected actual-Core SDK fixtures passed locally on the verified
 Node 22.23.2 runtime in 41.00 s, including artifact retrieval and reclaim.
+
+
+### Issue #8 — consented local setup and pinned native OMP controller (v0.1.5)
+
+`fabric up` reuses native-context consent, the installed plugin registry and
+immutable READY preparation. It offers reviewed repository/Cargo/npm preparation
+or explicit `--source-only`; setup performs no inference. OMP controller opt-in
+pins the release binary, packaged typed extension and optional external plugin,
+disables ambient extensions, and preserves native provider/model/effort/auth.
+`/fabric` exposes the actual registered typed tools; `/swarm` explicitly selects
+the local Fabric route. Remote execution and OS/billing isolation remain unsupported.
+Setup metadata rejects symlinks and non-regular files, including FIFOs without
+blocking. Controller bindings reject tampering and duplicate references.
+
+The released v0.1.4 native implementer produced the captured change, then stalled
+inside a read of the user home directory. Two unchanged progress observations
+and a native process sample preceded explicit cancellation. Its 14 sealed
+artifacts were independently hash/size verified and its workspace reclaimed.
+That one-attempt budget is closed: no retry, replacement, helper or consumer was
+launched. The manager integrated the partial result and finished verification.
+The original host check selected an upstream Cursor pstack skill without its OMP
+adapter and failed; that input is not evidence against native plugin support.
+
+Manager checks on macOS arm64 used installed Rust 1.91.0, offline/locked Cargo,
+`RUST_TEST_THREADS=4`, a freshly built local v0.1.5 release-layout bundle and its
+real native reference plugin:
+
+```sh
+cargo test --offline --locked -p fabric-runner --lib controller::tests::pinned_controller_rejects_tampering_symlinks_and_duplicate_refs -- --exact --nocapture
+cargo test --offline --locked -p fabric-reference-harnesses --lib omp::tests::exact_version_plan_preserves_native_cost_argv_and_rejects_unverified_features -- --exact --nocapture
+cargo test --offline --locked -p fabric-cli --bin fabric up::tests::setup_metadata_rejects_symlinks_and_fifos -- --exact --nocapture
+cargo test --offline --locked -p fabric-cli --test onboarding -- --nocapture
+FABRIC_SMOKE_NATIVE_AGENT_DIR=/absolute/selected/native-agent \
+FABRIC_SMOKE_EVIDENCE=/absolute/private/evidence \
+bun /absolute/bundle/integrations/omp/up-smoke.ts \
+  /absolute/bundle/bin/fabric /absolute/native/omp \
+  /absolute/reviewed/native-swarm-subset \
+  292861c8bc85bf090ad5c9203fab7b044b494068a7f7d6a6293d7eec044e87e8
+```
+
+All four Rust commands passed (1, 1, 1, 4 tests). The actual OMP 19.1.0 RPC
+controller check exited 0 with `inference=NOT_RUN` and native defaults untouched.
+It observed `/skill:swarm`, `/fabric`, `/swarm` and all five typed tools; reused
+exact READY state; obtained early durable handles; ran four real fake-a workers
+with three successes and one deliberate failure; verified sealed artifact hashes,
+source pins and full captures; reconnected; cancelled another running worker;
+and independently checked database and filesystem workspace reclamation. Owned
+controller/manager processes were stopped. This provider-free check is not
+model-driven swarm/skill acceptance; that requires a separate consumer admission.
+
+The reviewed subset is five unmodified Git blobs from
+`satansdeer/om-pstack@eee3dcd532f876da68ecd90b67a1c0fb73111a66`:
+`plugin.json`, `.omp-plugin/plugin.json`, `LICENSE`, `skills/swarm/SKILL.md`,
+`docs/harness/omp.md`. Their Git blob hashes and aggregate SDK package pin were
+independently checked; no authentication database or credentials were copied.
+This verifies that subset, not full om-pstack parity or plugin installation.
+Exact-head CI, merge and independently verified public release are separate gates.
+
+Exact-head CI exposed an obsolete single-command assertion in the v1 OMP fake
+host. The host now selects `/fabric` without forbidding unrelated registered
+commands. `bun integrations/omp/conformance.ts /absolute/bundle/bin/fabric`
+passed against the packaged native CLI and reference plugins, including actual
+mixed batches, artifact/reclaim checks and transport failure handling; no inference.

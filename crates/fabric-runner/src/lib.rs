@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub mod controller;
 mod supervision;
 pub mod target;
 pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, StopReason};

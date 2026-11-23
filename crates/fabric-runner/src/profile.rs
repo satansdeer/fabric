@@ -159,7 +159,7 @@ pub fn revalidate(
     Ok(plan)
 }
 
-pub(crate) fn private_environment(
+pub fn private_environment(
     command: &mut std::process::Command,
 ) -> Result<tempfile::TempDir, FabricError> {
     let root = tempfile::tempdir().map_err(|_| invalid("Cannot create private runtime HOME."))?;

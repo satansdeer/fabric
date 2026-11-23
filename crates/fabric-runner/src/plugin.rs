@@ -129,9 +129,15 @@ impl PluginManifest {
         self.protocol.min <= 1 && self.protocol.max >= 1
     }
     pub fn verify_integrity(&self) -> Result<(), FabricError> {
-        let Some(pin) = &self.integrity else {
-            return Ok(());
-        };
+        self.integrity
+            .as_ref()
+            .map_or(Ok(()), PluginIntegrity::verify)
+    }
+}
+
+impl PluginIntegrity {
+    pub fn verify(&self) -> Result<(), FabricError> {
+        let pin = self;
         let root = &pin.root;
         let meta = fs::symlink_metadata(root).map_err(|_| failure("integrity_mismatch"))?;
         if !meta.is_dir()

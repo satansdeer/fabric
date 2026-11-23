@@ -96,6 +96,28 @@ The bundled extension/fake fixture supports later consumer checks; `host-smoke.t
 
 See [publication and evidence](docs/VERIFICATION.md#issue-38-native-release-bootstrap).
 
+### One-command local setup and opt-in OMP controller
+
+From an existing Git checkout, use the **native bundle's** binary:
+
+```sh
+/absolute/fabric-bundle/bin/fabric --root /absolute/private/storage up
+# Explicit OMP typed-tool integration, without editing ~/.omp:
+/absolute/fabric-bundle/bin/fabric --root /absolute/private/storage up --controller
+# For a repo with no dependency preparation, append --source-only.
+# Unattended explicit trust/execute/auth/preparation consent: --yes --json.
+```
+
+`up` explains source/HEAD/dirty state, selected native paths and exposure, then obtains consent before executing discovery plugins/harness probes and again before auth-enabled execution/preparation. It registers the bundle's hash-verified native packages in a private registry, discovers configured OMP 19.1.0 or Codex 0.171.0, connects through existing revocable native consent, registers/reuses the project and reuses exact READY identities. Existing valid grants are retained. It prepares committed HEAD only, never uncommitted changes. Repo `fabric.recipe.toml`/`.fabric/recipe.toml` takes precedence over detected `cargo build --locked`/`npm ci`; otherwise explicitly choose `--source-only` or `--recipe`. Preparation tools must already be installed; no harness, runtime or global dependency installation occurs. Installed Core/plugins/controller launch require no npm/Node; a repo's explicitly approved npm preparation still requires npm.
+
+Follow the printed `controller` command. `/fabric help` and `/fabric tools` are provider-free local controls; `/fabric spawn <typed JSON>` and status/results/wait/cancel execute the actual registered typed handlers. `/swarm <task>` explicitly starts a native model turn and routes local work through those tools, not a replacement scheduler. Empty `/swarm` is local help. Real controller inference is separately opt-in, not established by host registration.
+
+For a caller-reviewed external OMP plugin/skill package, append `--plugin-dir /canonical/private/pinned-tree --plugin-sha256 <content-hash>` to `up --controller`. The tree uses the existing SDK content-hash convention (sorted relative filename, NUL, file SHA256, newline); existing bounded package integrity rules apply, including owner-only root, no symlinks, at most 256 files/32 MiB. A large installed plugin must be explicitly reduced outside its live installation, preserving the selected native skill's manifests, license and referenced adapter documents. The verified om-pstack swarm-only selection contains `plugin.json`, `.omp-plugin/plugin.json`, `LICENSE`, `skills/swarm/SKILL.md` and `docs/harness/omp.md` from one exact reviewed `om-pstack` commit; upstream Cursor pstack is not a substitute. This is not full-plugin parity or automatic installation. The selected plugin is passed with OMP's supported `--plugin-dir`; ambient extension discovery is disabled and the exact packaged Fabric extension is explicitly loaded. Native OMP authentication, provider, model and effort are not overridden.
+
+The exact binary, private Fabric root, registry and optional plugin path are consent-bound and fingerprinted; only these finite exact environment values are forwarded in addition to existing native adapter allowlists. Changed pins fail closed and require reviewed setup again. Remote placement remains explicitly unsupported. Controller timeout 604800 s and 128 MiB copy/log/artifact limits remain representable; four-fixture workers use 60 s/128 MiB copy/1 MiB log/artifact. These are best-effort policies, not OS/billing quotas; reject truncated capture when full capture is required. No automatic 600 s restart.
+
+Provider-free actual-host proof: `FABRIC_SMOKE_NATIVE_AGENT_DIR=/absolute/selected/native-agent FABRIC_SMOKE_EVIDENCE=/absolute/evidence bun integrations/omp/up-smoke.ts /absolute/bundle/bin/fabric /absolute/omp [private-plugin-tree content-hash]`. This needs Bun only for verification and an explicitly selected configured native OMP agent directory. It launches actual native binaries and registered tools without copying credentials or emitting an agent/model turn. See [verification](docs/VERIFICATION.md).
+
 ### Discover and connect a native harness
 
 First explicitly install the reviewed, content-pinned OMP/Codex reference packages using the [SDK instructions](sdk/typescript/README.md#native-reference-harness-plugins), and set `FABRIC_PLUGIN_REGISTRY` in both controller and manager environments. Neither CLI is a built-in fallback. Their existing `omp`/`codex` identities, exact CLI versions, profiles and revocable native-context consent remain unchanged. Then run from the project's Git checkout:
