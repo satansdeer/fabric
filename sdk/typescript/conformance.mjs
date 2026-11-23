@@ -154,14 +154,16 @@ export async function conformance(path, { timeout = 5000, connectorFixture } = {
           expected: { version: 1, source_id: 'fixture', tenant_id: 'fixture', scope: 'events.read',
             route: 'fixture', event_id: 'event-1', idempotency_key: 'business-1', data: { title: FIXTURE_PROMPT } },
         };
-        if (!exact(fixture, ['body', 'expected']) || typeof fixture.body !== 'string' || !validNormalizedTrigger(fixture.expected)) fail('invalid_connector_fixture');
+        if (!(exact(fixture, ['body', 'expected']) || exact(fixture, ['body', 'expected', 'authorization'])) ||
+          typeof fixture.body !== 'string' || !validNormalizedTrigger(fixture.expected) ||
+          fixture.authorization !== undefined && (typeof fixture.authorization !== 'string' || fixture.authorization.length > 512)) fail('invalid_connector_fixture');
         const key = Buffer.alloc(32, 7), secret_ref = join(home, 'fixture-key');
         writeFileSync(secret_ref, key, { mode: 0o600 });
         const { source_id, tenant_id, scope, route } = fixture.expected;
         const input = { version: 1, now: 1000, policy: { source_id, tenant_id, scope, route,
           auth: 'hmac-sha256', secret_ref, max_payload_bytes: 8192, max_age_seconds: 60 },
           request: { body: fixture.body, timestamp: 1000, expires_at: 1060, nonce: 'conformance', authorization: '' } };
-        input.request.authorization = 'sha256=' + createHmac('sha256', key).update(webhookSigningBytes(input)).digest('hex');
+        input.request.authorization = fixture.authorization ?? ('sha256=' + createHmac('sha256', key).update(webhookSigningBytes(input)).digest('hex'));
         const verification = await call('connector.verify', input);
         if (!exact(verification, ['verified']) || verification.verified !== true) fail('connector_not_verified');
         const trigger = await call('connector.normalize', input);

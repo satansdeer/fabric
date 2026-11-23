@@ -72,6 +72,9 @@ jobs:
       - name: Generic Connect crash and reconnect acceptance (provider-free)
         timeout-minutes: 5
         run: python3 scripts/test-fabric-connect-agent.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
+      - name: External GitHub connector and scoped responses (provider-free)
+        timeout-minutes: 5
+        run: python3 scripts/test-fabric-github.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
       - name: OMP v1 conformance (fake workers, provider-free)
         timeout-minutes: 5
         run: bun integrations/omp/conformance.ts "$GITHUB_WORKSPACE/target/debug/fabric"
