@@ -2126,8 +2126,10 @@ fn wait_for_tree(fixture: &Fixture) -> PathBuf {
                 }
             }
         }
+        // Preparation and the batch's completed first task precede this heartbeat.
+        // Bound the wait, not loaded-runner filesystem preparation to eight seconds.
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(8),
+            start.elapsed() < std::time::Duration::from_secs(60),
             "worker was not ready"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));

@@ -2,6 +2,14 @@
 
 Operator platform override: macOS first. Verified on arm64 macOS; Rust/cargo 1.91.0. The parent orchestrator, not the implementer, owns this record and PRD status.
 
+## Issue 7 worker evidence (not independent acceptance)
+
+The native distribution implementation and local consumer checks are recorded in
+[docs/VERIFICATION.md](docs/VERIFICATION.md#issue-7-reachable-distribution).
+Raw worker command streams/timestamps/exits are retained under `.parity/`.
+These are worker evidence for manager review, not exact-head CI, release approval,
+registry publication, Developer ID signing/notarization or full issue-7 acceptance.
+
 ## FAB-01
 
 - Reviewed doctor implementation, command/error dispatch and all five integration tests.

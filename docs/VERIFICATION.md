@@ -12,6 +12,83 @@
 
 No cloud readiness or full model-driven skill-routing claim is made. Later sections preserve historical verification records; their counts and blockers are not current release gates.
 
+## Issue 7: reachable distribution
+
+The source installer and optional launcher consume the existing public v0.1.2
+`release.json` and archive checksum, not a new content-manifest convention.
+Only macOS arm64 is supported. The pinned source is
+`14f2d44b40f8489d38537e31eda41dd8752463df`; archive SHA-256 is
+`81f06df7a50f0e513fb64e409286f06835b0cf29f00eb991c1bfb42f671ec3d6`.
+System Ruby and its TLS/JSON/zlib stdlib provide the native installer; Node is
+optional launcher/build/smoke tooling, not a Core runtime requirement.
+See the [install commands](../README.md#native-macos-arm64-release).
+
+The Fabric run sealed `.parity/verification.txt`, `.parity/report.md` and separate
+command streams; all 14 sealed artifact hashes/sizes were independently verified.
+The parallel verification ledger interleaves command output, and native capture
+hit its 32 MiB limit. Neither is a complete, unambiguous native/per-command trace.
+Deterministic corrupt-input fixtures and local npm tarball checks are separate
+from actual public-release download/native CLI proof.
+The existing release-artifact CI smoke remains authoritative for its separately
+scoped provider-free local target/harness proof; no checkout build substitutes.
+
+Observed public download/native proof (2026-11-23): system Ruby downloaded the
+actual v0.1.2 archive and verified it before exposing the installation; explicit
+installed `fabric --version` reported the exact source above. `fabric doctor --json`
+reported `macos/aarch64`, `supported: true`, and only system Git on the isolated
+`PATH=/usr/bin:/bin`. Core SHA-256 was
+`40c99cc7f0e1d6284736b40dad8c54eab1ea365d85955edaa314909356712ea3`.
+Command exited 0. Separately, offline `npm pack --ignore-scripts` plus local-tarball
+`npm exec --offline` launched that real released Core and printed the same version
+(exit 0); this was not registry publication or clean-machine published `npx`.
+
+Regression fixtures require exact provenance/payload/plugin/extension pins and reject
+corruption, unsafe/link/alias archives and existing-install collisions. Explicit
+`--trust-plugins` registers all three real official packages. OMP/Codex harness
+executables are not bundled; isolated checks assert their actionable missing-CLI
+errors rather than fake executable success. Local-target health is checked against
+the real installed target and selected registry. Linux/Intel are unsupported;
+neither artifacts nor a release timeline are asserted.
+
+`node scripts/test-distribution.mjs --archive <independently-downloaded-public-archive>`
+passed the isolated Ruby adversarial checks and real native launcher/Core/target
+checks (exit 0, `PINNED_PUBLIC_DISTRIBUTION_CONSUMER`). Actual installed Homebrew
+`Formula#install` also passed against a privately copied reviewed tap layout with
+only destination and cached-download paths substituted, then invoked the real
+installed released CLI (exit 0, 2026-11-23T08:36:54Z); its complete native installer
+command log is retained. This is neither a global Brew installation nor a
+published tap proof. An earlier no-API Homebrew attempt unexpectedly cloned the
+shared core tap; the exact newly created clone was removed. Corrections and
+initial capture gaps remain documented in `.parity/report.md`, not hidden as a
+clean first-pass run.
+
+Manager review found and closed an unsafe-parent staging substitution risk:
+installation now rejects untrusted-owned or non-sticky group/other-writable
+ancestry before staging or executing any release code. Deterministic fixtures
+cover unsafe direct parents, unsafe ancestors above private children, and safe
+sticky parents. This host's global Homebrew Cellar is `0775` and is intentionally
+rejected; the formula evidence above uses a private protected prefix only.
+
+The optional launcher asynchronously awaits a dedicated installer process group
+and relays PID-directed SIGINT/SIGTERM/SIGHUP. A controlled blocking-installer
+fixture verifies that cancellation reaches and reaps the installer's child and
+prevents subsequent native `up`, even when the interrupted installer exits 0.
+This cancellation fixture is separate from the actual released-native proof.
+
+CI exposed an existing cancellation-test readiness guard that also charged the
+preceding batch task's preparation and durable capture to an eight-second wait.
+The shared heartbeat wait is now bounded at 60 seconds; cancellation, process
+termination, queued-task and durable-result assertions remain unchanged.
+
+Issue 7 remains **OPEN**: observed npm HTTP 401 means no authenticated publishing
+identity; the private candidate namespace is neither asserted owned nor published.
+Real registry publication and clean-machine `npx` proof require an owned package
+name and authorized publishing identity. Developer ID Application signing and
+notarization require the missing appropriate identity/credentials and a real signed
+release; Apple Development/Distribution identities, SHA-256 and ad-hoc signatures
+are not substitutes. No auth/keychain mutation, publication, signing, push or PR
+was performed by this worker.
+
 ## Issue 5: committed effects and usable target contracts
 
 Source baseline: `289c26ab163f3d3fe8040ddfe4013e16c51d7fea`, a private,
