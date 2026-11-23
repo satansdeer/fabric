@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { constants as osConstants } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,11 +55,31 @@ for (const [option, value] of options) {
   installerArgs.push(option);
   if (value !== true) installerArgs.push(value);
 }
-const installed = spawnSync('/usr/bin/ruby', installerArgs, { stdio: ['inherit', command === 'install' ? 'inherit' : 2, 'inherit'] });
-if (installed.error) fail(`cannot run the system Ruby installer: ${installed.error.message}`);
-if (installed.signal) {
-  process.kill(process.pid, installed.signal);
-  process.exit(128 + (osConstants.signals[installed.signal] ?? 1));
+const installer = spawn('/usr/bin/ruby', installerArgs, { detached: true, stdio: ['inherit', command === 'install' ? 'inherit' : 2, 'inherit'] });
+let interrupted;
+const handlers = ['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => [signal, () => {
+  interrupted ??= signal;
+  if (installer.pid) {
+    try { process.kill(-installer.pid, signal); }
+    catch (error) { if (error.code !== 'ESRCH') console.error(`fabric-native: cannot signal installer group: ${error.message}`); }
+  }
+}]);
+for (const [signal, handler] of handlers) process.on(signal, handler);
+let installed;
+try {
+  installed = await new Promise((resolve, reject) => {
+    installer.once('error', reject);
+    installer.once('close', (status, signal) => resolve({ status, signal }));
+  });
+} catch (error) {
+  fail(`cannot run the system Ruby installer: ${error.message}`);
+} finally {
+  for (const [signal, handler] of handlers) process.off(signal, handler);
+}
+const signal = interrupted ?? installed.signal;
+if (signal) {
+  process.kill(process.pid, signal);
+  process.exit(128 + (osConstants.signals[signal] ?? 1));
 }
 if (installed.status !== 0) process.exit(installed.status ?? 1);
 if (command !== 'install') {

@@ -2,12 +2,13 @@
 // Narrow, provider-free consumer proof against the committed public release pins.
 // With no --archive, download that existing release once (not the workflow's new candidate).
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const distribution = join(root, 'distribution');
@@ -115,7 +116,51 @@ try {
       assert.ok(diagnostic.message.includes(plugin.id) && diagnostic.message.includes('PATH'), 'unbundled harness CLI needs actionable discovery diagnostics');
     }
   }
-  console.log(JSON.stringify({ proof: 'PINNED_PUBLIC_DISTRIBUTION_CONSUMER', version: manifest.version, source_sha: manifest.source_sha, sha256: expectedHash, executable_sha256: manifest.files['bin/fabric'], ruby: '/usr/bin/ruby', launcher: 'actual native install/exec/init', no_implicit_plugin_consent: true, no_overwrite: true, native_error_status: 2, providers: 'not invoked', manager: 'not started', namespace: 'private unpublished unowned candidate' }));
+  const cancelledLauncher = join(fixture, 'cancellation');
+  mkdirSync(cancelledLauncher, { mode: 0o700 });
+  writeFileSync(join(cancelledLauncher, 'launcher.mjs'), readFileSync(launcher));
+  // Controlled blocking installer: cancellation must reach its child, even if Ruby exits 0.
+  writeFileSync(join(cancelledLauncher, 'install.rb'), `
+prefix = ARGV[ARGV.index('--prefix') + 1]
+child = fork { sleep 30 }
+%w[INT TERM HUP].each do |signal|
+  trap(signal) { Process.wait(child); File.write(prefix + '.cancelled', signal); exit 0 }
+end
+File.write(prefix + '.ready', "#{Process.pid} #{child}")
+sleep 30
+File.write(prefix + '.continued', 'unexpected post-cancellation work')
+Process.wait(child)
+`);
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    const prefix = join(cancelledLauncher, signal);
+    const child = spawn(process.execPath, [join(cancelledLauncher, 'launcher.mjs'), 'up', ...selectors(prefix)], { cwd: fixture, env, detached: true, stdio: 'ignore' });
+    const closed = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, received) => resolve({ code, signal: received }));
+    });
+    let installerPids = [];
+    try {
+      const deadline = Date.now() + 5000;
+      while (!existsSync(prefix + '.ready') && Date.now() < deadline) await delay(10);
+      assert.ok(existsSync(prefix + '.ready'), 'blocking installer and child must be ready before cancellation');
+      installerPids = readFileSync(prefix + '.ready', 'utf8').split(' ').map(Number);
+      process.kill(child.pid, signal); // Deliberately target only the launcher PID, not its group.
+      const result = await Promise.race([closed, delay(5000, null, { ref: false }).then(() => { throw new Error('launcher did not finish cancellation'); })]);
+      assert.ok(result.signal === signal || result.code === 128 + ({ SIGINT: 2, SIGTERM: 15, SIGHUP: 1 })[signal], 'launcher must preserve cancellation, not execute native up after a successful installer trap');
+      assert.equal(readFileSync(prefix + '.cancelled', 'utf8'), signal.slice(3), 'installer reaped its cancelled child');
+      assert.equal(existsSync(prefix + '.continued'), false, 'cancelled installation must not continue');
+    } finally {
+      if (!existsSync(prefix + '.cancelled')) {
+        for (const pid of [child.pid, ...installerPids]) {
+          for (const target of [-pid, pid]) {
+            try { process.kill(target, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          }
+        }
+        await closed;
+      }
+    }
+  }
+  console.log(JSON.stringify({ proof: 'PINNED_PUBLIC_DISTRIBUTION_CONSUMER', version: manifest.version, source_sha: manifest.source_sha, sha256: expectedHash, executable_sha256: manifest.files['bin/fabric'], ruby: '/usr/bin/ruby', launcher: 'actual native install/exec/init', launcher_cancellation: ['SIGINT', 'SIGTERM', 'SIGHUP'], no_implicit_plugin_consent: true, no_overwrite: true, native_error_status: 2, providers: 'not invoked', manager: 'not started', namespace: 'private unpublished unowned candidate' }));
 } finally {
   removePrivate(fixture);
   rmSync(fixture, { recursive: true, force: true });

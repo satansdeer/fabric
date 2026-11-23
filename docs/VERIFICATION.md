@@ -69,6 +69,12 @@ cover unsafe direct parents, unsafe ancestors above private children, and safe
 sticky parents. This host's global Homebrew Cellar is `0775` and is intentionally
 rejected; the formula evidence above uses a private protected prefix only.
 
+The optional launcher asynchronously awaits a dedicated installer process group
+and relays PID-directed SIGINT/SIGTERM/SIGHUP. A controlled blocking-installer
+fixture verifies that cancellation reaches and reaps the installer's child and
+prevents subsequent native `up`, even when the interrupted installer exits 0.
+This cancellation fixture is separate from the actual released-native proof.
+
 Issue 7 remains **OPEN**: observed npm HTTP 401 means no authenticated publishing
 identity; the private candidate namespace is neither asserted owned nor published.
 Real registry publication and clean-machine `npx` proof require an owned package
