@@ -1064,3 +1064,9 @@ The reviewed subset is five unmodified Git blobs from
 independently checked; no authentication database or credentials were copied.
 This verifies that subset, not full om-pstack parity or plugin installation.
 Exact-head CI, merge and independently verified public release are separate gates.
+
+Exact-head CI exposed an obsolete single-command assertion in the v1 OMP fake
+host. The host now selects `/fabric` without forbidding unrelated registered
+commands. `bun integrations/omp/conformance.ts /absolute/bundle/bin/fabric`
+passed against the packaged native CLI and reference plugins, including actual
+mixed batches, artifact/reclaim checks and transport failure handling; no inference.
