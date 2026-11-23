@@ -1,7 +1,14 @@
-import { defineTarget, serve, type TargetJob } from '../index.mjs';
+import { defineTarget, serve, TARGET_OPERATIONS } from '../index.mjs';
 
 await serve(defineTarget({
   id: 'sample-target',
   version: '1.0.0',
-  plan: (job: TargetJob) => ({ placement: job.placement }),
+  capabilities: () => ({ placements: ['sample-target'], operations: TARGET_OPERATIONS, optional: [] }),
+  // A fake remote target: every placement operation refuses; it never requests local execution.
+  prepare: () => ({ operation: 'unsupported' }),
+  start: () => ({ operation: 'unsupported' }),
+  inspect: () => ({ operation: 'unsupported' }),
+  cancel: () => ({ operation: 'unsupported' }),
+  collect: () => ({ operation: 'unsupported' }),
+  reclaim: () => ({ operation: 'unsupported' }),
 }));

@@ -24,12 +24,6 @@ pub fn negotiate_profile(
     profile: fabric_domain::ProfileEvidence,
 ) -> Result<HarnessPlan, FabricError> {
     request.validate()?;
-    if request.placement != "local" {
-        return Err(FabricError {
-            kind: ErrorKind::UnsupportedPlacement,
-            message: format!("Placement {} has no execution backend.", request.placement),
-        });
-    }
     if request.hard_read_only || request.access != "edit" {
         return Err(FabricError {
             kind: ErrorKind::UnsupportedCapability,

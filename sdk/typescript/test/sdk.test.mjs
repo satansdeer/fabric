@@ -10,6 +10,7 @@ import { create, install, reference } from '../cli.mjs';
 import { directory, archive, pack, loadPackage } from '../package.mjs';
 import { conformance, FIXTURE_PROMPT } from '../conformance.mjs';
 import { validVersion, validId, safePath, MAX_FRAME } from '../protocol.mjs';
+import { TARGET_OPERATIONS } from '../index.mjs';
 
 const sdk = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const cli = join(sdk, 'cli.mjs');
@@ -51,7 +52,7 @@ for (const kind of ['harness', 'target', 'connector']) {
     const proof = await conformance(project);
     assert.equal(proof.id, kind);
     assert.equal(proof.protocol, 1);
-    if (kind === 'target') assert.deepEqual(proof.result, { placement: 'local' });
+    if (kind === 'target') assert.deepEqual(proof.result, { placements: ['target'], operations: TARGET_OPERATIONS, optional: [] });
     else if (kind === 'connector') assert.deepEqual(proof.result, { available: false });
     else {
       assert.deepEqual(proof.result, { ready: true });
@@ -140,7 +141,7 @@ test('SDK rejects malformed, oversized and out-of-order host requests without re
 test('callback errors and invalid target/connector results are fixed protocol failures', async t => {
   const root = temporary(t);
   for (const [kind, callback, code] of [
-    ['target', `plan: () => ({placement:'remote', reclaim:true})`, 'remote_error'],
+    ['target', `capabilities: () => ({placements:['target'],operations:['prepare','start','inspect','cancel','collect','reclaim'],optional:[]}), prepare: () => ({operation:'local.prepare',reclaim:true}), start: () => ({operation:'unsupported'}), inspect: () => ({operation:'unsupported'}), cancel: () => ({operation:'unsupported'}), collect: () => ({operation:'unsupported'}), reclaim: () => ({operation:'unsupported'})`, 'closed_output'],
     ['connector', `evidence: () => { throw new Error('SECRET_CANARY'); }`, 'remote_error'],
   ]) {
     const project = create(kind, join(root, kind));
@@ -309,6 +310,25 @@ test('pinned OMP and Codex reference packages exercise the complete native contr
       assert.equal(checked.status, 0, checked.stderr + checked.stdout);
       assert.deepEqual(JSON.parse(checked.stdout), { compatible: true, healthy: true });
     }
+  }
+});
+
+test('reference local target package passes lifecycle conformance and installed Core check', { skip: !process.env.FABRIC_LOCAL_TARGET_BINARY && 'Set FABRIC_LOCAL_TARGET_BINARY' }, async t => {
+  const root = temporary(t);
+  const project = reference('local', join(root, 'local'), process.env.FABRIC_LOCAL_TARGET_BINARY);
+  const proof = await conformance(project);
+  assert.deepEqual(proof.result, { placements: ['local'], operations: TARGET_OPERATIONS, optional: [] });
+  assert.equal(archive(pack(directory(project))).hash, directory(project).hash);
+  if (!hostSkip) {
+    const registry = join(root, 'registry');
+    mkdirSync(registry, { mode: 0o700 });
+    install(project, { registry, fabric: host, version: '0.1.0', sha256: directory(project).hash, trust: true });
+    const checked = spawnSync(host, ['plugins', '--registry', registry, 'check', 'local'], {
+      env: environment(root), encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+    });
+    assert.equal(checked.error, undefined);
+    assert.equal(checked.status, 0, checked.stderr + checked.stdout);
+    assert.deepEqual(JSON.parse(checked.stdout), { compatible: true, healthy: true });
   }
 });
 

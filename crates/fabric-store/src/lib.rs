@@ -237,7 +237,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=13 => {}
+            1..=14 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -487,6 +487,23 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 13)?;
         }
+        if version < 14 {
+            transaction.execute_batch(
+                "CREATE TABLE run_targets (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                    pin TEXT NOT NULL CHECK(length(CAST(pin AS BLOB)) <= 16384) CHECK(json_valid(pin))
+                 );
+                 CREATE TRIGGER target_prelaunch BEFORE INSERT ON run_targets
+                 WHEN NOT EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id
+                    AND state = 'PREPARING' AND started_at IS NULL AND pid_metadata IS NULL)
+                 BEGIN SELECT RAISE(ABORT, 'target binding requires prelaunch run'); END;
+                 CREATE TRIGGER immutable_target_update BEFORE UPDATE ON run_targets
+                 BEGIN SELECT RAISE(ABORT, 'target binding is immutable'); END;
+                 CREATE TRIGGER immutable_target_delete BEFORE DELETE ON run_targets
+                 BEGIN SELECT RAISE(ABORT, 'target binding is immutable'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 14)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -559,7 +576,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=13) {
+        if !matches!(version, 5..=14) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -593,6 +610,17 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub fn record_run_target(&self, run: &RunId, pin: &str) -> Result<()> {
+        self.connection.execute("INSERT INTO run_targets(run_id,pin) VALUES (?1,?2)", params![run.as_str(), pin])?;
+        Ok(())
+    }
+
+    pub fn run_target(&self, run: &RunId) -> Result<Option<String>> {
+        let version: i64 = self.connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 14 { return Ok(None); }
+        Ok(self.connection.query_row("SELECT pin FROM run_targets WHERE run_id=?1", [run.as_str()], |row| row.get(0)).optional()?)
     }
 
     /// Insert observed invocation evidence or monotonically advance an existing attempt.
@@ -1980,7 +2008,8 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_observations;
+            "DROP TABLE run_targets;
+             DROP TABLE run_observations;
              DROP TABLE run_capture_contexts;
              DROP TRIGGER immutable_manifest;
              CREATE TRIGGER immutable_manifest BEFORE UPDATE OF artifact_manifest_id ON runs

@@ -12,6 +12,184 @@
 
 No cloud readiness claim is made. Native installed-host loading and fake workers do not establish authentication/model access or model-driven skill routing.
 
+## Issue 5: installed trusted-local target
+
+Source baseline: `b9a1b95c34594b4231b1e0387f22a5eefeb60c9b`.
+Reviewed issue-body SHA-256:
+`c637767c4dd99297177eb515357e6da088c7b91922d41c75d2b4667181d2f7e9`.
+Manager plan: <https://github.com/satansdeer/fabric/issues/5#issuecomment-7089448737>.
+
+`target.execute` replaces metadata-only `target.plan`. The installed driver
+negotiates placement and all six lifecycle operations over bounded persistent
+protocol-v1 stdio. Core interprets restricted local host instructions using its
+existing Rust workspace/process mechanisms; target replies cannot supply outcome,
+ownership, path, command or deletion evidence. Admission persists the target pin
+in accepted plans and immutable schema-14 run bindings. Foreground, batches,
+durable workers, cancellation, collection and recovery use this boundary.
+
+Deterministic regressions cover installed local workers, separate fake-remote
+placement refusal before allocation/no local worker launch, crash/forged-success
+retention, unavailable-target recovery refusal, restoration and safe reclaim.
+Release tooling bundles the local executable and pinned reference package.
+The target instruction set is trusted-local only; a real remote implementation,
+PTY, persistent environments, infrastructure evidence and provider-backed runs
+are not verified or implemented by this change. Independent manager review
+decides acceptance.
+
+Verification environment and commands (macOS arm64, Rust 1.91.0, Node 24.7.0):
+
+```sh
+export PATH=/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH
+export CARGO_HOME=/Users/maksimivanov/.cargo
+export CARGO_TARGET_DIR=/Users/maksimivanov/.local/share/fabric/reviews/issue-38-source/target
+cargo build --locked -p fabric-cli -p fabric-reference-harnesses --bins
+export FABRIC_REFERENCE_PLUGIN_BINARY="$CARGO_TARGET_DIR/debug/fabric-reference-harnesses"
+export FABRIC_PLUGIN_TEST_NODE=/opt/homebrew/bin/node
+export RUST_TEST_THREADS=4
+cargo test --locked -p fabric-runner -p fabric-core -p fabric-store -p fabric-domain --tests
+cargo test --locked -p fabric-cli --test run --test recovery --test workers --test async_workers
+cd sdk/typescript
+npm ci --ignore-scripts
+export FABRIC_PLUGIN_TEST_HOST="$CARGO_TARGET_DIR/debug/fabric"
+export FABRIC_LOCAL_TARGET_BINARY="$CARGO_TARGET_DIR/debug/fabric-local-target"
+npm test
+```
+
+The initial Rust build rejected the CLI's explicit `RunOptions` initializer
+missing its target pin field. After adding `target_pin: None` (admission selects
+and pins it), the same build passed. `npm ci --ignore-scripts` installed the
+existing single TypeScript development dependency. No Cargo/auth configuration,
+credentials, live providers, commits or published release artifacts were changed.
+
+The first Rust test invocation stopped at Core unit tests: 8 passed and 13
+failed because library test executables live in Cargo's `deps` directory rather
+than beside the distributed target. Test fixtures now explicitly pin the built
+companion; production resolution has no Cargo-layout fallback. The initial SDK
+run passed 15/16 tests with zero skips; its installed generated-target check
+exposed the new executable pin's 32 MiB runtime ceiling against the installed
+86,104,016-byte Node binary. Runtime hashing is now streamed/bounded at 128 MiB,
+allows owner/root-owned non-writable executables and still rejects symlink
+leaves; existing plugin-package/storage/frame limits are unchanged.
+
+After that runtime-bound fix, the SDK's failed check alone passed (1 test,
+0 failures, 0 skips):
+
+```sh
+cd sdk/typescript
+PATH=/opt/homebrew/bin:$PATH \
+FABRIC_PLUGIN_TEST_NODE=/opt/homebrew/bin/node \
+FABRIC_PLUGIN_TEST_HOST="$CARGO_TARGET_DIR/debug/fabric" \
+FABRIC_REFERENCE_PLUGIN_BINARY="$CARGO_TARGET_DIR/debug/fabric-reference-harnesses" \
+FABRIC_LOCAL_TARGET_BINARY="$CARGO_TARGET_DIR/debug/fabric-local-target" \
+node --test --test-name-pattern='actual Core: scaffold' test/sdk.test.mjs
+```
+
+The repaired Core library suite passed 21/21 and workspace integration passed
+11/11. The next command reached the domain contracts (library 1/1, domain 9/9),
+then stopped on two obsolete closed-placement assertions. Those contracts now
+accept installed target identifiers and still reject path-like identifiers;
+Core's installed fake-remote regression separately proves refusal/no fallback.
+The resumed commands, using the Rust/cache/plugin environment above, were:
+
+```sh
+cargo build --locked -p fabric-cli -p fabric-reference-harnesses --bins
+cargo test --locked -p fabric-core --lib
+cargo test --locked -p fabric-core --test workspace
+cargo test --locked -p fabric-domain --test harness
+cargo test --locked -p fabric-runner -p fabric-store --tests
+cargo test --locked -p fabric-cli --test run --test recovery --test workers --test async_workers
+```
+
+Domain harness contracts then passed 3/3; all runner tests passed 36/36.
+The store's v11 reconstruction fixture initially retained the newly introduced
+v14 table while lowering `user_version`, so migration correctly rejected a
+duplicate table. The fixture now removes `run_targets` when reconstructing
+v11, just like the external migration fixtures; production migration checks
+were not relaxed. Remaining verification resumed with:
+
+```sh
+cargo test --locked -p fabric-store --tests
+cargo test --locked -p fabric-cli --test run --test recovery --test workers --test async_workers
+```
+
+Store checks passed 29/29; asynchronous CLI worker checks passed 9/9.
+One new unavailable-target assertion initially expected internal GC action
+`refused`; the public recovery contract maps refusals to `retained`. The test
+now asserts that existing public value, exact `target_unavailable` reason,
+unchanged run/workspace records and unchanged ownership marker. No production
+recovery mapping or evidence requirement changed. The other recovery test
+passed; the failed test and remaining CLI suites resumed with:
+
+```sh
+cargo test --locked -p fabric-cli --test recovery recover_inspects_captureable_failure_then_seals_and_reclaims_without_inventing_success
+cargo test --locked -p fabric-cli --test run --test workers
+```
+
+The recovery regression passed after that public-contract correction. The first
+foreground CLI pass completed 44/50: two new fixtures omitted the explicit
+canonical `plugins --registry` argument; one historical fixture retained the
+v14 table; one assertion still treated an uninstalled syntactically valid target
+ID as invalid syntax. These fixtures/contracts were corrected without relaxing
+allocation, process, ownership or artifact assertions. The budget regression
+also exposed target negotiation preceding harness capability rejection; shared
+foreground/batch planning now validates the harness first, before target
+negotiation or storage allocation.
+
+The original six-second wall-time assertion failed and remains unchanged.
+Target lifecycle/shutdown RPCs now have a 250 ms post-negotiation bound rather
+than the five-second startup bound; a new hung-driver case joins crash and
+forged-outcome cases. The native normalizer retains its existing cancellation
+setter and deadlines (a compile error caught an accidental setter removal).
+Only the six failed foreground cases were rerun individually, followed by the
+not-yet-run workers suite and checks affected by the control-bound change:
+
+```sh
+for check in \
+  crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed \
+  direct_run_service_validates_budget_before_storage_allocation \
+  installed_remote_refuses_placement_without_starting_a_local_worker \
+  registered_profile_digest_verification_is_strict_and_legacy_absence_is_compatible \
+  unsupported_harness_requests_fail_before_run_or_batch_allocation \
+  wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason
+do
+  cargo test --locked -p fabric-cli --test run "$check"
+done
+cargo test --locked -p fabric-cli --test workers
+cargo test --locked -p fabric-runner --test plugins
+cargo test --locked -p fabric-core --lib native_consent_drives_shared_run_and_blocks_command_time_revocation
+```
+
+Results: all six individual foreground regressions passed (including the
+unchanged six-second wall-time bound and crash/forged/hung driver cases);
+workers 16/16 passed; the native-consent/revocation check passed. Together with
+the initial 44 passing foreground cases, every foreground case has passed,
+but there was no second all-50 invocation.
+
+The runner rerun passed 9/10; its failure was the fixture PID file not existing
+before the two-second startup timeout, not acceptance of malformed data.
+The target fixture now uses the same explicit `/usr/bin/python3` invocation as
+the harness/connector fixtures instead of creating a new shebang executable
+for each case. The two-second host bound, three-second wall bound, PID/reap
+and content-free assertions are unchanged. Its focused rerun and the actual
+Core SDK-scaffold check use:
+
+```sh
+cargo test --locked -p fabric-runner --test plugins protocol_failures_are_bounded_reaped_and_secret_free
+node --test --test-name-pattern='actual Core: scaffold' sdk/typescript/test/sdk.test.mjs
+```
+
+Both focused reruns passed: runner protocol 1/1 (8.09 s), actual Core SDK
+scaffold/install/check/tamper/upgrade/revoke 1/1 (12.77 s). No skipped tests
+in either command. Earlier passing suites were not rerun wholesale. Existing
+shared test-support imports emit unused-helper warnings; no warnings or failures
+were suppressed. All changes remain uncommitted for independent manager review.
+
+Release packaging and smoke scripts include the concrete `fabric-local-target`
+binary and independently installable `local` package. A release archive/download
+smoke was not executed here: no release artifacts were created or published.
+The actual built CLI, installed target packages and SDK conformance are the
+local proofs, not a claim of remote execution, cloud support or isolation.
+
 ## Issue 42: native capture drain accounting
 
 Source baseline: `ebaad083626f8d9b6fcef35d9ffaaabe29d357f7`.

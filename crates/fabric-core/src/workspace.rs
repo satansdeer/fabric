@@ -57,6 +57,16 @@ pub fn create_workspace(
     request: &WorkspaceRequest,
     copy_limit_bytes: u64,
 ) -> Result<RunnerWorkspace, FabricError> {
+    create_workspace_bound(root, backend, request, copy_limit_bytes, None)
+}
+
+pub(crate) fn create_workspace_bound(
+    root: &Path,
+    backend: &impl WorkspaceBackend,
+    request: &WorkspaceRequest,
+    copy_limit_bytes: u64,
+    target: Option<&fabric_runner::target::TargetPin>,
+) -> Result<RunnerWorkspace, FabricError> {
     if request.created_at < 0 || request.lease_expires_at <= timestamp(request.created_at)? {
         return Err(storage_error(
             "Startup lease must expire after creation and the current time.",
@@ -121,6 +131,10 @@ pub fn create_workspace(
         )
         .map_err(storage_error)?;
     let result = (|| {
+        if let Some(target) = target {
+            store.record_run_target(&run.run_id, &serde_json::to_string(target).map_err(storage_error)?)
+                .map_err(storage_error)?;
+        }
         let fork = backend.fork(&state, &request.workspace_id, copy_limit_bytes)?;
         if fork.path != path || fork.size_bytes != state.size_bytes {
             return Err(storage_error(
@@ -512,6 +526,9 @@ fn recover_one(
                 return Ok(());
             }
         };
+        item.reason = "target_unavailable".into();
+        crate::target::operation(store, &run.run_id, "inspect")?;
+        crate::target::operation(store, &run.run_id, "collect")?;
         if apply
             && (run.state != RunState::NeedsAttention
                 || workspace.state != WorkspaceState::RecoveryRequired)
@@ -727,6 +744,8 @@ fn clean_one(
         }
         report.reason = "invalid_or_missing_manifest".into();
         crate::artifacts::verify_registered(root, store, &run)?;
+        report.reason = "target_unavailable".into();
+        crate::target::operation(store, &run.run_id, "reclaim")?;
         let saved = store.cleanup_intent(id).map_err(storage_error)?;
         let prior: Option<CleanupAuthority> = saved
             .as_deref()
@@ -1173,6 +1192,7 @@ mod cleanup_tests {
                 &FakeHarness::new(fake).unwrap(),
                 &crate::run::RunOptions {
                     copy_limit_bytes: 1024 * 1024,
+                    target_pin: Some(crate::target::reference_pin()),
                     ..crate::run::RunOptions::default()
                 },
             );

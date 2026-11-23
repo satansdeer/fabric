@@ -21,6 +21,7 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         reference_plugins::install(&path);
+        reference_plugins::install_local(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
         Self(path)
     }
     fn cli(&self) -> Command {
@@ -37,6 +38,12 @@ impl Fixture {
             .arg("--root")
             .arg(self.0.join("storage"));
         command
+    }
+    fn options(&self) -> fabric_core::run::RunOptions {
+        fabric_core::run::RunOptions {
+            target_pin: Some(reference_plugins::local_pin(&self.0)),
+            ..Default::default()
+        }
     }
     fn git(&self, repo: &Path, args: &[&str]) -> String {
         let out = Command::new("/usr/bin/git")
@@ -109,6 +116,43 @@ impl Fixture {
         )).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         executable
+    }
+    fn target(&self, id: &str, behavior: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = self.0.canonicalize().unwrap().join(format!("target-{id}"));
+        fs::write(&executable, format!(r#"#!/usr/bin/python3
+import json, os, sys
+identity = {id:?}
+started = False
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'initialize':
+        result = dict(protocol=1, id=identity, version='0.1.0', kind='target')
+    elif method in ('health', 'shutdown'):
+        result = dict(ready=True)
+    elif method == 'target.capabilities':
+        result = dict(placements=[identity], operations=['prepare','start','inspect','cancel','collect','reclaim'], optional=[])
+    else:
+        op = method.split('.')[1]
+        if op == 'start': started = True
+        if started and op == 'inspect' and {behavior:?} == 'crash': os._exit(0)
+        if started and op == 'inspect' and {behavior:?} == 'hang': __import__('time').sleep(10)
+        result = dict(operation='local.' + op if identity == 'local' else 'unsupported')
+        if started and op == 'inspect' and {behavior:?} == 'forge':
+            result['exit_code'] = 0
+    print(json.dumps(dict(jsonrpc='2.0', id=request['id'], result=result)), flush=True)
+    if method == 'shutdown': break
+"#)).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = self.0.join("target.json");
+        fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
+            "id":id,"version":"0.1.0","kind":"target","protocol":{"min":1,"max":1},
+            "executable":executable,"args":[],"capabilities":["target.execute"]
+        })).unwrap()).unwrap();
+        success(&self.cli().args(["plugins", "--registry"]).arg(self.0.canonicalize().unwrap().join("plugin-registry"))
+            .arg(if id == "local" { "upgrade" } else { "install" })
+            .arg(manifest).output().unwrap());
     }
     fn native_profile(&self) -> serde_json::Value {
         use std::os::unix::fs::PermissionsExt;
@@ -211,6 +255,51 @@ fn success(out: &Output) {
 fn json(out: &Output) -> serde_json::Value {
     success(out);
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn installed_remote_refuses_placement_without_starting_a_local_worker() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("fake-remote", "unsupported");
+    let marker = fixture.0.join("LOCAL_FALLBACK");
+    let worker = fixture.script_fake(&format!("touch '{}'; exit 0", marker.display()));
+    let prompt = fixture.0.join("remote-prompt");
+    fs::write(&prompt, "never execute").unwrap();
+    let before = fixture.inventory();
+    let output = fixture.cli().args(["run", "test", "--harness", "fake", "--placement", "fake-remote", "--fake-binary"])
+        .arg(worker).arg("--prompt-file").arg(prompt).args(["--copy-limit-bytes","10485760","--json"])
+        .output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "unsupported_placement");
+    assert_eq!(fixture.inventory(), before);
+    assert!(!fixture.0.join("LOCAL_FALLBACK").exists());
+}
+
+#[test]
+fn crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed() {
+    for behavior in ["crash", "forge", "hang"] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        fixture.target("local", behavior);
+        let start = std::time::Instant::now();
+        let output = fixture.run(0);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(6));
+        let runs = json(&fixture.cli().args(["runs","list","--json"]).output().unwrap());
+        let id = runs[0]["run_id"].as_str().unwrap();
+        let before = json(&fixture.cli().args(["runs","show",id,"--json"]).output().unwrap());
+        assert_ne!(before["run"]["state"], "SUCCEEDED");
+        assert!(before["run"]["artifact_manifest_id"].is_null());
+        assert!(before["run"]["capture"].is_null());
+        let tree = Path::new(before["workspace"]["managed_path"].as_str().unwrap());
+        assert!(tree.exists());
+        let result = json(&fixture.cli().args(["recover",id,"--apply","--json"]).output().unwrap());
+        assert_ne!(result["action"], "reclaimed");
+        assert_eq!(json(&fixture.cli().args(["runs","show",id,"--json"]).output().unwrap()), before);
+        assert!(tree.exists());
+    }
 }
 
 #[test]
@@ -583,7 +672,7 @@ fn unsupported_harness_requests_fail_before_run_or_batch_allocation() {
         (vec!["--max-cost-usd", "0.25"], "unsupported_capability"),
         (vec!["--max-cost-usd", "NaN"], "invalid_arguments"),
         (vec!["--max-cost-usd", "0"], "invalid_arguments"),
-        (vec!["--placement", "unknown"], "invalid_arguments"),
+        (vec!["--placement", "unknown"], "unsupported_placement"),
         (vec!["--access", "unknown"], "invalid_arguments"),
         (
             vec!["--require-capability", "unknown.feature"],
@@ -1583,7 +1672,7 @@ fn api_cancellation_is_idempotent_and_escalates_term_ignoring_child() {
             timeout: std::time::Duration::from_secs(10),
             term_grace: std::time::Duration::from_millis(600),
         },
-        ..fabric_core::run::RunOptions::default()
+        ..fixture.options()
     };
     let harness =
         fabric_runner::FakeHarness::new(PathBuf::from(env!("CARGO_BIN_EXE_fabric-fake-harness")))
@@ -1741,7 +1830,7 @@ fn batch_api_applies_wall_timeout_per_worker_without_discarding_other_results() 
             timeout: std::time::Duration::from_millis(400),
             ..fabric_runner::ExecutionLimits::default()
         },
-        ..fabric_core::run::RunOptions::default()
+        ..fixture.options()
     };
     let registry = fabric_runner::HarnessRegistry::default();
     let registry_options = fabric_runner::RegistryOptions {
@@ -2952,12 +3041,12 @@ impl fabric_core::workspace::storage::DiskMeter for FixedDisk {
     }
 }
 
-fn storage_options() -> fabric_core::run::RunOptions {
+fn storage_options(fixture: &Fixture) -> fabric_core::run::RunOptions {
     let mut options = fabric_core::run::RunOptions {
         copy_limit_bytes: 10 * 1024 * 1024,
         max_log_bytes: 1024 * 1024,
         max_artifact_bytes: 1024 * 1024,
-        ..Default::default()
+        ..fixture.options()
     };
     options.storage.policy.max_workspace_bytes = 128 * 1024;
     options.storage.policy.min_free_bytes = 1;
@@ -2976,7 +3065,7 @@ fn storage_injected_low_free_and_managed_cap_never_launch() {
     .unwrap();
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     options.storage.meter = std::sync::Arc::new(FixedDisk(0));
     let denied = fabric_core::run::foreground(
         &fixture.0.join("storage"),
@@ -3040,7 +3129,7 @@ fn storage_concurrent_workers_share_atomic_admission() {
     .unwrap();
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     let reservation = options.storage.policy.max_workspace_bytes
         + options.max_log_bytes
         + options.max_artifact_bytes;
@@ -3098,7 +3187,7 @@ fn storage_evicts_only_unreferenced_cache_and_same_key_rebuilds() {
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
     let harness = fabric_runner::FakeHarness::new(fixture.script_fake("exit 0")).unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     let reservation = options.storage.policy.max_workspace_bytes
         + options.max_log_bytes
         + options.max_artifact_bytes;
@@ -3196,7 +3285,7 @@ fn storage_workspace_monitor_terminates_owned_group_and_zero_exit_is_failure() {
     let harness = fabric_runner::FakeHarness::new(binary).unwrap();
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     options.storage.policy.max_workspace_bytes = 1024 * 1024;
     options.max_artifact_bytes = 8 * 1024 * 1024;
     options.limits.term_grace = std::time::Duration::from_secs(2);
@@ -3245,7 +3334,7 @@ fn storage_pressure_keeps_its_reason_and_captures_evidence() {
     .unwrap();
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     options.storage.meter = std::sync::Arc::new(PressureDisk(pressure));
     options.limits.term_grace = std::time::Duration::from_secs(2);
     let report = fabric_core::run::foreground(
@@ -3299,7 +3388,7 @@ fn storage_meter_failure_survives_terminal_reconnect_without_raw_content() {
     .unwrap();
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     options.storage.meter = std::sync::Arc::new(FailingDisk(failure));
     options.limits.term_grace = std::time::Duration::from_secs(2);
     let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
@@ -3362,7 +3451,7 @@ fn storage_fast_zero_exit_overlimit_retains_reason_when_capture_exceeds_cap() {
     )).unwrap();
     let prompt = fixture.0.join("prompt");
     fs::write(&prompt, "{}").unwrap();
-    let mut options = storage_options();
+    let mut options = storage_options(&fixture);
     options.storage.policy.max_workspace_bytes = 1024 * 1024;
     assert!(fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).is_err());
     let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
@@ -3897,7 +3986,7 @@ fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compat
         if case == "legacy" {
             // Historical runs predate the immutable prelaunch capture context.
             db.execute_batch(
-                "DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
+                "DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
             )
             .unwrap();
         }

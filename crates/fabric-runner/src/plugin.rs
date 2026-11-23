@@ -117,7 +117,7 @@ impl PluginManifest {
         }
         let allowed = match self.kind {
             PluginKind::Harness => "harness.run",
-            PluginKind::Target => "target.plan",
+            PluginKind::Target => "target.execute",
             PluginKind::Connector => "connector.evidence",
         };
         if self.capabilities != [allowed] {
@@ -469,11 +469,6 @@ pub fn configured_registry() -> Result<Option<PluginRegistry>, FabricError> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TargetPlan {
-    pub placement: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConnectorEvidence {
     pub available: bool,
 }
@@ -519,6 +514,12 @@ impl Default for PluginHost {
     }
 }
 impl PluginHost {
+    pub fn target(
+        &self, manifest: &PluginManifest, cancel: &CancellationToken,
+    ) -> Result<crate::target::Target, FabricError> {
+        crate::target::TargetPin::from_manifest(manifest.clone(), manifest.id.as_str())?
+            .open_with_timeout(cancel, self.timeout)
+    }
     pub(crate) fn invoke<T: serde::de::DeserializeOwned>(
         &self,
         manifest: &PluginManifest,
@@ -565,25 +566,6 @@ impl PluginHost {
         Ok(HarnessInfo {
             version: manifest.version.clone(),
         })
-    }
-    pub fn target_plan(
-        &self,
-        manifest: &PluginManifest,
-        cancel: &CancellationToken,
-    ) -> Result<TargetPlan, FabricError> {
-        if manifest.kind != PluginKind::Target {
-            return Err(failure("wrong_kind"));
-        }
-        let plan: TargetPlan = self.invoke(
-            manifest,
-            "target.plan",
-            json!({"placement":"local"}),
-            cancel,
-        )?;
-        if plan.placement != "local" {
-            return Err(failure("unsupported_placement"));
-        }
-        Ok(plan)
     }
     pub fn connector_evidence(
         &self,

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+#[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
+mod reference_plugins;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -67,6 +69,7 @@ impl Fixture {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let path = fs::canonicalize(path).unwrap();
+        reference_plugins::install_local(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
         let mut fixture = Self {
             repo: path.join("repo ; literal"),
             path,
@@ -107,6 +110,7 @@ impl Fixture {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.path)
+            .env("FABRIC_PLUGIN_REGISTRY", self.path.join("plugin-registry"))
             .arg("--root")
             .arg(self.path.join("storage"));
         command
@@ -425,6 +429,16 @@ fn recover_inspects_captureable_failure_then_seals_and_reclaims_without_inventin
     let sentinel = fixture.path.join("outside-root-sentinel");
     fs::write(&sentinel, b"never delete outside managed root\n").unwrap();
 
+    // An unavailable pinned target cannot convert exit 7 into success or authorize deletion.
+    let target = fixture.path.join("plugin-registry/local-target/plugin");
+    let held = target.with_extension("unavailable");
+    fs::rename(&target, &held).unwrap();
+    let unavailable = fixture.query(&["recover", id, "--apply"]);
+    assert_eq!(unavailable["action"], "retained");
+    assert_eq!(unavailable["reason"], "target_unavailable");
+    assert_eq!(fixture.query(&["runs", "show", id]), before);
+    assert_eq!(fs::read(tree.parent().unwrap().join(".fabric-owner")).unwrap(), marker);
+    fs::rename(held, target).unwrap();
     let inspection = fixture.query(&["recover", id]);
     assert_eq!(inspection["run_id"], id);
     assert_eq!(inspection["workspace_id"], workspace_id);

@@ -7,7 +7,12 @@ function define(kind, options) {
   return Object.freeze({ ...options, kind });
 }
 export const defineHarness = (options) => define('harness', options);
-export const defineTarget = (options) => define('target', options);
+export const TARGET_OPERATIONS = Object.freeze(['prepare', 'start', 'inspect', 'cancel', 'collect', 'reclaim']);
+export function defineTarget(options) {
+  identity({ ...options, kind: 'target' });
+  if (['capabilities', ...TARGET_OPERATIONS].some(method => typeof options[method] !== 'function')) fail('invalid_definition');
+  return Object.freeze({ ...options, kind: 'target' });
+}
 export const defineConnector = (options) => define('connector', options);
 const write = (value, max) => new Promise((resolve, reject) => process.stdout.write(frame(value, max), e => e ? reject(e) : resolve()));
 const nativeMethods = Object.freeze({
@@ -56,6 +61,43 @@ async function serveNative(plugin) {
   fail('incomplete_exchange');
 }
 
+async function serveTarget(plugin) {
+  let id = 1;
+  for await (const request of frames(process.stdin)) {
+    if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== id) fail('invalid_request');
+    const { method, params } = request;
+    let result;
+    if (id === 1) {
+      if (method !== 'initialize' || !exact(params, ['protocol']) || params.protocol !== 1) fail('protocol_mismatch');
+      result = { protocol: 1, ...identity(plugin) };
+    } else if (id === 2) {
+      if (method !== 'health' || !exact(params, [])) fail('invalid_request');
+      result = { ready: true };
+    } else if (method === 'shutdown') {
+      if (!exact(params, [])) fail('invalid_params');
+      await write({ jsonrpc: '2.0', id, result: { ready: true } });
+      process.stdin.destroy();
+      return;
+    } else if (method === 'target.capabilities') {
+      if (!exact(params, [])) fail('invalid_params');
+      result = await plugin.capabilities();
+      if (!exact(result, ['placements', 'operations', 'optional']) ||
+          JSON.stringify(result.placements) !== JSON.stringify([plugin.id]) ||
+          JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
+          !Array.isArray(result.optional) || result.optional.length) fail('unsupported_target_capabilities');
+    } else {
+      const operation = method.startsWith('target.') && method.slice(7);
+      if (!TARGET_OPERATIONS.includes(operation) || !exact(params, ['placement', 'run_id']) ||
+          params.placement !== plugin.id || typeof params.run_id !== 'string' ||
+          !params.run_id.length || params.run_id.length > 128) fail('invalid_params');
+      result = await plugin[operation](params);
+      if (!exact(result, ['operation']) || !['unsupported', `local.${operation}`].includes(result.operation)) fail('invalid_target_proposal');
+    }
+    await write({ jsonrpc: '2.0', id: id++, result });
+  }
+  fail('incomplete_exchange');
+}
+
 /** Transport adapter only. Fabric owns launch, cancellation, workspaces and artifacts. */
 export async function serve(plugin) {
   try {
@@ -73,12 +115,13 @@ export async function serve(plugin) {
       return;
     }
     if (args.length !== 1 || args[0] !== '--fabric-plugin-stdio') fail('invalid_mode');
+    if (plugin.kind === 'target') return await serveTarget(plugin);
     let step = 0;
     for await (const request of frames(process.stdin)) {
       const methods = ['initialize', 'health', plugin.kind === 'connector' ? 'connector.evidence' : `${plugin.kind}.plan`, 'shutdown'];
       if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== step + 1 || request.method !== methods[step]) fail('invalid_request');
       const params = request.params;
-      const expected = step === 0 ? { protocol: PROTOCOL_VERSION } : step === 2 && plugin.kind === 'target' ? { placement: 'local' } : {};
+      const expected = step === 0 ? { protocol: PROTOCOL_VERSION } : {};
       if (!exact(params, Object.keys(expected)) || Object.keys(expected).some(k => params[k] !== expected[k])) fail(step === 0 ? 'protocol_mismatch' : 'invalid_params');
       let result;
       try {

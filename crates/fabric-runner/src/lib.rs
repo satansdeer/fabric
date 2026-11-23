@@ -11,6 +11,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod supervision;
+pub mod target;
 pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, StopReason};
 use supervision::{PipeReader, ProcessGroup};
 
@@ -180,6 +181,19 @@ pub fn execute(
     owner_lease: Option<&File>,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
 ) -> Result<Execution, FabricError> {
+    execute_observed(spec, cwd, capture, limits, cancellation, owner_lease, started, |_| Ok(()))
+}
+
+pub(crate) fn execute_observed(
+    spec: &CommandSpec,
+    cwd: &Path,
+    capture: Capture<'_>,
+    limits: &ExecutionLimits,
+    cancellation: &CancellationToken,
+    owner_lease: Option<&File>,
+    started: impl FnOnce(u32) -> Result<(), FabricError>,
+    mut observed: impl FnMut(bool) -> Result<(), FabricError>,
+) -> Result<Execution, FabricError> {
     limits.validate()?;
     if cancellation.is_cancelled() {
         return Err(execution_error("Cancelled before harness launch."));
@@ -234,7 +248,13 @@ pub fn execute(
         let out = scope.spawn(|| capture.stdout(stdout));
         let err = scope.spawn(|| capture.stderr(stderr));
         let status = started(group.child.id())
-            .and_then(|()| group.supervise(limits, cancellation, || capture.observe_alive()));
+            .and_then(|()| {
+                observed(false)?;
+                group.supervise_observed(limits, cancellation, |stopping| {
+                    if !stopping { capture.observe_alive(); }
+                    observed(stopping)
+                })
+            });
         // Stop the owned group before joining drains, including on persistence errors.
         drop(group);
         stopped.store(true, Ordering::Release);

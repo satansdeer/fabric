@@ -249,8 +249,11 @@ impl HarnessRequest {
             kind: ErrorKind::InvalidArguments,
             message: message.into(),
         };
-        if !matches!(self.placement.as_str(), "local" | "remote" | "byoc") {
-            return Err(invalid("Placement must be local, remote or byoc."));
+        if HarnessId::try_from(self.placement.clone()).is_err() {
+            return Err(FabricError {
+                kind: ErrorKind::InvalidArguments,
+                message: "Placement must name an installed target.".into(),
+            });
         }
         if !matches!(self.access.as_str(), "edit" | "inspect" | "publish") {
             return Err(invalid("Access must be edit, inspect or publish."));

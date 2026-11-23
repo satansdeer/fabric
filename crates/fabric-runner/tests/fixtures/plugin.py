@@ -34,10 +34,12 @@ for line in sys.stdin:
         result = {'protocol': 2 if mode == 'protocol' else 1, 'id': 'external-' + kind, 'version': '1.0.0', 'kind': kind}
     elif method in ('health', 'shutdown', 'harness.plan'):
         result = {'ready': True}
-    elif method == 'target.plan':
-        result = {'placement': 'local'}
+    elif method == 'target.capabilities':
+        result = {'placements': ['external-target'], 'operations': ['prepare', 'start', 'inspect', 'cancel', 'collect', 'reclaim'], 'optional': []}
         if mode == 'reclaim':
             result.update({'reclaim': True, 'path': '/SECRET_CANARY', 'artifacts_verified': True})
+    elif method.startswith('target.'):
+        result = {'operation': 'unsupported'}
     elif method == 'connector.evidence':
         result = {'available': True}
     elif method == 'harness.normalize':

@@ -10,24 +10,24 @@ fn manifest(kind: PluginKind, mode: &str, dir: &Path) -> PluginManifest {
         PluginKind::Target => "target",
         PluginKind::Connector => "connector",
     };
+    let executable = "/usr/bin/python3".into();
+    let args = vec![
+        format!("{}/tests/fixtures/plugin.py", env!("CARGO_MANIFEST_DIR")),
+        name.into(), mode.into(), dir.join("pid").display().to_string(),
+    ];
     PluginManifest {
         id: format!("external-{name}").parse().unwrap(),
         version: "1.0.0".into(),
         protocol: ProtocolRange { min: 1, max: 1 },
         kind,
-        executable: "/usr/bin/python3".into(),
-        args: vec![
-            format!("{}/tests/fixtures/plugin.py", env!("CARGO_MANIFEST_DIR")),
-            name.into(),
-            mode.into(),
-            dir.join("pid").display().to_string(),
-        ],
+        executable,
+        args,
         integrity: None,
         native: None,
         capabilities: vec![
             match kind {
                 PluginKind::Harness => "harness.run",
-                PluginKind::Target => "target.plan",
+                PluginKind::Target => "target.execute",
                 PluginKind::Connector => "connector.evidence",
             }
             .into(),
@@ -54,12 +54,9 @@ fn external_kinds_and_harness_execution_bridge() {
     let dir = tempfile::tempdir().unwrap();
     let host = PluginHost::default();
     let cancel = CancellationToken::default();
-    assert_eq!(
-        host.target_plan(&manifest(PluginKind::Target, "ok", dir.path()), &cancel)
-            .unwrap()
-            .placement,
-        "local"
-    );
+    let target = host.target(&manifest(PluginKind::Target, "ok", dir.path()), &cancel).unwrap();
+    assert_eq!(target.operation("prepare", "test").unwrap_err().kind, fabric_domain::ErrorKind::UnsupportedPlacement);
+    drop(target);
     reaped(dir.path());
     assert!(
         host.connector_evidence(&manifest(PluginKind::Connector, "ok", dir.path()), &cancel)
@@ -125,11 +122,11 @@ fn protocol_failures_are_bounded_reaped_and_secret_free() {
         };
         let start = std::time::Instant::now();
         let error = host
-            .target_plan(
+            .target(
                 &manifest(PluginKind::Target, mode, dir.path()),
                 &CancellationToken::default(),
             )
-            .unwrap_err();
+            .err().unwrap();
         assert!(!format!("{error:?}").contains("SECRET_CANARY"));
         assert!(start.elapsed() < Duration::from_secs(3));
         assert!(dir.path().join("pid").exists(), "{mode}: {error:?}");
@@ -159,7 +156,7 @@ fn cancellation_reaps_live_plugin() {
             let manifest = manifest(kind, "hang", dir.path());
             let error = match kind {
                 PluginKind::Harness => host.harness_info(&manifest, &cancel).map(|_| ()),
-                PluginKind::Target => host.target_plan(&manifest, &cancel).map(|_| ()),
+                PluginKind::Target => host.target(&manifest, &cancel).map(|_| ()),
                 PluginKind::Connector => host.connector_evidence(&manifest, &cancel).map(|_| ()),
             }
             .unwrap_err();
@@ -373,10 +370,8 @@ fn typescript_scaffolds_use_existing_native_host() {
                 );
             }
             PluginKind::Target => {
-                assert_eq!(
-                    host.target_plan(&plugin, &cancel).unwrap().placement,
-                    "local"
-                );
+                let target = host.target(&plugin, &cancel).unwrap();
+                assert_eq!(target.operation("start", "test").unwrap_err().kind, fabric_domain::ErrorKind::UnsupportedPlacement);
             }
             PluginKind::Connector => {
                 assert!(!host.connector_evidence(&plugin, &cancel).unwrap().available);

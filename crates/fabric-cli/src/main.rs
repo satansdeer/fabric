@@ -202,7 +202,8 @@ fn plugins(root: PathBuf, command: PluginCommands) -> Result<(), FabricError> {
                     host.harness_info(&manifest, &token.token())?;
                 }
                 PluginKind::Target => {
-                    host.target_plan(&manifest, &token.token())?;
+                    let pin = fabric_runner::target::TargetPin::from_manifest(manifest, id.as_str())?;
+                    pin.open(&token.token())?.finish()?;
                 }
                 PluginKind::Connector => {
                     host.connector_evidence(&manifest, &token.token())?;
@@ -814,6 +815,7 @@ fn run_options(
             ..fabric_runner::ExecutionLimits::default()
         },
         cancellation,
+        target_pin: None,
         max_cost_usd: args.max_cost_usd,
         storage: args.storage.options(),
         harness_request: HarnessRequest {

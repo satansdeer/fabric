@@ -2,7 +2,7 @@
 
 Node **22.18+** (or 24+) runs erasable TypeScript directly. No Rust toolchain, transpilation, runtime dependencies, provider accounts, or npm install are needed for generated projects. Use standard erasable types, not enums, namespaces, parameter properties, or tsconfig path aliases. The SDK itself ships JavaScript and `.d.mts` contracts, so importing it from `node_modules` does not rely on Node stripping dependency TypeScript.
 
-This is a protocol v1 adapter and provider-free development kit, not a worker runtime. [Core's plugin protocol](../../docs/PLUGIN_PROTOCOL.md) remains authoritative. Targets only propose local placement; connectors only report evidence availability. Core owns worker admission, workspace ownership, budgets, capture, artifacts, cancellation and reclamation.
+This is a protocol v1 adapter and provider-free development kit, not a worker runtime. [Core's plugin protocol](../../docs/PLUGIN_PROTOCOL.md) remains authoritative. Target drivers negotiate placement and issue restricted lifecycle instructions; connectors only report evidence availability. Core owns worker admission, source/target pins, workspace ownership, budgets, process evidence, capture, artifacts, cancellation and reclamation. The current instruction set supports trusted-local execution, not an actual remote backend.
 
 ## Scaffold, test, develop
 
@@ -26,7 +26,7 @@ The runnable templates in `samples/{harness,target,connector}.ts` also accept th
 ## Typed adapters
 
 ```ts
-import { defineHarness, defineTarget, defineConnector, serve } from './sdk/index.mjs';
+import { defineHarness, defineTarget, defineConnector, serve, TARGET_OPERATIONS } from './sdk/index.mjs';
 
 const harness = defineHarness({
   id: 'my-harness', version: '1.0.0',
@@ -38,7 +38,13 @@ const harness = defineHarness({
 });
 const target = defineTarget({
   id: 'my-target', version: '1.0.0',
-  plan: job => ({ placement: job.placement }),
+  capabilities: () => ({ placements: ['my-target'], operations: [...TARGET_OPERATIONS], optional: [] }),
+  prepare: () => ({ operation: 'unsupported' }),
+  start: () => ({ operation: 'unsupported' }),
+  inspect: () => ({ operation: 'unsupported' }),
+  cancel: () => ({ operation: 'unsupported' }),
+  collect: () => ({ operation: 'unsupported' }),
+  reclaim: () => ({ operation: 'unsupported' }),
 });
 const connector = defineConnector({
   id: 'my-connector', version: '1.0.0',
@@ -59,7 +65,7 @@ For a conventional npm dependency, import from `@fabric/plugin-sdk`. Do not run 
 | Kind | Mocked request/payload | Expected response |
 | --- | --- | --- |
 | harness | `harness.plan {}` | `{ "ready": true }` |
-| target | `target.plan { "placement": "local" }` | `{ "placement": "local" }` |
+| target | `target.capabilities {}`, then `target.{prepare,start,inspect,cancel,collect,reclaim} {placement: ID,run_id: "conformance"}` | Exact declared capabilities; sample operations explicitly `unsupported`, reference local operations `local.OP` |
 | connector | `connector.evidence {}` | `{ "available": false }` for the sample; either boolean conforms |
 | harness run | `--fabric-plugin-run PROMPT_FILE`, fixed fixture prompt | sample text event containing the prompt, then `done` |
 
@@ -116,6 +122,23 @@ This is **not a sandbox or code-signing system**. The Node binary and system imp
 ## Maintainer checks
 
 `npm ci --ignore-scripts && npm test` checks typed contracts, compiles generated projects, runs all three real stdio kinds, malformed/version/pin/archive boundaries, npm-packaged scaffolding and macOS watch mode without providers. `FABRIC_PLUGIN_TEST_HOST=/absolute/fabric npm test` additionally exercises actual Core registry installation, check, tamper rejection, upgrade and revoke for all kinds. That test explicitly skips when no host is supplied or TMPDIR is inside a Git checkout; CI supplies a built host and an external temporary directory. In restricted workers, `FABRIC_PLUGIN_TEST_NODE=/absolute/node cargo test -p fabric-runner --test plugins typescript_scaffolds_use_existing_native_host` proves generated SDK processes through the actual host/admission boundary without writing an on-disk registry inside the checkout.
+
+## Reference local target
+
+`cargo build --locked -p fabric-cli --bins` builds `fabric-local-target` beside `fabric`. Downloaded releases include both siblings and the installable local reference package; no source build is required by an operator. Without a registry override, the sibling is the reference driver. Explicit installation/upgrade/revocation uses the same registry as other plugins:
+
+```sh
+node sdk/typescript/cli.mjs reference local /absolute/new/local-package \
+  --binary /absolute/path/to/fabric-local-target
+node sdk/typescript/cli.mjs test /absolute/new/local-package
+node sdk/typescript/cli.mjs hash /absolute/new/local-package
+node sdk/typescript/cli.mjs install /absolute/new/local-package \
+  --registry /canonical/owner/private/fabric-plugins --fabric /absolute/path/to/fabric \
+  --version 0.1.0 --sha256 REVIEWED_CONTENT_SHA256 --trust
+```
+
+`local` uses six typed host instructions, not plugin-supplied success, paths, commands or deletion claims. Core interprets each instruction with its validated run/workspace/process/artifact objects. The fake-remote sample proves explicit placement refusal only; no cloud support is claimed. `target.plan` plugins must migrate to `defineTarget`'s capabilities and six callbacks; no compatibility shim remains. Set `FABRIC_LOCAL_TARGET_BINARY=/absolute/path/to/fabric-local-target` for SDK reference-package conformance plus installed-host check; Rust local worker/recovery tests exercise the resulting installed target against actual workers and sealed artifacts.
+
 
 ## Native reference harness plugins
 

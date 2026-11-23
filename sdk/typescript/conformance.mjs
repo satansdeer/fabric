@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { directory } from './package.mjs';
 import { exact, frame, frames, resultFor, fail, NATIVE_MAX_FRAME } from './protocol.mjs';
+import { TARGET_OPERATIONS } from './index.mjs';
 
 export const FIXTURE_PROMPT = 'Fabric provider-free fixture';
 function kill(child) { if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } }
@@ -98,13 +99,16 @@ export async function conformance(path, { timeout = 5000 } = {}) {
   const { info } = directory(path); // Negotiation metadata is checked before any plugin code runs.
   const entry = resolve(path, info.entry);
   if (info.native) return nativeConformance(info, entry, timeout);
-  const method = info.kind === 'connector' ? 'connector.evidence' : `${info.kind}.plan`;
+  const method = info.kind === 'connector' ? 'connector.evidence' : 'harness.plan';
   let result;
-  await processFixture(entry, () => ['--fabric-plugin-stdio'], async child => {
+  await processFixture(entry, () => [...(info.args ?? []), '--fabric-plugin-stdio'], async child => {
     const responses = frames(child.stdout)[Symbol.asyncIterator]();
     const requests = [
       ['initialize', { protocol: 1 }], ['health', {}],
-      [method, info.kind === 'target' ? { placement: 'local' } : {}], ['shutdown', {}],
+      ...(info.kind === 'target' ? [
+        ['target.capabilities', {}],
+        ...TARGET_OPERATIONS.map(op => [`target.${op}`, { placement: info.id, run_id: 'conformance' }]),
+      ] : [[method, {}]]), ['shutdown', {}],
     ];
     for (let i = 0; i < requests.length; i++) {
       child.stdin.write(frame({ jsonrpc: '2.0', id: i + 1, method: requests[i][0], params: requests[i][1] }));
@@ -115,6 +119,17 @@ export async function conformance(path, { timeout = 5000 } = {}) {
       if (!exact(r, ['jsonrpc', 'id', 'result']) || r.jsonrpc !== '2.0' || r.id !== i + 1) fail('invalid_response');
       if (i === 0) {
         if (!exact(r.result, ['protocol', 'id', 'version', 'kind']) || r.result.protocol !== 1 || ['id', 'version', 'kind'].some(k => r.result[k] !== info[k])) fail('negotiation_failed: check plugin identity/version/protocol');
+      } else if (info.kind === 'target' && requests[i][0] === 'target.capabilities') {
+        const caps = r.result;
+        if (!exact(caps, ['placements', 'operations', 'optional']) ||
+            JSON.stringify(caps.placements) !== JSON.stringify([info.id]) ||
+            JSON.stringify(caps.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
+            !Array.isArray(caps.optional) || caps.optional.length) fail('unsupported_target_capabilities');
+        result = caps;
+      } else if (info.kind === 'target' && requests[i][0].startsWith('target.')) {
+        const op = requests[i][0].slice(7);
+        if (!exact(r.result, ['operation']) || !['unsupported', `local.${op}`].includes(r.result.operation) ||
+            info.id !== 'local' && r.result.operation !== 'unsupported') fail('invalid_target_proposal');
       } else if (i === 2) {
         result = resultFor(info.kind, r.result);
         if (info.kind === 'harness' && !result.ready) fail('harness_not_ready');
@@ -122,7 +137,7 @@ export async function conformance(path, { timeout = 5000 } = {}) {
     }
     child.stdin.end();
     if (!(await responses.next()).done) fail('extra_response');
-  }, timeout);
+  }, timeout, info.runtime === 'native');
   const events = [];
   if (info.kind === 'harness') {
     await processFixture(entry, home => {
