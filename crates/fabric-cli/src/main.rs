@@ -44,6 +44,16 @@ enum Commands {
         #[command(subcommand)]
         command: PluginCommands,
     },
+    /// Verify, normalize and durably admit one event through an explicitly approved automation.
+    Connector {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long)]
+        automation: PathBuf,
+        /// Bounded JSON envelope, or '-' for stdin. Authorization is never persisted.
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Inspect this checkout and explicitly connect its native harness context.
     Init {
         #[arg(long)]
@@ -216,7 +226,7 @@ fn plugins(root: PathBuf, command: PluginCommands) -> Result<(), FabricError> {
                     pin.open(&token.token())?.finish()?;
                 }
                 PluginKind::Connector => {
-                    host.connector_evidence(&manifest, &token.token())?;
+                    host.connector_capabilities(&manifest, &token.token())?;
                 }
             }
             return write_inspection(&serde_json::json!({"compatible":true,"healthy":true}), true);
@@ -539,6 +549,14 @@ fn main() -> ExitCode {
         }
         Commands::Doctor { json } => (json, write_doctor(json)),
         Commands::Plugins { registry, command } => (true, plugins(registry, command)),
+        Commands::Connector {
+            registry,
+            automation,
+            request,
+        } => (
+            true,
+            write_connector(cli.root, registry, automation, request),
+        ),
         Commands::Harnesses { command, json } => (json, write_harnesses(command, json)),
         Commands::Project { command, json } => (json, write_project(cli.root, command, json)),
         Commands::Run(args) => (args.options.json, write_run(cli.root, args)),
@@ -664,6 +682,31 @@ fn write_worker(
     write_inspection(&report, true)
 }
 
+fn write_connector(
+    root: Option<PathBuf>,
+    registry: PathBuf,
+    automation: PathBuf,
+    path: PathBuf,
+) -> Result<(), FabricError> {
+    use std::io::Read;
+    let automation = fabric_core::connector::read_automation(&automation)?;
+    let event = if path == std::path::Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(output_error)?;
+        if bytes.len() > 65536 {
+            return Err(plugin_input_error());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| plugin_input_error())?
+    } else {
+        fabric_core::connector::read_incoming(&path)?
+    };
+    let root = root.map_or_else(fabric_project::default_root, Ok)?;
+    let report = fabric_core::connector::receive(&root, &registry, automation, event)?;
+    write_inspection(&report, true)
+}
 fn write_submit(
     root: Option<PathBuf>,
     path: PathBuf,

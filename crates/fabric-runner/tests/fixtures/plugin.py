@@ -55,8 +55,8 @@ for line in sys.stdin:
             result['grant'] = 'unissued'
         elif mode == 'ack-only':
             result = {'operation': 'local.' + method.split('.')[1]}
-    elif method == 'connector.evidence':
-        result = {'available': True}
+    elif method == 'connector.capabilities':
+        result = {'version': 1, 'optional': []}
     elif method == 'harness.normalize':
         with open(pidfile + '.normalizing', 'w') as f:
             f.write('active')

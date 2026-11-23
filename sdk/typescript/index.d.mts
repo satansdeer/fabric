@@ -23,8 +23,22 @@ export interface TargetCapabilities { placements: string[]; operations: readonly
 export interface TargetProposal<K extends TargetOperation = TargetOperation> { grant: string; action: TargetActionByOperation[K] | { primitive: 'unsupported' } }
 export const TARGET_ACTIONS: { readonly [K in TargetOperation]: readonly TargetActionByOperation[K][] };
 export function validTargetPlan(plan: unknown, job: TargetJob): boolean;
-/** Evidence is availability only, never a credential or authorization. */
-export interface ConnectorPayload { available: boolean }
+/** Incoming fields are data only. Routing and secret references come from operator policy. */
+export interface IncomingEvent { body: string; timestamp: number; expires_at: number; nonce: string; authorization: string }
+export interface ConnectorPolicy {
+  source_id: string; tenant_id: string; scope: string; route: string;
+  auth: 'hmac-sha256' | 'bearer'; secret_ref: string; max_payload_bytes: number; max_age_seconds: number;
+}
+export interface ConnectorInput { version: 1; request: IncomingEvent; policy: ConnectorPolicy; now: number }
+export interface NormalizedTrigger {
+  version: 1; source_id: string; event_id: string; tenant_id: string; idempotency_key: string;
+  scope: string; route: string; data: { [key: string]: Json };
+}
+export interface ConnectorCapabilities { version: 1; optional: ('subscribe' | 'reply')[] }
+export interface ConnectorOutbound { version: 1; data: Json }
+export function verifyWebhook(input: ConnectorInput): { verified: boolean };
+export function normalizeWebhook(input: ConnectorInput): NormalizedTrigger;
+export function webhookSigningBytes(input: ConnectorInput): Uint8Array;
 export type HarnessEvent = { type: string; [key: string]: Json };
 export interface HarnessContext { prompt: string; emit(event: HarnessEvent): Promise<void> }
 type Result<T> = T | Promise<T>;
@@ -38,7 +52,13 @@ export type TargetDefinition = Identity & {
   placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'unsupported' }>;
   completed(result: TargetCompleted): Result<{ received: string }>;
 } & { [K in TargetOperation]: (job: TargetJob<K>) => Result<TargetProposal<K>> };
-export interface ConnectorDefinition extends Identity { evidence(params: Record<string, never>): Result<ConnectorPayload> }
+export interface ConnectorDefinition extends Identity {
+  capabilities(): Result<ConnectorCapabilities>;
+  verify(input: ConnectorInput): Result<{ verified: boolean }>;
+  normalize(input: ConnectorInput): Result<NormalizedTrigger>;
+  subscribe?(input: ConnectorOutbound): Result<ConnectorOutbound>;
+  reply?(input: ConnectorOutbound): Result<ConnectorOutbound>;
+}
 export type Harness = Readonly<HarnessDefinition & { kind: 'harness' }>;
 export type Target = Readonly<TargetDefinition & { kind: 'target' }>;
 export type Connector = Readonly<ConnectorDefinition & { kind: 'connector' }>;
@@ -47,20 +67,22 @@ export function defineTarget(options: TargetDefinition): Target;
 export function defineConnector(options: ConnectorDefinition): Connector;
 export function serve(plugin: Harness | NativeHarness | Target | Connector): Promise<void>;
 export interface InitializeResult extends PluginIdentity { protocol: 1 }
-export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.evidence' | 'shutdown';
+export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.capabilities' | 'connector.verify' | 'connector.normalize' | 'connector.subscribe' | 'connector.reply' | 'shutdown';
 export type ControlRequest = { jsonrpc: '2.0'; id: number } & (
   { method: 'initialize'; params: { protocol: 1 } } |
   { [K in TargetOperation]: { method: `target.${K}`; params: TargetJob<K> } }[TargetOperation] |
   { method: 'target.placement'; params: TargetPlacement } |
   { method: 'target.completed'; params: TargetCompleted } |
-  { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | `target.${TargetOperation}`>; params: Record<string, never> }
+  { method: 'connector.verify' | 'connector.normalize'; params: ConnectorInput } |
+  { method: 'connector.subscribe' | 'connector.reply'; params: ConnectorOutbound } |
+  { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.verify' | 'connector.normalize' | 'connector.subscribe' | 'connector.reply'>; params: Record<string, never> }
 );
 export type ControlResponse<T> = { jsonrpc: '2.0'; id: number } & ({ result: T; error?: never } | { error: { code: number; message: string }; result?: never });
 export interface PluginManifest extends PluginIdentity {
   protocol: { min: number; max: number };
   executable: string;
   args: string[];
-  capabilities: ('harness.run' | 'target.execute' | 'connector.evidence')[];
+  capabilities: ('harness.run' | 'target.execute' | 'connector.ingest')[];
   integrity?: { root: string; sha256: string };
   native?: NativeMetadata;
 }

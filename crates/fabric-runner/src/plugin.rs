@@ -118,7 +118,7 @@ impl PluginManifest {
         let allowed = match self.kind {
             PluginKind::Harness => "harness.run",
             PluginKind::Target => "target.execute",
-            PluginKind::Connector => "connector.evidence",
+            PluginKind::Connector => "connector.ingest",
         };
         if self.capabilities != [allowed] {
             return Err(failure("unsupported_capability"));
@@ -473,11 +473,6 @@ pub fn configured_registry() -> Result<Option<PluginRegistry>, FabricError> {
         .transpose()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConnectorEvidence {
-    pub available: bool,
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ready {
@@ -575,16 +570,68 @@ impl PluginHost {
             version: manifest.version.clone(),
         })
     }
-    pub fn connector_evidence(
+    pub fn connector_capabilities(
         &self,
         manifest: &PluginManifest,
         cancel: &CancellationToken,
-    ) -> Result<ConnectorEvidence, FabricError> {
+    ) -> Result<fabric_domain::ConnectorCapabilities, FabricError> {
         if manifest.kind != PluginKind::Connector {
             return Err(failure("wrong_kind"));
         }
-        self.invoke(manifest, "connector.evidence", json!({}), cancel)
+        let capabilities: fabric_domain::ConnectorCapabilities =
+            self.invoke(manifest, "connector.capabilities", json!({}), cancel)?;
+        validate_connector_capabilities(&capabilities)?;
+        Ok(capabilities)
     }
+
+    /// Verification and normalization share one bounded owned process. A rejection never normalizes.
+    pub fn connector_event(
+        &self,
+        manifest: &PluginManifest,
+        input: &fabric_domain::ConnectorInput,
+        cancel: &CancellationToken,
+    ) -> Result<fabric_domain::NormalizedTrigger, FabricError> {
+        if manifest.kind != PluginKind::Connector || input.version != 1 {
+            return Err(failure("wrong_connector_contract"));
+        }
+        let mut session = PluginSession::open(manifest, self.timeout, cancel)?;
+        let capabilities =
+            serde_json::from_value(session.call("connector.capabilities", json!({}))?)
+                .map_err(|_| failure("invalid_result"))?;
+        validate_connector_capabilities(&capabilities)?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Verified {
+            verified: bool,
+        }
+        let params = serde_json::to_value(input).map_err(|_| failure("invalid_request"))?;
+        let verified: Verified =
+            serde_json::from_value(session.call("connector.verify", params.clone())?)
+                .map_err(|_| failure("invalid_result"))?;
+        if !verified.verified {
+            return Err(failure("connector_authentication"));
+        }
+        let trigger = serde_json::from_value(session.call("connector.normalize", params)?)
+            .map_err(|_| failure("invalid_trigger"))?;
+        session.finish()?;
+        Ok(trigger)
+    }
+}
+
+fn validate_connector_capabilities(
+    value: &fabric_domain::ConnectorCapabilities,
+) -> Result<(), FabricError> {
+    if value.version != 1
+        || value
+            .optional
+            .iter()
+            .any(|s| !matches!(s.as_str(), "subscribe" | "reply"))
+        || value.optional.len() > 2
+        || (value.optional.len() == 2 && value.optional[0] == value.optional[1])
+    {
+        return Err(failure("unsupported_connector_contract"));
+    }
+    Ok(())
 }
 fn exchange_bounded(
     (input, output): (&mut impl Write, &mut impl Read),

@@ -39,6 +39,11 @@ pub enum Request {
         fake_binary: Option<PathBuf>,
         idempotency_key: Option<String>,
     },
+    Trigger {
+        automation: crate::connector::Automation,
+        trigger: fabric_domain::NormalizedTrigger,
+        delivery: fabric_domain::ConnectorDelivery,
+    },
     Status {
         id: String,
         after: u64,
@@ -318,7 +323,7 @@ impl Manager {
             } => {
                 let digest = request_digest(&request, &fake_binary)?;
                 let batch = crate::api::translate_v1(request, CancellationToken::default())?;
-                self.submit(batch, fake_binary, idempotency_key, digest, false)
+                self.submit(batch, fake_binary, idempotency_key, digest, false, None)
             }
             Request::Spawn {
                 request,
@@ -327,7 +332,24 @@ impl Manager {
             } => {
                 let digest = request_digest(&request, &fake_binary)?;
                 let batch = crate::api::translate_workers(request)?;
-                self.submit(batch, fake_binary, idempotency_key, digest, true)
+                self.submit(batch, fake_binary, idempotency_key, digest, true, None)
+            }
+            Request::Trigger {
+                automation,
+                trigger,
+                delivery,
+            } => {
+                let (request, key) = automation.route(&trigger)?;
+                if delivery.namespace != automation.namespace()
+                    || delivery.rate_limit != automation.rate_limit_per_minute
+                {
+                    return Err(invalid(
+                        "Connector delivery does not match approved policy.",
+                    ));
+                }
+                let digest = request_digest(&(&trigger, &request), &None)?;
+                let batch = crate::api::translate_workers(request)?;
+                self.submit(batch, None, Some(key), digest, true, Some(delivery))
             }
             Request::Status { id, after } => self.status(&id, after),
             Request::Results { id } => self.results(&id),
@@ -358,6 +380,7 @@ impl Manager {
         key: Option<String>,
         digest: String,
         generic: bool,
+        delivery: Option<fabric_domain::ConnectorDelivery>,
     ) -> Result<Value, FabricError> {
         if key
             .as_ref()
@@ -375,7 +398,19 @@ impl Manager {
             .transpose()?
             .flatten()
         {
-            self.schedule(prior.batch_id.clone())?;
+            if let Some(delivery) = &delivery {
+                store
+                    .accept_connector_batch(
+                        &prior,
+                        key.as_deref().expect("connector key"),
+                        &[],
+                        delivery,
+                        now()?,
+                    )
+                    .map_err(error)?;
+            } else {
+                self.schedule(prior.batch_id.clone())?;
+            }
             return accepted(&store, &prior.batch_id, generic);
         }
         let registry = HarnessRegistry::default();
@@ -437,16 +472,26 @@ impl Manager {
         if control.stopping {
             return Err(invalid("Manager is stopping; reconnect and submit again."));
         }
-        let id = store
-            .accept_async_batch(&batch, key.as_deref(), &tasks, now()?)
-            .map_err(|failure| {
-                if matches!(failure, fabric_store::StoreError::Conflict) {
-                    invalid("Idempotency key is already bound to a different request.")
-                } else {
-                    error(failure)
-                }
-            })?;
-        Self::enqueue(&mut control, id.clone());
+        let id = match &delivery {
+            Some(delivery) => store.accept_connector_batch(
+                &batch,
+                key.as_deref().expect("connector key"),
+                &tasks,
+                delivery,
+                now()?,
+            ),
+            None => store.accept_async_batch(&batch, key.as_deref(), &tasks, now()?),
+        }
+        .map_err(|failure| {
+            if matches!(failure, fabric_store::StoreError::Conflict) {
+                invalid("Idempotency key is already bound to a different request.")
+            } else {
+                error(failure)
+            }
+        })?;
+        if delivery.is_none() || id == batch.batch_id {
+            Self::enqueue(&mut control, id.clone());
+        }
         self.changed.notify_all();
         drop(control);
         accepted(&store, &id, generic)
