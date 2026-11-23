@@ -12,6 +12,38 @@
 
 No cloud readiness claim is made. Native installed-host loading and fake workers do not establish authentication/model access or model-driven skill routing.
 
+## Issue 38 native release bootstrap
+
+Scope: unsigned/unnotarized macOS arm64 native archive, not full issue #7. Publication and downloaded-install verification remain pending until actual successful evidence is recorded in issues #38 and #7.
+
+`scripts/package-release.mjs FULL_SHA NEW_ABSOLUTE_OUTPUT` requires clean source, matching HEAD/version tag and main ancestry. It builds locked native binaries in an external temporary target directory, then packages an explicit public allowlist. `--local` permits unmerged worktree verification with unmistakable `local-unreviewed` manifest/CLI identity; never publish that local archive.
+
+```sh
+SOURCE_SHA=b0bedbb6654c6f65ba9270b5c52e20a56d4df79d
+BASE=$(cd "$(mktemp -d)" && pwd -P)
+node scripts/package-release.mjs --local "$SOURCE_SHA" "$BASE/package"
+ARCHIVE="$BASE/package/fabric-v0.1.0-local.$(printf %.12s "$SOURCE_SHA")-macos-arm64.tar.gz"
+HASH=$(cut -d ' ' -f 1 "$ARCHIVE.sha256")
+node scripts/smoke-release.mjs --local "$ARCHIVE" "$HASH" "$SOURCE_SHA" "$BASE/install"
+```
+
+Manager local package verification passed on macOS arm64: archive SHA-256 `3268b92a01341b585e66edb5adc5dbac7c3aac75a9c33b4389d838789d9f5dfb`, base source `b0bedbb6654c6f65ba9270b5c52e20a56d4df79d`. The isolated installed archive reported `LOCAL_PACKAGE_ONLY`; executable/version, payload hashes, both plugin pins, pinned OMP discovery, disposable project and preparation passed with Cargo/Rust absent from child PATH. Providers and manager were not started; Codex discovery and host swarm were not tested. This verifies the unmerged local package, not a published release.
+
+After manager review/merge and successful main CI, create a lightweight `v0.1.0` tag at that exact merged implementation commit, then dispatch:
+
+```sh
+: "${SOURCE_SHA:?accepted merged implementation commit}"
+gh api repos/satansdeer/fabric/git/refs -f ref=refs/tags/v0.1.0 -f sha="$SOURCE_SHA"
+gh workflow run release-macos.yml --repo satansdeer/fabric --ref main \
+  -f source_sha="$SOURCE_SHA" -f tag=v0.1.0
+```
+
+Never move an existing tag or overwrite a release/asset. Inspect partial drafts before deciding how to proceed. Workflow package/publish/download jobs record the archive hash, public inventory and downloaded-install proof separately. Its tag/source/merged-PR/main-CI checks precede publication; only publication has write permission. Tag immutability is an operational no-overwrite rule, not Apple signing or an assertion about GitHub immutable-release settings.
+
+The smoke uses the packaged executable/plugins and pinned official OMP 19.1.0 host only for provider-free discovery. Cargo/Rust are absent from child PATH. It checks a disposable project and prepared state, not auth/model access, installed OMP host integration or skill routing. User config/credentials and existing managers remain untouched.
+
+The public manifest includes plugin/version/content pins, source SHA, file hashes, matching public OMP extension provenance and the bundled fake fixture. Consumer om-pstack #2 must use the downloaded version/hash, separately pinned OMP/pstack and Bun; `integrations/omp/host-smoke.ts` is bundled but not executed by this release smoke. No source-built fallback or full runtime-parity claim.
+
 ## C-00 baseline reproduction
 
 Baseline SHA: `8e926f934f6508d114579e87d53e60a6d9ebdaf6`, macOS arm64. Documentation-only changes begin this milestone; no production behavior was changed for baseline reproduction.
