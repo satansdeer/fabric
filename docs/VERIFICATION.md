@@ -638,3 +638,12 @@ was weakened.
 The corrected Codex fixture passed (one parent test and all three isolated
 authorization child modes); `cargo fmt --all --check` passed. New exact-head CI
 remains a separate gate; the failed run is not release acceptance.
+
+The next exact-head run (`45118225823`, source `09ebb508c14f2493ca5141296bbc085aaca893bf`)
+reached the store suite and exposed five stale schema-version expectations:
+the target-failure cleanup migration advances the database to v15.
+Removed four redundant latest-version pins while retaining legacy ownership,
+artifact, lease, queue, WAL and foreign-key assertions. Read-only inspection
+now covers both v15 and v14 through v5, requiring exact version and byte
+preservation in each fixture. All 28 store tests and formatting passed locally.
+This correction still requires green exact-head CI before merge.
