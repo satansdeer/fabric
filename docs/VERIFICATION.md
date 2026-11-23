@@ -12,6 +12,50 @@
 
 No cloud readiness claim is made. Native installed-host loading and fake workers do not establish authentication/model access or model-driven skill routing.
 
+## Issue 39: content-free storage meter diagnostics
+
+Source baseline verified before editing: `a8448f5a04dee05ffda801157655685e6eb01cf9`.
+Reviewed issue-body SHA-256 supplied with the task:
+`96f260f6bf75f69851f2aad3410d53781525aef1fedc239f28359484a11fdae0`.
+
+`TESTED_WITH_FAKE`: the candidate carries typed measurement stage/cause codes
+through storage supervision, durable observations and terminal reports, including
+report reconstruction from observations. No database schema migration, cap
+increase, retry, storage-error suppression or stop-category change was made.
+Legacy observations/results without the optional field remain readable.
+
+Exact focused command on macOS arm64 (source-built candidate CLI; existing
+released v0.1.0 reference plugin used only for fixture discovery/planning):
+
+```sh
+PATH="/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:$PATH" FABRIC_REFERENCE_PLUGIN_BINARY=/Users/maksimivanov/.local/share/fabric/releases/v0.1.0/install/fabric-v0.1.0-macos-arm64/plugins/omp/plugin cargo test --locked -p fabric-cli --test run storage_meter_failure_survives_terminal_reconnect_without_raw_content -- --exact --nocapture
+```
+
+First attempt: `0 passed; 1 failed; 47 filtered out`; the read-only viewer rejected
+the fixture's noncanonical macOS temporary-path alias (`Log root must be canonical.`).
+Only the test viewer was corrected to pass the canonical root. Same focused
+command rerun:
+
+```text
+test storage_meter_failure_survives_terminal_reconnect_without_raw_content ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 6.77s
+```
+
+The single regression injects a free-space `statvfs`/`EIO` failure after a fake
+shell worker starts. It checks that zero exit remains `FAILED` /
+`storage_meter_failed`, artifacts are captured, the fork is reclaimed, admission
+capacity is released, and a new read-only CLI process reconnects to terminal
+observations containing `{"stage":"free_space","code":"io","operation":"statvfs","os_code":5}`.
+Credential-path, file-content and native-log sentinels are absent; raw output is
+not requested. No manager, native/model worker or failed-worker replay was started.
+
+Limitations: only this regression was run; no full suite, lint/format pass,
+manager-restart scenario or scan-bound/race injection was run. This is candidate
+source proof, **not released-runtime verification**. The historical issue #38
+meter failure's actual cause remains **UNKNOWN**, not proven storage pressure,
+a scan bound or a race. Verification with the next released runtime and inspection
+of its new evidence remain manager-owned prerequisites to any root-cause fix.
+
 ## Issue 38 native release bootstrap
 
 Scope: unsigned/unnotarized macOS arm64 native archive, not full issue #7. Publication and downloaded-install verification remain pending until actual successful evidence is recorded in issues #38 and #7.

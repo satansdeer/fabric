@@ -25,6 +25,8 @@ pub struct Progress {
     pub cleanup_observed_at_ms: Option<u64>,
     pub sampled_at_ms: u64,
     pub activity: Activity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_meter_failure: Option<crate::workspace::storage::MeterFailure>,
 }
 
 impl Progress {
@@ -40,6 +42,7 @@ impl Progress {
             cleanup_observed_at_ms: None,
             sampled_at_ms: timestamp_ms(),
             activity: Activity::default(),
+            storage_meter_failure: None,
         }
     }
 
