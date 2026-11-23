@@ -292,7 +292,8 @@ test('actual Core: scaffold -> conformance -> local package install/check, tampe
   mkdirSync(registry, { mode: 0o700 });
   function fabric(args, expected = 0) {
     const r = spawnSync(host, ['plugins', '--registry', registry, ...args], { env: environment(root), encoding: 'utf8', timeout: 15_000 });
-    assert.equal(r.status, expected, r.stderr);
+    assert.ifError(r.error);
+    assert.equal(r.status, expected, JSON.stringify({ args, signal: r.signal, stdout: r.stdout, stderr: r.stderr }));
     assert.doesNotMatch(r.stderr + r.stdout, /SECRET_CANARY/);
     return r;
   }

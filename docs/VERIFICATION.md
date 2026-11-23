@@ -982,3 +982,12 @@ No timer is increased and no failed check is bypassed.
 A checksum-verified official Node 22.23.2 macOS arm64 binary, matching CI's
 Node version, passed the focused generated-target test in 26.84 s locally.
 That pass does not explain or invalidate the two CI failures.
+
+At diagnostic head `53968fbc5c813b36c4aa5a75b6527a5881766d3c`, PR CI
+`45158840103` passed all acceptance steps. Push CI `45158827281` passed
+the generated-target test but failed the preceding actual-Core SDK
+install/check fixture with status 1 and empty stderr. That helper now also
+asserts subprocess errors and reports command/stdout/stderr instead of
+discarding evidence. Its focused test passed locally on the same verified
+Node 22.23.2 runtime in 20.29 s. Neither outer fixture timeout is changed.
+One green workflow does not override its failed exact-head partner.
