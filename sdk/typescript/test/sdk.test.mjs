@@ -334,7 +334,7 @@ test('generated third-party target executes a Core host worker, seals verified a
   install(target, { registry, fabric: host, version: '1.0.0', sha256: directory(target).hash, trust: true });
   function invoke(program, args, cwd = root) {
     const r = spawnSync(program, args, { cwd, env, encoding: 'utf8', timeout: 30_000 });
-    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr + r.stdout);
     return r.stdout;
   }
   invoke('/usr/bin/git', ['init', '--quiet'], repo);

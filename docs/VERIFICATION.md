@@ -950,3 +950,11 @@ failure cases. Its first invocation failed before execution because the
 SDK executable environment variable was missing; the invocation above
 corrected that setup. Public release and real native follow-on acceptance
 are separate gates, not claimed by these provider-free checks.
+
+Both exact-head CI runs at `f0ff6ccd693410aca0cb3c7ed5478d5b23a9115e`
+failed in the existing generated third-party-target/Core SDK integration:
+Core exited 1, but the assertion printed only empty stderr and omitted its
+JSON stdout. No CI artifacts survived. The assertion now includes stdout
+without weakening its expected success. A local invocation of only that
+case passed in 15.42 s; this does not explain the CI failure or clear the
+merge gate. A new exact-head CI run must provide the missing diagnostic.
