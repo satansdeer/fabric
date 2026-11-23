@@ -72,7 +72,7 @@ try {
   }
   // Existing SDK installer and its imports; no npm dependencies or lifecycle hooks.
   for (const file of ['cli.mjs', 'package.mjs', 'protocol.mjs', 'conformance.mjs', 'index.mjs']) copy(join(repo, 'sdk/typescript', file), `sdk/${file}`);
-  for (const file of ['fabric.ts', 'host-smoke.ts']) copy(join(repo, 'integrations/omp', file), `integrations/omp/${file}`);
+  for (const file of ['fabric.ts', 'host-smoke.ts', 'up-smoke.ts']) copy(join(repo, 'integrations/omp', file), `integrations/omp/${file}`);
   copy(join(repo, 'scripts/smoke-release.mjs'), 'scripts/smoke-release.mjs');
   // The smoke's SDK imports are dynamic and resolve inside the extracted bundle.
   const manifest = {

@@ -31,13 +31,13 @@ impl HarnessCommand {
     }
 }
 
-fn invalid(message: impl Into<String>) -> FabricError {
+pub(super) fn invalid(message: impl Into<String>) -> FabricError {
     FabricError {
         kind: ErrorKind::InvalidArguments,
         message: message.into(),
     }
 }
-fn approve(question: &str) -> Result<bool, FabricError> {
+pub(super) fn approve(question: &str) -> Result<bool, FabricError> {
     if !io::stdin().is_terminal() {
         return Ok(false);
     }
@@ -49,7 +49,7 @@ fn approve(question: &str) -> Result<bool, FabricError> {
         .map_err(super::output_error)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
-fn exposure(context: &NativeContext) {
+pub(super) fn exposure(context: &NativeContext) {
     eprintln!(
         "Harness: {} {}",
         context.profile.harness_id, context.profile.harness_version

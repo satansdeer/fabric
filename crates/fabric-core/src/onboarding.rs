@@ -44,11 +44,31 @@ pub fn inspect(id: &HarnessId) -> Result<NativeContext, FabricError> {
 pub fn connect(root: &Path, context: &NativeContext) -> Result<(), FabricError> {
     let adapter = HarnessRegistry::default()
         .resolve(&context.profile.harness_id, &RegistryOptions::default())?;
-    let current = adapter.native_context()?;
-    if json(context)? != json(&current)? || !current.credential_available {
+    let mut inspected = context.clone();
+    let controllers: Vec<_> = inspected
+        .profile
+        .native_config_refs
+        .iter()
+        .filter(|reference| reference.kind == fabric_runner::controller::REFERENCE)
+        .cloned()
+        .collect();
+    inspected
+        .profile
+        .native_config_refs
+        .retain(|reference| reference.kind != fabric_runner::controller::REFERENCE);
+    let mut current = adapter.native_context()?;
+    if json(&inspected)? != json(&current)? || !current.credential_available {
         return Err(authorization(
             "Native context is unavailable or changed; configure the harness locally, then inspect and connect again.",
         ));
+    }
+    current.profile.native_config_refs.extend(controllers);
+    if let Some(controller) = fabric_runner::controller::load(&current.profile)? {
+        if controller.root != root {
+            return Err(authorization(
+                "Controller storage root differs from the consent destination.",
+            ));
+        }
     }
     let request = HarnessRequest {
         profile: Some(current.profile.clone()),
@@ -194,7 +214,7 @@ fn load_selection(root: &Path, id: &HarnessId) -> Result<Option<(Selection, Stri
 }
 
 /// The stamp belongs to the implicit selection, never to advanced explicit profiles.
-pub(crate) fn plan(
+pub fn plan(
     root: &Path,
     adapter: &dyn HarnessAdapter,
     mut request: HarnessRequest,
@@ -226,11 +246,7 @@ pub(crate) fn plan(
     Ok((plan, selection.map(|(_, stamp)| stamp)))
 }
 
-pub(crate) fn revalidate(
-    root: &Path,
-    plan: &HarnessPlan,
-    stamp: Option<&str>,
-) -> Result<(), FabricError> {
+pub fn revalidate(root: &Path, plan: &HarnessPlan, stamp: Option<&str>) -> Result<(), FabricError> {
     let Some(stamp) = stamp else { return Ok(()) };
     let Some((_, current)) = load_selection(root, &plan.manifest.harness_id)? else {
         return Err(authorization(

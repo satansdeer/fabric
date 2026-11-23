@@ -169,3 +169,55 @@ fn explicit_connection_is_private_selected_and_revocable() {
     assert_eq!(report["connected"], false);
     assert_eq!(fs::read_dir(fixture.0.join("source")).unwrap().count(), 2);
 }
+
+#[test]
+fn up_requires_consent_before_probes_and_reuses_the_exact_ready() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.join("probed");
+    fs::write(
+        fixture.0.join("bin/codex"),
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf 'codex-cli 0.171.0\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join("native/auth.json"),
+        "opaque fixture auth, never copied",
+    )
+    .unwrap();
+    let denied = fixture.cli(&["up", "--harness", "codex", "--source-only", "--json"]);
+    assert!(!denied.status.success(), "{denied:?}");
+    assert!(!marker.exists(), "unconsented setup executed a harness");
+    assert!(!fixture.0.join("managed").exists());
+    let args = [
+        "up",
+        "--harness",
+        "codex",
+        "--source-only",
+        "--yes",
+        "--json",
+    ];
+    let first = fixture.cli(&args);
+    assert!(first.status.success(), "{first:?}");
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let grant = fs::read(fixture.0.join("managed/.native-context-codex.json")).unwrap();
+    let second = fixture.cli(&args);
+    assert!(second.status.success(), "{second:?}");
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(first["prepared_state_id"], second["prepared_state_id"]);
+    assert_eq!(first["preparation_key"], second["preparation_key"]);
+    assert_eq!(first["project"], "source");
+    assert_eq!(
+        grant,
+        fs::read(fixture.0.join("managed/.native-context-codex.json")).unwrap()
+    );
+    assert!(!String::from_utf8_lossy(&grant).contains("opaque fixture auth"));
+    assert!(
+        second["next_command"]
+            .as_str()
+            .unwrap()
+            .contains("workers spawn")
+    );
+}

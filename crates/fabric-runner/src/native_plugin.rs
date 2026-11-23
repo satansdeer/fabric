@@ -291,6 +291,10 @@ pub(crate) fn plan(
         &files,
         "Selected native config changed or is unsafe to fingerprint.",
     )?;
+    let fingerprint = match effective.profile.as_ref() {
+        Some(profile) => crate::controller::fingerprint(profile, fingerprint)?,
+        None => fingerprint,
+    };
     if fingerprint != evidence.native_config_fingerprint {
         return Err(failure("invalid_native_fingerprint"));
     }
@@ -418,6 +422,11 @@ pub(crate) fn command(
     }
     let profile = spec.request.profile.as_ref().unwrap();
     let metadata = manifest.native.as_ref().unwrap();
+    let controller = crate::controller::load(profile)?;
+    let controller_environment = controller
+        .as_ref()
+        .map(|c| c.environment())
+        .unwrap_or_default();
     let mut environment = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (key, value) in command.environment {
@@ -455,12 +464,14 @@ pub(crate) fn command(
                     message: "Selected credential is unavailable.".into(),
                 })?;
             environment.push((key.into(), secret));
-        } else if (key == "HOME" || metadata.root_environment.contains(&key))
+        } else if controller_environment.iter().any(|(name, selected)| {
+            name == std::ffi::OsStr::new(&key) && selected == std::ffi::OsStr::new(&value)
+        }) || ((key == "HOME" || metadata.root_environment.contains(&key))
             && clean_path(std::path::Path::new(&value))
             && profile
                 .native_config_refs
                 .iter()
-                .any(|r| std::path::Path::new(&value).starts_with(&r.path))
+                .any(|r| std::path::Path::new(&value).starts_with(&r.path)))
         {
             environment.push((key.into(), value.into()));
         } else {
