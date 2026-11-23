@@ -2,7 +2,7 @@
 
 Node **22.18+** (or 24+) runs erasable TypeScript directly. No Rust toolchain, transpilation, runtime dependencies, provider accounts, or npm install are needed for generated projects. Use standard erasable types, not enums, namespaces, parameter properties, or tsconfig path aliases. The SDK itself ships JavaScript and `.d.mts` contracts, so importing it from `node_modules` does not rely on Node stripping dependency TypeScript.
 
-This is a protocol v1 adapter and provider-free development kit, not a worker runtime. [Core's plugin protocol](../../docs/PLUGIN_PROTOCOL.md) remains authoritative. Target drivers negotiate placement and issue restricted lifecycle instructions; connectors only report evidence availability. Core owns worker admission, source/target pins, workspace ownership, budgets, process evidence, capture, artifacts, cancellation and reclamation. The current instruction set supports trusted-local execution, not an actual remote backend.
+This is a protocol v1 adapter and provider-free development kit, not a worker runtime. [Core's plugin protocol](../../docs/PLUGIN_PROTOCOL.md) remains authoritative. Target drivers negotiate placement and issue restricted lifecycle instructions; connectors verify and normalize incoming events against explicit operator policy. Core owns routing, durable/idempotent worker admission, source/target pins, workspace ownership, budgets, process evidence, capture, artifacts, cancellation and reclamation. The current instruction set supports trusted-local execution, not an acknowledgement-only remote target.
 
 ## Scaffold, test, develop
 
@@ -26,7 +26,7 @@ The runnable templates in `samples/{harness,target,connector}.ts` also accept th
 ## Typed adapters
 
 ```ts
-import { defineHarness, defineTarget, defineConnector, serve, TARGET_OPERATIONS } from './sdk/index.mjs';
+import { defineHarness, defineTarget, defineConnector, serve, TARGET_OPERATIONS, verifyWebhook, normalizeWebhook } from './sdk/index.mjs';
 
 const harness = defineHarness({
   id: 'my-harness', version: '1.0.0',
@@ -50,7 +50,9 @@ const target = defineTarget({
 });
 const connector = defineConnector({
   id: 'my-connector', version: '1.0.0',
-  evidence: () => ({ available: false }),
+  capabilities: () => ({ version: 1, optional: [] }),
+  verify: verifyWebhook,
+  normalize: normalizeWebhook,
 });
 // Each executable serves one kind, not all three:
 await serve(harness);
@@ -68,12 +70,21 @@ For a conventional npm dependency, import from `@fabric/plugin-sdk`. Do not run 
 | --- | --- | --- |
 | harness | `harness.plan {}` | `{ "ready": true }` |
 | target | Capabilities, placement, then six `target.OP {placement,run_id,grant,actions,context}` exchanges and concrete-plan completion receipts | Exact capabilities, offered backend/action and matching grant; fake remote refuses explicitly. Completion evidence here is fixture data, not execution proof. |
-| connector | `connector.evidence {}` | `{ "available": false }` for the sample; either boolean conforms |
+| connector | Capabilities, HMAC-authenticated `connector.verify`, then `connector.normalize` with the identical versioned input | Exact capabilities, `verified: true`, and the complete expected normalized trigger |
 | harness run | `--fabric-plugin-run PROMPT_FILE`, fixed fixture prompt | sample text event containing the prompt, then `done` |
 
-All kinds negotiate protocol/id/version/kind and complete health/shutdown. Harness execution runs in a second actual process. The kit bounds frames to 65,536 bytes including LF, and its harness fixture capture to 1,024 events / 1 MiB. Invalid/malformed/oversized/truncated frames, remote errors and timeouts fail with fixed secret-free diagnostics and terminate the process group. The kit does not normalize events or replace Core artifact/lifecycle tests. Third-party callback correctness and provider-backed behavior are outside fixture proof.
+All kinds negotiate protocol/id/version/kind and complete health/shutdown. Harness execution runs in a second actual process. The kit bounds frames to 65,536 bytes including LF, and its harness fixture capture to 1,024 events / 1 MiB. Invalid/malformed/oversized/truncated frames, remote errors and timeouts fail with fixed secret-free diagnostics and terminate the process group. Connector fixtures exercise authentication and normalization, not worker scheduling. Third-party callback correctness, provider-backed behavior and Core artifact/lifecycle acceptance remain outside fixture proof.
 
 SDK metadata must be exactly `sdk: "0.1.0", protocol: 1`; mismatch diagnostics explain what to regenerate/update **before plugin code runs**. Runtime identity/protocol mismatches fail negotiation before Core admits execution. Update package pins only after reviewing the new content.
+
+### Incoming connector fixtures and webhook
+
+The generated connector accepts `{event_id,idempotency_key,data}` JSON bodies with HMAC-SHA256 or a scoped bearer-file reference. It advertises no subscribe/reply operations. Another format implements the same typed `verify`/`normalize` callbacks; Core does not gain provider branches.
+
+`fabric-plugin test DIR --connector-fixture FILE` tests an alternate format without rebuilding Core. The JSON fixture is `{body: STRING, expected: NormalizedTrigger}`: a raw body string and the complete version-1 normalized contract. The kit supplies a private deterministic HMAC key reference, trusted policy identities from `expected`, fixture timestamps and a valid signature, then checks the exact normalized result. Fixtures are local test data, not automation approval or provider authentication.
+
+See [incoming connector contract](../../docs/PLUGIN_PROTOCOL.md#incoming-connectors-contract-version-1) for explicit private automation files, source/tenant/scope/route checks, signing bytes, durable acknowledgements/replay/rate limits and the stdlib-only loopback HTTP reference. Raw event fields are data, never unrestricted worker instructions. The existing content-pinned external installation below applies unchanged.
+
 
 ## Reproducible local packaging (not public publication)
 

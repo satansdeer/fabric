@@ -54,7 +54,7 @@ for (const kind of ['harness', 'target', 'connector']) {
     assert.equal(proof.id, kind);
     assert.equal(proof.protocol, 1);
     if (kind === 'target') assert.deepEqual(proof.result, { placements: ['target'], operations: TARGET_OPERATIONS, optional: [] });
-    else if (kind === 'connector') assert.deepEqual(proof.result, { available: false });
+    else if (kind === 'connector') assert.deepEqual(proof.result, { version: 1, optional: [] });
     else {
       assert.deepEqual(proof.result, { ready: true });
       assert.deepEqual(proof.events, [{ type: 'text', text: `Provider-free fixture: ${FIXTURE_PROMPT}` }, { type: 'done' }]);
@@ -194,7 +194,7 @@ test('SDK rejects malformed, oversized and out-of-order host requests without re
   for (const input of [
     'SECRET_CANARY\n', 'x'.repeat(MAX_FRAME) + '\n', Buffer.from([0xff, 10]),
     JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocol: 2 } }) + '\n',
-    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'connector.evidence', params: {} }) + '\n',
+    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'connector.verify', params: {} }) + '\n',
   ]) {
     const r = spawnSync(process.execPath, [join(project, 'plugin.ts'), '--fabric-plugin-stdio'], { input, env: environment(root), encoding: 'utf8', timeout: 5000, maxBuffer: MAX_FRAME * 2 });
     assert.equal(r.status, 1);
@@ -207,7 +207,7 @@ test('callback errors and invalid target/connector results are fixed protocol fa
   const root = temporary(t);
   for (const [kind, callback, code] of [
     ['target', `capabilities: () => ({placements:['target'],operations:['prepare','start','inspect','cancel','collect','reclaim'],optional:[]}), placement:()=>({backend:'host.local'}), completed:({grant})=>({received:grant}), prepare: ({grant}) => ({grant,action:{primitive:'workspace.fork',strategy:'copy'},reclaim:true}), start: ({grant}) => ({grant,action:{primitive:'unsupported'}}), inspect: ({grant}) => ({grant,action:{primitive:'unsupported'}}), cancel: ({grant}) => ({grant,action:{primitive:'unsupported'}}), collect: ({grant}) => ({grant,action:{primitive:'unsupported'}}), reclaim: ({grant}) => ({grant,action:{primitive:'unsupported'}})`, 'closed_output'],
-    ['connector', `evidence: () => { throw new Error('SECRET_CANARY'); }`, 'remote_error'],
+    ['connector', `capabilities: () => { throw new Error('SECRET_CANARY'); }, verify: () => ({verified:false}), normalize: () => { throw new Error('SECRET_CANARY'); }`, 'closed_output'],
   ]) {
     const project = create(kind, join(root, kind));
     const name = kind === 'target' ? 'defineTarget' : 'defineConnector';

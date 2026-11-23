@@ -1,15 +1,18 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { directory } from './package.mjs';
 import { exact, frame, frames, resultFor, fail, NATIVE_MAX_FRAME } from './protocol.mjs';
 import { TARGET_OPERATIONS, TARGET_ACTIONS, validTargetPlan } from './index.mjs';
+import { createHmac } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import { webhookSigningBytes, validNormalizedTrigger } from './webhook.mjs';
 
 export const FIXTURE_PROMPT = 'Fabric provider-free fixture';
 function kill(child) { if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } }
 async function processFixture(entry, args, operation, timeout, native = false) {
-  const home = mkdtempSync(join(tmpdir(), 'fabric-plugin-'));
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'fabric-plugin-')));
   let child;
   let timer;
   let timedOut = false;
@@ -94,14 +97,14 @@ async function nativeConformance(info, entry, timeout) {
   }, timeout, info.runtime === 'native');
   return { id: info.id, kind: info.kind, protocol: 1, result, events };
 }
-export async function conformance(path, { timeout = 5000 } = {}) {
+export async function conformance(path, { timeout = 5000, connectorFixture } = {}) {
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60_000) fail('invalid_timeout');
   const { info } = directory(path); // Negotiation metadata is checked before any plugin code runs.
   const entry = resolve(path, info.entry);
   if (info.native) return nativeConformance(info, entry, timeout);
-  const method = info.kind === 'connector' ? 'connector.evidence' : 'harness.plan';
+  const method = info.kind === 'connector' ? 'connector.capabilities' : 'harness.plan';
   let result;
-  await processFixture(entry, () => [...(info.args ?? []), '--fabric-plugin-stdio'], async child => {
+  await processFixture(entry, () => [...(info.args ?? []), '--fabric-plugin-stdio'], async (child, home) => {
     const responses = frames(child.stdout)[Symbol.asyncIterator]();
     let id = 0;
     const call = async (method, params) => {
@@ -144,6 +147,25 @@ export async function conformance(path, { timeout = 5000 } = {}) {
     } else {
       result = resultFor(info.kind, await call(method, {}));
       if (info.kind === 'harness' && !result.ready) fail('harness_not_ready');
+      if (info.kind === 'connector') {
+        const fixture = connectorFixture ?? {
+          body: JSON.stringify({ event_id: 'event-1', idempotency_key: 'business-1', data: { title: FIXTURE_PROMPT } }),
+          expected: { version: 1, source_id: 'fixture', tenant_id: 'fixture', scope: 'events.read',
+            route: 'fixture', event_id: 'event-1', idempotency_key: 'business-1', data: { title: FIXTURE_PROMPT } },
+        };
+        if (!exact(fixture, ['body', 'expected']) || typeof fixture.body !== 'string' || !validNormalizedTrigger(fixture.expected)) fail('invalid_connector_fixture');
+        const key = Buffer.alloc(32, 7), secret_ref = join(home, 'fixture-key');
+        writeFileSync(secret_ref, key, { mode: 0o600 });
+        const { source_id, tenant_id, scope, route } = fixture.expected;
+        const input = { version: 1, now: 1000, policy: { source_id, tenant_id, scope, route,
+          auth: 'hmac-sha256', secret_ref, max_payload_bytes: 8192, max_age_seconds: 60 },
+          request: { body: fixture.body, timestamp: 1000, expires_at: 1060, nonce: 'conformance', authorization: '' } };
+        input.request.authorization = 'sha256=' + createHmac('sha256', key).update(webhookSigningBytes(input)).digest('hex');
+        const verification = await call('connector.verify', input);
+        if (!exact(verification, ['verified']) || verification.verified !== true) fail('connector_not_verified');
+        const trigger = await call('connector.normalize', input);
+        if (!validNormalizedTrigger(trigger) || !isDeepStrictEqual(trigger, fixture.expected)) fail('invalid_connector_trigger');
+      }
     }
     ready(await call('shutdown', {}));
     child.stdin.end();

@@ -5,6 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 mod capture;
+mod connector;
 mod harness;
 mod ids;
 mod policy;
@@ -13,6 +14,10 @@ mod state;
 mod worker;
 
 pub use capture::{AgentEvent, CaptureMetadata, CapturedFile, EventCounts};
+pub use connector::{
+    ConnectorCapabilities, ConnectorDelivery, ConnectorInput, ConnectorPolicy, IncomingEvent,
+    NormalizedTrigger, connector_id,
+};
 pub use harness::{
     Capability, CapabilityReason, CapabilityStatus, CapabilitySupport, HarnessCapabilityManifest,
     HarnessId, HarnessPlan, HarnessRequest, HarnessVersion,

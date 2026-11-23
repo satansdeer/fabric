@@ -5,7 +5,7 @@ export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME = 65_536;
 export const NATIVE_MAX_FRAME = 2 * MAX_FRAME;
 export const MAX_PACKAGE = 32 * 1024 * 1024;
-export const kinds = Object.freeze({ harness: 'harness.run', target: 'target.execute', connector: 'connector.evidence' });
+export const kinds = Object.freeze({ harness: 'harness.run', target: 'target.execute', connector: 'connector.ingest' });
 export const fail = (code) => { throw new Error(code); };
 export const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export const exact = (v, keys) => object(v) && Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
@@ -82,7 +82,10 @@ export async function* frames(stream, max = MAX_FRAME) {
   if (pending.length) fail('truncated_frame');
 }
 export function resultFor(kind, value) {
-  const key = kind === 'connector' ? 'available' : 'ready';
-  if (!exact(value, [key]) || typeof value[key] !== 'boolean') fail('invalid_result');
+  if (kind === 'connector') {
+    if (!exact(value, ['version', 'optional']) || value.version !== 1 || !Array.isArray(value.optional) ||
+        value.optional.some(name => !['subscribe', 'reply'].includes(name)) ||
+        new Set(value.optional).size !== value.optional.length) fail('invalid_result');
+  } else if (!exact(value, ['ready']) || typeof value.ready !== 'boolean') fail('invalid_result');
   return value;
 }

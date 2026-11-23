@@ -1,9 +1,11 @@
 import { readBounded, identity, exact, frame, frames, resultFor, fail, PROTOCOL_VERSION, SDK_VERSION, NATIVE_MAX_FRAME } from './protocol.mjs';
+import { validConnectorInput, validNormalizedTrigger } from './webhook.mjs';
+export { verifyWebhook, normalizeWebhook, webhookSigningBytes } from './webhook.mjs';
 
 export { PROTOCOL_VERSION, SDK_VERSION };
 function define(kind, options) {
   identity({ ...options, kind });
-  if (typeof options[kind === 'connector' ? 'evidence' : 'plan'] !== 'function' || (kind === 'harness' && typeof options.run !== 'function')) fail('invalid_definition');
+  if (typeof options.plan !== 'function' || (kind === 'harness' && typeof options.run !== 'function')) fail('invalid_definition');
   return Object.freeze({ ...options, kind });
 }
 export const defineHarness = (options) => define('harness', options);
@@ -13,7 +15,12 @@ export function defineTarget(options) {
   if (['capabilities', 'placement', 'completed', ...TARGET_OPERATIONS].some(method => typeof options[method] !== 'function')) fail('invalid_definition');
   return Object.freeze({ ...options, kind: 'target' });
 }
-export const defineConnector = (options) => define('connector', options);
+export function defineConnector(options) {
+  identity({ ...options, kind: 'connector' });
+  if (['capabilities', 'verify', 'normalize'].some(name => typeof options[name] !== 'function') ||
+      ['subscribe', 'reply'].some(name => options[name] !== undefined && typeof options[name] !== 'function')) fail('invalid_definition');
+  return Object.freeze({ ...options, kind: 'connector' });
+}
 const write = (value, max) => new Promise((resolve, reject) => process.stdout.write(frame(value, max), e => e ? reject(e) : resolve()));
 const nativeMethods = Object.freeze({
   'harness.probe': ['probe', ['context']],
@@ -130,6 +137,49 @@ async function serveTarget(plugin) {
   fail('incomplete_exchange');
 }
 
+
+async function serveConnector(plugin) {
+  let id = 1, verified, normalized = false;
+  for await (const request of frames(process.stdin)) {
+    if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== id) fail('invalid_request');
+    const { method, params } = request;
+    let result;
+    if (id === 1) {
+      if (method !== 'initialize' || !exact(params, ['protocol']) || params.protocol !== 1) fail('protocol_mismatch');
+      result = { protocol: 1, ...identity(plugin) };
+    } else if (id === 2) {
+      if (method !== 'health' || !exact(params, [])) fail('invalid_request');
+      result = { ready: true };
+    } else if (id === 3) {
+      if (method !== 'connector.capabilities' || !exact(params, [])) fail('invalid_request');
+      result = resultFor('connector', await plugin.capabilities());
+      if (JSON.stringify([...result.optional].sort()) !== JSON.stringify(['subscribe', 'reply'].filter(name => typeof plugin[name] === 'function').sort())) fail('invalid_definition');
+    } else if (method === 'shutdown') {
+      if (!exact(params, [])) fail('invalid_params');
+      await write({ jsonrpc: '2.0', id, result: { ready: true } });
+      process.stdin.destroy();
+      return;
+    } else if (id === 4 && method === 'connector.verify') {
+      const grant = JSON.stringify(params);
+      result = validConnectorInput(params) ? await plugin.verify(params) : { verified: false };
+      if (!exact(result, ['verified']) || typeof result.verified !== 'boolean') fail('invalid_verification');
+      // Keep immutable bytes before normalization; callbacks cannot mutate the verification grant.
+      if (result.verified) verified = grant;
+    } else if (id === 5 && method === 'connector.normalize' && verified && !normalized) {
+      if (JSON.stringify(params) !== verified) fail('invalid_normalization_grant');
+      normalized = true;
+      result = await plugin.normalize(params);
+      if (!validNormalizedTrigger(result)) fail('invalid_trigger');
+    } else if (id === 4 && ['connector.subscribe', 'connector.reply'].includes(method)) {
+      const name = method.slice(10);
+      if (typeof plugin[name] !== 'function' || !exact(params, ['version', 'data']) || params.version !== 1) fail('unsupported_operation');
+      result = await plugin[name](params);
+      if (!exact(result, ['version', 'data']) || result.version !== 1) fail('invalid_result');
+    } else fail('invalid_request');
+    await write({ jsonrpc: '2.0', id: id++, result });
+  }
+  fail('incomplete_exchange');
+}
 /** Transport adapter only. Fabric owns launch, cancellation, workspaces and artifacts. */
 export async function serve(plugin) {
   try {
@@ -148,9 +198,10 @@ export async function serve(plugin) {
     }
     if (args.length !== 1 || args[0] !== '--fabric-plugin-stdio') fail('invalid_mode');
     if (plugin.kind === 'target') return await serveTarget(plugin);
+    if (plugin.kind === 'connector') return await serveConnector(plugin);
     let step = 0;
     for await (const request of frames(process.stdin)) {
-      const methods = ['initialize', 'health', plugin.kind === 'connector' ? 'connector.evidence' : `${plugin.kind}.plan`, 'shutdown'];
+      const methods = ['initialize', 'health', 'harness.plan', 'shutdown'];
       if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== step + 1 || request.method !== methods[step]) fail('invalid_request');
       const params = request.params;
       const expected = step === 0 ? { protocol: PROTOCOL_VERSION } : {};
@@ -158,7 +209,7 @@ export async function serve(plugin) {
       let result;
       try {
         if (step === 0) result = { protocol: PROTOCOL_VERSION, ...identity(plugin) };
-        else if (step === 2) result = resultFor(plugin.kind, await plugin[plugin.kind === 'connector' ? 'evidence' : 'plan'](params));
+        else if (step === 2) result = resultFor(plugin.kind, await plugin.plan(params));
         else result = { ready: true };
       } catch {
         await write({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'plugin_failed' } });

@@ -31,7 +31,7 @@ fn manifest(kind: PluginKind, mode: &str, dir: &Path) -> PluginManifest {
             match kind {
                 PluginKind::Harness => "harness.run",
                 PluginKind::Target => "target.execute",
-                PluginKind::Connector => "connector.evidence",
+                PluginKind::Connector => "connector.ingest",
             }
             .into(),
         ],
@@ -239,10 +239,11 @@ fn external_kinds_and_harness_execution_bridge() {
         fabric_domain::ErrorKind::UnsupportedPlacement
     );
     reaped(dir.path());
-    assert!(
-        host.connector_evidence(&manifest(PluginKind::Connector, "ok", dir.path()), &cancel)
+    assert_eq!(
+        host.connector_capabilities(&manifest(PluginKind::Connector, "ok", dir.path()), &cancel)
             .unwrap()
-            .available
+            .version,
+        1
     );
     reaped(dir.path());
     let adapter = PluginHarness::new(manifest(PluginKind::Harness, "ok", dir.path())).unwrap();
@@ -347,7 +348,9 @@ fn cancellation_reaps_live_plugin() {
             let error = match kind {
                 PluginKind::Harness => host.harness_info(&manifest, &cancel).map(|_| ()),
                 PluginKind::Target => host.target(&manifest, &cancel).map(|_| ()),
-                PluginKind::Connector => host.connector_evidence(&manifest, &cancel).map(|_| ()),
+                PluginKind::Connector => {
+                    host.connector_capabilities(&manifest, &cancel).map(|_| ())
+                }
             }
             .unwrap_err();
             assert!(error.message.contains("cancelled"));
@@ -381,11 +384,12 @@ fn registry_install_upgrade_revoke_and_independent_compatibility() {
     assert_eq!(registry.reports()[0].code, "unsupported_protocol");
     assert_eq!(registry.reports()[1].code, "compatible");
     let selected = registry.select(&healthy.id, PluginKind::Connector).unwrap();
-    assert!(
+    assert_eq!(
         PluginHost::default()
-            .connector_evidence(&selected, &CancellationToken::default())
+            .connector_capabilities(&selected, &CancellationToken::default())
             .unwrap()
-            .available
+            .version,
+        1
     );
     reaped(&root);
     registry.install(manifest.clone(), true).unwrap();
@@ -750,7 +754,12 @@ fn typescript_scaffolds_use_existing_native_host() {
                 host.target(&plugin, &cancel).unwrap().finish().unwrap();
             }
             PluginKind::Connector => {
-                assert!(!host.connector_evidence(&plugin, &cancel).unwrap().available);
+                assert_eq!(
+                    host.connector_capabilities(&plugin, &cancel)
+                        .unwrap()
+                        .version,
+                    1
+                );
             }
         }
     }

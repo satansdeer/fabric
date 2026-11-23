@@ -237,7 +237,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=15 => {}
+            1..=16 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -528,6 +528,20 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 15)?;
         }
+        if version < 16 {
+            transaction.execute_batch(
+                "CREATE TABLE connector_deliveries (
+                    namespace TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    accepted_at INTEGER NOT NULL,
+                    batch_id TEXT NOT NULL REFERENCES async_batches(batch_id),
+                    PRIMARY KEY(namespace, nonce)
+                 );
+                 CREATE INDEX connector_rate ON connector_deliveries(namespace, accepted_at);",
+            )?;
+            transaction.pragma_update(None, "user_version", 16)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -600,7 +614,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=15) {
+        if !matches!(version, 5..=16) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -2065,7 +2079,8 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_targets;
+            "DROP TABLE connector_deliveries;
+             DROP TABLE run_targets;
              DROP TABLE run_observations;
              DROP TABLE run_capture_contexts;
              DROP TRIGGER immutable_manifest;

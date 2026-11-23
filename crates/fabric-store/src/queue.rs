@@ -101,7 +101,30 @@ impl Store {
         tasks: &[NewAsyncTask],
         now: i64,
     ) -> Result<BatchId> {
-        if tasks.is_empty()
+        self.accept_batch(batch, key, tasks, None, now)
+    }
+
+    /// The authenticated nonce, rate charge, stable dedupe and worker rows commit together.
+    pub fn accept_connector_batch(
+        &mut self,
+        batch: &AsyncBatch,
+        key: &str,
+        tasks: &[NewAsyncTask],
+        delivery: &fabric_domain::ConnectorDelivery,
+        now: i64,
+    ) -> Result<BatchId> {
+        self.accept_batch(batch, Some(key), tasks, Some(delivery), now)
+    }
+
+    fn accept_batch(
+        &mut self,
+        batch: &AsyncBatch,
+        key: Option<&str>,
+        tasks: &[NewAsyncTask],
+        delivery: Option<&fabric_domain::ConnectorDelivery>,
+        now: i64,
+    ) -> Result<BatchId> {
+        if (tasks.is_empty() && delivery.is_none())
             || tasks.len() > 128
             || batch.concurrency == 0
             || batch.concurrency > 128
@@ -113,6 +136,9 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(delivery) = delivery {
+            check_delivery(&tx, delivery, now)?;
+        }
         if let Some(key) = key {
             let prior: Option<(String, String)> = tx
                 .query_row(
@@ -122,12 +148,18 @@ impl Store {
                 )
                 .optional()?;
             if let Some((id, digest)) = prior {
-                return if digest == batch.request_digest {
-                    Ok(BatchId::try_from(id)?)
-                } else {
-                    Err(StoreError::Conflict)
-                };
+                if digest != batch.request_digest {
+                    return Err(StoreError::Conflict);
+                }
+                if let Some(delivery) = delivery {
+                    record_delivery(&tx, delivery, &id, now)?;
+                }
+                tx.commit()?;
+                return Ok(BatchId::try_from(id)?);
             }
+        }
+        if tasks.is_empty() {
+            return Err(StoreError::InvalidRecord("connector batch requires tasks"));
         }
         if !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM prepared_states WHERE state_id=?1 AND status='READY')",
@@ -162,6 +194,9 @@ impl Store {
                 "INSERT INTO async_tasks(run_id,prompt,harness,plan_json,consent_stamp,state) VALUES(?1,?2,?3,?4,?5,'QUEUED')",
                 params![task.task.run_id.as_str(),task.prompt,task.harness,task.plan_json,task.consent_stamp],
             )?;
+        }
+        if let Some(delivery) = delivery {
+            record_delivery(&tx, delivery, batch.batch_id.as_str(), now)?;
         }
         tx.commit()?;
         Ok(batch.batch_id.clone())
@@ -352,5 +387,60 @@ pub(super) fn insert_task_source(
         "INSERT INTO batch_task_sources(run_id,prepared_state_id,provenance_json) VALUES(?1,?2,?3)",
         params![run.as_str(), state.as_str(), json],
     )?;
+    Ok(())
+}
+
+fn check_delivery(
+    tx: &rusqlite::Transaction<'_>,
+    delivery: &fabric_domain::ConnectorDelivery,
+    now: i64,
+) -> Result<()> {
+    if now < 0
+        || delivery.expires_at <= now
+        || delivery.expires_at.saturating_sub(now) > 3600
+        || !fabric_domain::connector_id(&delivery.nonce)
+        || delivery.namespace.len() != 64
+        || !delivery
+            .namespace
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !(1..=10000).contains(&delivery.rate_limit)
+    {
+        return Err(StoreError::InvalidRecord(
+            "connector delivery expired or invalid",
+        ));
+    }
+    tx.execute(
+        "DELETE FROM connector_deliveries WHERE expires_at<=?1 AND accepted_at<=?2",
+        params![now, now.saturating_sub(60)],
+    )?;
+    let replay: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM connector_deliveries WHERE namespace=?1 AND nonce=?2)",
+        params![delivery.namespace, delivery.nonce],
+        |r| r.get(0),
+    )?;
+    if replay {
+        return Err(StoreError::InvalidRecord("connector replay"));
+    }
+    let count: u32 = tx.query_row(
+        "SELECT count(*) FROM connector_deliveries WHERE namespace=?1 AND accepted_at>?2",
+        params![delivery.namespace, now.saturating_sub(60)],
+        |r| r.get(0),
+    )?;
+    if count >= delivery.rate_limit {
+        return Err(StoreError::InvalidRecord("connector rate limit"));
+    }
+    Ok(())
+}
+
+fn record_delivery(
+    tx: &rusqlite::Transaction<'_>,
+    delivery: &fabric_domain::ConnectorDelivery,
+    batch_id: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO connector_deliveries(namespace,nonce,expires_at,accepted_at,batch_id) VALUES(?1,?2,?3,?4,?5)",
+        params![delivery.namespace, delivery.nonce, delivery.expires_at, now, batch_id])?;
     Ok(())
 }

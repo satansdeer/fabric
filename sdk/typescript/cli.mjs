@@ -8,7 +8,7 @@ import { conformance } from './conformance.mjs';
 import { SDK_VERSION, kinds, validId, validVersion, fail, readBounded, MAX_PACKAGE } from './protocol.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const runtimeFiles = ['index.mjs', 'index.d.mts', 'protocol.mjs', 'package.mjs', 'conformance.mjs', 'cli.mjs'];
+const runtimeFiles = ['index.mjs', 'index.d.mts', 'protocol.mjs', 'webhook.mjs', 'package.mjs', 'conformance.mjs', 'cli.mjs'];
 const warning = 'TRUST WARNING: plugins execute as your user, not in a sandbox. Install only reviewed code; --trust is explicit consent. No npm lifecycle scripts are run.';
 export function create(kind, path, id = basename(resolve(path))) {
   if (!Object.hasOwn(kinds, kind) || !validId(id)) fail('invalid_identity');
@@ -158,7 +158,7 @@ const diagnostics = {
 };
 export async function main(args) {
   const command = args.shift();
-  const allowed = { create: ['id'], reference: ['binary'], dev: ['once'], test: [], hash: [], pack: ['out'], install: ['registry', 'fabric', 'version', 'sha256', 'trust', 'upgrade'] };
+  const allowed = { create: ['id'], reference: ['binary'], dev: ['once'], test: ['connector-fixture'], hash: [], pack: ['out'], install: ['registry', 'fabric', 'version', 'sha256', 'trust', 'upgrade'] };
   if (!Object.hasOwn(allowed, command)) fail('usage');
   const options = {};
   const positional = [];
@@ -182,7 +182,8 @@ export async function main(args) {
     console.log('Created provider-free TypeScript plugin. Run npm test in the project.');
   } else if (command === 'test' || command === 'dev' && options.once) {
     process.stderr.write('Trusted-local conformance: runs plugin code without a sandbox; fixtures require no provider.\n');
-    const proof = await conformance(positional[0]);
+    const connectorFixture = options['connector-fixture'] ? JSON.parse(readBounded(resolve(options['connector-fixture']), 65_536).toString('utf8')) : undefined;
+    const proof = await conformance(positional[0], { connectorFixture });
     console.log(JSON.stringify({ id: proof.id, kind: proof.kind, protocol: proof.protocol, conformance: 'passed', harnessEvents: proof.events.length }));
   } else if (command === 'dev') {
     directory(positional[0]);

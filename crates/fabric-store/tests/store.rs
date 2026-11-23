@@ -128,7 +128,8 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
 fn remove_task_source_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS run_targets;
+            "DROP TABLE IF EXISTS connector_deliveries;
+         DROP TABLE IF EXISTS run_targets;
          DROP TABLE IF EXISTS run_observations;
          DROP TABLE IF EXISTS run_capture_contexts;
          DROP TABLE IF EXISTS batch_task_sources;
@@ -1313,9 +1314,12 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
+    for version in [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
         db.pragma_update(None, "user_version", version).unwrap();
+        if version == 15 {
+            db.execute_batch("DROP TABLE connector_deliveries").unwrap();
+        }
         if version == 13 {
             db.execute_batch("DROP TABLE run_targets; PRAGMA user_version=13;")
                 .unwrap();
