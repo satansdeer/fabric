@@ -694,3 +694,92 @@ the explicit installed-toolchain PATH; it was not repeated.
 No workspace suite or protocol/security regression was rerun: only test failure
 diagnostics changed, not the production protocol or security boundaries. This
 patch does not fix or close cancellation acceptance; no CI-green claim is made.
+
+### Owned-group EPERM exit-visibility correction (base `128834a50175ec40d4d10c25be298761eb5372b9`)
+
+The first syscall-context diagnostic run failed (exit 101): label 8, Run
+`r-1795413841038572000-32693-10`, reported
+`kill(-33225, 15): Operation not permitted (os error 1); owned-child waitid(WNOWAIT): not exited`.
+It retained `NEEDS_ATTENTION` / `RECOVERY_REQUIRED`, with no recorded exit or
+capture. The existing full Run/batch/retention diagnostics were printed before
+fixture teardown. This identifies group SIGTERM, not spawn, wait failure or a
+target RPC timeout. A second, changed diagnostic run added bounded follow-up
+exit observation but still returned the error if that branch ran; it passed
+(1 passed / 1 filtered, 105.67 s). That pass did not expose the transition and
+is not evidence for the correction.
+
+A separate controlled native experiment forked an owned group leader, filled
+a loopback TCP socket with blocking SO_LINGER, then released the child to
+`_exit(23)`. Group SIGTERM returned EPERM while `waitid(P_PID, child,
+WEXITED|WNOHANG|WNOWAIT)` returned zeroed status; the same unreaped child became
+waitable about 9 ms later and `waitpid` returned actual exit 23. No worker or
+fixture was repeatedly launched until green. An initial Python attempt could
+not observe waitid because Darwin Python lacks `os.waitid`; its owned child
+was subsequently reaped, and the experiment used libc waitid through ctypes.
+
+The observed gap matches XNU's exit ordering:
+[`proc_prepareexit` sets `P_REF_DEAD` before `proc_exit` sets `SZOMB`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exit.c);
+[`pgrp_iterate` uses `proc_find`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_proc.c),
+which excludes `P_REF_DEAD`, while
+[`killpg1` returns EPERM when no signalable member was found](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
+The source inspected is upstream XNU, not a syscall trace of private kernel
+state; the native experiment establishes the externally observable race.
+
+On macOS only, group EPERM now permits bounded non-reaping exit observation,
+not success by errno alone. The observation deadline uses the caller's existing
+termination grace; TERM observation consumes that grace instead of adding to
+its subsequent sleep. KILL can use at most one grace for exit visibility after
+EPERM, where the ordinary successful path already proceeds to blocking reap.
+Live-child EPERM at the deadline and wait errors remain errors with syscall
+context. Successful confirmation preserves the PID ownership anchor until
+the actual final group signal and reap. No persisted PID is used.
+
+One deterministic regression supplies EPERM at that boundary, observes a real
+owned child still live, and only then releases its stdin so it can exit 23.
+It requires eventual non-reaping exit proof and the real reaped status; it
+also requires EPERM to survive when the live-child observation budget expires.
+Target authority checks, independent cancellation, 250 ms RPC bound, committed
+effect receipts, capture/artifact verification and recovery assertions are
+unchanged. True host/target/capture failures still retain their evidence.
+
+LSP reference lookup was attempted but its rust-analyzer launcher failed:
+the installed 1.91.0 toolchain has no rust-analyzer and the shim has no default
+toolchain. Bounded source caller inspection was used instead, as authorized.
+Public Fabric remains v0.1.1; producer 0.1.2 is unreleased.
+
+Final narrow checks used the installed 1.91.0 binaries directly, offline shared
+`CARGO_TARGET_DIR` above, `RUST_TEST_THREADS=4`, the real reference-plugin,
+local-target, host and Node binary environment, and no `FABRIC_PLUGIN_REGISTRY`.
+Commands and observed results:
+
+```sh
+cargo test --offline --locked -p fabric-runner --lib supervision::tests::group_eperm_requires_eventual_owned_exit_and_does_not_reap -- --exact --nocapture
+# exit 0: 1 passed, 14 filtered; 0.01 s
+cargo test --offline --locked -p fabric-cli --test recovery twenty_real_workers_recover_only_proven_captureable_inactive_work_and_explain_retention -- --exact --nocapture
+# exit 0: 1 passed, 1 filtered; 97.52 s; existing cancellation/artifact/reclaim assertions intact
+cargo test --offline --locked -p fabric-runner --test plugins native_capture_respects_the_execution_deadline_and_preserves_cancellation -- --exact --nocapture
+# exit 0: 1 passed, 11 filtered; 2.06 s
+/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin/rustfmt --edition 2024 --check crates/fabric-runner/src/supervision.rs crates/fabric-runner/src/target.rs
+# exit 0
+```
+
+The first plugin command used the incorrect exact filter
+`native_capture_respects_deadline_and_cancellation_while_normalizer_hangs`:
+zero tests ran (12 filtered); it is not verification. The initial rustfmt check
+exited 1 for two line wraps; those were corrected before the successful check.
+No unchanged stress retries, full suites, commit, push or release were performed.
+
+Manager independently verified all 14 sealed artifacts from native released
+v0.1.1 worker `r-1795413693072002000-76187-8`, including the 14,000-byte patch
+SHA-256 `bb69b76f1d579af43035a94e225f0ff344cff4626aedd41b09419c584a3d8eaf`.
+The actual controlled socket experiment is present in sealed event lines
+2969–2971: EPERM with no waitable status at 0.2 ms, then unreaped actual exit
+23 around 8.9 ms. The worker exited 0 and its workspace was reclaimed and
+physically absent.
+
+Raw capture reached the admitted 10 MiB combined budget: `truncated=true`,
+stdout 8,998,213 bytes seen versus 5,495,906 persisted, events 4,987,859 bytes.
+The final narrow-check results above are the worker's report, not a claim
+that the manager recovered their complete raw tool output. Final acceptance
+requires exact-head CI on this actual production correction; the green
+diagnostic-only CI run 45121442039 is not proof of the new correction.

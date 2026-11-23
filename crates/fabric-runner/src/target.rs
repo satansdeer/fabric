@@ -340,6 +340,7 @@ impl Target {
         started: impl FnOnce(u32) -> Result<(), FabricError>,
     ) -> Result<crate::Execution, FabricError> {
         let cancellation = request.cancellation;
+        let term_grace = request.limits.term_grace;
         let validate = |validate_launch: &mut dyn FnMut() -> Result<(), FabricError>| {
             if cancellation.is_cancelled() {
                 return Err(failure("cancelled"));
@@ -355,7 +356,9 @@ impl Target {
                 let mut host_failed = false;
                 let result = if stopping {
                     self.drive("cancel", run, &[Action::Terminate], json!({}), |_| {
-                        let result = group.signal(libc::SIGTERM).map_err(crate::execution_error);
+                        let result = group
+                            .signal(libc::SIGTERM, std::time::Instant::now() + term_grace)
+                            .map_err(crate::execution_error);
                         host_failed = result.is_err();
                         result?;
                         Ok(((), json!({"termination_requested":true})))

@@ -208,21 +208,34 @@ impl ProcessGroup {
         }
     }
 
-    pub(crate) fn signal(&mut self, signal: i32) -> io::Result<()> {
+    pub(crate) fn signal(&mut self, signal: i32, _exit_deadline: Instant) -> io::Result<()> {
         // SAFETY: the unreaped, owned group leader reserves this PID until our last signal.
         // Never consult persisted PID metadata or signal after wait/reap.
         let result = unsafe { libc::kill(-(self.child.id() as i32), signal) };
         if result == -1 {
             let error = io::Error::last_os_error();
-            // Darwin skips zombies when signalling a group and returns EPERM if
-            // none remain signalable. Confirm the owned leader exited first;
-            // EPERM while it is live still fails closed.
+            // Darwin removes an exiting process from group lookup before waitid
+            // can observe its zombie. EPERM is benign only after owned, unreaped
+            // exit evidence arrives within the termination grace.
             #[cfg(target_os = "macos")]
-            if error.raw_os_error() == Some(libc::EPERM) && self.exited()? {
-                return Ok(());
+            if error.raw_os_error() == Some(libc::EPERM) {
+                return confirm_group_exit(error, _exit_deadline, || self.exited()).map_err(
+                    |error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "kill(-{}, {signal}): {error}; owned-child exit not verified within termination grace",
+                                self.child.id()
+                            ),
+                        )
+                    },
+                );
             }
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("kill(-{}, {signal}): {error}", self.child.id()),
+                ));
             }
         }
         Ok(())
@@ -248,7 +261,13 @@ impl ProcessGroup {
             if error.raw_os_error() == Some(libc::ECHILD) {
                 self.reaped = true;
             }
-            return Err(error);
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "waitid(P_PID, {}, WEXITED|WNOHANG|WNOWAIT): {error}",
+                    self.child.id()
+                ),
+            ));
         }
         #[cfg(target_os = "macos")]
         let pid = info.si_pid;
@@ -304,10 +323,15 @@ impl ProcessGroup {
 
     pub(crate) fn stop_and_reap(&mut self, grace: Duration) -> Result<ExitStatus, FabricError> {
         // Also clean up background descendants after a natural leader exit.
-        self.signal(libc::SIGTERM).map_err(execution_error)?;
-        std::thread::sleep(grace);
-        self.signal(libc::SIGKILL).map_err(execution_error)?;
-        let status = self.child.wait().map_err(execution_error)?;
+        let deadline = Instant::now() + grace;
+        self.signal(libc::SIGTERM, deadline)
+            .map_err(execution_error)?;
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        self.signal(libc::SIGKILL, Instant::now() + grace)
+            .map_err(execution_error)?;
+        let status = self.child.wait().map_err(|error| {
+            execution_error(format!("waitpid({}, 0): {error}", self.child.id()))
+        })?;
         self.reaped = true;
         Ok(status)
     }
@@ -315,12 +339,32 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if !self.reaped {
-            let _ = self.signal(libc::SIGTERM);
-            std::thread::sleep(Duration::from_millis(250));
-            let _ = self.signal(libc::SIGKILL);
+            let grace = Duration::from_millis(250);
+            let deadline = Instant::now() + grace;
+            let _ = self.signal(libc::SIGTERM, deadline);
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let _ = self.signal(libc::SIGKILL, Instant::now() + grace);
             let _ = self.child.wait();
             self.reaped = true;
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn confirm_group_exit(
+    signal_error: io::Error,
+    deadline: Instant,
+    mut exited: impl FnMut() -> io::Result<bool>,
+) -> io::Result<()> {
+    loop {
+        if exited()? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(signal_error);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
     }
 }
 
@@ -384,6 +428,51 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::os::fd::FromRawFd;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_eperm_requires_eventual_owned_exit_and_does_not_reap() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("/bin/sh")
+            .args(["-c", "read ignored; exit 23"])
+            .stdin(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut group = ProcessGroup::new(child, Instant::now());
+        let mut release = group.child.stdin.take();
+        assert!(!group.exited().unwrap());
+        let error = confirm_group_exit(
+            io::Error::from_raw_os_error(libc::EPERM),
+            Instant::now(),
+            || group.exited(),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+
+        // Force the kernel boundary deterministically: the first real waitid
+        // observes a live child; only then release it to exit.
+        confirm_group_exit(
+            io::Error::from_raw_os_error(libc::EPERM),
+            Instant::now() + Duration::from_secs(2),
+            || {
+                let exited = group.exited()?;
+                if release.is_some() {
+                    assert!(!exited);
+                    drop(release.take());
+                }
+                Ok(exited)
+            },
+        )
+        .unwrap();
+        assert!(group.exited().unwrap(), "exit observation must not reap");
+        assert_eq!(
+            group.stop_and_reap(Duration::ZERO).unwrap().code(),
+            Some(23)
+        );
+    }
 
     #[test]
     fn stopped_capture_excludes_time_between_reads_from_drain_budget() {
