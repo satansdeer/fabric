@@ -408,6 +408,21 @@ Prompts, exact plans, consent stamps, source IDs and task IDs are persisted toge
 
 Fresh clients can read retained results and artifacts after workspace reclamation. Status events are cursor-ordered and bounded (256 per reply; 1,024 recent events per batch). `wait` uses manager notifications and a bounded timeout, not controller hot-polling. Cancellation only signals live manager-owned workers; queued cancellation never launches a worker. After manager failure, only unclaimed queued work resumes. Claimed work becomes `NEEDS_ATTENTION`, remains protected, and cannot be cancelled using persisted PIDs.
 
+`results` and `workers results` return each task's `artifacts` with unchanged
+`kind`, canonical storage-relative `relative_path`, `size_bytes` and `sha256`,
+plus `local_read_path`: an absolute path to the exact retained sealed file on
+the manager's host. Pass `local_read_path` directly to an ordinary file reader
+from any parent cwd; do not join `relative_path` to the parent's workspace.
+Core reuses cleanup's complete sealed-manifest, run/profile/attempt, containment,
+no-symlink, size and SHA-256 verification before returning these references.
+An invalid, missing or changed registered artifact fails the entire results
+request with an error, not a readable-path claim; pending/unpublished artifacts
+have an empty inventory. Worker success alone never proves artifact validity.
+This is point-in-time verification of retained trusted-local files, not a remote
+download URL or protection from subsequent same-user mutation. Unsupported
+remote targets still reject without fallback. `runs artifacts` remains
+metadata-only and does not expose verified local references.
+
 Native consent is revalidated immediately before launch. Async environment-backed connection profiles are rejected rather than persisting secret environment values or silently changing credentials after restart; use durable native configuration or the foreground API.
 
 ### Timeout and cancellation (macOS)

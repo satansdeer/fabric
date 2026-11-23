@@ -445,6 +445,123 @@ fn four_workers_survive_submitter_exit_and_reconnect_with_captured_artifacts() {
 }
 
 #[test]
+fn results_expose_verified_artifacts_readable_from_parent_cwd_and_reject_tampering() {
+    let mut fixture = Fixture::new();
+    let parent = fixture.path.join("unrelated-parent");
+    fs::create_dir(&parent).unwrap();
+    let request = fixture.request(&[0, 1], 2, None);
+    let accepted = fixture.accept(&request, None);
+    let batch = accepted["batch_id"].as_str().unwrap();
+    for i in 0..2 {
+        fixture.started(i);
+    }
+    for task in fixture.query("results", batch)["tasks"].as_array().unwrap() {
+        assert!(task["artifacts"].as_array().unwrap().is_empty());
+    }
+    for i in 0..2 {
+        fixture.release(i);
+    }
+    fixture.terminal(batch);
+    let mut command = fixture.cli();
+    command
+        .current_dir(&parent)
+        .args(["workers", "results", batch, "--json"]);
+    let results = parsed(&fixture.run(command));
+    assert_eq!(results["succeeded"], true);
+    let mut patches = Vec::new();
+    for (i, task) in results["tasks"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(task["run_id"], accepted["run_ids"][i]);
+        let artifact = task["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["kind"] == "tracked_patch")
+            .unwrap();
+        let path = PathBuf::from(artifact["local_read_path"].as_str().unwrap());
+        assert!(path.is_absolute());
+        assert_eq!(
+            path,
+            fixture
+                .path
+                .join("storage")
+                .join(artifact["relative_path"].as_str().unwrap())
+        );
+        // The consumer uses only the returned reference, with no storage-root resolution.
+        let output = Command::new("/bin/cat")
+            .current_dir(&parent)
+            .arg(&path)
+            .output()
+            .unwrap();
+        checked(&output);
+        assert_eq!(artifact["size_bytes"], output.stdout.len() as u64);
+        assert_eq!(
+            artifact["sha256"],
+            format!("{:x}", Sha256::digest(&output.stdout))
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("+task-{i}")));
+        patches.push((path, output.stdout));
+    }
+    assert_ne!(patches[0].0, patches[1].0);
+    assert_ne!(patches[0].1, patches[1].1);
+    let denied = || {
+        let mut command = fixture.cli();
+        command
+            .current_dir(&parent)
+            .args(["results", batch, "--json"]);
+        let output = fixture.run(command);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    };
+    let (path, original) = &patches[0];
+    let directory = path.parent().unwrap();
+    let outside = parent.join("outside.patch");
+    fs::write(&outside, original).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_file(path).unwrap();
+    std::os::unix::fs::symlink(&outside, path).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o500)).unwrap();
+    denied();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_file(path).unwrap();
+    let mut altered = original.clone();
+    altered[0] ^= 1; // Same length, different immutable content.
+    fs::write(path, altered).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o500)).unwrap();
+    denied();
+    // Inspection remains persisted metadata only, even when content verification fails.
+    let mut inspect = fixture.cli();
+    inspect.args([
+        "runs",
+        "artifacts",
+        accepted["run_ids"][0].as_str().unwrap(),
+        "--json",
+    ]);
+    let inventory = parsed(&fixture.run(inspect));
+    assert!(
+        inventory["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file.get("local_read_path").is_none())
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(path, original).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+    // Isolated fixture corruption; production metadata remains immutable.
+    let db = rusqlite::Connection::open(fixture.path.join("storage/fabric.db")).unwrap();
+    db.execute_batch("DROP TRIGGER immutable_artifact_update;")
+        .unwrap();
+    db.execute(
+        "UPDATE artifacts SET relative_path = '../unrelated-parent/outside.patch'
+         WHERE run_id = ?1 AND kind = 'tracked_patch'",
+        [accepted["run_ids"][0].as_str().unwrap()],
+    )
+    .unwrap();
+    denied();
+}
+
+#[test]
 fn partial_failure_keeps_healthy_siblings_running_and_preserves_each_result() {
     let mut fixture = Fixture::new();
     let request = fixture.request(&[0, 1, 2], 3, Some(0));
