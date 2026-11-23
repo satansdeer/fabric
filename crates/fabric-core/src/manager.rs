@@ -789,13 +789,34 @@ impl Manager {
     }
 
     fn results(&self, id: &str) -> Result<Value, FabricError> {
-        let (_, store) = open_store(&self.root)?;
+        let (root, store) = open_store(&self.root)?;
         let (batch, _, tasks) = selection(&store, id)?;
         let settled = tasks.iter().all(|task| terminal(task.queue_state));
         let succeeded = settled.then(|| tasks.iter().all(|task| task.state == RunState::Succeeded));
         let tasks = tasks.into_iter().map(|task| {
             let mut result: Option<Value> = task.result.as_deref().map(serde_json::from_str).transpose().map_err(error)?;
-            if let Some(run) = store.run(&task.run_id).map_err(error)? {
+            let run = store.run(&task.run_id).map_err(error)?;
+            let artifacts = match &run {
+                Some(run) if run.artifact_manifest_id.is_some() => {
+                    crate::artifacts::verify_registered(&root, &store, run)?
+                }
+                _ => {
+                    let files = store.artifacts(&task.run_id).map_err(error)?;
+                    if !files.is_empty() {
+                        return Err(error("Artifacts have no registered run manifest."));
+                    }
+                    files
+                }
+            };
+            // Only verified canonical inventory paths reach this join; never resolve result JSON.
+            let artifacts = artifacts.into_iter().map(|file| json!({
+                "kind":file.kind,
+                "relative_path":file.relative_path,
+                "sha256":file.sha256,
+                "size_bytes":file.size_bytes,
+                "local_read_path":root.join(&file.relative_path)
+            })).collect::<Vec<_>>();
+            if let Some(run) = run {
                 if result.is_none() {
                     result = recovered_report(&store, &run)?
                         .map(serde_json::to_value)
@@ -823,7 +844,6 @@ impl Manager {
                     }
                 }
             }
-            let artifacts = store.artifacts(&task.run_id).map_err(error)?;
             let source = store.task_source(&task.run_id).map_err(error)?;
             Ok(json!({"task_id":task.task_id,"run_id":task.run_id,"state":task.state,"source":source,"result":result,"error":task.error,"artifacts":artifacts}))
         }).collect::<Result<Vec<_>,FabricError>>()?;

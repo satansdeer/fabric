@@ -40,6 +40,34 @@ The generic `fabric` tool retains its default load mode:
 | `fabric_cancel` | `batch_id`; explicit cancellation request, not a controller-disconnect side effect. |
 | `fabric_wait` | `batch_id`, integer `timeout_seconds` from 0 through 10; bounded wait, not a full-batch blocking spawn. |
 
+### Result artifact references
+
+The shared `results` / `workers results` response carries
+`tasks[].artifacts[] = {kind, relative_path, sha256, size_bytes, local_read_path}`.
+`relative_path` remains the canonical storage-relative identity.
+`local_read_path` is an explicitly verified absolute local path to that same
+retained sealed artifact, usable directly by native `read` from the parent's
+actual cwd. No root discovery, injected host path, artifact copy or alternate
+checkout is needed. OMP typed results and completion notifications forward this
+Core response unchanged.
+
+Core checks the entire registered sealed artifact set against its manifest,
+immutable run/capture/profile/worker-attempt provenance, safe canonical paths,
+private regular files with no symlinks/hardlinks, sizes and SHA-256 before
+exposing any reference. Invalid/missing registered files or metadata fail the
+whole retrieval; no partial verified references are returned. An unpublished
+task has no artifacts, regardless of its reported success. Retrieval success
+does not imply worker success. Verification reads retained artifact bytes but
+does not reconcile, repair or launch work. `runs artifacts` remains a separate
+persisted-metadata-only inspection API.
+
+References are local to the manager's host and verified at retrieval time;
+they are not portable remote references or a guarantee against later same-user
+mutation. Unsupported/missing remote targets remain errors, never pretend local
+paths or silent local fallback.
+
+### Worker admission and lifecycle
+
 Each task has `task_id`, `harness_id`, and a complete independent `prompt`.
 Omit `execution_context` for the connected native context and `model` for the
 worker harness's own default. Native context requires prior explicit consent;

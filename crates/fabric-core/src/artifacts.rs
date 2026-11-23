@@ -108,19 +108,20 @@ struct RegisteredFile {
     size_bytes: u64,
 }
 
-/// Validate all durable recovery evidence immediately before reclaiming a workspace.
+/// Validate retained sealed recovery evidence and return the exact verified inventory.
 pub(super) fn verify_registered(
     root: &Path,
     store: &Store,
     run: &fabric_store::Run,
-) -> Result<(), FabricError> {
+) -> Result<Vec<Artifact>, FabricError> {
     let manifest = run
         .artifact_manifest_id
         .as_ref()
         .ok_or_else(|| error("Missing registered artifact manifest"))?;
     let files = store.artifacts(&run.run_id).map_err(error)?;
     let directory = root.join("artifacts").join(format!("a-{}", run.run_id));
-    verify_files(root, store, run, manifest, &directory, &files, true)
+    verify_files(root, store, run, manifest, &directory, &files, true)?;
+    Ok(files)
 }
 
 fn verify_files(
