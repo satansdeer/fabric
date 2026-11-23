@@ -8,22 +8,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub trait DiskMeter: Send + Sync {
-    fn free_bytes(&self, root: &Path) -> Result<u64, FabricError>;
+    fn free_bytes(&self, root: &Path) -> Result<u64, MeterCause>;
 }
 
 pub struct NativeDiskMeter;
 impl DiskMeter for NativeDiskMeter {
-    fn free_bytes(&self, root: &Path) -> Result<u64, FabricError> {
+    fn free_bytes(&self, root: &Path) -> Result<u64, MeterCause> {
         use std::os::unix::ffi::OsStrExt;
-        let path = CString::new(root.as_os_str().as_bytes()).map_err(storage_error)?;
+        let path =
+            CString::new(root.as_os_str().as_bytes()).map_err(|_| MeterCause::InvalidPath)?;
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-            return Err(storage_error(std::io::Error::last_os_error()));
+            return Err(MeterCause::io(
+                MeterOperation::Statvfs,
+                std::io::Error::last_os_error(),
+            ));
         }
         let stat = unsafe { stat.assume_init() };
         (stat.f_bavail as u64)
             .checked_mul(stat.f_frsize)
-            .ok_or_else(|| storage_error("Disk free-byte overflow"))
+            .ok_or(MeterCause::FreeSpaceOverflow)
     }
 }
 
@@ -41,14 +45,77 @@ impl Default for StorageOptions {
     }
 }
 
+/// Content-free measurement evidence; never constructed from an error's text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MeterFailure {
+    pub stage: MeterStage,
+    #[serde(flatten)]
+    pub cause: MeterCause,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeterStage {
+    WorkspaceUsage,
+    ManagedUsage,
+    FreeSpace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum MeterCause {
+    DepthLimit,
+    EntryLimit,
+    TimeLimit,
+    MountedSubtree,
+    IdentityChanged,
+    InvalidSize,
+    UsageOverflow,
+    InvalidPath,
+    FreeSpaceOverflow,
+    Io {
+        operation: MeterOperation,
+        os_code: Option<i32>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeterOperation {
+    OpenDirectory,
+    ReadDirectory,
+    Metadata,
+    Statvfs,
+}
+
+impl MeterCause {
+    fn io(operation: MeterOperation, error: std::io::Error) -> Self {
+        Self::Io {
+            operation,
+            os_code: error.raw_os_error(),
+        }
+    }
+}
+
+impl From<MeterCause> for FabricError {
+    fn from(cause: MeterCause) -> Self {
+        storage_error(format!("Storage meter: {cause:?}"))
+    }
+}
+
 /// Logical file lengths, including symlink text, never APFS exclusive physical bytes.
 /// ponytail: bounded full scan; use incremental accounting if large trees need it.
 pub fn usage(path: &Path) -> Result<u64, FabricError> {
+    measured_usage(path).map_err(Into::into)
+}
+
+fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
+    use MeterOperation::{Metadata, OpenDirectory, ReadDirectory};
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(path)
-        .map_err(storage_error)?;
+        .map_err(|error| MeterCause::io(OpenDirectory, error))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut remaining = 200_000usize;
     fn scan(
@@ -57,9 +124,9 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
         depth: usize,
         remaining: &mut usize,
         deadline: Instant,
-    ) -> Result<u64, FabricError> {
+    ) -> Result<u64, MeterCause> {
         if depth > 64 {
-            return Err(storage_error("Storage meter depth limit"));
+            return Err(MeterCause::DepthLimit);
         }
         let fd = unsafe {
             libc::openat(
@@ -69,12 +136,16 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
             )
         };
         if fd < 0 {
-            return Err(storage_error(std::io::Error::last_os_error()));
+            return Err(MeterCause::io(
+                OpenDirectory,
+                std::io::Error::last_os_error(),
+            ));
         }
         let stream = unsafe { libc::fdopendir(fd) };
         if stream.is_null() {
+            let error = std::io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Err(storage_error(std::io::Error::last_os_error()));
+            return Err(MeterCause::io(ReadDirectory, error));
         }
         struct Stream(*mut libc::DIR);
         impl Drop for Stream {
@@ -85,10 +156,11 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
         let stream = Stream(stream);
         let mut bytes = 0u64;
         loop {
-            if *remaining == 0 || Instant::now() >= deadline {
-                return Err(storage_error(
-                    "Storage meter scan bound exceeded; usage is unknown",
-                ));
+            if *remaining == 0 {
+                return Err(MeterCause::EntryLimit);
+            }
+            if Instant::now() >= deadline {
+                return Err(MeterCause::TimeLimit);
             }
             #[cfg(target_os = "macos")]
             let errno = unsafe { libc::__error() };
@@ -100,7 +172,10 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
             let entry = unsafe { libc::readdir(stream.0) };
             if entry.is_null() {
                 if unsafe { *errno } != 0 {
-                    return Err(storage_error(std::io::Error::last_os_error()));
+                    return Err(MeterCause::io(
+                        ReadDirectory,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
                 break;
             }
@@ -123,11 +198,11 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     continue;
                 }
-                return Err(storage_error(error));
+                return Err(MeterCause::io(Metadata, error));
             }
             let stat = unsafe { metadata.assume_init() };
             if stat.st_dev as u64 != device {
-                return Err(storage_error("Storage meter refuses mounted subtree"));
+                return Err(MeterCause::MountedSubtree);
             }
             let value = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 let fd = unsafe {
@@ -145,23 +220,31 @@ pub fn usage(path: &Path) -> Result<u64, FabricError> {
                     ) {
                         continue;
                     }
-                    return Err(storage_error(error));
+                    return Err(MeterCause::io(OpenDirectory, error));
                 }
                 let child = unsafe { File::from_raw_fd(fd) };
-                check_identity(&crate::artifacts::stat(&child)?, &Identity::of(&stat))?;
+                let metadata = crate::artifacts::stat(&child).map_err(|_| MeterCause::Io {
+                    operation: Metadata,
+                    os_code: None,
+                })?;
+                check_identity(&metadata, &Identity::of(&stat))
+                    .map_err(|_| MeterCause::IdentityChanged)?;
                 scan(&child, device, depth + 1, remaining, deadline)?
             } else {
-                u64::try_from(stat.st_size).map_err(storage_error)?
+                u64::try_from(stat.st_size).map_err(|_| MeterCause::InvalidSize)?
             };
             bytes = bytes
                 .checked_add(value)
-                .ok_or_else(|| storage_error("Storage usage overflow"))?;
+                .ok_or(MeterCause::UsageOverflow)?;
         }
         Ok(bytes)
     }
     scan(
         &directory,
-        directory.metadata().map_err(storage_error)?.dev(),
+        directory
+            .metadata()
+            .map_err(|error| MeterCause::io(Metadata, error))?
+            .dev(),
         0,
         &mut remaining,
         deadline,
@@ -494,27 +577,31 @@ pub(crate) fn violation(
     root: &Path,
     workspace: &Path,
     options: &StorageOptions,
-) -> Option<fabric_runner::StopReason> {
+) -> Result<Option<fabric_runner::StopReason>, MeterFailure> {
     use fabric_runner::StopReason;
-    let measured = (|| {
-        let bytes = usage(workspace)?;
-        if bytes > options.policy.max_workspace_bytes {
-            return Ok(Some(StopReason::WorkspaceLimit));
-        }
-        if bytes >= options.policy.max_workspace_bytes.saturating_mul(9) / 10 {
-            eprintln!("warning: workspace near storage limit: {bytes} bytes");
-        }
-        if options.meter.free_bytes(root)? < options.policy.min_free_bytes
-            || usage(root)? > options.policy.max_managed_bytes
-        {
-            return Ok(Some(StopReason::StoragePressure));
-        }
-        Ok::<_, FabricError>(None)
-    })();
-    match measured {
-        Ok(reason) => reason,
-        Err(_) => Some(StopReason::StorageMeterFailed),
+    let bytes = measured_usage(workspace).map_err(|cause| MeterFailure {
+        stage: MeterStage::WorkspaceUsage,
+        cause,
+    })?;
+    if bytes > options.policy.max_workspace_bytes {
+        return Ok(Some(StopReason::WorkspaceLimit));
     }
+    if bytes >= options.policy.max_workspace_bytes.saturating_mul(9) / 10 {
+        eprintln!("warning: workspace near storage limit: {bytes} bytes");
+    }
+    let free = options.meter.free_bytes(root).map_err(|cause| MeterFailure {
+        stage: MeterStage::FreeSpace,
+        cause,
+    })?;
+    if free < options.policy.min_free_bytes
+        || measured_usage(root).map_err(|cause| MeterFailure {
+            stage: MeterStage::ManagedUsage,
+            cause,
+        })? > options.policy.max_managed_bytes
+    {
+        return Ok(Some(StopReason::StoragePressure));
+    }
+    Ok(None)
 }
 
 pub(crate) fn monitor(
@@ -523,13 +610,19 @@ pub(crate) fn monitor(
     options: &StorageOptions,
     token: &fabric_runner::CancellationToken,
     done: &std::sync::atomic::AtomicBool,
-) {
+) -> Option<MeterFailure> {
     use std::sync::atomic::Ordering;
     while !done.load(Ordering::Acquire) {
-        if let Some(reason) = violation(root, workspace, options) {
-            token.stop_for_storage(reason);
-            break;
-        }
-        std::thread::park_timeout(Duration::from_millis(100));
+        let (reason, failure) = match violation(root, workspace, options) {
+            Ok(Some(reason)) => (reason, None),
+            Err(failure) => (fabric_runner::StopReason::StorageMeterFailed, Some(failure)),
+            Ok(None) => {
+                std::thread::park_timeout(Duration::from_millis(100));
+                continue;
+            }
+        };
+        token.stop_for_storage(reason);
+        return failure;
     }
+    None
 }

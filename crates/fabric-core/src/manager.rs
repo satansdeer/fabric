@@ -1064,6 +1064,13 @@ fn recovered_report(
         exit_code: run.exit_code,
         exit_signal: run.exit_signal,
         error_kind: run.error_kind.clone(),
+        storage_meter_failure: store
+            .observation(&run.run_id)
+            .map_err(error)?
+            .map(|(_, json)| serde_json::from_str::<crate::logs::Progress>(&json))
+            .transpose()
+            .map_err(error)?
+            .and_then(|progress| progress.storage_meter_failure),
         created_at: run.created_at,
         started_at: run.started_at,
         finished_at: run.finished_at,

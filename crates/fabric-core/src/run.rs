@@ -41,6 +41,8 @@ pub struct RunReport {
     pub exit_signal: Option<i32>,
     #[serde(default)]
     pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_meter_failure: Option<crate::workspace::storage::MeterFailure>,
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
@@ -336,9 +338,9 @@ pub(crate) fn execute_prepared(
         let done = std::sync::atomic::AtomicBool::new(false);
         crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
         let observation_store = open_store(&root)?.1;
-        let mut result = std::thread::scope(|scope| {
+        let (mut result, meter_failure) = std::thread::scope(|scope| {
             let monitor = scope.spawn(|| {
-                crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done);
+                crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done)
             });
             let observations = scope.spawn(|| {
                 crate::logs::monitor(observation_store, &run_id, &progress, &activity, &done)
@@ -364,20 +366,34 @@ pub(crate) fn execute_prepared(
             done.store(true, std::sync::atomic::Ordering::Release);
             monitor.thread().unpark();
             observations.thread().unpark();
-            monitor
+            let meter_failure = monitor
                 .join()
                 .map_err(|_| error("Storage monitor panicked"))?;
             observations
                 .join()
                 .map_err(|_| error("Activity monitor panicked"))??;
-            result
+            Ok::<_, FabricError>((result, meter_failure))
         })?;
-        // A fast zero-exit worker must not hide an oversized final workspace.
-        if result.stop_reason.is_none() {
-            result.stop_reason = token
-                .storage_reason()
-                .or_else(|| crate::workspace::storage::violation(&root, fresh.path(), &storage));
+        progress.storage_meter_failure = meter_failure;
+        // A fast zero-exit worker must not hide an oversized or unmeasurable workspace.
+        if let Ok(result) = &mut result {
+            if result.stop_reason.is_none() {
+                result.stop_reason = token.storage_reason().or_else(|| {
+                    match crate::workspace::storage::violation(&root, fresh.path(), &storage) {
+                        Ok(reason) => reason,
+                        Err(failure) => {
+                            progress.storage_meter_failure = Some(failure);
+                            Some(fabric_runner::StopReason::StorageMeterFailed)
+                        }
+                    }
+                });
+            }
         }
+        // Save before exit/capture: finalization failure must not erase meter evidence.
+        if progress.storage_meter_failure.is_some() {
+            progress.save(&store, &run_id, &activity)?;
+        }
+        let result = result?;
         let finished_at = now()?;
         attempt.finished_at = Some(finished_at);
         attempt.exit_code = result.status.code();
@@ -493,6 +509,7 @@ pub(crate) fn execute_prepared(
         exit_code: run.exit_code,
         exit_signal: run.exit_signal,
         error_kind: run.error_kind,
+        storage_meter_failure: progress.storage_meter_failure,
         events: capture.event_counts.clone(),
         capture,
         artifact_manifest_id: run.artifact_manifest_id.map(|id| id.to_string()),

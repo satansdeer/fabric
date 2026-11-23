@@ -2947,7 +2947,7 @@ fn storage_admission_cli_denies_before_worker_and_reports_usage() {
 
 struct FixedDisk(u64);
 impl fabric_core::workspace::storage::DiskMeter for FixedDisk {
-    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_domain::FabricError> {
+    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_core::workspace::storage::MeterCause> {
         Ok(self.0)
     }
 }
@@ -3228,7 +3228,7 @@ fn storage_workspace_monitor_terminates_owned_group_and_zero_exit_is_failure() {
 
 struct PressureDisk(PathBuf);
 impl fabric_core::workspace::storage::DiskMeter for PressureDisk {
-    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_domain::FabricError> {
+    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_core::workspace::storage::MeterCause> {
         Ok(if self.0.exists() { 0 } else { u64::MAX })
     }
 }
@@ -3269,6 +3269,87 @@ fn storage_pressure_keeps_its_reason_and_captures_evidence() {
             .artifact_manifest_id
             .is_some()
     );
+}
+
+struct FailingDisk(PathBuf);
+impl fabric_core::workspace::storage::DiskMeter for FailingDisk {
+    fn free_bytes(&self, _: &Path) -> Result<u64, fabric_core::workspace::storage::MeterCause> {
+        use fabric_core::workspace::storage::{MeterCause, MeterOperation};
+        if self.0.exists() {
+            Err(MeterCause::Io {
+                operation: MeterOperation::Statvfs,
+                os_code: Some(libc::EIO),
+            })
+        } else {
+            Ok(u64::MAX)
+        }
+    }
+}
+
+#[test]
+fn storage_meter_failure_survives_terminal_reconnect_without_raw_content() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    let root = fixture.0.join("storage");
+    let failure = fixture.0.join("credential-path-sentinel");
+    let harness = fabric_runner::FakeHarness::new(fixture.script_fake(&format!(
+        "trap 'exit 0' TERM\nprintf file-content-sentinel > tracked\nprintf 'native-raw-sentinel\\n'\ntouch '{}'\nwhile :; do sleep 1; done",
+        failure.display()
+    )))
+    .unwrap();
+    let prompt = fixture.0.join("prompt");
+    fs::write(&prompt, "{}").unwrap();
+    let mut options = storage_options();
+    options.storage.meter = std::sync::Arc::new(FailingDisk(failure));
+    options.limits.term_grace = std::time::Duration::from_secs(2);
+    let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
+    assert_eq!(report.state, fabric_domain::RunState::Failed);
+    assert_eq!(report.error_kind.as_deref(), Some("storage_meter_failed"));
+    assert_eq!(
+        report.exit_code,
+        Some(0),
+        "storage failure overrides zero exit"
+    );
+    assert!(!options.cancellation.is_cancelled());
+    assert!(report.artifact_manifest_id.is_some());
+    assert!(
+        !Path::new(&report.workspace_path).exists(),
+        "captured fork reclaimed"
+    );
+    let expected = serde_json::json!({
+        "stage":"free_space", "code":"io", "operation":"statvfs", "os_code":libc::EIO
+    });
+    assert_eq!(
+        serde_json::to_value(report.storage_meter_failure).unwrap(),
+        expected
+    );
+
+    // New viewer process, reading durable metadata after the supervisor has returned.
+    let canonical_root = root.canonicalize().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fabric"))
+        .env_clear()
+        .arg("--root")
+        .arg(canonical_root)
+        .args(["runs", "logs", &report.run_id, "--json"])
+        .output()
+        .unwrap();
+    let reconnected = json(&output);
+    assert_eq!(reconnected["terminal"], true);
+    assert_eq!(reconnected["state"], "FAILED");
+    assert_eq!(reconnected["termination"], "storage_meter_failed");
+    assert_eq!(reconnected["workspace_state"], "RECLAIMED");
+    assert_eq!(reconnected["progress"]["storage_meter_failure"], expected);
+    assert!(reconnected["raw"].is_null());
+    let visible = String::from_utf8(output.stdout).unwrap();
+    for private in [
+        "credential-path-sentinel",
+        "native-raw-sentinel",
+        "file-content-sentinel",
+    ] {
+        assert!(!visible.contains(private), "private content in observation");
+    }
+    let store = fabric_store::Store::open_existing_read_only(root.join("fabric.db")).unwrap();
+    assert_eq!(store.reserved_storage_bytes().unwrap(), 0);
 }
 
 #[test]

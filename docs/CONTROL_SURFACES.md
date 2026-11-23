@@ -88,6 +88,15 @@ Reconnect with `fabric_results` and the saved batch ID; never blindly resubmit
 after an uncertain transport error. Resume observation with a necessary status
 or wait call. Do not hot-poll or loop zero-timeout waits.
 
+Storage measurement failures remain fail-closed (`storage_meter_failed`). Terminal
+results optionally include `storage_meter_failure`; `runs logs --json` exposes the
+same evidence under `progress.storage_meter_failure`. Evidence contains an
+allowlisted measurement `stage` and cause `code`; I/O causes add an allowlisted
+`operation` and optional numeric `os_code`, never paths, raw errors, contents or
+native logs. Legacy records without this evidence have an unknown cause. This
+does not change storage caps, authorize replay, or identify the cause of the
+earlier issue #38 failure; inspect evidence from the next released runtime first.
+
 ## Legacy version 1 foreground API
 
 ```sh
