@@ -603,7 +603,19 @@ fn exchange_bounded(
             return Err(failure("cancelled"));
         }
         if Instant::now() >= deadline {
-            return Err(failure("timeout"));
+            let phase = if sent < request.len() {
+                "request_write"
+            } else {
+                "response_read"
+            };
+            return Err(FabricError {
+                kind: ErrorKind::Output,
+                message: format!(
+                    "Plugin: timeout. RPC {method} (request {id}, phase {phase}, sent {sent}/{} bytes, received {} bytes).",
+                    request.len(),
+                    frame.len()
+                ),
+            });
         }
         if sent < request.len() {
             match input.write(&request[sent..]) {
@@ -801,6 +813,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("timeout"));
+        assert!(
+            error
+                .message
+                .contains("RPC initialize (request 1, phase request_write, sent 0/")
+        );
+        assert!(error.message.contains("received 0 bytes"));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

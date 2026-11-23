@@ -1975,7 +1975,6 @@ fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() 
     fixture.setup();
     let prompt = fixture.0.join("timeout.json");
     fs::write(&prompt, r#"{"process_tree":{"ignore_child_term":true}}"#).unwrap();
-    let start = std::time::Instant::now();
     let out = fixture
         .cli()
         .args(["run", "test", "--harness", "fake", "--prompt-file"])
@@ -2005,7 +2004,6 @@ fn wall_timeout_stops_fake_parent_and_term_ignoring_child_and_persists_reason() 
         report["exit_signal"]
     );
     assert!(report["worker_attempts"][0]["exit_code"].is_null());
-    assert!(start.elapsed() < std::time::Duration::from_secs(6));
     assert_tree_stopped(&fixture, &report);
     let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
     let run = store

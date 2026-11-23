@@ -138,6 +138,41 @@ fn target_rejects_acknowledgment_only_and_wrong_grant_without_executing() {
 }
 
 #[test]
+fn target_timeout_identifies_rpc_and_exchange_phase_without_host_effects() {
+    use fabric_runner::target::Action;
+    let dir = tempfile::tempdir().unwrap();
+    let target = PluginHost::default()
+        .target(
+            &manifest(PluginKind::Target, "inspect-hang", dir.path()),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    let start = std::time::Instant::now();
+    let error = target
+        .drive(
+            "inspect",
+            "test",
+            &[Action::Inspect],
+            serde_json::json!({}),
+            |_| -> Result<((), serde_json::Value), fabric_domain::FabricError> {
+                panic!("unresponsive target authorized a host effect")
+            },
+        )
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .message
+            .contains("RPC target.inspect (request 5, phase response_read,"),
+        "{error}"
+    );
+    assert!(error.message.contains("received 0 bytes"), "{error}");
+    assert!(start.elapsed() < Duration::from_secs(3));
+    drop(target);
+    reaped(dir.path());
+}
+
+#[test]
 fn external_kinds_and_harness_execution_bridge() {
     let dir = tempfile::tempdir().unwrap();
     let host = PluginHost::default();
@@ -221,6 +256,14 @@ fn protocol_failures_are_bounded_reaped_and_secret_free() {
             .err()
             .unwrap();
         assert!(!format!("{error:?}").contains("SECRET_CANARY"));
+        if mode == "health-hang" {
+            assert!(
+                error
+                    .message
+                    .contains("RPC health (request 2, phase response_read,"),
+                "{error}"
+            );
+        }
         assert!(start.elapsed() < Duration::from_secs(3));
         assert!(dir.path().join("pid").exists(), "{mode}: {error:?}");
         reaped(dir.path());
