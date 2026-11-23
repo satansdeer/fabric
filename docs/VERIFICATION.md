@@ -625,3 +625,16 @@ No live OMP/Codex model-provider turn, service connection, credential change, de
 The combined full-workspace and SDK command completed in 392.52 seconds. The SDK run exercised both installed native reference executables through real Core `plugins check` and executed a third-party fake harness through Core without vendor registration changes. These provider-free results satisfy the issue's local fixture gates, not live model-provider or remote-target acceptance.
 
 Controller: macOS arm64, Node 22.23.2, `RUST_TEST_THREADS=4`, explicit release reference executable and actual debug Core host. No separate live-provider smoke, credential change, service deployment or npm publication.
+
+## Issue #5 — exact-head CI correction
+
+PR #44 exact-head CI at `c502c32b9f24ec0dd2e9fa3cb38d043b9e9a2ac9`
+passed formatting and compilation but found an obsolete Codex fixture contract:
+it expected the harness planner to reject placement before harness capabilities.
+Placement now belongs to the target selected by Core. Removed those misplaced
+harness assertions; existing CLI preallocation/remote-refusal checks retain the
+consumer-visible no-local-fallback contract. No product fallback or validation
+was weakened.
+The corrected Codex fixture passed (one parent test and all three isolated
+authorization child modes); `cargo fmt --all --check` passed. New exact-head CI
+remains a separate gate; the failed run is not release acceptance.
