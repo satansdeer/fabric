@@ -334,7 +334,15 @@ test('generated third-party target executes a Core host worker, seals verified a
   install(target, { registry, fabric: host, version: '1.0.0', sha256: directory(target).hash, trust: true });
   function invoke(program, args, cwd = root) {
     const r = spawnSync(program, args, { cwd, env, encoding: 'utf8', timeout: 30_000 });
-    assert.equal(r.status, 0, r.stderr + r.stdout);
+    if (r.error || r.status !== 0) {
+      t.diagnostic(JSON.stringify({ program, args, error: r.error?.message, status: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr }));
+      if (program === host) {
+        const observed = spawnSync(host, ['--root', join(root, 'storage'), 'runs', 'list', '--json'], { cwd, env, encoding: 'utf8', timeout: 5000 });
+        t.diagnostic(`Provider-free fixture run evidence: ${observed.stdout}${observed.stderr}`);
+      }
+    }
+    assert.ifError(r.error);
+    assert.equal(r.status, 0, JSON.stringify({ program, args, signal: r.signal, stdout: r.stdout, stderr: r.stderr }));
     return r.stdout;
   }
   invoke('/usr/bin/git', ['init', '--quiet'], repo);

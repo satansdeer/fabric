@@ -971,3 +971,14 @@ for both dead parent/descendant, captured streams, NEEDS_ATTENTION, retained
 workspace, sealed recovery artifacts and unchanged terminal evidence stay.
 The updated focused recovery test passed in 31.63 s on macOS with the
 same released SDK executable environment shown above.
+
+At `99c9083177645aabda9fa7d1c8595612304d29b5`, both push CI
+`45156176189` and PR CI `45156187156` passed the Rust checks but failed
+the generated third-party TypeScript target's real `fabric run` command
+with status 1 and empty stdout/stderr. The test now reports subprocess
+errors (including outer-fixture timeouts), the exact command and bounded,
+provider-free durable run evidence before deleting its temporary storage.
+No timer is increased and no failed check is bypassed.
+A checksum-verified official Node 22.23.2 macOS arm64 binary, matching CI's
+Node version, passed the focused generated-target test in 26.84 s locally.
+That pass does not explain or invalidate the two CI failures.
