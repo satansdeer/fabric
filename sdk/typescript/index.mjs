@@ -1,4 +1,4 @@
-import { readBounded, identity, exact, frame, frames, resultFor, fail, PROTOCOL_VERSION, SDK_VERSION, NATIVE_MAX_FRAME } from './protocol.mjs';
+import { readBounded, identity, exact, frame, frames, resultFor, fail, PROTOCOL_VERSION, SDK_VERSION, NATIVE_MAX_FRAME, NATIVE_NORMALIZE_MAX_FRAME } from './protocol.mjs';
 import { validConnectorInput, validNormalizedTrigger } from './webhook.mjs';
 export { verifyWebhook, normalizeWebhook, webhookSigningBytes } from './webhook.mjs';
 
@@ -39,7 +39,8 @@ export function defineNativeHarness(options) {
 export function rejectNative(kind) { throw Object.assign(new Error('native_rejection'), { kind }); }
 async function serveNative(plugin) {
   let expected = 1;
-  for await (const request of frames(process.stdin, NATIVE_MAX_FRAME)) {
+  const requestLimit = request => request?.method === 'harness.normalize' ? NATIVE_NORMALIZE_MAX_FRAME : NATIVE_MAX_FRAME;
+  for await (const request of frames(process.stdin, NATIVE_NORMALIZE_MAX_FRAME, requestLimit)) {
     if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== expected) fail('invalid_request');
     const { method, params } = request;
     let result;

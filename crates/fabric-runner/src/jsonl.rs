@@ -5,7 +5,9 @@ use crate::EventFormat;
 pub use fabric_domain::EventCounts as Summary;
 use serde_json::Value;
 
-pub const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Fixed structured-record ceiling, excluding LF and including a possible CR.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+const INITIAL_LINE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub enum Event {
@@ -33,7 +35,7 @@ impl<R: BufRead> Events<R> {
     pub fn with_format(reader: R, format: EventFormat) -> Self {
         Self {
             reader,
-            line: Vec::with_capacity(MAX_LINE_BYTES),
+            line: Vec::with_capacity(INITIAL_LINE_BYTES),
             line_number: 0,
             line_bytes: 0,
             format,
@@ -70,6 +72,10 @@ impl<R: BufRead> Iterator for Events<R> {
         self.line.clear();
         self.line_bytes = 0;
         let mut oversized = false;
+        let max_line_bytes = match self.format {
+            EventFormat::JsonLines => MAX_LINE_BYTES,
+            EventFormat::TextLines => 64 * 1024,
+        };
         loop {
             let chunk = match self.reader.fill_buf() {
                 Ok(chunk) => chunk,
@@ -85,10 +91,16 @@ impl<R: BufRead> Iterator for Events<R> {
             let length = newline.unwrap_or(chunk.len());
             self.line_bytes += length as u64;
             if !oversized {
-                if length > MAX_LINE_BYTES - self.line.len() {
+                if length > max_line_bytes - self.line.len() {
                     oversized = true;
                     self.line.clear();
                 } else {
+                    let needed = self.line.len() + length;
+                    if needed > self.line.capacity() {
+                        // Explicit power-of-two growth cannot overshoot the fixed ceiling.
+                        self.line
+                            .reserve_exact(needed.next_power_of_two() - self.line.len());
+                    }
                     self.line.extend_from_slice(&chunk[..length]);
                 }
             }
@@ -149,6 +161,36 @@ mod tests {
             panic!("must parse final unterminated line");
         };
         assert_eq!(value["final"], true);
+        assert!(events.next().is_none());
+        assert_eq!(events.line.capacity(), MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn small_streams_keep_a_small_reusable_buffer() {
+        let mut events = Events::new(Cursor::new(b"{}\nnull\n"));
+        assert_eq!(events.line.capacity(), INITIAL_LINE_BYTES);
+        assert!(matches!(events.next(), Some(Ok(Event::Parsed(_)))));
+        assert!(matches!(events.next(), Some(Ok(Event::Parsed(_)))));
+        assert!(events.next().is_none());
+        assert_eq!(events.line.capacity(), INITIAL_LINE_BYTES);
+    }
+
+    #[test]
+    fn crlf_counts_cr_at_the_exact_boundary_and_recovers_after_one_byte_over() {
+        let exact = format!("\"{}\"\r", "x".repeat(MAX_LINE_BYTES - 3));
+        let bytes = format!("{exact}\n{exact} \nfalse");
+        let mut events = Events::new(BufReader::with_capacity(257, Cursor::new(bytes)));
+        assert!(matches!(events.next(), Some(Ok(Event::Parsed(_)))));
+        assert_eq!(events.line_number(), 1);
+        assert_eq!(events.line_bytes(), MAX_LINE_BYTES as u64);
+        assert!(matches!(events.next(), Some(Ok(Event::Oversized))));
+        assert_eq!(events.line_number(), 2);
+        assert_eq!(events.line_bytes(), (MAX_LINE_BYTES + 1) as u64);
+        assert!(matches!(
+            events.next(),
+            Some(Ok(Event::Parsed(Value::Bool(false))))
+        ));
+        assert_eq!(events.line_bytes(), 5);
         assert!(events.next().is_none());
         assert_eq!(events.line.capacity(), MAX_LINE_BYTES);
     }

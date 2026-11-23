@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
+/// Request-only envelope for one bounded record, including JSON escaping/number
+/// reserialization and the native RPC wrapper. Responses retain their old bound.
+pub const MAX_NORMALIZE_FRAME: usize =
+    6 * crate::jsonl::MAX_LINE_BYTES + 2 * crate::plugin::MAX_FRAME;
+const MAX_NORMALIZED_TEXT_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativePluginMetadata {
@@ -519,7 +525,7 @@ pub(crate) fn normalize(
         let valid = match event {
             AgentEvent::Output { stream, text } => {
                 matches!(stream.as_str(), "stdout" | "stderr")
-                    && text.len() <= crate::jsonl::MAX_LINE_BYTES
+                    && text.len() <= MAX_NORMALIZED_TEXT_BYTES
             }
             AgentEvent::Tool { name, phase } => {
                 !name.is_empty()
@@ -530,9 +536,7 @@ pub(crate) fn normalize(
                 cost_usd.is_none_or(|v| v.is_finite() && v >= 0.0)
             }
             AgentEvent::Failure { code, message } => {
-                !code.is_empty()
-                    && code.len() <= 128
-                    && message.len() <= crate::jsonl::MAX_LINE_BYTES
+                !code.is_empty() && code.len() <= 128 && message.len() <= MAX_NORMALIZED_TEXT_BYTES
             }
             _ => false,
         };

@@ -3,7 +3,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'nod
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { directory } from './package.mjs';
-import { exact, frame, frames, resultFor, fail, NATIVE_MAX_FRAME } from './protocol.mjs';
+import { exact, frame, frames, resultFor, fail, NATIVE_MAX_FRAME, NATIVE_NORMALIZE_MAX_FRAME } from './protocol.mjs';
 import { TARGET_OPERATIONS, TARGET_ACTIONS, validTargetPlan } from './index.mjs';
 import { createHmac } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -59,7 +59,8 @@ async function nativeConformance(info, entry, timeout) {
     const responses = frames(child.stdout, NATIVE_MAX_FRAME)[Symbol.asyncIterator]();
     let id = 0;
     async function rpc(method, params) {
-      child.stdin.write(frame({ jsonrpc: '2.0', id: ++id, method, params }, NATIVE_MAX_FRAME));
+      const limit = method === 'harness.normalize' ? NATIVE_NORMALIZE_MAX_FRAME : NATIVE_MAX_FRAME;
+      child.stdin.write(frame({ jsonrpc: '2.0', id: ++id, method, params }, limit));
       const next = await responses.next();
       if (next.done || !exact(next.value, ['jsonrpc', 'id', 'result']) || next.value.jsonrpc !== '2.0' || next.value.id !== id) fail('invalid_response');
       return next.value.result;
