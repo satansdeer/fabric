@@ -1,12 +1,12 @@
 # Fabric Connect: stable authenticated automation identities
 
-Connect uses the existing owner-provisioned Cloudflare Worker at `https://fabric-connect.satansdeer.workers.dev` and its SQLite Durable Object. Issue [#9](https://github.com/satansdeer/fabric/issues/9) adds claimed account/project/automation identities to that service; it does not create another service or deploy this source. `polyglo.tv` is optional future custom-hostname work, not a DNS prerequisite. No `usemont.com` changes are involved. Broad outbound reconnect (#10) and external GitHub setup (#11) remain separate.
+Connect uses the existing owner-provisioned Cloudflare Worker at `https://fabric-connect.satansdeer.workers.dev` and its SQLite Durable Object. Issue [#9](https://github.com/satansdeer/fabric/issues/9) adds claimed account/project/automation identities; [#10](https://github.com/satansdeer/fabric/issues/10) adds the generic outbound local agent described below. Neither change deploys this source. `polyglo.tv` is optional future custom-hostname work, not a DNS prerequisite. No `usemont.com` changes are involved. External GitHub setup (#11) remains separate.
 
 ## Trust and execution
 
 GitHub signs raw `issues` webhook bodies with a separate, randomly generated secret for each automation. Claimed policy fixes the repository, author, sender and readiness label. Only open, non-PR issues with that exact policy enter the inbox. Supported actions are opened, edited, reopened and addition of the readiness label. SHA-256 of the raw body is the event identity; reusing a GitHub delivery UUID for different bytes is rejected. New events must have a valid issue update timestamp within the preceding 24 hours (at most five minutes in the future). Authenticated exact redeliveries return the retained receipt even after that freshness window.
 
-A label only queues a notification. The local owner selects one issue, reviews its current snapshot and supplies that exact approval SHA. The consumer refetches GitHub and calls the existing local bridge; Fabric owns admission, execution, artifacts and reclaim. No hosted plugin execution, inbound local port, automatic model spending, push or merge. Native harnesses require both existing local consent and `--allow-model-spend`. Existing connector source/tenant/scope/route checks and Core lifecycle invariants remain unchanged.
+A GitHub label only queues a notification. The legacy GitHub consumer remains supervised: the local owner selects one issue, reviews its current snapshot and supplies that exact approval SHA. It refetches GitHub and calls the existing local bridge; Fabric owns admission, execution, artifacts and reclaim. The generic route below instead requires a preinstalled trusted local Automation. Neither path executes webhook-selected commands or grants authority through a public URL. No hosted plugin execution, inbound local port, automatic model-spend consent, push or merge. Native harnesses require both existing local consent and `--allow-model-spend`.
 
 Account and project claims bind an immutable principal ID; an automation binds that principal, a stable identity, an explicit webhook policy and a worker ID. Authorization checks the principal's account, exact project/automation grant and operation, plus the stored owner. Parent claims do not grant access to descendant inboxes. Moving a private connection and its existing local recovery state to another authorized Mac does not change the public URL. A worker ID is an authenticated consumer binding, never a route key, tunnel ID or lease identity. Copying a token alone is not permission to resubmit a running event.
 
@@ -109,9 +109,9 @@ Historical controller-supplied production observations for [#21](https://github.
 - Repository webhook `715419509` is active, issues-only, with SSL verification enabled, at `https://fabric-connect.satansdeer.workers.dev/v1/projects/satansdeer/fabric/automations/issues/github`.
 - A real signed ready-label delivery for #21 queued while the local consumer was offline, survived production redeploy, and was subsequently consumed through real Core/fake-harness execution.
 
-This proves permanent ingress/redeploy durability and provider-free consumption, not model-backed implementation. [#23](https://github.com/satansdeer/fabric/issues/23) and [#25](https://github.com/satansdeer/fabric/issues/25) separately supply native-worker evidence. Ingress queues unattended; execution remains supervised and outbound-only through the existing `status`/`once` consumer, not a new daemon.
+This proves permanent ingress/redeploy durability and provider-free consumption, not model-backed implementation. [#23](https://github.com/satansdeer/fabric/issues/23) and [#25](https://github.com/satansdeer/fabric/issues/25) separately supply native-worker evidence. Those GitHub observations use the existing supervised outbound `status`/`once` consumer, not the new generic agent.
 
-Those observations concern the original deployment, not acceptance of this source. The upgraded server stores only scoped principal hashes and route-specific webhook secrets; no hosted GitHub token, issue body/title, raw local harness logs or arbitrary plugin code. Authenticated status returns allowlisted identifiers, lifecycle counts, safe failure codes, attempt/backoff timestamps and worker heartbeat. Responses never expose token hashes, webhook secrets or internal acknowledgement records; errors withhold raw exceptions. Liveness is not execution evidence.
+Those observations concern the original deployment, not acceptance of this source. The upgraded server stores scoped principal hashes and route-specific webhook secrets, never a hosted GitHub token, raw local harness logs or arbitrary plugin code. GitHub receipts omit issue body/title; generic receipts retain their bounded normalized data. Authenticated status returns allowlisted receipt fields, lifecycle counts, safe failure codes, attempt/backoff timestamps and worker heartbeat. Responses never expose token hashes, webhook secrets, local installation IDs or internal acknowledgement records; errors withhold raw exceptions. Liveness is not execution evidence.
 
 ## Historical Netlify/domain fallback
 
@@ -121,13 +121,70 @@ These limitations do not gate the live Cloudflare path. The Netlify adapter uses
 
 ## Bounds and recovery
 
-Each route is bounded: 128 KiB request bodies, 64 active events, 256 retained records, 60 new events/minute persisted across restart, 24-hour queued/delivering expiry and seven days of terminal receipt retention. Schema 2 permits at most 514 KiB route state, reserving 2 KiB above the original 512 KiB cap so an otherwise full v1 inbox can migrate without dropping events. A further 600 requests/minute per active Durable Object handler bounds work on invalid signatures, claims and replays; this defensive counter resets on cold start, unlike the durable new-event limit. All non-health requests consume it. Capacity returns 429 rather than evicting required history; bounded CAS exhaustion returns 503 rather than acknowledging unpersisted work.
+Each route is bounded: 128 KiB request bodies, 64 active events, 256 retained records, 60 new events/minute persisted across restart, 24-hour never-delivered queue expiry and seven days of terminal receipt retention. Schema 2 permits at most 514 KiB route state, reserving 2 KiB above the original 512 KiB cap so an otherwise full v1 inbox can migrate without dropping events. A further 600 requests/minute per active Durable Object handler bounds work on invalid signatures, claims and replays; this defensive counter resets on cold start, unlike the durable new-event limit. All non-health requests consume it. Capacity returns 429 rather than evicting required history; bounded CAS exhaustion returns 503 rather than acknowledging unpersisted work.
 
 `queued` means durably accepted, not executed. `delivering` has a renewable 120-second lease, not confirmed Core admission. `running` requires a matching lease and accepted batch/run handles. Only subsequent acknowledgement with the same handles can record `completed` or `failed`; only explicit `approval_mismatch`/`issue_rejected` can fail before admission without handles. Terminal acknowledgement is idempotent; a stale lease or cross-route/principal acknowledgement cannot update another receipt.
 
-Expired delivery leases become queued with 1/2/4/8-second backoff; the fifth failed lease becomes `failed` (`delivery_exhausted`). Offline queued/delivering work becomes `expired` after 24 hours, irrespective of retries. Maintenance runs lazily on valid route activity, not via a new scheduler. Running work is retained, never blindly requeued or expired merely because a worker disconnects: only its existing local Core evidence may settle it. A full inbox with unresolved running work rejects new input rather than duplicating admissions.
+GitHub delivery leases become queued with 1/2/4/8-second backoff; the fifth failed lease becomes `failed` (`delivery_exhausted`). GitHub queued/delivering work expires after 24 hours, irrespective of retries. Generic events that have ever been leased do **not** expire or exhaust retries: admission may already have committed despite a lost reply. Their expired leases requeue with exponential backoff capped at 60 seconds. Maintenance runs lazily on valid route activity, not via a new scheduler. Running work is retained, never blindly requeued or expired merely because a worker disconnects: only its existing local Core evidence may settle it. A full inbox with unresolved admissions rejects new input rather than risking duplication.
 
-Offline workers leave events queued. Run `status` after reconnect, then explicitly approve and consume the chosen issue. Do not delete local journals to force a retry: retained Core handles and evidence are the recovery authority. The hosted inbox is not an artifact store; inspect and verify actual artifacts through Fabric locally.
+Offline workers leave events queued. For GitHub, run `status` after reconnect, then explicitly approve and consume the chosen issue. For generic routes, restart `fabric connect` with the same root, connection and trusted automation. Do not delete local journals or the Core database to force a retry: retained Core handles and evidence are the recovery authority. The hosted inbox is not an artifact store; inspect and verify actual artifacts through Fabric locally.
+
+## Generic outbound local agent (#10)
+
+This source adds foreground `fabric connect` and `fabric up --connect` on macOS/Unix, requiring Python 3 on PATH and using its standard-library agent embedded in the CLI. It opens only outbound authenticated HTTPS requests: scoped status, heartbeat, poll and acknowledgement, not a laptop listener, tunnel, arbitrary port forward or hosted worker. Interrupting the agent disconnects it without cancelling healthy Core work. The existing detached local manager continues to own execution, cancellation, artifacts and cleanup.
+
+### Provision the authorized route
+
+Claim the account/project as above. Claim a **new generic automation** with the same exact scoped `claim/read/poll/ack` grants, worker ID and secret rules; legacy GitHub routes cannot be reassigned:
+
+```json
+{"worker_id":"OWNER_PROVISIONED_ID","webhook_secret":"64_LOWERCASE_HEX_RANDOM_SECRET","policy":{"kind":"generic","source_id":"webhook","tenant_id":"team","scope":"fabric","route":"events","max_payload_bytes":8192}}
+```
+
+Send this body to `POST /v1/projects/team/fabric/automations/events/claim`. `tenant_id`, `scope` and `route` must equal the claimed account, project and automation respectively. `source_id` is a bounded identifier; `max_payload_bytes` is 1–8192. The returned canonical URL is permanent for that identity. Ingress is its `/webhook` suffix, not `/github`. Knowing either URL grants no ingress, inspection or worker authorization. Producer HMAC and scoped worker bearer are different credentials.
+
+The producer sends UTF-8 JSON with **exactly** `version: 1`, an ASCII `event_id` (1–128 letters/digits/`_.-`), integer Unix-seconds `timestamp`, and object `data`. Sign the exact raw bytes with `x-fabric-signature-256: sha256=<hex HMAC-SHA256>` over:
+
+```text
+team/fabric/events\n<raw JSON bytes>
+```
+
+Here `\n` means one newline byte; the HMAC key is the route's webhook-secret string. New timestamps must be within 24 hours, allowing five minutes of clock skew into the future. Invalid UTF-8, unpaired Unicode surrogates, nonfinite numbers and nesting deeper than 64 are rejected. The normalized envelope must also fit 8192 UTF-8 bytes. The server retains and delivers those exact normalized JSON bytes; the agent submits them unchanged, avoiding cross-language numeric serialization differences. Its identity is SHA-256 of the producer event ID, namespaced by the claimed route; resend **identical bytes**, including timestamp, on retry. A retained ID with different bytes returns 409. After terminal receipt expiry, permanent Core idempotency still prevents a second admitted run; conflicting normalized data fails closed locally.
+
+### Install trusted local execution policy
+
+Register and prepare the owner-selected source using `fabric project add` / `fabric project prepare` from the local workflow. Create a private owner-owned, nonsymlink, single-link mode-0600 Automation JSON file (existing connector schema, at most 64 KiB). It must specify:
+
+- `version: 1`, a `connector_id`, `project` naming the registered local project, and `placement: "local"`.
+- `policy` with the route's exact `source_id/tenant_id/scope/route/max_payload_bytes`; existing schema fields `auth` (`hmac-sha256` or `bearer`), absolute `secret_ref`, and `max_age_seconds` (1–3600) remain required. The outbound consumer **does not open `secret_ref`**: hosted ingress already authenticated the event.
+- `rate_limit_per_minute` (1–10000), enforced atomically by existing Core connector admission for new runs, independently of the hosted ingress ceiling.
+- A trusted `worker`: `task_id`, installed `harness_id`, owner-authored `prompt`, and `source_ref: {"kind":"prepared","state_id":...}` containing the actual READY prepared-state ID. Prepared source size must be at most 128 MiB for new admission.
+- Explicit `worker.limits`: `timeout_seconds` 1–604800; `copy_limit_bytes`, `max_log_bytes` and `max_artifact_bytes` each 1–134217728. Existing runner validation and tighter local resource policy still apply.
+- `data_fields`, an explicit allowlist of event-data fields appended as labeled untrusted JSON. All other data is discarded before prompt construction. Event fields cannot select prompts, source paths, commands, harnesses, models, credentials or resource limits.
+
+Use a private schema-2 connection file as above, with the generic claimed identity. Keep credentials outside the checkout. Paths may contain spaces; no shell interprets them. Connect requires the owner to choose either an actual fake executable or explicit model-spend authorization:
+
+```sh
+fabric --root "$FABRIC_ROOT" connect \
+  --connection "$CONNECTION" --automation "$AUTOMATION" \
+  --fake-binary "$FAKE_HARNESS"
+
+fabric --root "$FABRIC_ROOT" up --connect \
+  --connection "$CONNECTION" --automation "$AUTOMATION" \
+  --allow-model-spend
+```
+
+`--fake-binary` is restricted to the `fake`, `fake-a` and `fake-b` harness IDs and cannot be combined with `--allow-model-spend`. Native execution still needs existing local consent. `up --connect` consumes an already prepared policy; it does not run onboarding, install plugins or change consent, and cannot be combined with onboarding options. No workspace release version changes are required. Production requires an HTTPS origin with no path/query/credentials. `--allow-loopback-http` permits only literal loopback addresses for provider-free fixtures, never arbitrary HTTP.
+
+### Admission, recovery and visibility
+
+The agent locks one root/route consumer, pins the Automation and executable selection, and persists a private random installation identity plus pending event intent under `ROOT/connect/<route digest>/`. The first authenticated heartbeat binds that identity remotely; a copied connection file pointed at an empty root cannot take over an existing installation. Recovery on another authorized Mac requires the **entire existing root**, including Core database, artifacts and private Connect state, not just the token. The policy is immutable for that installation; use a separately claimed automation for a different execution policy.
+
+`connect-admit` is an owner-local internal CLI boundary, not an HTTP ingress: it accepts at most 8192 normalized bytes on stdin, revalidates the trusted Automation and uses existing Core/SQLite admission. The atomic transaction commits task/batch records and a route-scoped, content-checked event→batch/run mapping before any running acknowledgement. Lost admission replies, process crashes, server lease redelivery, acknowledgement loss and manager restart reuse those handles. A retry does not require the original prepared source to remain available once admission exists. The server stores actual accepted handles and optional real artifact-manifest ID, not synthetic results. Terminal status follows the existing manager's actual outcome.
+
+Ingress reserves 2048 bytes per retained event plus installation metadata for future leases and maximum receipt handles; large payloads can reach the storage bound before the record-count ceiling. Delivery is serial (one unsettled event per connection); the hosted bounded queue buffers disconnected laptops. Five-second polling also renews heartbeat/leases. Missing heartbeat becomes `local offline` after 60 seconds; clean shutdown posts offline immediately when reachable. Reconnect uses bounded 1–30-second exponential backoff, 15-second HTTP requests and 30-second local CLI calls; responses are bounded to 1 MiB. Interrupted CLI requests do not cancel manager-owned tasks. Authentication, identity, policy and local admission failures stop fail-closed with a safe error instead of pretending to complete a task; repair the trusted configuration/resource condition and restart with retained state. Transport failures reconnect automatically. Stdout emits JSON lifecycle/handle records, never the bearer or raw error bodies. Scoped Connect credentials are removed from child environments and are never written into Core admission, the pending journal or worker prompts.
+
+Unresolved attempted admissions deliberately consume queue capacity rather than being forgotten or retried under a new identity. Terminal hosted receipts last seven days; Core mappings remain durable. Keep normal owner-managed Core/artifact retention and explicit cancellation; disconnecting alone is not cancellation or evidence cleanup.
 
 ## Provider-free verification
 
@@ -137,11 +194,15 @@ Manager-owned commands, using only already provisioned dependencies and binaries
 
 ```sh
 node --test integrations/connect/service.test.mjs
+node --test integrations/connect/generic.test.mjs
 (cd integrations/connect/cloudflare && npm test)
 python3 scripts/test-fabric-connect-request.py -v
 python3 scripts/test-fabric-connect.py --fabric "$PWD/target/debug/fabric"
+python3 scripts/test-fabric-connect-agent.py --fabric "$PWD/target/debug/fabric"
 ```
 
 Run the Python commands from the repository root (the Cloudflare command runs in its own directory). The real-adapter test bundles a test-only subclass of the production Durable Object, runs the actual service through Miniflare, disposes the runtime and reopens its persisted SQLite directory. Test-only clock/seed/read/CAS endpoints are not part of the deployed adapter. Production deployment, GitHub setup, exact-head/main CI, release and independent consumer acceptance remain manager-owned. Historical fixture/live observations above do not certify this new migration or a model-backed implementation.
+
+Issue-10 checks: **NOT_RUN_BY_WORKER**. The generic service checks use the existing real on-disk CAS fixture and recreate the service across lease/ack boundaries; they cover scoped auth, installation binding, payload/rate/queue limits, uncertain-lease retention and stable offline URLs. The new Python check uses the actual native `connect` and `up --connect` paths, existing manager/SQLite admission, a real prepared source and real fake-harness mutations/artifact bytes. It loses a real committed admission reply and running/terminal acknowledgements, crashes/restarts the agent, restarts the server at the same endpoint, checks manager-restart idempotency, and rejects identity/content/resource substitution. Its fault injection drops replies **after** the real implementation commits; it does not mock admission, task execution, artifacts or durable ingress. Neither this worker nor these authored sources establish passing CI, deployment, consumer parity or live model execution. Manager owns execution and review of these checks.
 
 The observed [SIGTERM CI failure](https://github.com/satansdeer/fabric/actions/runs/45035376872) was a partial heartbeat PID record (#22); shared tree readiness now requires complete parent/child records. A later [typed-conformance CI failure](https://github.com/satansdeer/fabric/actions/runs/45036747038) exposed a manager startup SQLite handle retained across shutdown (#24); that startup-only handle now closes before readiness. The deterministic readiness regression, actual SIGTERM lifecycle test, binary build and actual typed conformance passed locally after these fixes. The conformance fixture owns/reaps the foreground manager and prints PASS only after successful resource cleanup. Controller-supplied GitHub macOS CI runs [45039604770](https://github.com/satansdeer/fabric/actions/runs/45039604770) and [45039529438](https://github.com/satansdeer/fabric/actions/runs/45039529438) at `c6583cb` completed successfully. These are recorded observations, not checks rerun here; #15 retains the real model-backed issue-to-reviewed-PR acceptance gate.

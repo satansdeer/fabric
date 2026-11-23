@@ -1,3 +1,4 @@
+mod connect;
 mod onboarding;
 mod up;
 
@@ -30,6 +31,15 @@ struct Cli {
 enum Commands {
     /// Consent once to local setup, preparation and optional OMP controller tools.
     Up(up::UpArgs),
+    /// Maintain an authenticated outbound connection to a claimed generic Connect automation.
+    Connect(connect::Options),
+    #[command(hide = true)]
+    ConnectAdmit {
+        #[arg(long)]
+        automation: PathBuf,
+        #[arg(long)]
+        fake_binary: Option<PathBuf>,
+    },
     /// Launch the explicitly connected OMP controller without changing native defaults.
     Controller {
         /// Provider-free host protocol mode; never starts a model turn by itself.
@@ -537,6 +547,11 @@ fn main() -> ExitCode {
     };
     let (json, result) = match cli.command {
         Commands::Up(args) => (args.json, up::up(cli.root, args)),
+        Commands::Connect(options) => (true, connect::run(cli.root, options)),
+        Commands::ConnectAdmit {
+            automation,
+            fake_binary,
+        } => (true, connect::admit(cli.root, automation, fake_binary)),
         Commands::Controller { rpc } => (false, up::controller(cli.root, rpc)),
         Commands::Init {
             harness,

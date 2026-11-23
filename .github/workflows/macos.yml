@@ -56,7 +56,7 @@ jobs:
         timeout-minutes: 5
         run: python3 scripts/test-fabric-issue.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
       - name: Connect signed ingress and durable inbox (provider-free)
-        run: node --test integrations/connect/service.test.mjs
+        run: node --test integrations/connect/service.test.mjs integrations/connect/generic.test.mjs
       - name: Cloudflare SQLite inbox (local workerd, provider-free)
         timeout-minutes: 5
         working-directory: integrations/connect/cloudflare
@@ -69,6 +69,9 @@ jobs:
       - name: Connect outbound local worker (provider-free)
         timeout-minutes: 5
         run: python3 scripts/test-fabric-connect.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
+      - name: Generic Connect crash and reconnect acceptance (provider-free)
+        timeout-minutes: 5
+        run: python3 scripts/test-fabric-connect-agent.py --fabric "$GITHUB_WORKSPACE/target/debug/fabric"
       - name: OMP v1 conformance (fake workers, provider-free)
         timeout-minutes: 5
         run: bun integrations/omp/conformance.ts "$GITHUB_WORKSPACE/target/debug/fabric"

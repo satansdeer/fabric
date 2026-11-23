@@ -1,5 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { githubEvent, validPolicy } from "./github.mjs";
+import { genericEvent, validGenericPolicy } from "./generic.mjs";
+const validRoutePolicy = policy => validPolicy(policy) || validGenericPolicy(policy);
 
 export const PREFIX = "/v1/projects/satansdeer/fabric/automations/issues";
 const BODY_LIMIT = 128 * 1024;
@@ -55,7 +57,10 @@ async function readJSON(request) {
 
 function initial(identity, principal, body) {
   return { schema_version: 2, identity, principal_id: principal.id, worker_id: body.worker_id,
-    policy: { repo: body.policy.repo, author: body.policy.author, sender: body.policy.sender, label: body.policy.label },
+    policy: validGenericPolicy(body.policy) ? {
+      kind: "generic", source_id: body.policy.source_id, tenant_id: body.policy.tenant_id,
+      scope: body.policy.scope, route: body.policy.route, max_payload_bytes: body.policy.max_payload_bytes,
+    } : { repo: body.policy.repo, author: body.policy.author, sender: body.policy.sender, label: body.policy.label },
     webhook_secret: body.webhook_secret,
     events: [], rate: [], worker_last_seen_at: null };
 }
@@ -63,8 +68,12 @@ function validState(state) {
   return object(state) && [1, 2].includes(state.schema_version) && WORKER_ID.test(state.worker_id || "") && Array.isArray(state.events) &&
     (state.schema_version === 1 || (object(state.identity) &&
       ["account", "project", "automation"].every(key => segment(state.identity[key])) &&
-      safeID(state.principal_id) && validPolicy(state.policy) && HEX.test(state.webhook_secret || "") &&
+      safeID(state.principal_id) && validRoutePolicy(state.policy) && HEX.test(state.webhook_secret || "") &&
       (state.legacy_token_sha256 === undefined || HEX.test(state.legacy_token_sha256)))) &&
+      (!validGenericPolicy(state.policy) || (state.policy.tenant_id === state.identity.account &&
+        state.policy.scope === state.identity.project && state.policy.route === state.identity.automation &&
+        (state.local_id === undefined || HEX.test(state.local_id)) &&
+        (state.worker_offline === undefined || typeof state.worker_offline === "boolean"))) &&
     state.events.length <= 256 && Array.isArray(state.rate) && state.rate.length <= 60 &&
     state.rate.every(Number.isFinite) &&
     (state.worker_last_seen_at === null || Number.isFinite(Date.parse(state.worker_last_seen_at))) &&
@@ -136,6 +145,7 @@ function maintain(state, time) {
   let changed = false;
   for (const event of state.events) {
     if ((event.status === "queued" || event.status === "delivering") &&
+        !(event.source === "generic" && event.attempts > 0) &&
         time >= Date.parse(event.received_at) + DAY) {
       event.status = "expired";
       event.terminal_at = iso(Date.parse(event.received_at) + DAY);
@@ -143,11 +153,11 @@ function maintain(state, time) {
       delete event.lease_expires_at;
       changed = true;
     } else if (event.status === "delivering" && time >= Date.parse(event.lease_expires_at)) {
-      event.status = event.attempts >= 5 ? "failed" : "queued";
+      event.status = event.source !== "generic" && event.attempts >= 5 ? "failed" : "queued";
       if (event.status === "failed") {
         event.terminal_at = iso(time);
         event.reason = "delivery_exhausted";
-      } else event.next_attempt_at = iso(Date.parse(event.lease_expires_at) + Math.min(60000, 1000 * 2 ** (event.attempts - 1)));
+      } else event.next_attempt_at = iso(Date.parse(event.lease_expires_at) + Math.min(60000, 1000 * 2 ** Math.min(16, event.attempts - 1)));
       delete event.lease_id;
       delete event.lease_expires_at;
       changed = true;
@@ -162,20 +172,23 @@ function maintain(state, time) {
 
 function publicEvent(event) {
   // Explicit allowlist: never expose internal acknowledgements or future private fields.
-  return Object.fromEntries(["schema_version", "source", "event_id", "repo", "issue_number", "action",
+  const fields = Object.fromEntries(["schema_version", "source", "event_id", "repo", "issue_number", "action",
     "delivery_id", "status", "received_at", "attempts", "lease_id", "lease_expires_at",
-    "next_attempt_at", "terminal_at", "reason", "batch_id", "run_id", "artifact_manifest_id"]
+    "next_attempt_at", "terminal_at", "reason", "batch_id", "run_id", "artifact_manifest_id", "trigger_json"]
     .filter(key => event[key] !== undefined).map(key => [key, event[key]]));
+  if (event.trigger_json !== undefined) fields.trigger = JSON.parse(event.trigger_json);
+  return fields;
 }
 function worker(state, id, time) {
   return { id, last_seen_at: state.worker_last_seen_at,
-    online: state.worker_last_seen_at !== null && time - Date.parse(state.worker_last_seen_at) <= 60000 };
+    online: state.worker_offline !== true && state.worker_last_seen_at !== null && time - Date.parse(state.worker_last_seen_at) <= 60000 };
 }
 function status(state, id, time, origin) {
   const counts = Object.fromEntries(STATES.map(name => [name, 0]));
   for (const event of state.events) counts[event.status]++;
   return { schema_version: 1, owner: state.identity.account, project: state.identity.project,
     automation: state.identity.automation, url: origin + routePath(state.identity), policy: state.policy,
+    local_status: worker(state, id, time).online ? "local online" : "local offline",
     worker: worker(state, id, time), events: state.events.map(publicEvent), counts };
 }
 
@@ -290,15 +303,16 @@ export function createHandler({ store, env, now = Date.now }) {
       if (url.search) fail(400);
       const accountClaim = /^\/v1\/accounts\/([^/]+)\/claim$/.exec(path);
       const projectClaim = /^\/v1\/projects\/([^/]+)\/([^/]+)\/claim$/.exec(path);
-      const route = /^\/v1\/projects\/([^/]+)\/([^/]+)\/automations\/([^/]+)\/(claim|github|status|poll|events\/([0-9a-f]{64})\/ack)$/.exec(path);
+      const route = /^\/v1\/projects\/([^/]+)\/([^/]+)\/automations\/([^/]+)\/(claim|github|webhook|heartbeat|status|poll|events\/([0-9a-f]{64})\/ack)$/.exec(path);
       const identity = accountClaim ? { account: accountClaim[1] } :
         projectClaim ? { account: projectClaim[1], project: projectClaim[2] } :
           route ? { account: route[1], project: route[2], automation: route[3] } : null;
       if (!identity || !Object.values(identity).every(segment)) fail(404);
       const claim = Boolean(accountClaim || projectClaim || route?.[4] === "claim");
-      const ingress = route?.[4] === "github";
+      const ingress = ["github", "webhook"].includes(route?.[4]);
       const view = route?.[4] === "status";
       const poll = route?.[4] === "poll";
+      const heartbeat = route?.[4] === "heartbeat";
       if (request.method !== (view ? "GET" : "POST")) fail(404);
       const stored = route ? await load(identity) : null;
       const state = stored ? migrate(stored.data, identity, env) :
@@ -306,7 +320,7 @@ export function createHandler({ store, env, now = Date.now }) {
       let principal;
       if (!ingress) {
         principal = authenticate(request, configured, state);
-        authorize(principal, identity, claim ? "claim" : view ? "read" : poll ? "poll" : "ack", state);
+        authorize(principal, identity, claim ? "claim" : view ? "read" : poll || heartbeat ? "poll" : "ack", state);
       }
       if (claim) {
         const body = await readJSON(request);
@@ -322,7 +336,9 @@ export function createHandler({ store, env, now = Date.now }) {
             await owner({ account: identity.account, project: identity.project }, principal, false);
             if (Object.keys(body).sort().join(",") !== "policy,webhook_secret,worker_id" ||
                 !WORKER_ID.test(body.worker_id || "") || !HEX.test(body.webhook_secret || "") ||
-                !validPolicy(body.policy)) fail(400);
+                !validRoutePolicy(body.policy)) fail(400);
+            if (validGenericPolicy(body.policy) && (body.policy.tenant_id !== identity.account ||
+                body.policy.scope !== identity.project || body.policy.route !== identity.automation)) fail(400);
             const desired = initial(identity, principal, body);
             let current = state;
             if (!current) {
@@ -344,30 +360,61 @@ export function createHandler({ store, env, now = Date.now }) {
       if (!state) fail(404);
       const id = state.worker_id;
       if (ingress) {
-        const parsed = githubEvent(request.headers, await readBody(request), state.webhook_secret, time, state.policy);
+        const generic = validGenericPolicy(state.policy);
+        if (route[4] !== (generic ? "webhook" : "github")) fail(404);
+        const raw = await readBody(request);
+        const parsed = generic ? genericEvent(request.headers, raw, state.webhook_secret, time, state.policy, routeKey(identity)) :
+          githubEvent(request.headers, raw, state.webhook_secret, time, state.policy);
         if (parsed.error) fail(parsed.error);
         if (parsed.reply) return reply(parsed.reply);
         return await transaction(identity, (current, stamp) => {
           const existing = current.events.find(event => event.event_id === parsed.event.event_id);
-          if (existing) return { body: { event_id: existing.event_id, status: existing.status, duplicate: true }, changed: false };
+          if (existing) {
+            if (parsed.event.source === "generic" && existing.payload_sha256 !== parsed.event.payload_sha256) fail(409);
+            return { body: { event_id: existing.event_id, status: existing.status, duplicate: true }, changed: false };
+          }
           if (parsed.stale) fail(400);
           // A delivery ID may be retried with identical bytes, never repurposed for other content.
-          if (current.events.some(event => event.delivery_id === parsed.event.delivery_id && event.event_id !== parsed.event.event_id)) fail(409);
+          if (parsed.event.delivery_id && current.events.some(event => event.delivery_id === parsed.event.delivery_id && event.event_id !== parsed.event.event_id)) fail(409);
           if (current.events.length >= 256 || current.events.filter(event => ACTIVE.has(event.status)).length >= 64 || current.rate.length >= 60) fail(429);
           current.events.push({ ...parsed.event, status: "queued", received_at: iso(stamp), attempts: 0 });
           current.rate.push(stamp);
+          // Reserve future leases, handles, duplicate acknowledgement fields and installation metadata.
+          if (Buffer.byteLength(JSON.stringify(current)) + 2048 * current.events.length + 256 > 512 * 1024 + 2048) fail(429);
           return { body: { event_id: parsed.event.event_id, status: "queued" }, status: 202, changed: true };
         });
       }
       if (view) return await transaction(identity, (current, stamp) => ({ body: status(current, id, stamp, url.origin), changed: false }));
       const body = await readJSON(request);
       if (body.worker_id !== id) fail(403);
-      if (poll && (!Number.isSafeInteger(body.issue_number) || body.issue_number < 1 || body.issue_number > 2147483647)) fail(400);
+      const generic = validGenericPolicy(state.policy);
+      if (generic && (!HEX.test(body.local_id || "") ||
+          (state.local_id && state.local_id !== body.local_id))) fail(403);
+      if (heartbeat) {
+        if (!generic || typeof body.online !== "boolean") fail(400);
+        return await transaction(identity, (current, stamp) => {
+          if (current.local_id && current.local_id !== body.local_id) fail(403);
+          current.local_id = body.local_id;
+          current.worker_last_seen_at = iso(stamp);
+          current.worker_offline = !body.online;
+          return { body: { worker: worker(current, id, stamp) }, changed: true };
+        });
+      }
+      if (generic && !state.local_id) fail(409); // Bind the private installation before leasing.
+      if (poll && (generic ? (body.event_id !== undefined && !HEX.test(body.event_id)) :
+          (!Number.isSafeInteger(body.issue_number) || body.issue_number < 1 || body.issue_number > 2147483647))) fail(400);
       if (!poll && (typeof body.lease_id !== "string" || !SAFE_ID.test(body.lease_id) || !["running", "completed", "failed"].includes(body.status))) fail(400);
       return await transaction(identity, (current, stamp) => {
+        if (generic && current.local_id !== body.local_id) fail(403);
+        current.worker_offline = false;
         if (poll) {
-          const matches = current.events.filter(event => event.issue_number === body.issue_number);
+          const matches = current.events.filter(event => generic ?
+            (body.event_id === undefined || event.event_id === body.event_id) : event.issue_number === body.issue_number);
           let event = matches.find(event => event.status === "running") || matches.find(event => event.status === "delivering");
+          if (generic && body.event_id && !event) {
+            const retained = matches.find(event => !ACTIVE.has(event.status));
+            if (retained) return { body: { event: publicEvent(retained), worker: worker(current, id, stamp) }, changed: false };
+          }
           if (!event) {
             event = matches.find(event => event.status === "queued" && (!event.next_attempt_at || stamp >= Date.parse(event.next_attempt_at)));
             if (event) {
