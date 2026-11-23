@@ -126,7 +126,7 @@ impl PluginSession {
     }
     pub(crate) fn bound_target_operations(&mut self) {
         self.cancel = CancellationToken::default();
-        self.timeout = self.timeout.min(Duration::from_millis(250));
+        self.timeout = self.timeout.min(Duration::from_secs(1));
     }
     pub(crate) fn finish(mut self) -> Result<(), FabricError> {
         let ready: Ready = serde_json::from_value(self.call("shutdown", json!({}))?)

@@ -138,6 +138,59 @@ fn target_rejects_acknowledgment_only_and_wrong_grant_without_executing() {
 }
 
 #[test]
+fn target_delayed_inspection_does_not_kill_a_healthy_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::default();
+    let target = PluginHost::default()
+        .target(
+            &manifest(PluginKind::Target, "inspect-delayed", dir.path()),
+            &cancel,
+        )
+        .unwrap();
+    let spec = fabric_runner::CommandSpec {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 0.6; printf completed > result".into()],
+        environment: vec![],
+    };
+    let capture = fabric_runner::capture::Capture::new(
+        tempfile::tempfile().unwrap(),
+        tempfile::tempfile().unwrap(),
+        None,
+        4096,
+    )
+    .unwrap();
+    let execution = target
+        .execute(
+            "test",
+            fabric_runner::ExecutionRequest {
+                spec: &spec,
+                cwd: dir.path(),
+                capture,
+                limits: &fabric_runner::ExecutionLimits {
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+                cancellation: &cancel,
+                owner_lease: None,
+            },
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(execution.status.success());
+    assert!(execution.stop_reason.is_none());
+    assert!(execution.failure.is_none());
+    assert!(!execution.target_failed);
+    assert!(execution.capture.is_ok());
+    assert_eq!(
+        std::fs::read(dir.path().join("result")).unwrap(),
+        b"completed"
+    );
+    drop(target);
+    reaped(dir.path());
+}
+
+#[test]
 fn target_timeout_identifies_rpc_and_exchange_phase_without_host_effects() {
     use fabric_runner::target::Action;
     let dir = tempfile::tempdir().unwrap();

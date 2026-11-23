@@ -22,6 +22,8 @@ for line in sys.stdin:
             or (mode == 'health-hang' and method == 'health')
             or (mode == 'inspect-hang' and method == 'target.inspect')):
         time.sleep(60)
+    if mode == 'inspect-delayed' and method == 'target.inspect':
+        time.sleep(0.35)
     if mode == 'crash':
         sys.exit(7)
     if mode == 'malformed':
@@ -43,7 +45,7 @@ for line in sys.stdin:
         if mode == 'reclaim':
             result.update({'reclaim': True, 'path': '/SECRET_CANARY', 'artifacts_verified': True})
     elif method == 'target.placement':
-        result = {'backend': 'host.local' if mode in ('concrete', 'ack-only', 'wrong-grant', 'inspect-hang') else 'unsupported'}
+        result = {'backend': 'host.local' if mode in ('concrete', 'ack-only', 'wrong-grant', 'inspect-hang', 'inspect-delayed') else 'unsupported'}
     elif method == 'target.completed':
         result = {'received': req['params']['grant']}
     elif method.startswith('target.'):

@@ -51,9 +51,15 @@ Provider-free regression command: `cargo test -p fabric-runner --test plugins` p
 
 Target initialization, health and capability exchanges retain the five-second
 per-request startup bound. After negotiation, lifecycle operations and shutdown
-are limited to 250 ms each so a blocked driver cannot stall Core supervision
-for the startup timeout. Any overrun fails closed; owned processes are stopped
-and reaped, committed host evidence is retained, and no retry or local fallback occurs.
+are limited to one second each (or a smaller configured host timeout). This
+allows a valid response delayed beyond the previous 250 ms budget. Native
+dogfooding hit that deadline without a response; the cause of that actual delay
+is unknown. Supervision waits synchronously: an inspection and its receipt can delay
+the next cancellation/deadline check by up to two seconds, followed by bounded
+termination and shutdown exchanges. This is a responsiveness tradeoff, not an
+independent watchdog or a guarantee against longer scheduling pauses. Any
+overrun fails closed; owned processes are stopped and reaped, committed host
+evidence is retained, and no retry or local fallback occurs.
 
 Each `target.OP` receives `{placement,run_id,grant,actions,context}`. The opaque grant is scoped to that request and the offered actions; context contains bounded nonsecret inputs, not authority. The exact reply is `{grant,action}` selecting one offered action, or `{grant,action:{primitive:"unsupported"}}`. Unknown fields, stale grants, unoffered actions, paths, commands, PIDs and plugin-supplied outcomes fail closed. Core executes the selected primitive against captured validated objects inside this boundary, not after an acknowledgment. A separate target can, for example, select `copy` rather than `clone_or_copy` for preparation without rebuilding Core.
 

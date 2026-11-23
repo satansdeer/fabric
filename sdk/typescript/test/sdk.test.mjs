@@ -285,14 +285,16 @@ function inCheckout(path) {
   for (;;) { if (existsSync(join(path, '.git'))) return true; if (dirname(path) === path) return false; path = dirname(path); }
 }
 const host = process.env.FABRIC_PLUGIN_TEST_HOST;
+// Core bounds each RPC; a whole-command timer can interrupt valid multi-RPC work.
 const hostSkip = !host ? 'Set FABRIC_PLUGIN_TEST_HOST to test actual Core installation' : inCheckout(realpathSync(tmpdir())) ? 'Core registry intentionally forbids checkout-local TMPDIR; external writes not authorized in this worker' : false;
 test('actual Core: scaffold -> conformance -> local package install/check, tamper, upgrade, revoke', { skip: hostSkip }, async t => {
   const root = temporary(t);
   const registry = join(root, 'registry');
   mkdirSync(registry, { mode: 0o700 });
   function fabric(args, expected = 0) {
-    const r = spawnSync(host, ['plugins', '--registry', registry, ...args], { env: environment(root), encoding: 'utf8', timeout: 15_000 });
-    assert.equal(r.status, expected, r.stderr);
+    const r = spawnSync(host, ['plugins', '--registry', registry, ...args], { env: environment(root), encoding: 'utf8' });
+    assert.ifError(r.error);
+    assert.equal(r.status, expected, JSON.stringify({ args, signal: r.signal, stdout: r.stdout, stderr: r.stderr }));
     assert.doesNotMatch(r.stderr + r.stdout, /SECRET_CANARY/);
     return r;
   }
@@ -333,8 +335,16 @@ test('generated third-party target executes a Core host worker, seals verified a
   await conformance(target);
   install(target, { registry, fabric: host, version: '1.0.0', sha256: directory(target).hash, trust: true });
   function invoke(program, args, cwd = root) {
-    const r = spawnSync(program, args, { cwd, env, encoding: 'utf8', timeout: 30_000 });
-    assert.equal(r.status, 0, r.stderr);
+    const r = spawnSync(program, args, { cwd, env, encoding: 'utf8' });
+    if (r.error || r.status !== 0) {
+      t.diagnostic(JSON.stringify({ program, args, error: r.error?.message, status: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr }));
+      if (program === host) {
+        const observed = spawnSync(host, ['--root', join(root, 'storage'), 'runs', 'list', '--json'], { cwd, env, encoding: 'utf8', timeout: 5000 });
+        t.diagnostic(`Provider-free fixture run evidence: ${observed.stdout}${observed.stderr}`);
+      }
+    }
+    assert.ifError(r.error);
+    assert.equal(r.status, 0, JSON.stringify({ program, args, signal: r.signal, stdout: r.stdout, stderr: r.stderr }));
     return r.stdout;
   }
   invoke('/usr/bin/git', ['init', '--quiet'], repo);
@@ -347,7 +357,7 @@ test('generated third-party target executes a Core host worker, seals verified a
   writeFileSync(recipe, "version=1\n[[steps]]\nargv=['/usr/bin/true']\n");
   writeFileSync(prompt, FIXTURE_PROMPT);
   fabric(['project', 'prepare', 'fixture', '--recipe', recipe, '--json']);
-  const report = JSON.parse(fabric(['run', 'fixture', '--harness', 'third-fake', '--placement', 'third-target', '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--json']));
+  const report = JSON.parse(fabric(['run', 'fixture', '--harness', 'third-fake', '--placement', 'third-target', '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--timeout-seconds', '60', '--json']));
   assert.equal(report.state, 'SUCCEEDED');
   assert.equal(report.exit_code, 0);
   assert.equal(report.cleanup.action, 'reclaimed');
@@ -384,7 +394,7 @@ test('pinned OMP and Codex reference packages exercise the complete native contr
       writeFileSync(join(bin, id), '#!/bin/sh\n[ -z "${SECRET_CANARY+x}" ] || exit 17\n[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 18\n' + `printf '%s\\n' '${version}'\n`, { mode: 0o700 });
       const checked = spawnSync(host, ['plugins', '--registry', registry, 'check', id], {
         env: { ...environment(root), PATH: `${bin}:${environment(root).PATH}`, SECRET_CANARY: 'must-not-reach-native-cli' },
-        encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+        encoding: 'utf8', maxBuffer: 1024 * 1024,
       });
       assert.equal(checked.error, undefined);
       assert.equal(checked.status, 0, checked.stderr + checked.stdout);
@@ -404,7 +414,7 @@ test('reference local target package passes lifecycle conformance and installed 
     mkdirSync(registry, { mode: 0o700 });
     install(project, { registry, fabric: host, version: '0.1.0', sha256: directory(project).hash, trust: true });
     const checked = spawnSync(host, ['plugins', '--registry', registry, 'check', 'local'], {
-      env: environment(root), encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+      env: environment(root), encoding: 'utf8', maxBuffer: 1024 * 1024,
     });
     assert.equal(checked.error, undefined);
     assert.equal(checked.status, 0, checked.stderr + checked.stdout);

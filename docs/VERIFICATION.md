@@ -915,3 +915,95 @@ CLI startup, source fork/sync, artifact Git capture/publication or reclaim.
 Runner `timeout_escalates_a_term_ignoring_leader_and_reaps_its_observed_status`
 retains 100 ms execution + 50 ms TERM grace, SIGKILL/null exit, Timeout, <2 s
 and capture success; all end-to-end tree, durable evidence and reclaim checks remain.
+
+### Issue #47 — bounded native-target responsiveness tradeoff
+
+Public v0.1.3 issue #8 attempt `r-1795426708196470000-93848-0`
+failed on `target.inspect`, request 160, response_read, sent 195/195
+bytes and received 0 bytes. The child was reaped with SIGKILL before
+any tool started; captures were untruncated and the workspace remains
+RECOVERY_REQUIRED. Its one-attempt budget is closed. The owned idle
+manager was explicitly stopped and exited 0; no retry or replacement ran.
+The reason the actual target missed its 250 ms deadline is unknown.
+
+The shared post-negotiation target bound is now one second, still capped
+by a smaller configured host timeout. This deliberately trades up to
+two seconds per inspect/receipt pair for tolerating scheduling delays;
+it is not an independent cancellation watchdog or proof of the actual
+delay's cause. Startup bounds, fresh grants, fail-closed errors, receipts,
+capture, workspace retention and owned-process reaping are unchanged.
+
+Manager checks on macOS, after the change:
+
+```sh
+cargo test --locked -p fabric-runner --test plugins target_
+FABRIC_REFERENCE_PLUGIN_BINARY=/absolute/path/to/public-v0.1.3/plugins/omp/plugin \
+  cargo test --locked -p fabric-cli --test run target_failure_after_spawn_preserves_terminal_capture_and_safe_recovery -- --exact --nocapture
+```
+
+The four target tests passed in 2.74 s. The new regression drives a real
+worker through a target that delays valid inspections by 350 ms, then
+verifies successful completion and its actual output file. Hung-target
+diagnostics, refusal of unauthorized effects and plugin reap remain tested.
+The post-spawn failure/recovery test passed in 29.14 s across its existing
+failure cases. Its first invocation failed before execution because the
+SDK executable environment variable was missing; the invocation above
+corrected that setup. Public release and real native follow-on acceptance
+are separate gates, not claimed by these provider-free checks.
+
+Both exact-head CI runs at `f0ff6ccd693410aca0cb3c7ed5478d5b23a9115e`
+failed in the existing generated third-party-target/Core SDK integration:
+Core exited 1, but the assertion printed only empty stderr and omitted its
+JSON stdout. No CI artifacts survived. The assertion now includes stdout
+without weakening its expected success. A local invocation of only that
+case passed in 15.42 s; this does not explain the CI failure or clear the
+merge gate. A new exact-head CI run must provide the missing diagnostic.
+
+At diagnostic head `ce2a64b85ca7f13a46e722eceb542c48f8f922df`, push CI
+45153521177 passed, including that generated-target case. PR CI45153529797
+instead failed the unrelated whole-CLI six-second timing assertion in the
+post-spawn recovery test. That interval includes CLI startup, project
+preparation, target sessions and evidence persistence, not just a bounded
+RPC. The incidental total timer is removed rather than re-pinned.
+The runner's hung-inspect check still requires a failure within three
+seconds with no host effect and verifies target reaping. All CLI assertions
+for both dead parent/descendant, captured streams, NEEDS_ATTENTION, retained
+workspace, sealed recovery artifacts and unchanged terminal evidence stay.
+The updated focused recovery test passed in 31.63 s on macOS with the
+same released SDK executable environment shown above.
+
+At `99c9083177645aabda9fa7d1c8595612304d29b5`, both push CI
+`45156176189` and PR CI `45156187156` passed the Rust checks but failed
+the generated third-party TypeScript target's real `fabric run` command
+with status 1 and empty stdout/stderr. The test now reports subprocess
+errors (including outer-fixture timeouts), the exact command and bounded,
+provider-free durable run evidence before deleting its temporary storage.
+No timer is increased and no failed check is bypassed.
+A checksum-verified official Node 22.23.2 macOS arm64 binary, matching CI's
+Node version, passed the focused generated-target test in 26.84 s locally.
+That pass does not explain or invalidate the two CI failures.
+
+At diagnostic head `53968fbc5c813b36c4aa5a75b6527a5881766d3c`, PR CI
+`45158840103` passed all acceptance steps. Push CI `45158827281` passed
+the generated-target test but failed the preceding actual-Core SDK
+install/check fixture with status 1 and empty stderr. That helper now also
+asserts subprocess errors and reports command/stdout/stderr instead of
+discarding evidence. Its focused test passed locally on the same verified
+Node 22.23.2 runtime in 20.29 s. Neither outer fixture timeout is changed.
+One green workflow does not override its failed exact-head partner.
+
+At diagnostic head `dbbe48e6a33a4c21dc91f59ffae5ba4369715de7`, push CI
+`45161150206` exposed `spawnSync ... ETIMEDOUT` in both Core fixtures.
+The generated-target fixture's read-only run evidence recorded `SUCCEEDED`,
+exit 0, no error, and an artifact manifest before the outer 30 s timer
+interrupted the CLI without its JSON result. These failures were fixture
+timeouts, not evidence of a hung worker or a target-RPC deadline failure.
+Core fixture commands no longer have these incidental whole-command timers,
+including the reference-package checks using the same path. Core still
+bounds each RPC; the generated fake worker now explicitly has a 60 s worker
+budget, and the macOS CI job retains its 30 minute ceiling. SDK conformance
+timeout rejection and the real hung-target/cancellation/recovery assertions
+remain unchanged. Neither a passing local check nor a previous green workflow
+replaces exact-head CI.
+The four affected actual-Core SDK fixtures passed locally on the verified
+Node 22.23.2 runtime in 41.00 s, including artifact retrieval and reclaim.
