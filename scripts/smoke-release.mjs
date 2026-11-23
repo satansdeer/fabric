@@ -85,7 +85,8 @@ try {
   }
   const { directory } = await import(pathToFileURL(join(installed, 'sdk/package.mjs')));
   assert.deepEqual(manifest.plugins.map(p => p.id), ['omp', 'codex']);
-  for (const plugin of manifest.plugins) {
+  assert.deepEqual(manifest.target_plugins.map(p => p.id), ['local']);
+  for (const plugin of [...manifest.plugins, ...manifest.target_plugins]) {
     const pkg = directory(join(installed, 'plugins', plugin.id));
     assert.equal(pkg.hash, plugin.sha256);
     assert.equal(pkg.info.version, plugin.version);
@@ -103,7 +104,8 @@ try {
   assert.equal(hash(readFileSync(omp)), manifest.omp.sha256);
   chmodSync(omp, 0o700);
   assert.equal(run(omp, ['--version']), manifest.omp.version);
-  for (const plugin of manifest.plugins) run(process.execPath, [join(installed, 'sdk/cli.mjs'), 'install', join(installed, 'plugins', plugin.id), '--registry', env.FABRIC_PLUGIN_REGISTRY, '--fabric', binary, '--version', plugin.version, '--sha256', plugin.sha256, '--trust']);
+  for (const plugin of [...manifest.plugins, ...manifest.target_plugins]) run(process.execPath, [join(installed, 'sdk/cli.mjs'), 'install', join(installed, 'plugins', plugin.id), '--registry', env.FABRIC_PLUGIN_REGISTRY, '--fabric', binary, '--version', plugin.version, '--sha256', plugin.sha256, '--trust']);
+  assert.deepEqual(JSON.parse(run(binary, ['plugins', '--registry', env.FABRIC_PLUGIN_REGISTRY, 'check', 'local'])), { compatible: true, healthy: true });
   assert.deepEqual(JSON.parse(run(binary, ['plugins', '--registry', env.FABRIC_PLUGIN_REGISTRY, 'check', 'omp'])), { compatible: true, healthy: true });
   const native = JSON.parse(run(binary, ['harnesses', '--json', 'doctor', 'omp']));
   assert.equal(native.harness_id, 'omp');
@@ -122,7 +124,12 @@ try {
   writeFileSync(recipe, "version=1\n[[steps]]\nargv=['/usr/bin/true']\n");
   const prepared = cli(['prepare', 'release-smoke', '--recipe', recipe]);
   assert.ok(prepared.state_id, 'preparation must produce an immutable ready state');
-  console.log(JSON.stringify({ proof: fromArchive ? (local ? 'LOCAL_PACKAGE_ONLY' : 'RELEASE_CANDIDATE_LOCAL_PACKAGE') : 'DOWNLOADED_RELEASE', source_sha: source, archive: manifest.archive, sha256: expectedHash, installed, cli_version: manifest.cli_version, executable_sha256: manifest.files['bin/fabric'], plugins: manifest.plugins, omp_extension: manifest.omp_extension, fixture: manifest.fixture, native_discovery: native, project_source_sha: projectSource, prepared_state: prepared.state_id, runtime_path: env.PATH, cargo: 'absent', rustc: 'absent', providers: 'not invoked', manager: 'not started', codex_discovery: 'not tested', host_swarm: 'not tested' }, null, 2));
+  const prompt = join(fixture, 'prompt.json');
+  writeFileSync(prompt, JSON.stringify({ writes: [{ path: 'target-proof', content: 'installed local target\\n' }] }));
+  const worker = JSON.parse(run(binary, ['--root', join(fixture, 'fabric'), 'run', 'release-smoke', '--harness', 'fake', '--fake-binary', join(installed, manifest.fixture.path), '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--json'], repo));
+  assert.equal(worker.state, 'SUCCEEDED');
+  assert.equal(worker.cleanup.action, 'reclaimed');
+  console.log(JSON.stringify({ proof: fromArchive ? (local ? 'LOCAL_PACKAGE_ONLY' : 'RELEASE_CANDIDATE_LOCAL_PACKAGE') : 'DOWNLOADED_RELEASE', source_sha: source, archive: manifest.archive, sha256: expectedHash, installed, cli_version: manifest.cli_version, executable_sha256: manifest.files['bin/fabric'], plugins: manifest.plugins, target_plugins: manifest.target_plugins, local_target_worker: { run_id: worker.run_id, state: worker.state, cleanup: worker.cleanup.action }, omp_extension: manifest.omp_extension, fixture: manifest.fixture, native_discovery: native, project_source_sha: projectSource, prepared_state: prepared.state_id, runtime_path: env.PATH, cargo: 'absent', rustc: 'absent', providers: 'not invoked', manager: 'not started', codex_discovery: 'not tested', host_swarm: 'not tested' }, null, 2));
 } finally {
   removePrivate(fixture);
   rmSync(fixture, { recursive: true, force: true });

@@ -2,7 +2,7 @@
 
 Node **22.18+** (or 24+) runs erasable TypeScript directly. No Rust toolchain, transpilation, runtime dependencies, provider accounts, or npm install are needed for generated projects. Use standard erasable types, not enums, namespaces, parameter properties, or tsconfig path aliases. The SDK itself ships JavaScript and `.d.mts` contracts, so importing it from `node_modules` does not rely on Node stripping dependency TypeScript.
 
-This is a protocol v1 adapter and provider-free development kit, not a worker runtime. [Core's plugin protocol](../../docs/PLUGIN_PROTOCOL.md) remains authoritative. Targets only propose local placement; connectors only report evidence availability. Core owns worker admission, workspace ownership, budgets, capture, artifacts, cancellation and reclamation.
+This is a protocol v1 adapter and provider-free development kit, not a worker runtime. [Core's plugin protocol](../../docs/PLUGIN_PROTOCOL.md) remains authoritative. Target drivers negotiate placement and issue restricted lifecycle instructions; connectors only report evidence availability. Core owns worker admission, source/target pins, workspace ownership, budgets, process evidence, capture, artifacts, cancellation and reclamation. The current instruction set supports trusted-local execution, not an actual remote backend.
 
 ## Scaffold, test, develop
 
@@ -26,7 +26,7 @@ The runnable templates in `samples/{harness,target,connector}.ts` also accept th
 ## Typed adapters
 
 ```ts
-import { defineHarness, defineTarget, defineConnector, serve } from './sdk/index.mjs';
+import { defineHarness, defineTarget, defineConnector, serve, TARGET_OPERATIONS } from './sdk/index.mjs';
 
 const harness = defineHarness({
   id: 'my-harness', version: '1.0.0',
@@ -38,7 +38,15 @@ const harness = defineHarness({
 });
 const target = defineTarget({
   id: 'my-target', version: '1.0.0',
-  plan: job => ({ placement: job.placement }),
+  capabilities: () => ({ placements: ['my-target'], operations: [...TARGET_OPERATIONS], optional: [] }),
+  placement: () => ({ backend: 'host.local' }),
+  completed: ({ grant }) => ({ received: grant }),
+  prepare: ({ grant }) => ({ grant, action: { primitive: 'workspace.fork', strategy: 'copy' } }),
+  start: ({ grant }) => ({ grant, action: { primitive: 'process.spawn' } }),
+  inspect: ({ grant }) => ({ grant, action: { primitive: 'process.inspect' } }),
+  cancel: ({ grant }) => ({ grant, action: { primitive: 'process.terminate' } }),
+  collect: ({ grant, actions }) => ({ grant, action: actions[0] }),
+  reclaim: ({ grant }) => ({ grant, action: { primitive: 'workspace.reclaim' } }),
 });
 const connector = defineConnector({
   id: 'my-connector', version: '1.0.0',
@@ -59,7 +67,7 @@ For a conventional npm dependency, import from `@fabric/plugin-sdk`. Do not run 
 | Kind | Mocked request/payload | Expected response |
 | --- | --- | --- |
 | harness | `harness.plan {}` | `{ "ready": true }` |
-| target | `target.plan { "placement": "local" }` | `{ "placement": "local" }` |
+| target | Capabilities, placement, then six `target.OP {placement,run_id,grant,actions,context}` exchanges and concrete-plan completion receipts | Exact capabilities, offered backend/action and matching grant; fake remote refuses explicitly. Completion evidence here is fixture data, not execution proof. |
 | connector | `connector.evidence {}` | `{ "available": false }` for the sample; either boolean conforms |
 | harness run | `--fabric-plugin-run PROMPT_FILE`, fixed fixture prompt | sample text event containing the prompt, then `done` |
 
@@ -116,6 +124,23 @@ This is **not a sandbox or code-signing system**. The Node binary and system imp
 ## Maintainer checks
 
 `npm ci --ignore-scripts && npm test` checks typed contracts, compiles generated projects, runs all three real stdio kinds, malformed/version/pin/archive boundaries, npm-packaged scaffolding and macOS watch mode without providers. `FABRIC_PLUGIN_TEST_HOST=/absolute/fabric npm test` additionally exercises actual Core registry installation, check, tamper rejection, upgrade and revoke for all kinds. That test explicitly skips when no host is supplied or TMPDIR is inside a Git checkout; CI supplies a built host and an external temporary directory. In restricted workers, `FABRIC_PLUGIN_TEST_NODE=/absolute/node cargo test -p fabric-runner --test plugins typescript_scaffolds_use_existing_native_host` proves generated SDK processes through the actual host/admission boundary without writing an on-disk registry inside the checkout.
+
+## Reference local target
+
+`cargo build --locked -p fabric-cli --bins` builds `fabric-local-target` beside `fabric`. Downloaded releases include both siblings and the installable local reference package; no source build is required by an operator. Without a registry override, the sibling is the reference driver. Explicit installation/upgrade/revocation uses the same registry as other plugins:
+
+```sh
+node sdk/typescript/cli.mjs reference local /absolute/new/local-package \
+  --binary /absolute/path/to/fabric-local-target
+node sdk/typescript/cli.mjs test /absolute/new/local-package
+node sdk/typescript/cli.mjs hash /absolute/new/local-package
+node sdk/typescript/cli.mjs install /absolute/new/local-package \
+  --registry /canonical/owner/private/fabric-plugins --fabric /absolute/path/to/fabric \
+  --version 0.1.0 --sha256 REVIEWED_CONTENT_SHA256 --trust
+```
+
+Targets select concrete operation-keyed host primitives, never supply success, paths, commands or deletion authority. Core executes the selection against validated objects and sends independently observed `target.completed` evidence; the target returns `{received:grant}`. See [the full operation contract](../../docs/PLUGIN_PROTOCOL.md#installed-execution-targets). Generated and sample targets offer usable `host.local` plans under any installed ID; fake-remote refusal is a separate negative fixture. Conformance requires concrete offered plans and receipts for all six operations, but transport conformance alone is not execution proof. The generated-target Core integration executes a worker, verifies artifact hashes and reclaims. Session-lifetime grants cannot replay completed or unsupported callbacks. Set `FABRIC_LOCAL_TARGET_BINARY=/absolute/path/to/fabric-local-target` for reference-package checks. No cloud claim, fallback or legacy acknowledgment shim.
+
 
 ## Native reference harness plugins
 

@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "fabric-fake-harness"
 path = "src/fake.rs"
 
+[[bin]]
+name = "fabric-local-target"
+path = "src/local_target.rs"
+
 [dependencies]
 clap.workspace = true
 serde.workspace = true

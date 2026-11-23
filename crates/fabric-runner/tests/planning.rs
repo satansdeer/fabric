@@ -110,9 +110,10 @@ fn fake_rejects_unavailable_requests_before_command_construction() {
             placement: placement.into(),
             ..HarnessRequest::default()
         };
+        // Harness choice is independent of target placement. Core admission selects the target.
         assert_eq!(
-            fake().plan(&request, &info()).unwrap_err().kind,
-            ErrorKind::UnsupportedPlacement
+            fake().plan(&request, &info()).unwrap().request.placement,
+            placement
         );
     }
     assert_eq!(

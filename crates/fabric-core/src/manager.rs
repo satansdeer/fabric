@@ -391,6 +391,7 @@ impl Manager {
                 plan_json: serde_json::to_string(&AcceptedPlan {
                     plan,
                     limits: Some(Options::from_run(&input.options)),
+                    target: input.options.target_pin.clone(),
                 })
                 .map_err(error)?,
                 consent_stamp: stamp,
@@ -518,10 +519,11 @@ impl Manager {
                         "Accepted harness version changed; task was not launched.",
                     ));
                 }
-                let options = crate::api::run_options(
+                let mut options = crate::api::run_options(
                     accepted.limits.as_ref().unwrap_or(&options),
                     token.clone(),
                 )?;
+                options.target_pin = accepted.target;
                 crate::run::execute_prepared(
                     &self.root,
                     &state,
@@ -975,6 +977,8 @@ fn accepted(store: &Store, id: &BatchId, generic: bool) -> Result<Value, FabricE
 struct AcceptedPlan {
     #[serde(flatten)]
     plan: HarnessPlan,
+    #[serde(default)]
+    target: Option<fabric_runner::target::TargetPin>,
     #[serde(default)]
     limits: Option<Options>,
 }

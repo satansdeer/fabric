@@ -14,11 +14,10 @@ use fabric_domain::{
 };
 use fabric_runner::{AgentSpec, HarnessAdapter, HarnessRegistry, RegistryOptions};
 use fabric_store::{BatchTask, PreparedState, WorkerAttempt};
-use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::workspace::{WorkspaceRequest, create_workspace, open_store, runner_workspace};
+use crate::workspace::{WorkspaceRequest, create_workspace_bound, open_store, runner_workspace};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -68,6 +67,7 @@ pub struct RunOptions {
     /// Adapter-specific best-effort request admission, not an exact spending cap.
     pub max_cost_usd: Option<f64>,
     pub harness_request: HarnessRequest,
+    pub target_pin: Option<fabric_runner::target::TargetPin>,
 }
 
 impl Default for RunOptions {
@@ -81,6 +81,7 @@ impl Default for RunOptions {
             storage: crate::workspace::storage::StorageOptions::default(),
             max_cost_usd: None,
             harness_request: HarnessRequest::default(),
+            target_pin: None,
         }
     }
 }
@@ -118,6 +119,17 @@ impl RunOptions {
         request.validate()?;
         Ok(request)
     }
+
+    fn select_target(&mut self, placement: &str) -> Result<(), FabricError> {
+        let pin = match self.target_pin.take() {
+            Some(pin) if pin.placement == placement => pin,
+            Some(_) => return Err(error("Accepted target placement changed.")),
+            None => fabric_runner::target::TargetPin::select(placement)?,
+        };
+        pin.preflight(&self.cancellation)?;
+        self.target_pin = Some(pin);
+        Ok(())
+    }
 }
 
 pub fn foreground(
@@ -129,14 +141,16 @@ pub fn foreground(
 ) -> Result<RunReport, FabricError> {
     options.validate()?;
     let request = options.request()?;
+    let mut options = options.clone();
     let plan = crate::onboarding::plan(root, harness, request, &harness.probe()?)?;
+    options.select_target(&plan.0.request.placement)?;
     let (root, state, source) = select_prepared(root, project_name, &SourceRef::CurrentHead {})?;
     let mut report = foreground_prepared(
         &root,
         &state,
         prompt_file,
         harness,
-        options,
+        &options,
         &plan,
         new_run_id()?,
     )?;
@@ -245,6 +259,12 @@ pub(crate) fn execute_prepared(
     if options.cancellation.is_cancelled() {
         return Err(error("Cancelled before launch; task was not started."));
     }
+    let pin = match &options.target_pin {
+        Some(pin) if pin.placement == plan.request.placement => pin.clone(),
+        Some(_) => return Err(error("Accepted target placement changed.")),
+        None => fabric_runner::target::TargetPin::select(&plan.request.placement)?,
+    };
+    let target = pin.open(&options.cancellation)?;
     let mut storage = options.storage.clone();
     storage.policy.max_log_bytes_per_run = options.max_log_bytes;
     storage.policy.max_artifact_bytes_per_run = options.max_artifact_bytes;
@@ -265,8 +285,17 @@ pub(crate) fn execute_prepared(
             .checked_add(3600)
             .ok_or_else(|| error("Timestamp overflow"))?,
     };
-    let backend = LocalWorkspaceBackend::new(&root, ForkStrategy::CloneOrCopy)?;
-    let workspace = create_workspace(&root, &backend, &request, options.copy_limit_bytes)?;
+    let backend = fabric_workspace::LocalWorkspaceBackend::new(
+        &root,
+        fabric_workspace::ForkStrategy::CloneOrCopy,
+    )?;
+    let workspace = create_workspace_bound(
+        &root,
+        &backend,
+        &request,
+        options.copy_limit_bytes,
+        Some((&pin, &target)),
+    )?;
     let harness_id = harness.id();
     let mut attempt = WorkerAttempt {
         attempt_id: format!("a-{run_id}"),
@@ -338,20 +367,31 @@ pub(crate) fn execute_prepared(
         let done = std::sync::atomic::AtomicBool::new(false);
         crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
         let observation_store = open_store(&root)?.1;
-        let (mut result, meter_failure) = std::thread::scope(|scope| {
+        let (mut result, meter_failure, monitor_failure) = std::thread::scope(|scope| {
             let monitor = scope.spawn(|| {
                 crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done)
             });
             let observations = scope.spawn(|| {
                 crate::logs::monitor(observation_store, &run_id, &progress, &activity, &done)
             });
-            let result = fabric_runner::execute(
-                &command,
-                fresh.path(),
-                capture,
-                &options.limits,
-                &token,
-                Some(reservation.file()),
+            let result = target.execute(
+                run_id.as_str(),
+                fabric_runner::ExecutionRequest {
+                    spec: &command,
+                    cwd: fresh.path(),
+                    capture,
+                    limits: &options.limits,
+                    cancellation: &token,
+                    owner_lease: Some(reservation.file()),
+                },
+                || {
+                    let validated = runner_workspace(&root, &run_id)?;
+                    if validated.path() != fresh.path() {
+                        return Err(error("Workspace changed before launch."));
+                    }
+                    crate::workspace::storage::check_launch(&root, &storage)?;
+                    crate::onboarding::revalidate(&root, plan, consent.as_deref())
+                },
                 |pid| {
                     let started_at = now()?;
                     attempt.started_at = Some(started_at);
@@ -366,14 +406,17 @@ pub(crate) fn execute_prepared(
             done.store(true, std::sync::atomic::Ordering::Release);
             monitor.thread().unpark();
             observations.thread().unpark();
-            let meter_failure = monitor
+            let (meter_failure, meter_error) = match monitor.join() {
+                Ok(failure) => (failure, None),
+                Err(_) => (None, Some(error("Storage monitor panicked"))),
+            };
+            let observation_error = observations
                 .join()
-                .map_err(|_| error("Storage monitor panicked"))?;
-            observations
-                .join()
-                .map_err(|_| error("Activity monitor panicked"))??;
-            Ok::<_, FabricError>((result, meter_failure))
-        })?;
+                .map_err(|_| error("Activity monitor panicked"))
+                .and_then(|result| result)
+                .err();
+            (result, meter_failure, meter_error.or(observation_error))
+        });
         progress.storage_meter_failure = meter_failure;
         // A fast zero-exit worker must not hide an oversized or unmeasurable workspace.
         if let Ok(result) = &mut result {
@@ -389,9 +432,9 @@ pub(crate) fn execute_prepared(
                 });
             }
         }
-        // Save before exit/capture: finalization failure must not erase meter evidence.
-        if progress.storage_meter_failure.is_some() {
-            progress.save(&store, &run_id, &activity)?;
+        // Persist protocol failure before fallible exit/capture accounting.
+        if result.as_ref().is_ok_and(|result| result.target_failed) {
+            store.record_target_failure(&run_id).map_err(error)?;
         }
         let result = result?;
         let finished_at = now()?;
@@ -425,22 +468,43 @@ pub(crate) fn execute_prepared(
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
         store.record_capture(&run_id, &capture).map_err(error)?;
+        // Monitoring errors must not discard reaped status or finalized capture.
+        if progress.storage_meter_failure.is_some() {
+            progress.save(&store, &run_id, &activity)?;
+        }
+        if let Some(failure) = result.failure.or(monitor_failure) {
+            return Err(failure);
+        }
         progress.artifact_capture_started_at_ms = Some(fabric_runner::activity::timestamp_ms());
         progress.save(&store, &run_id, &activity)?;
-        let (manifest, artifacts) = crate::artifacts::capture(
-            &root,
-            &store,
-            &run_id,
-            state,
-            &capture,
-            &plan.profile,
-            options.max_artifact_bytes,
+        let committed = target.drive(
+            "collect",
+            run_id.as_str(),
+            &[fabric_runner::target::Action::Capture],
+            serde_json::json!({"max_bytes":options.max_artifact_bytes}),
+            |_| {
+                let captured = crate::artifacts::capture(
+                    &root,
+                    &store,
+                    &run_id,
+                    state,
+                    &capture,
+                    &plan.profile,
+                    options.max_artifact_bytes,
+                )?;
+                store
+                    .finish_run(&run_id, &capture, &captured.0, &captured.1, now()?)
+                    .map_err(error)?;
+                let evidence = serde_json::json!({"artifact_count":captured.1.len()});
+                Ok((captured, evidence))
+            },
         )?;
+        if let Some(failure) = committed.failure.or_else(|| target.finish().err()) {
+            store.record_target_failure(&run_id).map_err(error)?;
+            return Err(failure);
+        }
         progress.artifacts_captured_at_ms = Some(fabric_runner::activity::timestamp_ms());
         progress.save(&store, &run_id, &activity)?;
-        store
-            .finish_run(&run_id, &capture, &manifest, &artifacts, now()?)
-            .map_err(error)?;
         Ok::<_, FabricError>(capture)
     })();
     let capture = match execution {
@@ -453,20 +517,26 @@ pub(crate) fn execute_prepared(
             } else {
                 None
             };
-            store
-                .fail_run_execution(
-                    &run_id,
-                    &plan.manifest.exact_version,
-                    &failure.message,
-                    now()?,
-                    options.cancellation.is_cancelled(),
-                )
-                .map_err(|persist| {
-                    error(format!(
-                        "{}; could not persist run failure: {persist}",
-                        failure.message
-                    ))
-                })?;
+            if store
+                .run(&run_id)
+                .map_err(error)?
+                .is_some_and(|run| run.artifact_manifest_id.is_none())
+            {
+                store
+                    .fail_run_execution(
+                        &run_id,
+                        &plan.manifest.exact_version,
+                        &failure.message,
+                        now()?,
+                        options.cancellation.is_cancelled(),
+                    )
+                    .map_err(|persist| {
+                        error(format!(
+                            "{}; could not persist run failure: {persist}",
+                            failure.message
+                        ))
+                    })?;
+            }
             if let Some(persist) = attempt_failure {
                 return Err(error(format!(
                     "Run {run_id}: {}; could not persist worker attempt failure: {persist} (workspace retained)",
@@ -491,6 +561,12 @@ pub(crate) fn execute_prepared(
     });
     progress.cleanup_observed_at_ms = Some(fabric_runner::activity::timestamp_ms());
     progress.save(&store, &run_id, &activity)?;
+    if cleanup.reason == "target_protocol_failed" {
+        return Err(error(format!(
+            "Run {run_id}: target communication failed (cleanup: {})",
+            cleanup.action
+        )));
+    }
     let run = store
         .run(&run_id)
         .map_err(error)?
@@ -793,7 +869,7 @@ pub(crate) type PlannedAdapters =
 pub(crate) fn plan_task(
     root: &Path,
     id: &HarnessId,
-    options: &RunOptions,
+    options: &mut RunOptions,
     harnesses: &BatchHarnesses<'_>,
     adapters: &mut PlannedAdapters,
 ) -> Result<(HarnessPlan, Option<String>), FabricError> {
@@ -807,7 +883,9 @@ pub(crate) fn plan_task(
             entry.insert((adapter, probe))
         }
     };
-    crate::onboarding::plan(root, adapter.as_ref(), request, probe)
+    let plan = crate::onboarding::plan(root, adapter.as_ref(), request, probe)?;
+    options.select_target(&plan.0.request.placement)?;
+    Ok(plan)
 }
 
 pub(crate) fn validate_durable_plan(plan: &HarnessPlan) -> Result<(), FabricError> {
@@ -833,7 +911,7 @@ pub(crate) fn prepare_batch(
     if batch.concurrency == 0 {
         return Err(error("Concurrency must be positive."));
     }
-    let inputs = batch.tasks;
+    let mut inputs = batch.tasks;
     let mut ids = HashSet::with_capacity(inputs.len());
     if inputs.is_empty()
         || inputs
@@ -844,13 +922,14 @@ pub(crate) fn prepare_batch(
             "Task manifest requires nonempty unique IDs and at least one task.",
         ));
     }
+    drop(ids);
     let mut adapters = HashMap::new();
     let mut tasks = Vec::with_capacity(inputs.len());
     let mut plans = Vec::with_capacity(inputs.len());
     // Entire batch admission is read-only until every adapter/request has a plan.
-    for task in &inputs {
+    for task in &mut inputs {
         let id = task.harness.clone();
-        let plan = plan_task(root, &id, &task.options, harnesses, &mut adapters)?;
+        let plan = plan_task(root, &id, &mut task.options, harnesses, &mut adapters)?;
         tasks.push(BatchTask {
             task_id: task.id.clone(),
             run_id: new_run_id()?,

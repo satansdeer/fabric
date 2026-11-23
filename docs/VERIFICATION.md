@@ -4,13 +4,130 @@
 
 `IMPLEMENTED` means code exists; `TESTED_WITH_FAKE` means deterministic provider-free lifecycle proof; `LIVE_VERIFIED` means an actual provider-backed harness run with recorded evidence; `NOT_VERIFIED` and `BLOCKED` are not passes.
 
-| Gate | Current status | Evidence |
+| Gate | Status | Evidence |
 |---|---|---|
-| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Final local fmt/strict lint/build and all 224 workspace tests pass. Async/generic API, immutable sources and C06 recovery/storage include twenty real fake-worker processes, three capture cutpoints and schema-12 guards. Both OMP protocols and actual native control-plane checks pass without provider calls. |
-| PSTACK_LOCAL_SWARM_READY | TESTED_WITH_FAKE | Pstack `437dd8e`: explicit local-route generator/fail-closed drift tests pass; installed OMP 19.1.0 discovers `/skill:swarm`; native typed tools drive four fake workers, progress/reconnect, independent failure/artifacts/reclaim and cancel. Model-selected routing remains NOT_VERIFIED. |
-| LIVE_HARNESS_VERIFIED | BLOCKED | No authorization for provider spending; no live worker calls made. |
+| LOCAL_WORKER_API_READY | TESTED_WITH_FAKE | Deterministic lifecycle and recovery checks; current issue-5 candidate proof below. |
+| LIVE_HARNESS_VERIFIED | LIVE_VERIFIED, scoped | Published v0.1.1 ran the native OMP issue-5 correction worker to SUCCEEDED with sealed artifacts and independently verified reclamation. This does not prove full skill parity. |
+| PSTACK_LOCAL_SWARM_READY | TESTED_WITH_FAKE, scoped | [Accepted consumer overlap evidence](https://github.com/satansdeer/om-pstack/issues/2#issuecomment-7090364128): native controller plus four deterministic fake workers, overlapping RUNNING intervals and cancellation. Not four reasoning workers or full swarm parity. |
 
-No cloud readiness claim is made. Native installed-host loading and fake workers do not establish authentication/model access or model-driven skill routing.
+No cloud readiness or full model-driven skill-routing claim is made. Later sections preserve historical verification records; their counts and blockers are not current release gates.
+
+## Issue 5: committed effects and usable target contracts
+
+Source baseline: `289c26ab163f3d3fe8040ddfe4013e16c51d7fea`, a private,
+unaccepted checkpoint, not merged/released. Executing runtime remains the
+manager-independently verified public Fabric v0.1.1. Earlier source/acceptance
+descriptions are superseded by this correction brief. Rust package versions remain 0.1.2.
+
+Installed targets choose concrete offered host primitives for all six operations
+under Core-issued grants; any admitted ID can negotiate `host.local`. Core retains
+ownership, pins, admission, launch checks, leases, seals and descriptor-anchored
+reclaim. No target receipt supplies process status or cleanup proof.
+
+Before-action rejection executes nothing. After-action receipt failure retains
+the committed result and records `target_protocol`, never success. Preparation
+commits ownership/usage before its receipt; collection commits artifact references;
+reclaim commits actual deletion. Post-spawn protocol failure still stops/reaps the
+owned tree, drains capture and records actual terminal status/capture. Recovery
+can reclaim independently verified evidence; unknown evidence still refuses.
+Schema 15 permits only failure annotation after cleanup intent, leaving process,
+capture, ownership, artifact and timestamp evidence immutable.
+
+Generated/sample SDK targets now offer concrete `host.local` behavior. Conformance
+requires offered plans and matching receipts for every operation; fake-remote
+refusal is a separate negative fixture. Public TypeScript requests/proposals are
+operation-keyed. Rust and SDK drivers reject malformed and session-replayed grants
+before action selection/callbacks, including unsupported/completed operations.
+
+Manager previously observed six focused Rust regressions and all 17 SDK tests
+passing on the checkpoint. Those observations were not rerun for confirmation.
+The rejected null-capture target-crash contract has been replaced, not accepted.
+
+Current worker verification (macOS arm64, Rust 1.91.0, deterministic providers):
+
+```sh
+export PATH=/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:/bin
+export RUSTUP_TOOLCHAIN=1.91.0
+export CARGO_HOME=/Users/maksimivanov/.cargo
+export CARGO_TARGET_DIR=/Users/maksimivanov/.local/share/fabric/reviews/issue-38-source/target
+cargo build --locked -p fabric-cli -p fabric-reference-harnesses --bins
+export FABRIC_REFERENCE_PLUGIN_BINARY="$CARGO_TARGET_DIR/debug/fabric-reference-harnesses"
+export FABRIC_LOCAL_TARGET_BINARY="$CARGO_TARGET_DIR/debug/fabric-local-target"
+export FABRIC_PLUGIN_TEST_HOST="$CARGO_TARGET_DIR/debug/fabric"
+export FABRIC_PLUGIN_TEST_NODE=/opt/homebrew/bin/node RUST_TEST_THREADS=4
+cargo test --locked -p fabric-cli --test run target_failure_ -- --nocapture
+cargo test --locked -p fabric-cli --test run \
+  local_target_rejects_invalid_and_replayed_grants_before_a_second_plan -- --exact
+cargo test --locked -p fabric-runner --test plugins \
+  typescript_scaffolds_use_existing_native_host -- --exact
+cargo fmt --all --check
+cargo clippy --locked -p fabric-runner -p fabric-core -p fabric-store -p fabric-cli \
+  --all-targets -- -D warnings
+cd sdk/typescript
+npm ci --ignore-scripts
+./node_modules/.bin/tsc --project test/tsconfig.json
+/opt/homebrew/bin/node --test \
+  --test-name-pattern='target conformance requires|target grants are' test/sdk.test.mjs
+node --test --test-name-pattern='actual Core:|generated third-party target executes' \
+  test/sdk.test.mjs
+node --test --test-name-pattern='generated third-party target executes' test/sdk.test.mjs
+```
+
+Build, formatting, strict Clippy and TypeScript contracts passed. Five selected
+Rust regressions passed: post-effect failures across all six operations; spawned
+worker inspect/cancel failure with actual exit/capture and verified recovery;
+recovery-receipt failure retaining committed artifacts; local grant replay; and
+generated SDK target negotiation through the Rust host.
+
+Four selected SDK tests passed: all-six concrete plan/receipt requirements with
+separate remote refusal; effect-counted replay rejection; actual Core registry
+install/check/tamper/revoke; and generated third-party worker execution with
+verified artifact hashes and actual reclaim. Public declaration checks include
+positive consumers and `@ts-expect-error` start/fork and start/reclaim pairings.
+
+The initial focused run exposed a missed read-only schema bound after migration
+15; corrected, then only failed checks and checks not yet reached were run.
+No timeout, ownership or cleanup assertion was weakened. LSP references were
+attempted but unavailable (Rust analyzer missing; no `.mts` server); source callers
+were traced directly and final compiler/type checks passed.
+
+Scope limits: no live provider/model calls, cloud, PTY, persistent environment,
+remote isolation or security claims. No broad workspace suite, CI, release archive
+or downloaded-install proof in this pass. Manager owns review, CI, PR, merge and
+release; this checkpoint and worker execution are not acceptance or release approval.
+
+Manager verification of the sealed third correction: all 14 registered artifact
+payload lengths and SHA256 hashes matched; the owned workspace was absent.
+Ten focused Rust tests initially passed: three committed-effect/recovery failures, local
+grant replay, two installed-target lifecycle/refusal checks, two target authority
+checks, generated SDK/native-host negotiation, and dry-run/owner-mismatch reclaim.
+`npm test` passed all 19 SDK tests and TypeScript contracts, including actual Core
+execution, sealed artifact hashes and reclamation.
+
+The first generated-host invocation inherited the manager's live
+`FABRIC_PLUGIN_REGISTRY` and correctly rejected an uninstalled content-pinned
+scaffold. Only that failed check and checks not yet reached were run in an
+isolated environment with the registry unset; registry enforcement was unchanged.
+
+Independent review found a combined-failure gap: fallible capture persistence
+could erase target-protocol evidence. The manager correction records that
+evidence before exit/capture accounting and preserves it through exit recording.
+`Execution.target_failed` is independent of the primary host error, including
+simultaneous start-accounting and start-receipt failures. A PREPARING run can
+record its observed exit only with matching finished worker-attempt evidence.
+
+The five `target_failure_` CLI tests passed after correction (12 distinct focused
+Rust tests across the iteration). Two new regressions inject actual SQLite
+capture/start-accounting failures. The accounting test additionally passed with
+activity-observation failures, both with a healthy target and a simultaneous
+bad start receipt. Monitor errors propagate only after actual reaped status and
+capture are persisted. Healthy-target timeout classification remains unchanged.
+The checks require safe retention without invented artifacts when capture
+metadata was never persisted. Initial manager test assumptions about reclaim
+without metadata, the `runs show` envelope and timeout classification were
+corrected; production recovery was not weakened. Formatting passed. Independent
+reviews found no remaining blocking defect in the reviewed paths. Exact-head CI,
+merge and release remain separate gates.
 
 ## Issue 42: native capture drain accounting
 
@@ -508,3 +625,161 @@ No live OMP/Codex model-provider turn, service connection, credential change, de
 The combined full-workspace and SDK command completed in 392.52 seconds. The SDK run exercised both installed native reference executables through real Core `plugins check` and executed a third-party fake harness through Core without vendor registration changes. These provider-free results satisfy the issue's local fixture gates, not live model-provider or remote-target acceptance.
 
 Controller: macOS arm64, Node 22.23.2, `RUST_TEST_THREADS=4`, explicit release reference executable and actual debug Core host. No separate live-provider smoke, credential change, service deployment or npm publication.
+
+## Issue #5 — exact-head CI correction
+
+PR #44 exact-head CI at `c502c32b9f24ec0dd2e9fa3cb38d043b9e9a2ac9`
+passed formatting and compilation but found an obsolete Codex fixture contract:
+it expected the harness planner to reject placement before harness capabilities.
+Placement now belongs to the target selected by Core. Removed those misplaced
+harness assertions; existing CLI preallocation/remote-refusal checks retain the
+consumer-visible no-local-fallback contract. No product fallback or validation
+was weakened.
+The corrected Codex fixture passed (one parent test and all three isolated
+authorization child modes); `cargo fmt --all --check` passed. New exact-head CI
+remains a separate gate; the failed run is not release acceptance.
+
+The next exact-head run (`45118225823`, source `09ebb508c14f2493ca5141296bbc085aaca893bf`)
+reached the store suite and exposed five stale schema-version expectations:
+the target-failure cleanup migration advances the database to v15.
+Removed four redundant latest-version pins while retaining legacy ownership,
+artifact, lease, queue, WAL and foreign-key assertions. Read-only inspection
+now covers both v15 and v14 through v5, requiring exact version and byte
+preservation in each fixture. All 28 store tests and formatting passed locally.
+This correction still requires green exact-head CI before merge.
+
+### Cancellation acceptance diagnostics (source `c93537e47c6e578c066ea07dfd4ce8010bee32e3`)
+
+Exact-head CI `45119600623` failed the twenty-worker recovery test at its
+running-cancellation assertion: one of labels 8/9 was `NEEDS_ATTENTION`, not
+`CANCELLED`. The old assertion emitted neither the shown Run nor batch errors;
+the fixture was deleted and CI uploaded no artifacts. Its exact cause remains
+unknown; a passing sibling run would not resolve this failure.
+
+Traced durable cancellation through manager tokens, target start/inspect/cancel
+grants and receipts, process-group supervision, raw capture, exit accounting,
+artifact collection and reclamation. No evidence identifies the 250 ms RPC
+bound as the cause. Production behavior is unchanged: independent cancellation,
+bounded target communication, fresh authority checks, no fallback, owned
+process-group signaling, real exit/capture evidence and failure precedence
+remain intact. No speculative cancellation-success workaround was applied.
+
+The existing assertions now print label/Run ID, the complete shown Run
+(including worker attempts and capture), workspace retention reason and batch
+results/errors before fixture teardown. Both `CANCELLED` and `RECLAIMED`
+requirements and existing artifact verification are unchanged.
+
+One local diagnostic run reproduced the failure for label 9:
+`Operation not permitted (os error 1)`, `harness_execution`,
+`RECOVERY_REQUIRED`, no recorded exit code/signal or capture, and no artifacts.
+The batch error was `Run r-1795413377628649000-30082-11: Operation not permitted
+(os error 1) (workspace retained)`. Label 8 was `CANCELLED` with actual exit code
+143, verified artifacts and reclaimed workspace. The failing syscall and its
+relationship to the CI failure are not established. The local reproduction is
+not cancellation acceptance or evidence that a target timeout occurred.
+
+Exact narrow command (run once; exit 101, 0 passed / 1 failed / 1 filtered):
+
+```sh
+export PATH=/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:$PATH
+export RUSTUP_TOOLCHAIN=1.91.0 CARGO_HOME=/Users/maksimivanov/.cargo
+export CARGO_TARGET_DIR=/Users/maksimivanov/.local/share/fabric/reviews/issue-38-source/target
+cargo test --offline --locked -p fabric-cli --test recovery twenty_real_workers_recover_only_proven_captureable_inactive_work_and_explain_retention -- --exact --nocapture
+```
+
+With the same environment, `cargo fmt --all --check` exited 0. Rustup emitted
+channel-sync and six-component download messages during that command despite
+the explicit installed-toolchain PATH; it was not repeated.
+
+No workspace suite or protocol/security regression was rerun: only test failure
+diagnostics changed, not the production protocol or security boundaries. This
+patch does not fix or close cancellation acceptance; no CI-green claim is made.
+
+### Owned-group EPERM exit-visibility correction (base `128834a50175ec40d4d10c25be298761eb5372b9`)
+
+The first syscall-context diagnostic run failed (exit 101): label 8, Run
+`r-1795413841038572000-32693-10`, reported
+`kill(-33225, 15): Operation not permitted (os error 1); owned-child waitid(WNOWAIT): not exited`.
+It retained `NEEDS_ATTENTION` / `RECOVERY_REQUIRED`, with no recorded exit or
+capture. The existing full Run/batch/retention diagnostics were printed before
+fixture teardown. This identifies group SIGTERM, not spawn, wait failure or a
+target RPC timeout. A second, changed diagnostic run added bounded follow-up
+exit observation but still returned the error if that branch ran; it passed
+(1 passed / 1 filtered, 105.67 s). That pass did not expose the transition and
+is not evidence for the correction.
+
+A separate controlled native experiment forked an owned group leader, filled
+a loopback TCP socket with blocking SO_LINGER, then released the child to
+`_exit(23)`. Group SIGTERM returned EPERM while `waitid(P_PID, child,
+WEXITED|WNOHANG|WNOWAIT)` returned zeroed status; the same unreaped child became
+waitable about 9 ms later and `waitpid` returned actual exit 23. No worker or
+fixture was repeatedly launched until green. An initial Python attempt could
+not observe waitid because Darwin Python lacks `os.waitid`; its owned child
+was subsequently reaped, and the experiment used libc waitid through ctypes.
+
+The observed gap matches XNU's exit ordering:
+[`proc_prepareexit` sets `P_REF_DEAD` before `proc_exit` sets `SZOMB`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exit.c);
+[`pgrp_iterate` uses `proc_find`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_proc.c),
+which excludes `P_REF_DEAD`, while
+[`killpg1` returns EPERM when no signalable member was found](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
+The source inspected is upstream XNU, not a syscall trace of private kernel
+state; the native experiment establishes the externally observable race.
+
+On macOS only, group EPERM now permits bounded non-reaping exit observation,
+not success by errno alone. The observation deadline uses the caller's existing
+termination grace; TERM observation consumes that grace instead of adding to
+its subsequent sleep. KILL can use at most one grace for exit visibility after
+EPERM, where the ordinary successful path already proceeds to blocking reap.
+Live-child EPERM at the deadline and wait errors remain errors with syscall
+context. Successful confirmation preserves the PID ownership anchor until
+the actual final group signal and reap. No persisted PID is used.
+
+One deterministic regression supplies EPERM at that boundary, observes a real
+owned child still live, and only then releases its stdin so it can exit 23.
+It requires eventual non-reaping exit proof and the real reaped status; it
+also requires EPERM to survive when the live-child observation budget expires.
+Target authority checks, independent cancellation, 250 ms RPC bound, committed
+effect receipts, capture/artifact verification and recovery assertions are
+unchanged. True host/target/capture failures still retain their evidence.
+
+LSP reference lookup was attempted but its rust-analyzer launcher failed:
+the installed 1.91.0 toolchain has no rust-analyzer and the shim has no default
+toolchain. Bounded source caller inspection was used instead, as authorized.
+Public Fabric remains v0.1.1; producer 0.1.2 is unreleased.
+
+Final narrow checks used the installed 1.91.0 binaries directly, offline shared
+`CARGO_TARGET_DIR` above, `RUST_TEST_THREADS=4`, the real reference-plugin,
+local-target, host and Node binary environment, and no `FABRIC_PLUGIN_REGISTRY`.
+Commands and observed results:
+
+```sh
+cargo test --offline --locked -p fabric-runner --lib supervision::tests::group_eperm_requires_eventual_owned_exit_and_does_not_reap -- --exact --nocapture
+# exit 0: 1 passed, 14 filtered; 0.01 s
+cargo test --offline --locked -p fabric-cli --test recovery twenty_real_workers_recover_only_proven_captureable_inactive_work_and_explain_retention -- --exact --nocapture
+# exit 0: 1 passed, 1 filtered; 97.52 s; existing cancellation/artifact/reclaim assertions intact
+cargo test --offline --locked -p fabric-runner --test plugins native_capture_respects_the_execution_deadline_and_preserves_cancellation -- --exact --nocapture
+# exit 0: 1 passed, 11 filtered; 2.06 s
+/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin/rustfmt --edition 2024 --check crates/fabric-runner/src/supervision.rs crates/fabric-runner/src/target.rs
+# exit 0
+```
+
+The first plugin command used the incorrect exact filter
+`native_capture_respects_deadline_and_cancellation_while_normalizer_hangs`:
+zero tests ran (12 filtered); it is not verification. The initial rustfmt check
+exited 1 for two line wraps; those were corrected before the successful check.
+No unchanged stress retries, full suites, commit, push or release were performed.
+
+Manager independently verified all 14 sealed artifacts from native released
+v0.1.1 worker `r-1795413693072002000-76187-8`, including the 14,000-byte patch
+SHA-256 `bb69b76f1d579af43035a94e225f0ff344cff4626aedd41b09419c584a3d8eaf`.
+The actual controlled socket experiment is present in sealed event lines
+2969–2971: EPERM with no waitable status at 0.2 ms, then unreaped actual exit
+23 around 8.9 ms. The worker exited 0 and its workspace was reclaimed and
+physically absent.
+
+Raw capture reached the admitted 10 MiB combined budget: `truncated=true`,
+stdout 8,998,213 bytes seen versus 5,495,906 persisted, events 4,987,859 bytes.
+The final narrow-check results above are the worker's report, not a claim
+that the manager recovered their complete raw tool output. Final acceptance
+requires exact-head CI on this actual production correction; the green
+diagnostic-only CI run 45121442039 is not proof of the new correction.

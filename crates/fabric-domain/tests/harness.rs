@@ -11,7 +11,7 @@ fn request_defaults_and_strict_untrusted_configuration() {
     for invalid in [
         r#"{"unknown":true}"#,
         r#"{"profile":"future"}"#,
-        r#"{"placement":"typo"}"#,
+        r#"{"placement":"../local"}"#,
         r#"{"access":"typo"}"#,
         r#"{"model":" "}"#,
         r#"{"resume":""}"#,
@@ -26,10 +26,11 @@ fn request_defaults_and_strict_untrusted_configuration() {
         );
     }
     let request: HarnessRequest = serde_json::from_str(
-        r#"{"model":"requested","resume":"session-ref","placement":"remote","access":"inspect","max_cost_usd":0.01}"#,
+        r#"{"model":"requested","resume":"session-ref","placement":"fake-remote","access":"inspect","max_cost_usd":0.01}"#,
     )
     .unwrap();
     assert_eq!(request.model.as_deref(), Some("requested"));
+    assert_eq!(request.placement, "fake-remote");
     assert_eq!(request.resume.as_deref(), Some("session-ref"));
     assert_eq!(request.max_cost_usd, Some(0.01));
 }
@@ -48,7 +49,7 @@ fn direct_requests_cannot_bypass_validation() {
     }
     for request in [
         HarnessRequest {
-            placement: "typo".into(),
+            placement: "../local".into(),
             ..HarnessRequest::default()
         },
         HarnessRequest {

@@ -19,7 +19,7 @@ export function create(kind, path, id = basename(resolve(path))) {
   mkdirSync(join(root, 'sdk/samples'), { mode: 0o700 });
   for (const name of runtimeFiles) writeFileSync(join(root, 'sdk', name), readBounded(join(here, name), MAX_PACKAGE), { mode: 0o600, flag: 'wx' });
   for (const k of Object.keys(kinds)) writeFileSync(join(root, 'sdk/samples', `${k}.ts`), readBounded(join(here, 'samples', `${k}.ts`), 65_536), { mode: 0o600, flag: 'wx' });
-  const source = readBounded(join(here, 'samples', `${kind}.ts`), 65_536).toString('utf8').replace(`sample-${kind}`, id).replace("'../index.mjs'", "'./sdk/index.mjs'");
+  const source = readBounded(join(here, 'samples', `${kind}.ts`), 65_536).toString('utf8').replaceAll(`sample-${kind}`, id).replace("'../index.mjs'", "'./sdk/index.mjs'");
   writeFileSync(join(root, 'plugin.ts'), source, { mode: 0o600, flag: 'wx' });
   writeFileSync(join(root, 'package.json'), JSON.stringify({
     name: id, version: '1.0.0', type: 'module', engines: { node: '>=22.18.0' },
@@ -37,7 +37,7 @@ export function reference(id, path, binary) {
     omp: { domain: 'omp-native-config-v1', files: ['config.yml', 'config.yaml', 'settings.json', 'models.yml', 'models.yaml', 'mcp.json', '.mcp.json'], roots: [['native-agent-dir', ''], ['native-home', '.omp/agent']] },
     codex: { domain: 'codex-native-config-v1', files: ['config.toml'], roots: [['native-config-dir', '']] },
   };
-  if (!Object.hasOwn(roots, id) || !binary) fail('invalid_identity');
+  if ((!Object.hasOwn(roots, id) && id !== 'local') || !binary) fail('invalid_identity');
   const root = resolve(path);
   if (realpathSync(dirname(root)) !== dirname(root)) fail('unsafe_package_path');
   const bytes = readBounded(realpathSync(binary), MAX_PACKAGE - 65_536);
@@ -45,7 +45,9 @@ export function reference(id, path, binary) {
   writeFileSync(join(root, 'plugin'), bytes, { mode: 0o700, flag: 'wx' });
   writeFileSync(join(root, 'package.json'), JSON.stringify({
     name: id, version: '0.1.0', files: ['plugin'],
-    fabricPlugin: { id, kind: 'harness', entry: 'plugin', sdk: SDK_VERSION, protocol: 1, runtime: 'native', args: [id], native: { executable: id, root_environment: roots[id], fingerprint: fingerprints[id] } },
+    fabricPlugin: id === 'local'
+      ? { id, kind: 'target', entry: 'plugin', sdk: SDK_VERSION, protocol: 1, runtime: 'native', args: [] }
+      : { id, kind: 'harness', entry: 'plugin', sdk: SDK_VERSION, protocol: 1, runtime: 'native', args: [id], native: { executable: id, root_environment: roots[id], fingerprint: fingerprints[id] } },
   }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return root;
 }
@@ -174,7 +176,7 @@ export async function main(args) {
   if (positional.length !== (['create', 'reference'].includes(command) ? 2 : 1)) fail('usage');
   if (command === 'reference') {
     reference(positional[0], positional[1], options.binary);
-    console.log('Packaged reference harness; installation still requires explicit content-pinned trust.');
+    console.log('Packaged reference plugin; installation still requires explicit content-pinned trust.');
   } else if (command === 'create') {
     create(positional[0], positional[1], options.id);
     console.log('Created provider-free TypeScript plugin. Run npm test in the project.');
@@ -204,7 +206,7 @@ export async function main(args) {
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   main(process.argv.slice(2)).catch(error => {
     const code = typeof error?.message === 'string' ? error.message.split(':')[0] : '';
-    const message = code === 'usage' ? 'Usage: fabric-plugin create KIND DIR [--id ID] | reference omp|codex DIR --binary BINARY | dev DIR [--once] | test DIR | hash PATH | pack DIR --out FILE.tgz | install PATH --registry DIR --fabric BINARY --version VERSION --sha256 HASH --trust [--upgrade]' : diagnostics[code] ?? 'Invalid package/input or failed plugin operation. No remote error details are displayed.';
+    const message = code === 'usage' ? 'Usage: fabric-plugin create KIND DIR [--id ID] | reference omp|codex|local DIR --binary BINARY | dev DIR [--once] | test DIR | hash PATH | pack DIR --out FILE.tgz | install PATH --registry DIR --fabric BINARY --version VERSION --sha256 HASH --trust [--upgrade]' : diagnostics[code] ?? 'Invalid package/input or failed plugin operation. No remote error details are displayed.';
     process.stderr.write(`Fabric plugin: ${message}\n`);
     process.exitCode = 1;
   });

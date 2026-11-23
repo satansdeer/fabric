@@ -5,13 +5,13 @@ existing CLI/manager. A submit returns early batch/run handles; the local manage
 owns admitted workers independently of the controller session. The legacy v1
 foreground API remains available for debugging and compatibility.
 Controller, worker harness and execution backend are separate choices.
-Execution is macOS-first trusted-local, not remote/cloud or a security sandbox.
+Execution is macOS-first trusted-local, selected through an installed target driver, not remote/cloud or a security sandbox.
 
 ## Native OMP setup
 
-Requires OMP **19.1.0**, a built Fabric CLI and its sibling
-`fabric-fake-harness` for the deterministic example. No npm install is required;
-OMP provides `ExtensionAPI` and `pi.zod`, and imports of that package are type-only.
+Requires OMP **19.1.0**, a built Fabric CLI and its siblings
+`fabric-fake-harness` and `fabric-local-target` for the deterministic example.
+No npm install is required; OMP provides `ExtensionAPI`, `pi.zod`, and type-only imports.
 From the Fabric checkout, build when needed:
 
 ```sh
@@ -32,7 +32,7 @@ The default export registers five typed tools:
 
 | Tool | Arguments and behavior |
 | --- | --- |
-| `fabric_spawn` | `project`, inline `tasks`; optional `max_concurrency`, `placement`, `idempotency_key`. Returns early durable batch/run IDs. Only local placement is supported; remote requirements reject without fallback. |
+| `fabric_spawn` | `project`, inline `tasks`; optional `max_concurrency`, `placement`, `idempotency_key`. Returns early durable batch/run IDs. Placement selects an installed target ID, default `local`; unsupported/missing remote targets reject without local fallback. |
 | `fabric_status` | `batch_id`; current durable states/events. |
 | `fabric_results` | `batch_id`; persisted task results, source provenance, artifacts and actual failures. A successful retrieval does not mean the workers succeeded. |
 | `fabric_cancel` | `batch_id`; explicit cancellation request, not a controller-disconnect side effect. |
@@ -46,6 +46,24 @@ Optional `source_ref` is `{kind:"current-head"}`,
 `{kind:"prepared",state_id:"..."}`, or `{kind:"commit",sha:"..."}`.
 A READY exact base is required; no automatic preparation or dirty-change transfer.
 Optional per-task `limits` carries the generic worker limits documented in README.
+
+Foreground, batch and durable execution use the same `target.execute` boundary.
+Core persists the accepted target/executable pin, retains source/prepared pins,
+lease and workspace ownership, and independently observes process status and
+seals/verifies artifacts. Reconnect reads durable evidence, not plugin readiness.
+Installed targets choose request-scoped concrete primitives and receive observed
+completion evidence; receipts are not success evidence. Core validates launch
+authority before start dispatch and spawn. Reclaim requires apply, validated
+ownership and durable intent; dry-run never invokes target reclaim.
+Unavailable, changed, crashed or malformed target drivers cannot report success
+or authorize cleanup. Committed host exit/capture, ownership, artifact and deletion
+evidence survives failed receipts; failures are durably recorded separately.
+Recovery refuses unknown evidence but can reclaim independently verified effects
+under the existing policy; a failed target receipt is never cleanup proof.
+The bundled `fabric-local-target` is used only when no registry local entry exists;
+a revoked or broken installed entry never triggers a bundled/local fallback.
+Unsupported PTY, persistent-environment and infrastructure-evidence capabilities
+fail explicitly. See [the target contract](PLUGIN_PROTOCOL.md#installed-execution-targets).
 
 The legacy tool `fabric` accepts `{ "request": <v1 JSON object> }`;
 `/fabric <literal JSON request>` parses the same document without rewriting it

@@ -11,6 +11,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod supervision;
+pub mod target;
 pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, StopReason};
 use supervision::{PipeReader, ProcessGroup};
 
@@ -24,6 +25,10 @@ pub struct Execution {
     pub status: ExitStatus,
     pub stop_reason: Option<StopReason>,
     pub capture: std::io::Result<fabric_domain::CaptureMetadata>,
+    /// Post-spawn failure; status and finalized capture remain authoritative.
+    pub failure: Option<FabricError>,
+    /// Target observation or receipt failed, independently of a primary host error.
+    pub target_failed: bool,
 }
 
 pub struct HarnessInfo {
@@ -169,6 +174,16 @@ impl HarnessAdapter for FakeHarness {
     }
 }
 
+/// Validated launch inputs shared by direct and installed-target execution.
+pub struct ExecutionRequest<'a> {
+    pub spec: &'a CommandSpec,
+    pub cwd: &'a Path,
+    pub capture: Capture<'a>,
+    pub limits: &'a ExecutionLimits,
+    pub cancellation: &'a CancellationToken,
+    pub owner_lease: Option<&'a File>,
+}
+
 /// Core must supply a freshly validated owned fork as cwd. The callback commits
 /// RUNNING only after spawn; persistence failure kills/reaps the actual child.
 pub fn execute(
@@ -180,6 +195,37 @@ pub fn execute(
     owner_lease: Option<&File>,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
 ) -> Result<Execution, FabricError> {
+    execute_observed(
+        ExecutionRequest {
+            spec,
+            cwd,
+            capture,
+            limits,
+            cancellation,
+            owner_lease,
+        },
+        started,
+        |_, _| Ok(()),
+    )
+    .and_then(|mut execution| match execution.failure.take() {
+        Some(failure) => Err(failure),
+        None => Ok(execution),
+    })
+}
+
+pub(crate) fn execute_observed(
+    request: ExecutionRequest<'_>,
+    started: impl FnOnce(u32) -> Result<(), FabricError>,
+    mut observed: impl FnMut(&mut ProcessGroup, bool) -> Result<(), FabricError>,
+) -> Result<Execution, FabricError> {
+    let ExecutionRequest {
+        spec,
+        cwd,
+        capture,
+        limits,
+        cancellation,
+        owner_lease,
+    } = request;
     limits.validate()?;
     if cancellation.is_cancelled() {
         return Err(execution_error("Cancelled before harness launch."));
@@ -230,12 +276,42 @@ pub fn execute(
         .map_err(execution_error)?;
     let stderr = PipeReader::new(group.child.stderr.take().expect("piped stderr"), &stopped)
         .map_err(execution_error)?;
-    let (mut status, events) = std::thread::scope(|scope| {
+    let (mut status, failure, events) = std::thread::scope(|scope| {
         let out = scope.spawn(|| capture.stdout(stdout));
         let err = scope.spawn(|| capture.stderr(stderr));
-        let status = started(group.child.id())
-            .and_then(|()| group.supervise(limits, cancellation, || capture.observe_alive()));
-        // Stop the owned group before joining drains, including on persistence errors.
+        let mut observed_stop_reason = None;
+        let status = started(group.child.id()).and_then(|()| {
+            observed(&mut group, false)?;
+            group.supervise_observed(limits, cancellation, |group, stopping| {
+                if stopping {
+                    observed_stop_reason = cancellation.storage_reason().or_else(|| {
+                        if group.exited().ok() == Some(true) {
+                            None
+                        } else if cancellation.is_cancelled() {
+                            Some(StopReason::Cancelled)
+                        } else if launched.elapsed() >= limits.timeout {
+                            Some(StopReason::Timeout)
+                        } else {
+                            None
+                        }
+                    });
+                } else {
+                    capture.observe_alive();
+                }
+                observed(group, stopping)
+            })
+        });
+        // Retain the actual terminal outcome even when target observation failed.
+        let (status, failure) = match status {
+            Ok(status) => (status, None),
+            Err(failure) => (
+                (
+                    group.stop_and_reap(limits.term_grace)?,
+                    observed_stop_reason,
+                ),
+                Some(failure),
+            ),
+        };
         drop(group);
         stopped.store(true, Ordering::Release);
         let events = out
@@ -244,7 +320,11 @@ pub fn execute(
         let stderr = err
             .join()
             .map_err(|_| execution_error("Stderr capture panicked."))?;
-        Ok::<_, FabricError>((status?, events.and_then(|events| stderr.map(|()| events))))
+        Ok::<_, FabricError>((
+            status,
+            failure,
+            events.and_then(|events| stderr.map(|()| events)),
+        ))
     })?;
     if status.1.is_none() && capture.normalization_timed_out() {
         status.1 = Some(StopReason::Timeout);
@@ -252,12 +332,14 @@ pub fn execute(
     capture.completed(
         status.0.code(),
         status.0.signal(),
-        status.0.success() && status.1.is_none(),
+        status.0.success() && status.1.is_none() && failure.is_none(),
     );
     Ok(Execution {
         status: status.0,
         stop_reason: status.1,
         capture: events.and_then(|events| capture.finish(events)),
+        failure,
+        target_failed: false,
     })
 }
 

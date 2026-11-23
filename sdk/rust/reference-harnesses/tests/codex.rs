@@ -197,7 +197,7 @@ fn codex_fixture_conformance_through_public_runner_api() {
                 .contains(SECRET)
         }));
         assert!(!serde_json::to_string(&metadata).unwrap().contains(SECRET));
-        for mut unsupported in [
+        for unsupported in [
             HarnessRequest {
                 model: Some("requested".into()),
                 ..request.clone()
@@ -234,26 +234,6 @@ fn codex_fixture_conformance_through_public_runner_api() {
             assert_eq!(
                 harness.plan(&unsupported, &info).unwrap_err().kind,
                 ErrorKind::UnsupportedCapability
-            );
-            unsupported.placement = "remote".into();
-            assert_eq!(
-                harness.plan(&unsupported, &info).unwrap_err().kind,
-                ErrorKind::UnsupportedPlacement
-            );
-        }
-        for placement in ["remote", "byoc"] {
-            assert_eq!(
-                harness
-                    .plan(
-                        &HarnessRequest {
-                            placement: placement.into(),
-                            ..request.clone()
-                        },
-                        &info
-                    )
-                    .unwrap_err()
-                    .kind,
-                ErrorKind::UnsupportedPlacement
             );
         }
         for import in ["skills", "plugins", "mcp"] {

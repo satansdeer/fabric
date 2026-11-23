@@ -6,10 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { gzipSync, gunzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { create, install, reference } from '../cli.mjs';
 import { directory, archive, pack, loadPackage } from '../package.mjs';
 import { conformance, FIXTURE_PROMPT } from '../conformance.mjs';
 import { validVersion, validId, safePath, MAX_FRAME } from '../protocol.mjs';
+import { TARGET_OPERATIONS } from '../index.mjs';
 
 const sdk = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const cli = join(sdk, 'cli.mjs');
@@ -51,7 +53,7 @@ for (const kind of ['harness', 'target', 'connector']) {
     const proof = await conformance(project);
     assert.equal(proof.id, kind);
     assert.equal(proof.protocol, 1);
-    if (kind === 'target') assert.deepEqual(proof.result, { placement: 'local' });
+    if (kind === 'target') assert.deepEqual(proof.result, { placements: ['target'], operations: TARGET_OPERATIONS, optional: [] });
     else if (kind === 'connector') assert.deepEqual(proof.result, { available: false });
     else {
       assert.deepEqual(proof.result, { ready: true });
@@ -74,6 +76,70 @@ for (const kind of ['harness', 'target', 'connector']) {
     }
   });
 }
+
+test('a third-party target can select concrete host plans without using the local ID', async t => {
+  const root = temporary(t);
+  const project = create('target', join(root, 'alternate'));
+  rawPlugin(project, `import {defineTarget,serve,TARGET_OPERATIONS} from './sdk/index.mjs';
+    const choose = ({grant,actions}) => ({grant,action:actions.at(-1)});
+    await serve(defineTarget({id:'alternate',version:'1.0.0',
+      capabilities:()=>({placements:['alternate'],operations:[...TARGET_OPERATIONS],optional:[]}),
+      placement:()=>({backend:'host.local'}),completed:({grant})=>({received:grant}),
+      prepare:choose,start:choose,inspect:choose,cancel:choose,collect:choose,reclaim:choose}));`);
+  const proof = await conformance(project);
+  assert.deepEqual(proof.result, { placements: ['alternate'], operations: TARGET_OPERATIONS, optional: [] });
+});
+
+test('target conformance requires concrete plans and receipts for every operation; fake remote refuses separately', async t => {
+  const root = temporary(t);
+  for (const failure of ['unsupported', 'receipt', 'remote']) {
+    for (const operation of failure === 'remote' ? ['prepare'] : TARGET_OPERATIONS) {
+      const project = create('target', join(root, `${failure}-${operation}`));
+      const id = `${failure}-${operation}`;
+      rawPlugin(project, `import {defineTarget,serve,TARGET_OPERATIONS} from './sdk/index.mjs';
+        let current;
+        const operations = Object.fromEntries(TARGET_OPERATIONS.map(op => [op, ({grant,actions}) => {
+          current=op; return {grant,action:${JSON.stringify(failure)}==='unsupported' && op===${JSON.stringify(operation)} ? {primitive:'unsupported'} : actions[0]};
+        }]));
+        await serve(defineTarget({id:${JSON.stringify(id)},version:'1.0.0',...operations,
+          capabilities:()=>({placements:[${JSON.stringify(id)}],operations:TARGET_OPERATIONS,optional:[]}),
+          placement:()=>({backend:${JSON.stringify(failure === 'remote' ? 'unsupported' : 'host.local')}}),
+          completed:({grant})=>({received:${JSON.stringify(failure)}==='receipt' && current===${JSON.stringify(operation)} ? 'wrong' : grant})}));`);
+      await assert.rejects(conformance(project), failure === 'unsupported' ? /unsupported_target_operation/ :
+        failure === 'remote' ? /unsupported_target_placement/ : /closed_output|invalid_target_receipt/);
+    }
+  }
+});
+
+test('target grants are session-unique before callbacks, including unsupported and completed effects', t => {
+  const root = temporary(t);
+  for (const mode of ['pending', 'completed', 'unsupported', 'distinct', 'empty', 'malformed', 'newline']) {
+    const project = create('target', join(root, mode)), effects = join(root, `${mode}.effects`);
+    rawPlugin(project, `import {appendFileSync} from 'node:fs';
+      import {defineTarget,serve,TARGET_OPERATIONS} from './sdk/index.mjs';
+      const choose=({grant,actions})=>{appendFileSync(${JSON.stringify(effects)},'effect\\n');
+        return {grant,action:${JSON.stringify(mode)}==='unsupported'?{primitive:'unsupported'}:actions[0]};};
+      await serve(defineTarget({id:${JSON.stringify(mode)},version:'1.0.0',
+        capabilities:()=>({placements:[${JSON.stringify(mode)}],operations:TARGET_OPERATIONS,optional:[]}),
+        placement:()=>({backend:'host.local'}),completed:({grant})=>({received:grant}),
+        prepare:choose,start:choose,inspect:choose,cancel:choose,collect:choose,reclaim:choose}));`);
+    const frames = [['initialize', { protocol: 1 }], ['health', {}]];
+    const job = grant => ({ placement: mode, run_id: 'fixture', grant, actions: [{ primitive: 'process.spawn' }], context: {} });
+    const grant = mode === 'empty' ? '' : mode === 'malformed' ? 'bad grant' : mode === 'newline' ? 'bad\n' : 'one';
+    frames.push(['target.start', job(grant)]);
+    if (mode === 'completed' || mode === 'distinct') frames.push(['target.completed', { grant, evidence: {} }]);
+    if (!['empty', 'malformed', 'newline'].includes(mode)) frames.push(['target.start', job(mode === 'distinct' ? 'two' : grant)]);
+    if (mode === 'distinct') frames.push(['target.completed', { grant: 'two', evidence: {} }], ['shutdown', {}]);
+    const output = spawnSync(process.execPath, [join(project, 'plugin.ts'), '--fabric-plugin-stdio'], {
+      env: environment(root), encoding: 'utf8', timeout: 5000,
+      input: frames.map(([method, params], i) => JSON.stringify({ jsonrpc: '2.0', id: i + 1, method, params }) + '\n').join(''),
+    });
+    assert.equal(output.error, undefined);
+    assert.equal(output.status, mode === 'distinct' ? 0 : 1, output.stderr);
+    const observed = existsSync(effects) ? readFileSync(effects, 'utf8') : '';
+    assert.equal(observed, mode === 'distinct' ? 'effect\neffect\n' : ['empty', 'malformed', 'newline'].includes(mode) ? '' : 'effect\n');
+  }
+});
 
 test('pin/version/trust and SDK/protocol mismatches fail before any plugin execution', async t => {
   const root = temporary(t);
@@ -140,7 +206,7 @@ test('SDK rejects malformed, oversized and out-of-order host requests without re
 test('callback errors and invalid target/connector results are fixed protocol failures', async t => {
   const root = temporary(t);
   for (const [kind, callback, code] of [
-    ['target', `plan: () => ({placement:'remote', reclaim:true})`, 'remote_error'],
+    ['target', `capabilities: () => ({placements:['target'],operations:['prepare','start','inspect','cancel','collect','reclaim'],optional:[]}), placement:()=>({backend:'host.local'}), completed:({grant})=>({received:grant}), prepare: ({grant}) => ({grant,action:{primitive:'workspace.fork',strategy:'copy'},reclaim:true}), start: ({grant}) => ({grant,action:{primitive:'unsupported'}}), inspect: ({grant}) => ({grant,action:{primitive:'unsupported'}}), cancel: ({grant}) => ({grant,action:{primitive:'unsupported'}}), collect: ({grant}) => ({grant,action:{primitive:'unsupported'}}), reclaim: ({grant}) => ({grant,action:{primitive:'unsupported'}})`, 'closed_output'],
     ['connector', `evidence: () => { throw new Error('SECRET_CANARY'); }`, 'remote_error'],
   ]) {
     const project = create(kind, join(root, kind));
@@ -253,14 +319,19 @@ test('actual Core: scaffold -> conformance -> local package install/check, tampe
   }
 });
 
-test('third SDK fake harness executes through Core without vendor registration', { skip: hostSkip }, async t => {
+test('generated third-party target executes a Core host worker, seals verified artifacts and reclaims', { skip: hostSkip }, async t => {
   const root = temporary(t), registry = join(root, 'registry'), repo = join(root, 'repo');
   mkdirSync(registry, { mode: 0o700 }); mkdirSync(repo);
   const env = { ...environment(root), FABRIC_PLUGIN_REGISTRY: registry, UNSELECTED_SECRET: 'SECRET_CANARY' };
   const project = create('harness', join(root, 'third-fake'));
-  rawPlugin(project, readFileSync(join(project, 'plugin.ts'), 'utf8').replace("await emit({ type: 'text'", "if (Object.hasOwn(process.env, 'UNSELECTED_SECRET')) throw new Error('ambient environment leaked');\n    await emit({ type: 'text'"));
+  rawPlugin(project, `import {writeFileSync} from 'node:fs';\n` +
+    readFileSync(join(project, 'plugin.ts'), 'utf8').replace("await emit({ type: 'text'",
+      "if (Object.hasOwn(process.env, 'UNSELECTED_SECRET')) throw new Error('ambient environment leaked');\n    writeFileSync('tracked','third-party worker'); writeFileSync('new-file','third-party untracked');\n    await emit({ type: 'text'"));
   const snapshot = directory(project);
   install(project, { registry, fabric: host, version: '1.0.0', sha256: snapshot.hash, trust: true });
+  const target = create('target', join(root, 'third-target'));
+  await conformance(target);
+  install(target, { registry, fabric: host, version: '1.0.0', sha256: directory(target).hash, trust: true });
   function invoke(program, args, cwd = root) {
     const r = spawnSync(program, args, { cwd, env, encoding: 'utf8', timeout: 30_000 });
     assert.equal(r.status, 0, r.stderr);
@@ -276,13 +347,23 @@ test('third SDK fake harness executes through Core without vendor registration',
   writeFileSync(recipe, "version=1\n[[steps]]\nargv=['/usr/bin/true']\n");
   writeFileSync(prompt, FIXTURE_PROMPT);
   fabric(['project', 'prepare', 'fixture', '--recipe', recipe, '--json']);
-  try {
-    const report = JSON.parse(fabric(['run', 'fixture', '--harness', 'third-fake', '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--json']));
-    assert.equal(report.state, 'SUCCEEDED');
-    assert.ok(report.artifact_manifest_id);
-  } finally {
-    fabric(['manager', 'stop', '--json']);
+  const report = JSON.parse(fabric(['run', 'fixture', '--harness', 'third-fake', '--placement', 'third-target', '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--json']));
+  assert.equal(report.state, 'SUCCEEDED');
+  assert.equal(report.exit_code, 0);
+  assert.equal(report.cleanup.action, 'reclaimed');
+  assert.equal(existsSync(report.workspace_path), false);
+  assert.equal(readFileSync(join(repo, 'tracked'), 'utf8'), 'original');
+  const { artifacts } = JSON.parse(fabric(['runs', 'artifacts', report.run_id, '--json']));
+  for (const artifact of artifacts) {
+    const bytes = readFileSync(join(root, 'storage', artifact.relative_path));
+    assert.equal(bytes.length, artifact.size_bytes);
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256);
   }
+  const patch = artifacts.find(artifact => artifact.kind === 'tracked_patch');
+  assert.ok(patch);
+  assert.match(readFileSync(join(root, 'storage', patch.relative_path), 'utf8'), /third-party worker/);
+  assert.ok(artifacts.find(artifact => artifact.kind === 'untracked_archive'));
+  assert.ok(artifacts.find(artifact => artifact.kind === 'manifest'));
 });
 
 test('pinned OMP and Codex reference packages exercise the complete native contract without providers', { skip: !process.env.FABRIC_REFERENCE_PLUGIN_BINARY && 'Set FABRIC_REFERENCE_PLUGIN_BINARY' }, async t => {
@@ -309,6 +390,25 @@ test('pinned OMP and Codex reference packages exercise the complete native contr
       assert.equal(checked.status, 0, checked.stderr + checked.stdout);
       assert.deepEqual(JSON.parse(checked.stdout), { compatible: true, healthy: true });
     }
+  }
+});
+
+test('reference local target package passes lifecycle conformance and installed Core check', { skip: !process.env.FABRIC_LOCAL_TARGET_BINARY && 'Set FABRIC_LOCAL_TARGET_BINARY' }, async t => {
+  const root = temporary(t);
+  const project = reference('local', join(root, 'local'), process.env.FABRIC_LOCAL_TARGET_BINARY);
+  const proof = await conformance(project);
+  assert.deepEqual(proof.result, { placements: ['local'], operations: TARGET_OPERATIONS, optional: [] });
+  assert.equal(archive(pack(directory(project))).hash, directory(project).hash);
+  if (!hostSkip) {
+    const registry = join(root, 'registry');
+    mkdirSync(registry, { mode: 0o700 });
+    install(project, { registry, fabric: host, version: '0.1.0', sha256: directory(project).hash, trust: true });
+    const checked = spawnSync(host, ['plugins', '--registry', registry, 'check', 'local'], {
+      env: environment(root), encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+    });
+    assert.equal(checked.error, undefined);
+    assert.equal(checked.status, 0, checked.stderr + checked.stdout);
+    assert.deepEqual(JSON.parse(checked.stdout), { compatible: true, healthy: true });
   }
 });
 

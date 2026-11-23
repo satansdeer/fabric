@@ -592,6 +592,14 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
     };
     let prompt = fixture.temp.path().join("prompt");
     fs::write(&prompt, "literal prompt").unwrap();
+    let target_pid = fixture.temp.path().join("target-pid");
+    let target_pin = fabric_runner::target::TargetPin::from_manifest(serde_json::from_value(serde_json::json!({
+        "id":"external-target","version":"1.0.0","kind":"target","protocol":{"min":1,"max":1},
+        "executable":"/usr/bin/python3",
+        "args":[concat!(env!("CARGO_MANIFEST_DIR"),"/../fabric-runner/tests/fixtures/plugin.py"),
+            "target","concrete",target_pid],
+        "capabilities":["target.execute"]
+    })).unwrap(), "external-target").unwrap();
     assert!(
         fabric_core::run::foreground(
             &fixture.root,
@@ -600,12 +608,20 @@ fn launch_revalidates_ownership_after_adapter_command_and_preserves_failed_run()
             &harness,
             &fabric_core::run::RunOptions {
                 copy_limit_bytes: fixture.state.size_bytes,
+                harness_request: fabric_domain::HarnessRequest {
+                    placement: target_pin.placement.clone(),
+                    ..fabric_domain::HarnessRequest::default()
+                },
+                target_pin: Some(target_pin),
                 ..fabric_core::run::RunOptions::default()
             },
         )
         .is_err()
     );
     assert!(!fixture.temp.path().join("MUST_NOT_RUN").exists());
+    let calls = fs::read_to_string(target_pid.with_extension("calls")).unwrap();
+    assert!(calls.lines().any(|method| method == "target.prepare"));
+    assert!(!calls.lines().any(|method| method == "target.start"));
     let store = fixture.store();
     let run = store
         .run(harness.id.lock().unwrap().as_ref().unwrap())
@@ -771,23 +787,32 @@ fn external_plugin_reclaim_claim_cannot_bypass_artifacts_or_ownership() {
         version: "1.0.0".into(),
         protocol: ProtocolRange { min: 1, max: 1 },
         kind: PluginKind::Target,
-        executable: "/usr/bin/python3".into(),
+        executable: {
+            let path = fixture.temp.path().join("target-plugin");
+            std::fs::copy(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../fabric-runner/tests/fixtures/plugin.py"
+                ),
+                &path,
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        },
         args: vec![
-            format!(
-                "{}/../fabric-runner/tests/fixtures/plugin.py",
-                env!("CARGO_MANIFEST_DIR")
-            ),
             "target".into(),
             "reclaim".into(),
             fixture.temp.path().join("pid").display().to_string(),
         ],
-        capabilities: vec!["target.plan".into()],
+        capabilities: vec!["target.execute".into()],
         integrity: None,
         native: None,
     };
     let error = PluginHost::default()
-        .target_plan(&manifest, &fabric_runner::CancellationToken::default())
-        .unwrap_err();
+        .target(&manifest, &fabric_runner::CancellationToken::default())
+        .err()
+        .unwrap();
     assert!(!error.message.contains("SECRET_CANARY"));
     drop(workspace);
     // The external result claims artifact verification and deletion authority.

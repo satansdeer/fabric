@@ -582,7 +582,10 @@ mod tests {
                 .unwrap();
             let native = &context.profile.native_config_refs[0].path;
             let marker = native.join(".worker-launched");
-            let options = crate::run::RunOptions::default();
+            let options = crate::run::RunOptions {
+                target_pin: Some(crate::target::reference_pin()),
+                ..Default::default()
+            };
             let report =
                 crate::run::foreground(&root, "fixture", &prompt, adapter.as_ref(), &options)
                     .unwrap();
@@ -675,7 +678,7 @@ mod tests {
                     profile: Some(context.profile),
                     ..HarnessRequest::default()
                 },
-                ..crate::run::RunOptions::default()
+                ..options
             };
             let report =
                 crate::run::foreground(&root, "fixture", &prompt, &revoker, &explicit).unwrap();

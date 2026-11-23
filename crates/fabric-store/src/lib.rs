@@ -237,7 +237,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=13 => {}
+            1..=15 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -487,6 +487,47 @@ impl Store {
             )?;
             transaction.pragma_update(None, "user_version", 13)?;
         }
+        if version < 14 {
+            transaction.execute_batch(
+                "CREATE TABLE run_targets (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                    pin TEXT NOT NULL CHECK(length(CAST(pin AS BLOB)) <= 16384) CHECK(json_valid(pin))
+                 );
+                 CREATE TRIGGER target_prelaunch BEFORE INSERT ON run_targets
+                 WHEN NOT EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id
+                    AND state = 'PREPARING' AND started_at IS NULL AND pid_metadata IS NULL)
+                 BEGIN SELECT RAISE(ABORT, 'target binding requires prelaunch run'); END;
+                 CREATE TRIGGER immutable_target_update BEFORE UPDATE ON run_targets
+                 BEGIN SELECT RAISE(ABORT, 'target binding is immutable'); END;
+                 CREATE TRIGGER immutable_target_delete BEFORE DELETE ON run_targets
+                 BEGIN SELECT RAISE(ABORT, 'target binding is immutable'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 14)?;
+        }
+        if version < 15 {
+            transaction.execute_batch(
+                "DROP TRIGGER cleanup_run_update;
+                 CREATE TRIGGER cleanup_run_update BEFORE UPDATE ON runs
+                 WHEN EXISTS (SELECT 1 FROM cleanup_intents WHERE workspace_id = OLD.workspace_id)
+                   AND NOT (
+                     NEW.state IS CASE WHEN OLD.state = 'SUCCEEDED' THEN 'FAILED' ELSE OLD.state END
+                     AND NEW.error_kind = 'target_protocol'
+                     AND NEW.run_id IS OLD.run_id AND NEW.batch_id IS OLD.batch_id
+                     AND NEW.project_id IS OLD.project_id
+                     AND NEW.prepared_state_id IS OLD.prepared_state_id
+                     AND NEW.base_commit_sha IS OLD.base_commit_sha
+                     AND NEW.harness IS OLD.harness AND NEW.harness_version IS OLD.harness_version
+                     AND NEW.prompt_digest IS OLD.prompt_digest
+                     AND NEW.workspace_id IS OLD.workspace_id AND NEW.pid_metadata IS OLD.pid_metadata
+                     AND NEW.exit_code IS OLD.exit_code AND NEW.exit_signal IS OLD.exit_signal
+                     AND NEW.created_at IS OLD.created_at AND NEW.updated_at IS OLD.updated_at
+                     AND NEW.started_at IS OLD.started_at AND NEW.finished_at IS OLD.finished_at
+                     AND NEW.artifact_manifest_id IS OLD.artifact_manifest_id
+                     AND NEW.capture_metadata IS OLD.capture_metadata)
+                 BEGIN SELECT RAISE(ABORT, 'run has cleanup intent'); END;",
+            )?;
+            transaction.pragma_update(None, "user_version", 15)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -559,7 +600,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=13) {
+        if !matches!(version, 5..=15) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -591,6 +632,31 @@ impl Store {
                 "SELECT revision,metadata FROM run_observations WHERE run_id=?1",
                 [run.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn record_run_target(&self, run: &RunId, pin: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO run_targets(run_id,pin) VALUES (?1,?2)",
+            params![run.as_str(), pin],
+        )?;
+        Ok(())
+    }
+
+    pub fn run_target(&self, run: &RunId) -> Result<Option<String>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 14 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT pin FROM run_targets WHERE run_id=?1",
+                [run.as_str()],
+                |row| row.get(0),
             )
             .optional()?)
     }
@@ -1281,8 +1347,12 @@ impl Store {
         let count = self.connection.execute(
             "UPDATE runs SET state = 'FINALIZING', exit_code = ?1, updated_at = ?2,
              exit_signal = ?4,
-             error_kind = COALESCE(?5, CASE WHEN ?1 = 0 THEN NULL ELSE 'harness_exit' END)
-             WHERE run_id = ?3 AND state = 'RUNNING' AND ?2 >= updated_at",
+             error_kind = CASE WHEN error_kind = 'target_protocol' THEN error_kind
+               ELSE COALESCE(?5, CASE WHEN ?1 = 0 THEN NULL ELSE 'harness_exit' END) END
+             WHERE run_id = ?3 AND ?2 >= updated_at
+               AND (state = 'RUNNING' OR (state = 'PREPARING' AND EXISTS (
+                 SELECT 1 FROM worker_attempts a WHERE a.run_id = runs.run_id
+                   AND a.finished_at IS NOT NULL AND a.exit_code IS ?1 AND a.exit_signal IS ?4)))",
             params![exit, now, id.as_str(), signal, reason],
         )?;
         if count != 1 {
@@ -1458,6 +1528,21 @@ impl Store {
             .collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Failure-only annotation, including after cleanup intent. Never changes
+    /// ownership, process/capture/artifact evidence, timestamps or deletion authority.
+    pub fn record_target_failure(&self, id: &RunId) -> Result<()> {
+        if self.connection.execute(
+            "UPDATE runs SET error_kind = 'target_protocol',
+             state = CASE WHEN state = 'SUCCEEDED' THEN 'FAILED' ELSE state END
+             WHERE run_id = ?1 AND EXISTS (SELECT 1 FROM run_targets WHERE run_id = ?1)",
+            [id.as_str()],
+        )? != 1
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
     /// Setup/launch/supervision errors are uncertain, never invented process exits.
     pub fn fail_run_execution(
         &mut self,
@@ -1480,7 +1565,7 @@ impl Store {
              ELSE 'NEEDS_ATTENTION' END, harness_version = ?1,
              updated_at = ?2, finished_at = ?2,
              error_kind = CASE WHEN state = 'PREPARING' AND ?4 THEN 'cancelled'
-               WHEN error_kind IN ('timeout', 'cancelled', 'workspace_limit', 'storage_pressure', 'storage_meter_failed', 'native_failure') THEN error_kind
+               WHEN error_kind IN ('timeout', 'cancelled', 'workspace_limit', 'storage_pressure', 'storage_meter_failed', 'native_failure', 'target_protocol') THEN error_kind
                WHEN capture_metadata IS NOT NULL THEN 'artifact_capture'
                ELSE 'harness_execution' END
              WHERE run_id = ?3 AND state IN ('PREPARING', 'FINALIZING')
@@ -1698,7 +1783,7 @@ impl Store {
                 next.transition(WorkspaceState::RecoveryRequired)?;
                 transaction.execute(
                     "UPDATE runs SET state = 'NEEDS_ATTENTION', updated_at = ?1,
-                     finished_at = ?1, error_kind = 'workspace_fork' WHERE run_id = ?2",
+                     finished_at = ?1, error_kind = COALESCE(error_kind, 'workspace_fork') WHERE run_id = ?2",
                     params![updated_at, id.as_str()],
                 )?;
                 transaction.execute(
@@ -1980,7 +2065,8 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_observations;
+            "DROP TABLE run_targets;
+             DROP TABLE run_observations;
              DROP TABLE run_capture_contexts;
              DROP TRIGGER immutable_manifest;
              CREATE TRIGGER immutable_manifest BEFORE UPDATE OF artifact_manifest_id ON runs

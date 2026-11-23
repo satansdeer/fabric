@@ -58,15 +58,17 @@ try {
     chmodSync(destination, executable ? 0o700 : 0o600);
     files[to] = sha256(readFileSync(destination));
   }
-  for (const binary of ['fabric', 'fabric-fake-harness']) copy(join(build, 'aarch64-apple-darwin/release', binary), `bin/${binary}`, true);
+  for (const binary of ['fabric', 'fabric-fake-harness', 'fabric-local-target']) copy(join(build, 'aarch64-apple-darwin/release', binary), `bin/${binary}`, true);
   const plugins = [];
+  const targetPlugins = [];
   mkdirSync(join(stage, 'plugins'), { mode: 0o700 });
-  for (const id of ['omp', 'codex']) {
+  for (const id of ['omp', 'codex', 'local']) {
     const path = join(stage, 'plugins', id);
-    reference(id, path, join(build, 'aarch64-apple-darwin/release/fabric-reference-harnesses'));
+    reference(id, path, join(build, 'aarch64-apple-darwin/release', id === 'local' ? 'fabric-local-target' : 'fabric-reference-harnesses'));
     const pkg = directory(path);
     for (const [file, bytes] of pkg.files) files[`plugins/${id}/${file}`] = sha256(bytes);
-    plugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash, supported_cli: id === 'omp' ? 'omp/19.1.0' : 'codex-cli 0.171.0' });
+    if (id === 'local') targetPlugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash });
+    else plugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash, supported_cli: id === 'omp' ? 'omp/19.1.0' : 'codex-cli 0.171.0' });
   }
   // Existing SDK installer and its imports; no npm dependencies or lifecycle hooks.
   for (const file of ['cli.mjs', 'package.mjs', 'protocol.mjs', 'conformance.mjs', 'index.mjs']) copy(join(repo, 'sdk/typescript', file), `sdk/${file}`);
@@ -82,7 +84,7 @@ try {
     omp: { version: 'omp/19.1.0', url: 'https://github.com/can1357/oh-my-pi/releases/download/v19.1.0/omp-darwin-arm64', sha256: 'dca5643669ed5e553f707bd065499babd0fe3030696bbb24c9da09c798af5abb', bundled: false },
     omp_extension: { path: 'integrations/omp/fabric.ts', sha256: files['integrations/omp/fabric.ts'], source_url: `https://github.com/satansdeer/fabric/blob/${source}/integrations/omp/fabric.ts` },
     fixture: { path: 'bin/fabric-fake-harness', sha256: files['bin/fabric-fake-harness'], purpose: 'provider-free fake-a/fake-b only; not a native model worker' },
-    target_plugins: [], files,
+    target_plugins: targetPlugins, files,
   };
   const json = JSON.stringify(manifest, null, 2) + '\n';
   writeFileSync(join(stage, 'release.json'), json, { mode: 0o600, flag: 'wx' });
@@ -90,7 +92,7 @@ try {
   run('/usr/bin/tar', ['-czf', join(output, manifest.archive), '-C', output, name], { env: { PATH: '/usr/bin:/bin', COPYFILE_DISABLE: '1' } });
   const hash = sha256(readFileSync(join(output, manifest.archive)));
   writeFileSync(join(output, `${manifest.archive}.sha256`), `${hash}  ${manifest.archive}\n`, { mode: 0o600, flag: 'wx' });
-  const notes = `macOS arm64 native bootstrap ${tag}\n\nSource: ${manifest.source_url}\nBuild kind: ${buildKind}\nArchive: ${manifest.archive}\nSHA256: ${hash}\n\nOfficial plugin content pins (protocol 1):\n${plugins.map(p => `- ${p.id} ${p.version}: ${p.sha256}; supports ${p.supported_cli}`).join('\n')}\n\nOMP extension: ${manifest.omp_extension.source_url}\nExtension SHA256: ${manifest.omp_extension.sha256}\nProvider-free fixture: ${manifest.fixture.path} (${manifest.fixture.sha256})\nNo target plugin bundled. OMP/Codex CLIs are separately installed, not bundled.\n\nNo Apple signing/notarization, Intel/Linux, npm/npx/Homebrew, provider-backed or full swarm-parity claim. #7 stays open. Publication is not downloaded-install proof; link the later smoke evidence in #38 and #7 before release dogfooding.\n`;
+  const notes = `macOS arm64 native bootstrap ${tag}\n\nSource: ${manifest.source_url}\nBuild kind: ${buildKind}\nArchive: ${manifest.archive}\nSHA256: ${hash}\n\nOfficial plugin content pins (protocol 1):\n${plugins.map(p => `- ${p.id} ${p.version}: ${p.sha256}; supports ${p.supported_cli}`).join('\n')}\n${targetPlugins.map(p => `- target ${p.id} ${p.version}: ${p.sha256}`).join('\n')}\n\nOMP extension: ${manifest.omp_extension.source_url}\nExtension SHA256: ${manifest.omp_extension.sha256}\nProvider-free fixture: ${manifest.fixture.path} (${manifest.fixture.sha256})\nTrusted-local target bundled as executable and installable package. OMP/Codex CLIs are separately installed, not bundled.\n\nNo cloud, PTY, persistent-environment, Apple signing/notarization, Intel/Linux, npm/npx/Homebrew, provider-backed or full swarm-parity claim. #7 stays open. Publication is not downloaded-install proof; link the later smoke evidence in #38 and #7 before release dogfooding.\n`;
   writeFileSync(join(output, 'release-notes.md'), notes, { mode: 0o600, flag: 'wx' });
   console.log(JSON.stringify({ archive: join(output, manifest.archive), sha256: hash, source_sha: source, build_kind: buildKind, plugins }, null, 2));
 } finally {

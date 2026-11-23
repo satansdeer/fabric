@@ -1,4 +1,5 @@
 //! Local diagnostics and durable workspace ownership orchestration.
+mod target;
 
 use std::env;
 use std::path::PathBuf;

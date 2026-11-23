@@ -10,24 +10,26 @@ fn manifest(kind: PluginKind, mode: &str, dir: &Path) -> PluginManifest {
         PluginKind::Target => "target",
         PluginKind::Connector => "connector",
     };
+    let executable = "/usr/bin/python3".into();
+    let args = vec![
+        format!("{}/tests/fixtures/plugin.py", env!("CARGO_MANIFEST_DIR")),
+        name.into(),
+        mode.into(),
+        dir.join("pid").display().to_string(),
+    ];
     PluginManifest {
         id: format!("external-{name}").parse().unwrap(),
         version: "1.0.0".into(),
         protocol: ProtocolRange { min: 1, max: 1 },
         kind,
-        executable: "/usr/bin/python3".into(),
-        args: vec![
-            format!("{}/tests/fixtures/plugin.py", env!("CARGO_MANIFEST_DIR")),
-            name.into(),
-            mode.into(),
-            dir.join("pid").display().to_string(),
-        ],
+        executable,
+        args,
         integrity: None,
         native: None,
         capabilities: vec![
             match kind {
                 PluginKind::Harness => "harness.run",
-                PluginKind::Target => "target.plan",
+                PluginKind::Target => "target.execute",
                 PluginKind::Connector => "connector.evidence",
             }
             .into(),
@@ -50,15 +52,102 @@ fn reaped(dir: &Path) {
     );
 }
 #[test]
+fn target_start_requires_fresh_authority_before_dispatch_and_before_spawn() {
+    for scenario in ["cancelled", "owner_invalid", "changed_during_plan"] {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::default();
+        let target = PluginHost::default()
+            .target(
+                &manifest(PluginKind::Target, "concrete", dir.path()),
+                &cancel,
+            )
+            .unwrap();
+        if scenario == "cancelled" {
+            cancel.cancel();
+        }
+        let marker = dir.path().join("UNAUTHORIZED");
+        let spec = fabric_runner::CommandSpec {
+            program: "/usr/bin/touch".into(),
+            args: vec![marker.clone().into_os_string()],
+            environment: vec![],
+        };
+        let capture = fabric_runner::capture::Capture::new(
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            None,
+            4096,
+        )
+        .unwrap();
+        let mut validations = 0;
+        let result = target.execute(
+            "test",
+            fabric_runner::ExecutionRequest {
+                spec: &spec,
+                cwd: dir.path(),
+                capture,
+                limits: &fabric_runner::ExecutionLimits::default(),
+                cancellation: &cancel,
+                owner_lease: None,
+            },
+            || {
+                validations += 1;
+                if scenario == "owner_invalid" || validations == 2 {
+                    Err(fabric_runner::execution_error("Ownership changed"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| panic!("unauthorized process started"),
+        );
+        assert!(result.is_err());
+        assert!(!marker.exists());
+        let calls = std::fs::read_to_string(dir.path().join("pid.calls")).unwrap();
+        assert_eq!(
+            calls.lines().any(|method| method == "target.start"),
+            scenario == "changed_during_plan"
+        );
+        drop(target);
+        reaped(dir.path());
+    }
+}
+
+#[test]
+fn target_rejects_acknowledgment_only_and_wrong_grant_without_executing() {
+    use fabric_runner::target::Action;
+    for mode in ["ack-only", "wrong-grant"] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = PluginHost::default()
+            .target(
+                &manifest(PluginKind::Target, mode, dir.path()),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        let result = target.drive(
+            "reclaim",
+            "test",
+            &[Action::Reclaim],
+            serde_json::json!({}),
+            |_| -> Result<((), serde_json::Value), fabric_domain::FabricError> {
+                panic!("invalid target plan executed")
+            },
+        );
+        assert!(result.is_err());
+        drop(target);
+        reaped(dir.path());
+    }
+}
+
+#[test]
 fn external_kinds_and_harness_execution_bridge() {
     let dir = tempfile::tempdir().unwrap();
     let host = PluginHost::default();
     let cancel = CancellationToken::default();
     assert_eq!(
-        host.target_plan(&manifest(PluginKind::Target, "ok", dir.path()), &cancel)
+        host.target(&manifest(PluginKind::Target, "ok", dir.path()), &cancel)
+            .err()
             .unwrap()
-            .placement,
-        "local"
+            .kind,
+        fabric_domain::ErrorKind::UnsupportedPlacement
     );
     reaped(dir.path());
     assert!(
@@ -125,11 +214,12 @@ fn protocol_failures_are_bounded_reaped_and_secret_free() {
         };
         let start = std::time::Instant::now();
         let error = host
-            .target_plan(
+            .target(
                 &manifest(PluginKind::Target, mode, dir.path()),
                 &CancellationToken::default(),
             )
-            .unwrap_err();
+            .err()
+            .unwrap();
         assert!(!format!("{error:?}").contains("SECRET_CANARY"));
         assert!(start.elapsed() < Duration::from_secs(3));
         assert!(dir.path().join("pid").exists(), "{mode}: {error:?}");
@@ -159,7 +249,7 @@ fn cancellation_reaps_live_plugin() {
             let manifest = manifest(kind, "hang", dir.path());
             let error = match kind {
                 PluginKind::Harness => host.harness_info(&manifest, &cancel).map(|_| ()),
-                PluginKind::Target => host.target_plan(&manifest, &cancel).map(|_| ()),
+                PluginKind::Target => host.target(&manifest, &cancel).map(|_| ()),
                 PluginKind::Connector => host.connector_evidence(&manifest, &cancel).map(|_| ()),
             }
             .unwrap_err();
@@ -373,10 +463,7 @@ fn typescript_scaffolds_use_existing_native_host() {
                 );
             }
             PluginKind::Target => {
-                assert_eq!(
-                    host.target_plan(&plugin, &cancel).unwrap().placement,
-                    "local"
-                );
+                host.target(&plugin, &cancel).unwrap().finish().unwrap();
             }
             PluginKind::Connector => {
                 assert!(!host.connector_evidence(&plugin, &cancel).unwrap().available);

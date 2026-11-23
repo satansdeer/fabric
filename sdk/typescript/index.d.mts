@@ -4,8 +4,25 @@ export type PluginKind = 'harness' | 'target' | 'connector';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface PluginIdentity { id: string; version: string; kind: PluginKind }
 export interface Ready { ready: boolean }
-/** Protocol v1 only proposes local placement; this is not worker admission. */
-export interface TargetJob { placement: 'local' }
+/** Grants are opaque session-unique identifiers, never paths or launch authority. */
+export type TargetActionByOperation = {
+  prepare: { primitive: 'workspace.fork'; strategy: 'clone_or_copy' | 'copy' };
+  start: { primitive: 'process.spawn' };
+  inspect: { primitive: 'process.inspect' };
+  cancel: { primitive: 'process.terminate' };
+  collect: { primitive: 'artifacts.capture' | 'artifacts.recover' };
+  reclaim: { primitive: 'workspace.reclaim' };
+};
+export type TargetAction = TargetActionByOperation[TargetOperation] | { primitive: 'unsupported' };
+export interface TargetJob<K extends TargetOperation = TargetOperation> { placement: string; run_id: string; grant: string; actions: TargetActionByOperation[K][]; context: { [key: string]: Json } }
+export interface TargetPlacement { placement: string; backends: ['host.local'] }
+export interface TargetCompleted { grant: string; evidence: { [key: string]: Json } }
+export type TargetOperation = 'prepare' | 'start' | 'inspect' | 'cancel' | 'collect' | 'reclaim';
+export const TARGET_OPERATIONS: readonly TargetOperation[];
+export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: string[] }
+export interface TargetProposal<K extends TargetOperation = TargetOperation> { grant: string; action: TargetActionByOperation[K] | { primitive: 'unsupported' } }
+export const TARGET_ACTIONS: { readonly [K in TargetOperation]: readonly TargetActionByOperation[K][] };
+export function validTargetPlan(plan: unknown, job: TargetJob): boolean;
 /** Evidence is availability only, never a credential or authorization. */
 export interface ConnectorPayload { available: boolean }
 export type HarnessEvent = { type: string; [key: string]: Json };
@@ -16,7 +33,11 @@ export interface HarnessDefinition extends Identity {
   plan(params: Record<string, never>): Result<Ready>;
   run(context: HarnessContext): Result<void>;
 }
-export interface TargetDefinition extends Identity { plan(job: TargetJob): Result<TargetJob> }
+export type TargetDefinition = Identity & {
+  capabilities(): Result<TargetCapabilities>;
+  placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'unsupported' }>;
+  completed(result: TargetCompleted): Result<{ received: string }>;
+} & { [K in TargetOperation]: (job: TargetJob<K>) => Result<TargetProposal<K>> };
 export interface ConnectorDefinition extends Identity { evidence(params: Record<string, never>): Result<ConnectorPayload> }
 export type Harness = Readonly<HarnessDefinition & { kind: 'harness' }>;
 export type Target = Readonly<TargetDefinition & { kind: 'target' }>;
@@ -26,18 +47,20 @@ export function defineTarget(options: TargetDefinition): Target;
 export function defineConnector(options: ConnectorDefinition): Connector;
 export function serve(plugin: Harness | NativeHarness | Target | Connector): Promise<void>;
 export interface InitializeResult extends PluginIdentity { protocol: 1 }
-export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.plan' | 'connector.evidence' | 'shutdown';
+export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.evidence' | 'shutdown';
 export type ControlRequest = { jsonrpc: '2.0'; id: number } & (
   { method: 'initialize'; params: { protocol: 1 } } |
-  { method: 'target.plan'; params: TargetJob } |
-  { method: Exclude<ControlMethod, 'initialize' | 'target.plan'>; params: Record<string, never> }
+  { [K in TargetOperation]: { method: `target.${K}`; params: TargetJob<K> } }[TargetOperation] |
+  { method: 'target.placement'; params: TargetPlacement } |
+  { method: 'target.completed'; params: TargetCompleted } |
+  { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | `target.${TargetOperation}`>; params: Record<string, never> }
 );
 export type ControlResponse<T> = { jsonrpc: '2.0'; id: number } & ({ result: T; error?: never } | { error: { code: number; message: string }; result?: never });
 export interface PluginManifest extends PluginIdentity {
   protocol: { min: number; max: number };
   executable: string;
   args: string[];
-  capabilities: ('harness.run' | 'target.plan' | 'connector.evidence')[];
+  capabilities: ('harness.run' | 'target.execute' | 'connector.evidence')[];
   integrity?: { root: string; sha256: string };
   native?: NativeMetadata;
 }
@@ -69,7 +92,7 @@ export interface NativeProfile {
 }
 export interface NativeRequest {
   profile?: NativeProfile | null; model?: string | null; required_capabilities?: string[];
-  placement?: 'local' | 'remote' | 'byoc'; access?: 'edit' | 'inspect' | 'publish';
+  placement?: string; access?: 'edit' | 'inspect' | 'publish';
   hard_read_only?: boolean; resume?: string | null; max_cost_usd?: number | null;
 }
 export interface ProfileEvidence {

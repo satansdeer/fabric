@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+#[path = "../../fabric-runner/tests/support/local_target.rs"]
+mod local_target;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -67,6 +69,7 @@ impl Fixture {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let path = fs::canonicalize(path).unwrap();
+        local_target::install(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
         let mut fixture = Self {
             repo: path.join("repo ; literal"),
             path,
@@ -107,6 +110,7 @@ impl Fixture {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.path)
+            .env("FABRIC_PLUGIN_REGISTRY", self.path.join("plugin-registry"))
             .arg("--root")
             .arg(self.path.join("storage"));
         command
@@ -425,6 +429,19 @@ fn recover_inspects_captureable_failure_then_seals_and_reclaims_without_inventin
     let sentinel = fixture.path.join("outside-root-sentinel");
     fs::write(&sentinel, b"never delete outside managed root\n").unwrap();
 
+    // An unavailable pinned target cannot convert exit 7 into success or authorize deletion.
+    let target = fixture.path.join("plugin-registry/local-target/plugin");
+    let held = target.with_extension("unavailable");
+    fs::rename(&target, &held).unwrap();
+    let unavailable = fixture.query(&["recover", id, "--apply"]);
+    assert_eq!(unavailable["action"], "retained");
+    assert_eq!(unavailable["reason"], "target_unavailable");
+    assert_eq!(fixture.query(&["runs", "show", id]), before);
+    assert_eq!(
+        fs::read(tree.parent().unwrap().join(".fabric-owner")).unwrap(),
+        marker
+    );
+    fs::rename(held, target).unwrap();
     let inspection = fixture.query(&["recover", id]);
     assert_eq!(inspection["run_id"], id);
     assert_eq!(inspection["workspace_id"], workspace_id);
@@ -967,16 +984,26 @@ fn twenty_real_workers_recover_only_proven_captureable_inactive_work_and_explain
     let cancelled = fixture.submit(&[8, 9], "", 0);
     fixture.started(8);
     fixture.started(9);
-    fixture.query(&["cancel", cancelled["batch_id"].as_str().unwrap()]);
-    fixture.terminal(cancelled["batch_id"].as_str().unwrap());
+    let batch = cancelled["batch_id"].as_str().unwrap();
+    fixture.query(&["cancel", batch]);
+    fixture.terminal(batch);
+    let results = fixture.query(&["results", batch]);
     for (label, id) in [8, 9]
         .into_iter()
         .zip(cancelled["run_ids"].as_array().unwrap())
     {
         let id = id.as_str().unwrap();
         let shown = fixture.query(&["runs", "show", id]);
-        assert_eq!(shown["run"]["state"], "CANCELLED");
-        assert_eq!(shown["workspace"]["state"], "RECLAIMED");
+        assert_eq!(
+            shown["run"]["state"], "CANCELLED",
+            "cancelled worker label={label} run={id}\nretention_reason={}\nshown={shown:#}\nresults={results:#}",
+            shown["workspace"]["retention_reason"]
+        );
+        assert_eq!(
+            shown["workspace"]["state"], "RECLAIMED",
+            "cancelled worker label={label} run={id}\nretention_reason={}\nshown={shown:#}\nresults={results:#}",
+            shown["workspace"]["retention_reason"]
+        );
         completed.push((id.to_owned(), verified_artifacts(&fixture, id, label)));
     }
     // Four real capture failures before stage creation. Marker corruption and

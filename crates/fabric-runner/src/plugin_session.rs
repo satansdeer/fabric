@@ -79,7 +79,7 @@ impl PluginSession {
             } else {
                 MAX_FRAME
             },
-            persistent: manifest.native.is_some(),
+            persistent: manifest.native.is_some() || manifest.kind == PluginKind::Target,
         };
         let hello: Hello =
             serde_json::from_value(session.call("initialize", json!({"protocol":1}))?)
@@ -123,6 +123,10 @@ impl PluginSession {
     }
     pub(crate) fn set_cancellation(&mut self, cancellation: &CancellationToken) {
         self.cancel = cancellation.clone();
+    }
+    pub(crate) fn bound_target_operations(&mut self) {
+        self.cancel = CancellationToken::default();
+        self.timeout = self.timeout.min(Duration::from_millis(250));
     }
     pub(crate) fn finish(mut self) -> Result<(), FabricError> {
         let ready: Ready = serde_json::from_value(self.call("shutdown", json!({}))?)

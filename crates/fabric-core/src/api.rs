@@ -189,12 +189,10 @@ pub(crate) fn translate_v1(
 }
 
 pub(crate) fn validate_worker_request(request: &WorkerBatchRequest) -> Result<(), FabricError> {
-    if request.placement != "local" {
-        return Err(FabricError {
-            kind: ErrorKind::UnsupportedPlacement,
-            message: "Only local worker placement is supported.".into(),
-        });
-    }
+    HarnessId::try_from(request.placement.clone()).map_err(|_| FabricError {
+        kind: ErrorKind::UnsupportedPlacement,
+        message: "Placement must name an installed target.".into(),
+    })?;
     validate_size(
         &request.project,
         request.max_concurrency,
@@ -232,12 +230,13 @@ pub(crate) fn translate_workers(
         .tasks
         .into_iter()
         .map(|task| {
-            let options = worker_options(
+            let mut options = worker_options(
                 &task.harness_id,
                 task.model,
                 task.execution_context,
                 task.limits.unwrap_or_default(),
             )?;
+            options.harness_request.placement = request.placement.clone();
             Ok(ExecutionTask {
                 id: task.task_id,
                 prompt: Some(task.prompt.into_bytes()),
@@ -312,14 +311,20 @@ pub(crate) fn preflight_workers(
     };
     let mut adapters = crate::run::PlannedAdapters::new();
     for task in &request.tasks {
-        let options = worker_options(
+        let mut options = worker_options(
             &task.harness_id,
             task.model.clone(),
             task.execution_context.clone(),
             task.limits.clone().unwrap_or_default(),
         )?;
-        let (plan, _) =
-            crate::run::plan_task(root, &task.harness_id, &options, &harnesses, &mut adapters)?;
+        options.harness_request.placement = request.placement.clone();
+        let (plan, _) = crate::run::plan_task(
+            root,
+            &task.harness_id,
+            &mut options,
+            &harnesses,
+            &mut adapters,
+        )?;
         crate::run::validate_durable_plan(&plan)?;
     }
     Ok(())
