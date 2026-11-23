@@ -233,9 +233,7 @@ fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
             } else {
                 u64::try_from(stat.st_size).map_err(|_| MeterCause::InvalidSize)?
             };
-            bytes = bytes
-                .checked_add(value)
-                .ok_or(MeterCause::UsageOverflow)?;
+            bytes = bytes.checked_add(value).ok_or(MeterCause::UsageOverflow)?;
         }
         Ok(bytes)
     }
@@ -589,10 +587,13 @@ pub(crate) fn violation(
     if bytes >= options.policy.max_workspace_bytes.saturating_mul(9) / 10 {
         eprintln!("warning: workspace near storage limit: {bytes} bytes");
     }
-    let free = options.meter.free_bytes(root).map_err(|cause| MeterFailure {
-        stage: MeterStage::FreeSpace,
-        cause,
-    })?;
+    let free = options
+        .meter
+        .free_bytes(root)
+        .map_err(|cause| MeterFailure {
+            stage: MeterStage::FreeSpace,
+            cause,
+        })?;
     if free < options.policy.min_free_bytes
         || measured_usage(root).map_err(|cause| MeterFailure {
             stage: MeterStage::ManagedUsage,
