@@ -915,3 +915,38 @@ CLI startup, source fork/sync, artifact Git capture/publication or reclaim.
 Runner `timeout_escalates_a_term_ignoring_leader_and_reaps_its_observed_status`
 retains 100 ms execution + 50 ms TERM grace, SIGKILL/null exit, Timeout, <2 s
 and capture success; all end-to-end tree, durable evidence and reclaim checks remain.
+
+### Issue #47 — bounded native-target responsiveness tradeoff
+
+Public v0.1.3 issue #8 attempt `r-1795426708196470000-93848-0`
+failed on `target.inspect`, request 160, response_read, sent 195/195
+bytes and received 0 bytes. The child was reaped with SIGKILL before
+any tool started; captures were untruncated and the workspace remains
+RECOVERY_REQUIRED. Its one-attempt budget is closed. The owned idle
+manager was explicitly stopped and exited 0; no retry or replacement ran.
+The reason the actual target missed its 250 ms deadline is unknown.
+
+The shared post-negotiation target bound is now one second, still capped
+by a smaller configured host timeout. This deliberately trades up to
+two seconds per inspect/receipt pair for tolerating scheduling delays;
+it is not an independent cancellation watchdog or proof of the actual
+delay's cause. Startup bounds, fresh grants, fail-closed errors, receipts,
+capture, workspace retention and owned-process reaping are unchanged.
+
+Manager checks on macOS, after the change:
+
+```sh
+cargo test --locked -p fabric-runner --test plugins target_
+FABRIC_REFERENCE_PLUGIN_BINARY=/absolute/path/to/public-v0.1.3/plugins/omp/plugin \
+  cargo test --locked -p fabric-cli --test run target_failure_after_spawn_preserves_terminal_capture_and_safe_recovery -- --exact --nocapture
+```
+
+The four target tests passed in 2.74 s. The new regression drives a real
+worker through a target that delays valid inspections by 350 ms, then
+verifies successful completion and its actual output file. Hung-target
+diagnostics, refusal of unauthorized effects and plugin reap remain tested.
+The post-spawn failure/recovery test passed in 29.14 s across its existing
+failure cases. Its first invocation failed before execution because the
+SDK executable environment variable was missing; the invocation above
+corrected that setup. Public release and real native follow-on acceptance
+are separate gates, not claimed by these provider-free checks.
