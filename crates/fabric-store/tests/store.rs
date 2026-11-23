@@ -1338,7 +1338,8 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     for version in [14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
         if version == 13 {
-            db.execute_batch("DROP TABLE run_targets; PRAGMA user_version=13;").unwrap();
+            db.execute_batch("DROP TABLE run_targets; PRAGMA user_version=13;")
+                .unwrap();
         }
         if version == 12 {
             db.execute_batch("DROP TABLE run_observations; PRAGMA user_version=12;")

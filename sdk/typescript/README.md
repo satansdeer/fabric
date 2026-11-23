@@ -39,12 +39,14 @@ const harness = defineHarness({
 const target = defineTarget({
   id: 'my-target', version: '1.0.0',
   capabilities: () => ({ placements: ['my-target'], operations: [...TARGET_OPERATIONS], optional: [] }),
-  prepare: () => ({ operation: 'unsupported' }),
-  start: () => ({ operation: 'unsupported' }),
-  inspect: () => ({ operation: 'unsupported' }),
-  cancel: () => ({ operation: 'unsupported' }),
-  collect: () => ({ operation: 'unsupported' }),
-  reclaim: () => ({ operation: 'unsupported' }),
+  placement: () => ({ backend: 'host.local' }),
+  completed: ({ grant }) => ({ received: grant }),
+  prepare: ({ grant }) => ({ grant, action: { primitive: 'workspace.fork', strategy: 'copy' } }),
+  start: ({ grant }) => ({ grant, action: { primitive: 'process.spawn' } }),
+  inspect: ({ grant }) => ({ grant, action: { primitive: 'process.inspect' } }),
+  cancel: ({ grant }) => ({ grant, action: { primitive: 'process.terminate' } }),
+  collect: ({ grant, actions }) => ({ grant, action: actions[0] }),
+  reclaim: ({ grant }) => ({ grant, action: { primitive: 'workspace.reclaim' } }),
 });
 const connector = defineConnector({
   id: 'my-connector', version: '1.0.0',
@@ -65,7 +67,7 @@ For a conventional npm dependency, import from `@fabric/plugin-sdk`. Do not run 
 | Kind | Mocked request/payload | Expected response |
 | --- | --- | --- |
 | harness | `harness.plan {}` | `{ "ready": true }` |
-| target | `target.capabilities {}`, then `target.{prepare,start,inspect,cancel,collect,reclaim} {placement: ID,run_id: "conformance"}` | Exact declared capabilities; sample operations explicitly `unsupported`, reference local operations `local.OP` |
+| target | Capabilities, placement, then six `target.OP {placement,run_id,grant,actions,context}` exchanges and concrete-plan completion receipts | Exact capabilities, offered backend/action and matching grant; fake remote refuses explicitly. Completion evidence here is fixture data, not execution proof. |
 | connector | `connector.evidence {}` | `{ "available": false }` for the sample; either boolean conforms |
 | harness run | `--fabric-plugin-run PROMPT_FILE`, fixed fixture prompt | sample text event containing the prompt, then `done` |
 
@@ -137,7 +139,7 @@ node sdk/typescript/cli.mjs install /absolute/new/local-package \
   --version 0.1.0 --sha256 REVIEWED_CONTENT_SHA256 --trust
 ```
 
-`local` uses six typed host instructions, not plugin-supplied success, paths, commands or deletion claims. Core interprets each instruction with its validated run/workspace/process/artifact objects. The fake-remote sample proves explicit placement refusal only; no cloud support is claimed. `target.plan` plugins must migrate to `defineTarget`'s capabilities and six callbacks; no compatibility shim remains. Set `FABRIC_LOCAL_TARGET_BINARY=/absolute/path/to/fabric-local-target` for SDK reference-package conformance plus installed-host check; Rust local worker/recovery tests exercise the resulting installed target against actual workers and sealed artifacts.
+Targets select concrete request-scoped host primitives, never supply success, paths, commands or deletion authority. Core executes the selection against validated objects and sends independently observed `target.completed` evidence; the target returns `{received:grant}`. See [the full operation contract](../../docs/PLUGIN_PROTOCOL.md#installed-execution-targets). Any installed ID can use `host.local`; the fake-remote sample explicitly refuses placement. There is no cloud claim or legacy acknowledgment shim. Set `FABRIC_LOCAL_TARGET_BINARY=/absolute/path/to/fabric-local-target` for SDK reference-package conformance plus installed-host checks. Rust tests exercise installed replacement targets against real workers, sealed artifacts and reclaim; SDK conformance alone is not lifecycle proof.
 
 
 ## Native reference harness plugins

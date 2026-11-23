@@ -170,6 +170,16 @@ impl HarnessAdapter for FakeHarness {
     }
 }
 
+/// Validated launch inputs shared by direct and installed-target execution.
+pub struct ExecutionRequest<'a> {
+    pub spec: &'a CommandSpec,
+    pub cwd: &'a Path,
+    pub capture: Capture<'a>,
+    pub limits: &'a ExecutionLimits,
+    pub cancellation: &'a CancellationToken,
+    pub owner_lease: Option<&'a File>,
+}
+
 /// Core must supply a freshly validated owned fork as cwd. The callback commits
 /// RUNNING only after spawn; persistence failure kills/reaps the actual child.
 pub fn execute(
@@ -181,19 +191,33 @@ pub fn execute(
     owner_lease: Option<&File>,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
 ) -> Result<Execution, FabricError> {
-    execute_observed(spec, cwd, capture, limits, cancellation, owner_lease, started, |_| Ok(()))
+    execute_observed(
+        ExecutionRequest {
+            spec,
+            cwd,
+            capture,
+            limits,
+            cancellation,
+            owner_lease,
+        },
+        started,
+        |_, _| Ok(()),
+    )
 }
 
 pub(crate) fn execute_observed(
-    spec: &CommandSpec,
-    cwd: &Path,
-    capture: Capture<'_>,
-    limits: &ExecutionLimits,
-    cancellation: &CancellationToken,
-    owner_lease: Option<&File>,
+    request: ExecutionRequest<'_>,
     started: impl FnOnce(u32) -> Result<(), FabricError>,
-    mut observed: impl FnMut(bool) -> Result<(), FabricError>,
+    mut observed: impl FnMut(&mut ProcessGroup, bool) -> Result<(), FabricError>,
 ) -> Result<Execution, FabricError> {
+    let ExecutionRequest {
+        spec,
+        cwd,
+        capture,
+        limits,
+        cancellation,
+        owner_lease,
+    } = request;
     limits.validate()?;
     if cancellation.is_cancelled() {
         return Err(execution_error("Cancelled before harness launch."));
@@ -247,14 +271,15 @@ pub(crate) fn execute_observed(
     let (mut status, events) = std::thread::scope(|scope| {
         let out = scope.spawn(|| capture.stdout(stdout));
         let err = scope.spawn(|| capture.stderr(stderr));
-        let status = started(group.child.id())
-            .and_then(|()| {
-                observed(false)?;
-                group.supervise_observed(limits, cancellation, |stopping| {
-                    if !stopping { capture.observe_alive(); }
-                    observed(stopping)
-                })
-            });
+        let status = started(group.child.id()).and_then(|()| {
+            observed(&mut group, false)?;
+            group.supervise_observed(limits, cancellation, |group, stopping| {
+                if !stopping {
+                    capture.observe_alive();
+                }
+                observed(group, stopping)
+            })
+        });
         // Stop the owned group before joining drains, including on persistence errors.
         drop(group);
         stopped.store(true, Ordering::Release);

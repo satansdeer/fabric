@@ -47,7 +47,7 @@ Provider-free regression command: `cargo test -p fabric-runner --test plugins` p
 
 ## Installed execution targets
 
-`target.plan` is removed, not a compatibility alias. `target.execute` negotiates initialize/health as above, then `target.capabilities {}`. The exact result is `{"placements":["PLUGIN_ID"],"operations":["prepare","start","inspect","cancel","collect","reclaim"],"optional":[]}`. Optional PTY, persistent environments and infrastructure-evidence claims are currently rejected, not emulated. Every operation is a distinct `target.OP` request with `{"placement":"PLUGIN_ID","run_id":"OPAQUE_RUN_ID"}`. `inspect` with run ID `preflight` checks placement before admission. Shutdown is acknowledged and its successful exit checked before successful finalization.
+`target.plan` and operation-token acknowledgments are removed, not compatibility aliases. After initialize/health, `target.capabilities {}` returns exactly `{"placements":["PLUGIN_ID"],"operations":["prepare","start","inspect","cancel","collect","reclaim"],"optional":[]}`. Optional PTY, persistent environments and infrastructure-evidence claims are rejected. Before admission, `target.placement {"placement":"PLUGIN_ID","backends":["host.local"]}` selects `{"backend":"host.local"}` or refuses with `{"backend":"unsupported"}`. Any installed target ID may select the offered backend; this is not a literal-`local` allowlist.
 
 Target initialization, health and capability exchanges retain the five-second
 per-request startup bound. After negotiation, lifecycle operations and shutdown
@@ -55,9 +55,20 @@ are limited to 250 ms each so a blocked driver cannot stall Core supervision
 for the startup timeout. Any overrun fails closed, terminates owned processes
 and retains incomplete cleanup evidence; there is no retry or local fallback.
 
-The executable returns an instruction, never outcome evidence: `{"operation":"local.OP"}` or `{"operation":"unsupported"}`. Unknown fields, exit statuses, PIDs, paths, ownership, artifact-verification and reclaim claims are rejected. Only the `local` placement can request local primitives. A separately installed fake remote advertises its own ID and returns `unsupported`; Core rejects placement before allocating runs/workspaces and never launches a local worker as fallback. The current host instruction set implements trusted-local execution only; an actual remote backend needs a separately specified/verifiable host contract, not acceptance of remote status assertions.
+Each `target.OP` receives `{placement,run_id,grant,actions,context}`. The opaque grant is scoped to that request and the offered actions; context contains bounded nonsecret inputs, not authority. The exact reply is `{grant,action}` selecting one offered action, or `{grant,action:{primitive:"unsupported"}}`. Unknown fields, stale grants, unoffered actions, paths, commands, PIDs and plugin-supplied outcomes fail closed. Core executes the selected primitive against captured validated objects inside this boundary, not after an acknowledgment. A separate target can, for example, select `copy` rather than `clone_or_copy` for preparation without rebuilding Core.
 
-Core interprets local instructions against its already-authorized objects: prepare invokes the existing Rust APFS/copy workspace mechanism; start revalidates workspace, consent, command and storage immediately before supervised launch; inspect gates actual host-observed process/capture evidence; cancel gates process-group termination; collect gates existing artifact capture; reclaim gates descriptor-anchored deletion only after sealed hashes, owner and lease checks. Control replies cannot manufacture process completion or artifact evidence. Process termination remains mandatory on a driver failure.
+| Operation | Offered concrete primitive |
+| --- | --- |
+| prepare | `workspace.fork`, strategy `clone_or_copy` or `copy` |
+| start | `process.spawn` |
+| inspect | `process.inspect` (live owned group or recovery ownership evidence) |
+| cancel | `process.terminate` |
+| collect | `artifacts.capture` or recovery `artifacts.recover` |
+| reclaim | `workspace.reclaim` |
+
+After executing a primitive Core sends `target.completed {grant,evidence}` with observed facts; the exact receipt is `{received:grant}`. Receipts do not create successful outcomes. Actual Rust workspace/process/capture results, independently committed pins, status and artifact hashes remain authoritative. Start revalidates workspace, consent, command, storage and cancellation before dispatch and again immediately before spawn. Cancellation drives process-group termination; mandatory host stop/reap remains in force even on driver failure. Reclaim is offered only after apply, sealed hashes, owner and lease checks and durable cleanup intent; deletion remains descriptor-anchored. Dry-run never dispatches reclaim. Shutdown must exit successfully before successful finalization.
+
+A separately installed fake remote refuses placement before allocating runs/workspaces; no local fallback occurs. Only the trusted-local host primitive backend is implemented. Actual remote execution requires a separately specified verifiable backend, not acceptance of remote status assertions.
 
 `local` resolves through the registry like any other target, or to the distributed sibling `fabric-local-target` when no local registry entry exists. A revoked/broken installed local entry is an error, not permission to use the bundled executable. Admission pins manifest, executable SHA-256, placement and selected registry into the durable accepted plan and immutable schema-14 `run_targets` row before preparation. Execution/recovery never silently repin after upgrades; missing/revoked/changed plugins refuse finalization/reclaim and retain unknown cleanup evidence. Existing pre-target workspace records retain their original evidence-based recovery rules.
 

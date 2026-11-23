@@ -1,9 +1,9 @@
 //! Installed target drivers propose operations; only the host executes authority-bearing primitives.
-use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fabric_domain::{ErrorKind, FabricError, HarnessId};
@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::CancellationToken;
 use crate::plugin::{PluginKind, PluginManifest, PluginSession, configured_registry, failure};
 
-pub const OPERATIONS: [&str; 6] = ["prepare", "start", "inspect", "cancel", "collect", "reclaim"];
+pub const OPERATIONS: [&str; 6] = [
+    "prepare", "start", "inspect", "cancel", "collect", "reclaim",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,26 +28,36 @@ pub struct TargetPin {
 }
 
 fn executable_hash(path: &Path) -> Result<String, FabricError> {
-    let mut file = std::fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
         .map_err(|_| failure("target_unavailable"))?;
     let metadata = file.metadata().map_err(|_| failure("target_unavailable"))?;
     // Includes installed language runtimes, not just the separately bounded plugin package.
     const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
-    if !metadata.is_file() || metadata.len() > MAX_EXECUTABLE_BYTES
+    if !metadata.is_file()
+        || metadata.len() > MAX_EXECUTABLE_BYTES
         || (metadata.uid() != unsafe { libc::geteuid() } && metadata.uid() != 0)
-        || metadata.mode() & 0o022 != 0 {
+        || metadata.mode() & 0o022 != 0
+    {
         return Err(failure("unsafe_target_executable"));
     }
     let mut hash = Sha256::new();
     let mut buffer = [0; 16384];
     let mut remaining = MAX_EXECUTABLE_BYTES + 1;
     loop {
-        let count = (&mut file).take(remaining).read(&mut buffer)
+        let count = (&mut file)
+            .take(remaining)
+            .read(&mut buffer)
             .map_err(|_| failure("target_unavailable"))?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         remaining -= count as u64;
-        if remaining == 0 { return Err(failure("unsafe_target_executable")); }
+        if remaining == 0 {
+            return Err(failure("unsafe_target_executable"));
+        }
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
@@ -55,21 +67,32 @@ impl TargetPin {
     pub fn select(placement: &str) -> Result<Self, FabricError> {
         let id = HarnessId::try_from(placement.to_owned())?;
         let registry = configured_registry()?;
-        let manifest = if let Some(registry) = registry.as_ref()
-            .filter(|registry| registry.plugins.iter().any(|p| p.manifest.id == id)) {
+        let manifest = if let Some(registry) = registry
+            .as_ref()
+            .filter(|registry| registry.plugins.iter().any(|p| p.manifest.id == id))
+        {
             registry.select(&id, PluginKind::Target)?
         } else if placement == "local" {
-            let executable = std::env::current_exe().map_err(|_| failure("target_unavailable"))?
-                .parent().ok_or_else(|| failure("target_unavailable"))?.join("fabric-local-target");
+            let executable = std::env::current_exe()
+                .map_err(|_| failure("target_unavailable"))?
+                .parent()
+                .ok_or_else(|| failure("target_unavailable"))?
+                .join("fabric-local-target");
             serde_json::from_value(json!({"id":"local","version":"0.1.0","kind":"target",
                 "protocol":{"min":1,"max":1},"executable":executable,"args":[],
-                "capabilities":["target.execute"]})).map_err(|_| failure("invalid_target"))?
+                "capabilities":["target.execute"]}))
+            .map_err(|_| failure("invalid_target"))?
         } else {
-            return Err(FabricError { kind: ErrorKind::UnsupportedPlacement,
-                message: "No installed target accepts the requested placement.".into() });
+            return Err(FabricError {
+                kind: ErrorKind::UnsupportedPlacement,
+                message: "No installed target accepts the requested placement.".into(),
+            });
         };
         let mut pin = Self::from_manifest(manifest, placement)?;
-        if registry.as_ref().is_some_and(|r| r.plugins.iter().any(|p| p.manifest.id == id)) {
+        if registry
+            .as_ref()
+            .is_some_and(|r| r.plugins.iter().any(|p| p.manifest.id == id))
+        {
             pin.registry = std::env::var_os("FABRIC_PLUGIN_REGISTRY").map(PathBuf::from);
         }
         Ok(pin)
@@ -79,7 +102,12 @@ impl TargetPin {
         manifest.validate()?;
         manifest.verify_integrity()?;
         let executable_sha256 = executable_hash(&manifest.executable)?;
-        Ok(Self { manifest, executable_sha256, placement: placement.into(), registry: None })
+        Ok(Self {
+            manifest,
+            executable_sha256,
+            placement: placement.into(),
+            registry: None,
+        })
     }
 
     pub fn open(&self, cancellation: &CancellationToken) -> Result<Target, FabricError> {
@@ -87,15 +115,19 @@ impl TargetPin {
     }
 
     pub fn preflight(&self, cancellation: &CancellationToken) -> Result<(), FabricError> {
-        let target = self.open(cancellation)?;
-        target.operation("inspect", "preflight")?;
-        target.finish()
+        self.open(cancellation)?.finish()
     }
 
-    pub(crate) fn open_with_timeout(&self, cancellation: &CancellationToken, timeout: Duration) -> Result<Target, FabricError> {
-        if self.manifest.kind != PluginKind::Target || self.manifest.capabilities != ["target.execute"]
+    pub(crate) fn open_with_timeout(
+        &self,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<Target, FabricError> {
+        if self.manifest.kind != PluginKind::Target
+            || self.manifest.capabilities != ["target.execute"]
             || self.manifest.id.as_str() != self.placement
-            || executable_hash(&self.manifest.executable)? != self.executable_sha256 {
+            || executable_hash(&self.manifest.executable)? != self.executable_sha256
+        {
             return Err(failure("target_pin_mismatch"));
         }
         // Revocation remains effective for accepted work and recovery. Replacement never silently repins.
@@ -104,72 +136,215 @@ impl TargetPin {
             None => configured_registry()?,
         };
         if let Some(registry) = registry {
-            if let Some(installed) = registry.plugins.iter().find(|p| p.manifest.id == self.manifest.id) {
-                if installed.revoked { return Err(failure("revoked")); }
-                if serde_json::to_value(&installed.manifest).ok() != serde_json::to_value(&self.manifest).ok() {
+            if let Some(installed) = registry
+                .plugins
+                .iter()
+                .find(|p| p.manifest.id == self.manifest.id)
+            {
+                if installed.revoked {
+                    return Err(failure("revoked"));
+                }
+                if serde_json::to_value(&installed.manifest).ok()
+                    != serde_json::to_value(&self.manifest).ok()
+                {
                     return Err(failure("target_pin_mismatch"));
                 }
             } else if self.registry.is_some() || self.manifest.integrity.is_some() {
                 return Err(failure("target_unavailable"));
             }
         }
-        if cancellation.is_cancelled() { return Err(failure("cancelled")); }
+        if cancellation.is_cancelled() {
+            return Err(failure("cancelled"));
+        }
         // A cancelled worker must still be able to request target cancellation and cleanup.
         let mut session = PluginSession::open(&self.manifest, timeout, cancellation)?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Capabilities { placements: Vec<String>, operations: Vec<String>, optional: Vec<String> }
-        let caps: Capabilities = serde_json::from_value(session.call("target.capabilities", json!({}))?)
-            .map_err(|_| failure("invalid_target_capabilities"))?;
-        if caps.placements != [self.placement.as_str()] || caps.operations != OPERATIONS || !caps.optional.is_empty() {
+        struct Capabilities {
+            placements: Vec<String>,
+            operations: Vec<String>,
+            optional: Vec<String>,
+        }
+        let caps: Capabilities =
+            serde_json::from_value(session.call("target.capabilities", json!({}))?)
+                .map_err(|_| failure("invalid_target_capabilities"))?;
+        if caps.placements != [self.placement.as_str()]
+            || caps.operations != OPERATIONS
+            || !caps.optional.is_empty()
+        {
             return Err(failure("unsupported_target_capabilities"));
         }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Placement {
+            backend: String,
+        }
+        let placement: Placement = serde_json::from_value(session.call(
+            "target.placement",
+            json!({"placement":self.placement,"backends":["host.local"]}),
+        )?)
+        .map_err(|_| failure("invalid_target_placement"))?;
+        if placement.backend != "host.local" {
+            return Err(FabricError {
+                kind: ErrorKind::UnsupportedPlacement,
+                message: "Target refused available placement; no execution fallback.".into(),
+            });
+        }
         session.bound_target_operations();
-        Ok(Target { pin: self.clone(), session: Mutex::new(Some(session)) })
+        Ok(Target {
+            pin: self.clone(),
+            session: Mutex::new(Some(session)),
+            next_grant: AtomicU64::new(1),
+        })
     }
+}
+
+/// Only these scoped primitives can be offered by an authority-bearing caller.
+/// The target chooses a plan; the host executes it against captured validated objects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "primitive", deny_unknown_fields)]
+pub enum Action {
+    #[serde(rename = "workspace.fork")]
+    Fork { strategy: ForkMode },
+    #[serde(rename = "process.spawn")]
+    Spawn,
+    #[serde(rename = "process.inspect")]
+    Inspect,
+    #[serde(rename = "process.terminate")]
+    Terminate,
+    #[serde(rename = "artifacts.capture")]
+    Capture,
+    #[serde(rename = "artifacts.recover")]
+    Recover,
+    #[serde(rename = "workspace.reclaim")]
+    Reclaim,
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkMode {
+    CloneOrCopy,
+    Copy,
 }
 
 pub struct Target {
     pin: TargetPin,
     session: Mutex<Option<PluginSession>>,
+    next_grant: AtomicU64,
 }
 impl Target {
-    /// This is an executable proposal, not readiness or completion evidence. Unknown operations,
-    /// paths, process IDs, exit statuses, and remote-to-local proposals cannot cross this boundary.
-    pub fn operation(&self, operation: &str, run: &str) -> Result<(), FabricError> {
-        if !OPERATIONS.contains(&operation) { return Err(failure("unsupported_target_operation")); }
-        let mut session = self.session.lock().map_err(|_| failure("target_session_failed"))?;
-        let session = session.as_mut().ok_or_else(|| failure("target_session_failed"))?;
+    /// A grant exists for this call only. No plugin paths, PIDs, argv, outcome or
+    /// deletion claims are accepted. Only the supplied executor can produce evidence.
+    pub fn drive<T>(
+        &self,
+        operation: &str,
+        run: &str,
+        actions: &[Action],
+        context: serde_json::Value,
+        execute: impl FnOnce(Action) -> Result<(T, serde_json::Value), FabricError>,
+    ) -> Result<T, FabricError> {
+        if !OPERATIONS.contains(&operation) || actions.is_empty() {
+            return Err(failure("unsupported_target_operation"));
+        }
+        let grant = self.next_grant.fetch_add(1, Ordering::Relaxed).to_string();
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Proposal { operation: String }
-        let proposal: Proposal = serde_json::from_value(session.call(&format!("target.{operation}"),
-            json!({"placement":self.pin.placement,"run_id":run}))?)
-            .map_err(|_| failure("invalid_target_proposal"))?;
-        if self.pin.placement != "local" || proposal.operation != format!("local.{operation}") {
-            return Err(FabricError { kind: ErrorKind::UnsupportedPlacement,
-                message: "Target operation is not supported for this placement; no local fallback.".into() });
+        struct Plan {
+            grant: String,
+            action: Action,
         }
-        Ok(())
+        let plan: Plan = serde_json::from_value(self.call(
+            &format!("target.{operation}"),
+            json!({"placement":self.pin.placement,"run_id":run,"grant":grant,
+                "actions":actions,"context":context}),
+        )?)
+        .map_err(|_| failure("invalid_target_plan"))?;
+        if plan.action == Action::Unsupported {
+            return Err(FabricError {
+                kind: ErrorKind::UnsupportedPlacement,
+                message: "Target refused the granted operation; no execution fallback.".into(),
+            });
+        }
+        if plan.grant != grant || !actions.contains(&plan.action) {
+            return Err(failure("target_grant_mismatch"));
+        }
+        let (value, evidence) = execute(plan.action)?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Received {
+            received: String,
+        }
+        let received: Received = serde_json::from_value(self.call(
+            "target.completed",
+            json!({"grant":grant,"evidence":evidence}),
+        )?)
+        .map_err(|_| failure("invalid_target_receipt"))?;
+        if received.received != grant {
+            return Err(failure("target_receipt_mismatch"));
+        }
+        Ok(value)
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, FabricError> {
+        self.session
+            .lock()
+            .map_err(|_| failure("target_session_failed"))?
+            .as_mut()
+            .ok_or_else(|| failure("target_session_failed"))?
+            .call(method, params)
     }
 
     pub fn finish(&self) -> Result<(), FabricError> {
-        let session = self.session.lock().map_err(|_| failure("target_session_failed"))?
-            .take().ok_or_else(|| failure("target_session_failed"))?;
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| failure("target_session_failed"))?
+            .take()
+            .ok_or_else(|| failure("target_session_failed"))?;
         session.finish()
     }
 
     pub fn execute(
-        &self, run: &str, spec: &crate::CommandSpec, cwd: &Path,
-        capture: crate::capture::Capture<'_>, limits: &crate::ExecutionLimits,
-        cancellation: &CancellationToken, lease: Option<&File>,
-        validate_launch: impl FnOnce() -> Result<(), FabricError>,
+        &self,
+        run: &str,
+        request: crate::ExecutionRequest<'_>,
+        mut validate_launch: impl FnMut() -> Result<(), FabricError>,
         started: impl FnOnce(u32) -> Result<(), FabricError>,
     ) -> Result<crate::Execution, FabricError> {
-        self.operation("start", run)?;
-        validate_launch()?;
-        crate::execute_observed(spec, cwd, capture, limits, cancellation, lease, started, |stopping| {
-            self.operation(if stopping { "cancel" } else { "inspect" }, run)
+        let cancellation = request.cancellation;
+        let validate = |validate_launch: &mut dyn FnMut() -> Result<(), FabricError>| {
+            if cancellation.is_cancelled() {
+                return Err(failure("cancelled"));
+            }
+            validate_launch()
+        };
+        // No concrete start request reaches installed code before fresh authority checks.
+        validate(&mut validate_launch)?;
+        self.drive("start", run, &[Action::Spawn], json!({}), |_| {
+            validate(&mut validate_launch)?;
+            let execution = crate::execute_observed(request, started, |group, stopping| {
+                if stopping {
+                    self.drive("cancel", run, &[Action::Terminate], json!({}), |_| {
+                        group.signal(libc::SIGTERM).map_err(crate::execution_error)?;
+                        Ok(((), json!({"termination_requested":true})))
+                    })
+                } else {
+                    self.drive("inspect", run, &[Action::Inspect], json!({}), |_| {
+                        let exited = group.exited().map_err(crate::execution_error)?;
+                        Ok(((), json!({"exited":exited})))
+                    })
+                }
+            })?;
+            use std::os::unix::process::ExitStatusExt;
+            let evidence = json!({"exit_code":execution.status.code(),"exit_signal":execution.status.signal(),
+                "stop_reason":execution.stop_reason.map(|reason| reason.as_str())});
+            Ok((execution, evidence))
         })
     }
 }
@@ -177,8 +352,9 @@ impl Target {
 impl Drop for Target {
     fn drop(&mut self) {
         if let Ok(session) = self.session.get_mut() {
-            if let Some(session) = session.take() { let _ = session.finish(); }
+            if let Some(session) = session.take() {
+                let _ = session.finish();
+            }
         }
     }
 }
-

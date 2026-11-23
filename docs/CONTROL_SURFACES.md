@@ -51,6 +51,10 @@ Foreground, batch and durable execution use the same `target.execute` boundary.
 Core persists the accepted target/executable pin, retains source/prepared pins,
 lease and workspace ownership, and independently observes process status and
 seals/verifies artifacts. Reconnect reads durable evidence, not plugin readiness.
+Installed targets choose request-scoped concrete primitives and receive observed
+completion evidence; receipts are not success evidence. Core validates launch
+authority before start dispatch and spawn. Reclaim requires apply, validated
+ownership and durable intent; dry-run never invokes target reclaim.
 Unavailable, changed, crashed or malformed target drivers cannot report success
 or authorize cleanup; recovery retains unknown evidence and refuses reclaim.
 The bundled `fabric-local-target` is used only when no registry local entry exists;

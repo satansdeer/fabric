@@ -132,7 +132,11 @@ pub(crate) fn create_workspace_bound(
         .map_err(storage_error)?;
     let result = (|| {
         if let Some(target) = target {
-            store.record_run_target(&run.run_id, &serde_json::to_string(target).map_err(storage_error)?)
+            store
+                .record_run_target(
+                    &run.run_id,
+                    &serde_json::to_string(target).map_err(storage_error)?,
+                )
                 .map_err(storage_error)?;
         }
         let fork = backend.fork(&state, &request.workspace_id, copy_limit_bytes)?;
@@ -526,9 +530,6 @@ fn recover_one(
                 return Ok(());
             }
         };
-        item.reason = "target_unavailable".into();
-        crate::target::operation(store, &run.run_id, "inspect")?;
-        crate::target::operation(store, &run.run_id, "collect")?;
         if apply
             && (run.state != RunState::NeedsAttention
                 || workspace.state != WorkspaceState::RecoveryRequired)
@@ -537,6 +538,22 @@ fn recover_one(
             return Ok(());
         }
         item.reason = "unsafe_path_or_owner".into();
+        validate_owned_workspace(root, &run, &workspace)?;
+        item.reason = "target_unavailable".into();
+        crate::target::drive(
+            store,
+            &run.run_id,
+            "inspect",
+            fabric_runner::target::Action::Inspect,
+            serde_json::json!({}),
+            || {
+                validate_owned_workspace(root, &run, &workspace)?;
+                Ok((
+                    (),
+                    serde_json::json!({"owner_inactive":true,"ownership_valid":true}),
+                ))
+            },
+        )?;
         let owned = validate_owned_workspace(root, &run, &workspace)?;
         item.reason = if run.capture.is_some() {
             "incomplete_or_invalid_capture"
@@ -544,7 +561,18 @@ fn recover_one(
             "capture_metadata_unavailable"
         }
         .into();
-        let captured = crate::artifacts::recover_capture(root, store, &run, &owned, apply)?;
+        let captured = crate::target::drive(
+            store,
+            &run.run_id,
+            "collect",
+            fabric_runner::target::Action::Recover,
+            serde_json::json!({"apply":apply}),
+            || {
+                let captured = crate::artifacts::recover_capture(root, store, &run, &owned, apply)?;
+                let evidence = serde_json::json!({"captured":captured.is_some(),"applied":apply});
+                Ok((captured, evidence))
+            },
+        )?;
         if !apply {
             item.action = "would_recover".into();
             item.reason = "captureable_inactive_workspace".into();
@@ -744,8 +772,6 @@ fn clean_one(
         }
         report.reason = "invalid_or_missing_manifest".into();
         crate::artifacts::verify_registered(root, store, &run)?;
-        report.reason = "target_unavailable".into();
-        crate::target::operation(store, &run.run_id, "reclaim")?;
         let saved = store.cleanup_intent(id).map_err(storage_error)?;
         let prior: Option<CleanupAuthority> = saved
             .as_deref()
@@ -771,7 +797,19 @@ fn clean_one(
             .map_err(storage_error)?;
         report.reason = "cleanup_interrupted".into();
         hook(CleanupStep::Intent)?;
-        opened.delete(id, hook)?;
+        report.reason = "target_unavailable".into();
+        crate::target::drive(
+            store,
+            &run.run_id,
+            "reclaim",
+            fabric_runner::target::Action::Reclaim,
+            serde_json::json!({"cleanup_intent":true}),
+            || {
+                report.reason = "cleanup_interrupted".into();
+                opened.delete(id, hook)?;
+                Ok(((), serde_json::json!({"removed":true})))
+            },
+        )?;
         hook(CleanupStep::Deleted)?;
         store
             .finish_cleanup(id, &authority)
@@ -1138,6 +1176,13 @@ mod cleanup_tests {
         }
 
         fn capture(interrupt_association: bool) -> Self {
+            Self::capture_with_target(interrupt_association, crate::target::reference_pin())
+        }
+
+        fn capture_with_target(
+            interrupt_association: bool,
+            pin: fabric_runner::target::TargetPin,
+        ) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
@@ -1192,7 +1237,11 @@ mod cleanup_tests {
                 &FakeHarness::new(fake).unwrap(),
                 &crate::run::RunOptions {
                     copy_limit_bytes: 1024 * 1024,
-                    target_pin: Some(crate::target::reference_pin()),
+                    harness_request: fabric_domain::HarnessRequest {
+                        placement: pin.placement.clone(),
+                        ..fabric_domain::HarnessRequest::default()
+                    },
+                    target_pin: Some(pin),
                     ..crate::run::RunOptions::default()
                 },
             );
@@ -1241,6 +1290,36 @@ mod cleanup_tests {
             }
             writable(self.temp.path());
         }
+    }
+
+    #[test]
+    fn dry_run_and_owner_mismatch_never_dispatch_target_reclaim() {
+        let target_home = tempfile::tempdir().unwrap();
+        let pid = target_home.path().join("pid");
+        let pin = fabric_runner::target::TargetPin::from_manifest(serde_json::from_value(serde_json::json!({
+            "id":"external-target","version":"1.0.0","kind":"target","protocol":{"min":1,"max":1},
+            "executable":"/usr/bin/python3",
+            "args":[concat!(env!("CARGO_MANIFEST_DIR"),"/../fabric-runner/tests/fixtures/plugin.py"),
+                "target","concrete",pid],
+            "capabilities":["target.execute"]
+        })).unwrap(), "external-target").unwrap();
+        let fixture = Fixture::capture_with_target(false, pin);
+        let calls = pid.with_extension("calls");
+        fs::write(&calls, "").unwrap();
+        let tree = fork_path(&fixture.root, &fixture.id);
+        let before = fs::read(tree.join("tracked")).unwrap();
+        let dry = garbage_collect(&fixture.root, false).unwrap();
+        assert_eq!(dry.items[0].action, "would_reclaim");
+        assert_eq!(fs::read(tree.join("tracked")).unwrap(), before);
+        assert!(fs::read_to_string(&calls).unwrap().is_empty());
+        let (_, store) = open_store(&fixture.root).unwrap();
+        assert!(store.cleanup_intent(&fixture.id).unwrap().is_none());
+        drop(store);
+        fs::remove_file(tree.parent().unwrap().join(".fabric-owner")).unwrap();
+        let refused = garbage_collect(&fixture.root, true).unwrap();
+        assert_eq!(refused.items[0].reason, "unsafe_path_or_owner");
+        assert!(fs::read_to_string(&calls).unwrap().is_empty());
+        assert_eq!(fs::read(tree.join("tracked")).unwrap(), before);
     }
 
     #[test]

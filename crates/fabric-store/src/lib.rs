@@ -613,14 +613,28 @@ impl Store {
     }
 
     pub fn record_run_target(&self, run: &RunId, pin: &str) -> Result<()> {
-        self.connection.execute("INSERT INTO run_targets(run_id,pin) VALUES (?1,?2)", params![run.as_str(), pin])?;
+        self.connection.execute(
+            "INSERT INTO run_targets(run_id,pin) VALUES (?1,?2)",
+            params![run.as_str(), pin],
+        )?;
         Ok(())
     }
 
     pub fn run_target(&self, run: &RunId) -> Result<Option<String>> {
-        let version: i64 = self.connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version < 14 { return Ok(None); }
-        Ok(self.connection.query_row("SELECT pin FROM run_targets WHERE run_id=?1", [run.as_str()], |row| row.get(0)).optional()?)
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 14 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT pin FROM run_targets WHERE run_id=?1",
+                [run.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Insert observed invocation evidence or monotonically advance an existing attempt.

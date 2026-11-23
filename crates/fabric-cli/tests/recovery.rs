@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-#[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
-mod reference_plugins;
+#[path = "../../fabric-runner/tests/support/local_target.rs"]
+mod local_target;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -69,7 +69,7 @@ impl Fixture {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let path = fs::canonicalize(path).unwrap();
-        reference_plugins::install_local(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
+        local_target::install(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
         let mut fixture = Self {
             repo: path.join("repo ; literal"),
             path,
@@ -437,7 +437,10 @@ fn recover_inspects_captureable_failure_then_seals_and_reclaims_without_inventin
     assert_eq!(unavailable["action"], "retained");
     assert_eq!(unavailable["reason"], "target_unavailable");
     assert_eq!(fixture.query(&["runs", "show", id]), before);
-    assert_eq!(fs::read(tree.parent().unwrap().join(".fabric-owner")).unwrap(), marker);
+    assert_eq!(
+        fs::read(tree.parent().unwrap().join(".fabric-owner")).unwrap(),
+        marker
+    );
     fs::rename(held, target).unwrap();
     let inspection = fixture.query(&["recover", id]);
     assert_eq!(inspection["run_id"], id);

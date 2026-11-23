@@ -515,7 +515,9 @@ impl Default for PluginHost {
 }
 impl PluginHost {
     pub fn target(
-        &self, manifest: &PluginManifest, cancel: &CancellationToken,
+        &self,
+        manifest: &PluginManifest,
+        cancel: &CancellationToken,
     ) -> Result<crate::target::Target, FabricError> {
         crate::target::TargetPin::from_manifest(manifest.clone(), manifest.id.as_str())?
             .open_with_timeout(cancel, self.timeout)

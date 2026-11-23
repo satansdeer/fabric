@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { directory } from './package.mjs';
 import { exact, frame, frames, resultFor, fail, NATIVE_MAX_FRAME } from './protocol.mjs';
-import { TARGET_OPERATIONS } from './index.mjs';
+import { TARGET_OPERATIONS, TARGET_ACTIONS, validTargetPlan } from './index.mjs';
 
 export const FIXTURE_PROMPT = 'Fabric provider-free fixture';
 function kill(child) { if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } }
@@ -103,38 +103,52 @@ export async function conformance(path, { timeout = 5000 } = {}) {
   let result;
   await processFixture(entry, () => [...(info.args ?? []), '--fabric-plugin-stdio'], async child => {
     const responses = frames(child.stdout)[Symbol.asyncIterator]();
-    const requests = [
-      ['initialize', { protocol: 1 }], ['health', {}],
-      ...(info.kind === 'target' ? [
-        ['target.capabilities', {}],
-        ...TARGET_OPERATIONS.map(op => [`target.${op}`, { placement: info.id, run_id: 'conformance' }]),
-      ] : [[method, {}]]), ['shutdown', {}],
-    ];
-    for (let i = 0; i < requests.length; i++) {
-      child.stdin.write(frame({ jsonrpc: '2.0', id: i + 1, method: requests[i][0], params: requests[i][1] }));
+    let id = 0;
+    const call = async (method, params) => {
+      child.stdin.write(frame({ jsonrpc: '2.0', id: ++id, method, params }));
       const next = await responses.next();
       if (next.done) fail('closed_output');
       const r = next.value;
-      if (exact(r, ['jsonrpc', 'id', 'error']) && r.jsonrpc === '2.0' && r.id === i + 1) fail('remote_error');
-      if (!exact(r, ['jsonrpc', 'id', 'result']) || r.jsonrpc !== '2.0' || r.id !== i + 1) fail('invalid_response');
-      if (i === 0) {
-        if (!exact(r.result, ['protocol', 'id', 'version', 'kind']) || r.result.protocol !== 1 || ['id', 'version', 'kind'].some(k => r.result[k] !== info[k])) fail('negotiation_failed: check plugin identity/version/protocol');
-      } else if (info.kind === 'target' && requests[i][0] === 'target.capabilities') {
-        const caps = r.result;
-        if (!exact(caps, ['placements', 'operations', 'optional']) ||
-            JSON.stringify(caps.placements) !== JSON.stringify([info.id]) ||
-            JSON.stringify(caps.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
-            !Array.isArray(caps.optional) || caps.optional.length) fail('unsupported_target_capabilities');
-        result = caps;
-      } else if (info.kind === 'target' && requests[i][0].startsWith('target.')) {
-        const op = requests[i][0].slice(7);
-        if (!exact(r.result, ['operation']) || !['unsupported', `local.${op}`].includes(r.result.operation) ||
-            info.id !== 'local' && r.result.operation !== 'unsupported') fail('invalid_target_proposal');
-      } else if (i === 2) {
-        result = resultFor(info.kind, r.result);
-        if (info.kind === 'harness' && !result.ready) fail('harness_not_ready');
-      } else if (!exact(r.result, ['ready']) || r.result.ready !== true) fail('invalid_readiness');
+      if (exact(r, ['jsonrpc', 'id', 'error']) && r.jsonrpc === '2.0' && r.id === id) fail('remote_error');
+      if (!exact(r, ['jsonrpc', 'id', 'result']) || r.jsonrpc !== '2.0' || r.id !== id) fail('invalid_response');
+      return r.result;
+    };
+    const initialized = await call('initialize', { protocol: 1 });
+    if (!exact(initialized, ['protocol', 'id', 'version', 'kind']) || initialized.protocol !== 1 ||
+        ['id', 'version', 'kind'].some(k => initialized[k] !== info[k])) fail('negotiation_failed: check plugin identity/version/protocol');
+    const ready = value => { if (!exact(value, ['ready']) || value.ready !== true) fail('invalid_readiness'); };
+    ready(await call('health', {}));
+    if (info.kind === 'target') {
+      result = await call('target.capabilities', {});
+      if (!exact(result, ['placements', 'operations', 'optional']) ||
+          JSON.stringify(result.placements) !== JSON.stringify([info.id]) ||
+          JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
+          !Array.isArray(result.optional) || result.optional.length) fail('unsupported_target_capabilities');
+      const placement = await call('target.placement', { placement: info.id, backends: ['host.local'] });
+      if (!exact(placement, ['backend']) || !['host.local', 'unsupported'].includes(placement.backend)) fail('invalid_target_placement');
+      // Transport fixtures only. Real execution/ownership evidence comes from Core, not this probe.
+      const evidence = {
+        prepare: { size_bytes: 1, cloned_files: 0, copied_files: 1 },
+        start: { exit_code: 0, exit_signal: null, stop_reason: null },
+        inspect: { exited: true }, cancel: { termination_requested: true },
+        collect: { artifact_count: 1 }, reclaim: { removed: true },
+      };
+      for (const op of TARGET_OPERATIONS) {
+        const job = { placement: info.id, run_id: 'conformance', grant: String(id + 1),
+          actions: TARGET_ACTIONS[op], context: {} };
+        const plan = await call(`target.${op}`, job);
+        if (!validTargetPlan(plan, job)) fail('invalid_target_proposal');
+        if (placement.backend === 'unsupported' && plan.action.primitive !== 'unsupported') fail('invalid_target_proposal');
+        if (plan.action.primitive !== 'unsupported') {
+          const received = await call('target.completed', { grant: job.grant, evidence: evidence[op] });
+          if (!exact(received, ['received']) || received.received !== job.grant) fail('invalid_target_receipt');
+        }
+      }
+    } else {
+      result = resultFor(info.kind, await call(method, {}));
+      if (info.kind === 'harness' && !result.ready) fail('harness_not_ready');
     }
+    ready(await call('shutdown', {}));
     child.stdin.end();
     if (!(await responses.next()).done) fail('extra_response');
   }, timeout, info.runtime === 'native');

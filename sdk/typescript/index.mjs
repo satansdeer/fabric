@@ -10,7 +10,7 @@ export const defineHarness = (options) => define('harness', options);
 export const TARGET_OPERATIONS = Object.freeze(['prepare', 'start', 'inspect', 'cancel', 'collect', 'reclaim']);
 export function defineTarget(options) {
   identity({ ...options, kind: 'target' });
-  if (['capabilities', ...TARGET_OPERATIONS].some(method => typeof options[method] !== 'function')) fail('invalid_definition');
+  if (['capabilities', 'placement', 'completed', ...TARGET_OPERATIONS].some(method => typeof options[method] !== 'function')) fail('invalid_definition');
   return Object.freeze({ ...options, kind: 'target' });
 }
 export const defineConnector = (options) => define('connector', options);
@@ -61,8 +61,23 @@ async function serveNative(plugin) {
   fail('incomplete_exchange');
 }
 
+export const TARGET_ACTIONS = Object.freeze({
+  prepare: [{ primitive: 'workspace.fork', strategy: 'clone_or_copy' }, { primitive: 'workspace.fork', strategy: 'copy' }],
+  start: [{ primitive: 'process.spawn' }], inspect: [{ primitive: 'process.inspect' }],
+  cancel: [{ primitive: 'process.terminate' }],
+  collect: [{ primitive: 'artifacts.capture' }, { primitive: 'artifacts.recover' }],
+  reclaim: [{ primitive: 'workspace.reclaim' }],
+});
+export function validTargetPlan(plan, job) {
+  return exact(plan, ['grant', 'action']) && plan.grant === job.grant &&
+    (exact(plan.action, ['primitive']) && plan.action.primitive === 'unsupported' ||
+      job.actions.some(action => exact(plan.action, Object.keys(action)) &&
+        Object.keys(action).every(key => action[key] === plan.action[key])));
+}
+
 async function serveTarget(plugin) {
   let id = 1;
+  const pending = new Set();
   for await (const request of frames(process.stdin)) {
     if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== id) fail('invalid_request');
     const { method, params } = request;
@@ -74,7 +89,7 @@ async function serveTarget(plugin) {
       if (method !== 'health' || !exact(params, [])) fail('invalid_request');
       result = { ready: true };
     } else if (method === 'shutdown') {
-      if (!exact(params, [])) fail('invalid_params');
+      if (!exact(params, []) || pending.size) fail('invalid_params');
       await write({ jsonrpc: '2.0', id, result: { ready: true } });
       process.stdin.destroy();
       return;
@@ -85,13 +100,28 @@ async function serveTarget(plugin) {
           JSON.stringify(result.placements) !== JSON.stringify([plugin.id]) ||
           JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
           !Array.isArray(result.optional) || result.optional.length) fail('unsupported_target_capabilities');
+    } else if (method === 'target.placement') {
+      if (!exact(params, ['placement', 'backends']) || params.placement !== plugin.id ||
+          JSON.stringify(params.backends) !== '["host.local"]') fail('invalid_params');
+      result = await plugin.placement(params);
+      if (!exact(result, ['backend']) || !['host.local', 'unsupported'].includes(result.backend)) fail('invalid_target_placement');
+    } else if (method === 'target.completed') {
+      if (!exact(params, ['grant', 'evidence']) || !pending.delete(params.grant) ||
+          !params.evidence || Array.isArray(params.evidence) || typeof params.evidence !== 'object') fail('invalid_params');
+      result = await plugin.completed(params);
+      if (!exact(result, ['received']) || result.received !== params.grant) fail('invalid_target_receipt');
     } else {
       const operation = method.startsWith('target.') && method.slice(7);
-      if (!TARGET_OPERATIONS.includes(operation) || !exact(params, ['placement', 'run_id']) ||
+      if (!TARGET_OPERATIONS.includes(operation) || !exact(params, ['placement', 'run_id', 'grant', 'actions', 'context']) ||
           params.placement !== plugin.id || typeof params.run_id !== 'string' ||
-          !params.run_id.length || params.run_id.length > 128) fail('invalid_params');
+          !params.run_id.length || params.run_id.length > 128 || typeof params.grant !== 'string' ||
+          !params.grant.length || pending.has(params.grant) || !Array.isArray(params.actions) ||
+          !params.actions.length || !params.actions.every(action => TARGET_ACTIONS[operation].some(
+            allowed => exact(action, Object.keys(allowed)) && Object.keys(allowed).every(key => allowed[key] === action[key]))) ||
+          !params.context || Array.isArray(params.context) || typeof params.context !== 'object') fail('invalid_params');
       result = await plugin[operation](params);
-      if (!exact(result, ['operation']) || !['unsupported', `local.${operation}`].includes(result.operation)) fail('invalid_target_proposal');
+      if (!validTargetPlan(result, params)) fail('invalid_target_proposal');
+      if (result.action.primitive !== 'unsupported') pending.add(params.grant);
     }
     await write({ jsonrpc: '2.0', id: id++, result });
   }

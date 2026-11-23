@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../../fabric-runner/tests/support/local_target.rs"]
+mod local_target;
 #[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
 mod reference_plugins;
 
@@ -21,7 +23,7 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         reference_plugins::install(&path);
-        reference_plugins::install_local(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
+        local_target::install(&path, Path::new(env!("CARGO_BIN_EXE_fabric-local-target")));
         Self(path)
     }
     fn cli(&self) -> Command {
@@ -40,8 +42,18 @@ impl Fixture {
         command
     }
     fn options(&self) -> fabric_core::run::RunOptions {
+        let registry = self.0.canonicalize().unwrap().join("plugin-registry");
+        let manifest = fabric_runner::plugin::PluginRegistry::load(&registry)
+            .unwrap()
+            .select(
+                &"local".parse().unwrap(),
+                fabric_runner::plugin::PluginKind::Target,
+            )
+            .unwrap();
+        let mut pin = fabric_runner::target::TargetPin::from_manifest(manifest, "local").unwrap();
+        pin.registry = Some(registry);
         fabric_core::run::RunOptions {
-            target_pin: Some(reference_plugins::local_pin(&self.0)),
+            target_pin: Some(pin),
             ..Default::default()
         }
     }
@@ -127,32 +139,51 @@ started = False
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
+    with open({log:?}, 'a') as log: log.write(json.dumps(request) + '\n')
     if method == 'initialize':
         result = dict(protocol=1, id=identity, version='0.1.0', kind='target')
     elif method in ('health', 'shutdown'):
         result = dict(ready=True)
     elif method == 'target.capabilities':
         result = dict(placements=[identity], operations=['prepare','start','inspect','cancel','collect','reclaim'], optional=[])
+    elif method == 'target.placement':
+        result = dict(backend='unsupported' if {behavior:?} == 'unsupported' else 'host.local')
+    elif method == 'target.completed':
+        result = dict(received=request['params']['grant'])
     else:
         op = method.split('.')[1]
         if op == 'start': started = True
         if started and op == 'inspect' and {behavior:?} == 'crash': os._exit(0)
         if started and op == 'inspect' and {behavior:?} == 'hang': __import__('time').sleep(10)
-        result = dict(operation='local.' + op if identity == 'local' else 'unsupported')
+        job = request['params']
+        action = job['actions'][-1] if op == 'prepare' and {behavior:?} == 'copy' else job['actions'][0]
+        result = dict(grant=job['grant'], action=action)
         if started and op == 'inspect' and {behavior:?} == 'forge':
             result['exit_code'] = 0
     print(json.dumps(dict(jsonrpc='2.0', id=request['id'], result=result)), flush=True)
     if method == 'shutdown': break
-"#)).unwrap();
+"#, log=self.0.join(format!("target-{id}.jsonl")).to_str().unwrap())).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let manifest = self.0.join("target.json");
-        fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-            "id":id,"version":"0.1.0","kind":"target","protocol":{"min":1,"max":1},
-            "executable":executable,"args":[],"capabilities":["target.execute"]
-        })).unwrap()).unwrap();
-        success(&self.cli().args(["plugins", "--registry"]).arg(self.0.canonicalize().unwrap().join("plugin-registry"))
-            .arg(if id == "local" { "upgrade" } else { "install" })
-            .arg(manifest).output().unwrap());
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "id":id,"version":"0.1.0","kind":"target","protocol":{"min":1,"max":1},
+                "executable":executable,"args":[],"capabilities":["target.execute"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        success(
+            &self
+                .cli()
+                .args(["plugins", "--registry"])
+                .arg(self.0.canonicalize().unwrap().join("plugin-registry"))
+                .arg(if id == "local" { "upgrade" } else { "install" })
+                .arg(manifest)
+                .output()
+                .unwrap(),
+        );
     }
     fn native_profile(&self) -> serde_json::Value {
         use std::os::unix::fs::PermissionsExt;
@@ -267,14 +298,104 @@ fn installed_remote_refuses_placement_without_starting_a_local_worker() {
     let prompt = fixture.0.join("remote-prompt");
     fs::write(&prompt, "never execute").unwrap();
     let before = fixture.inventory();
-    let output = fixture.cli().args(["run", "test", "--harness", "fake", "--placement", "fake-remote", "--fake-binary"])
-        .arg(worker).arg("--prompt-file").arg(prompt).args(["--copy-limit-bytes","10485760","--json"])
-        .output().unwrap();
+    let output = fixture
+        .cli()
+        .args([
+            "run",
+            "test",
+            "--harness",
+            "fake",
+            "--placement",
+            "fake-remote",
+            "--fake-binary",
+        ])
+        .arg(worker)
+        .arg("--prompt-file")
+        .arg(prompt)
+        .args(["--copy-limit-bytes", "10485760", "--json"])
+        .output()
+        .unwrap();
     assert!(!output.status.success(), "{output:?}");
     let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["kind"], "unsupported_placement");
     assert_eq!(fixture.inventory(), before);
     assert!(!fixture.0.join("LOCAL_FALLBACK").exists());
+}
+
+#[test]
+fn installed_nonlocal_id_selects_copy_and_drives_real_worker_artifacts_and_reclaim() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("alternate", "copy");
+    let prompt = fixture.0.join("alternate-prompt");
+    fs::write(
+        &prompt,
+        r#"{"writes":[{"path":"tracked","content":"alternate target"}]}"#,
+    )
+    .unwrap();
+    let report = json(
+        &fixture
+            .cli()
+            .args([
+                "run",
+                "test",
+                "--harness",
+                "fake",
+                "--placement",
+                "alternate",
+                "--copy-limit-bytes",
+                "10485760",
+                "--json",
+                "--prompt-file",
+            ])
+            .arg(prompt)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report["state"], "SUCCEEDED");
+    assert_eq!(report["cleanup"]["action"], "reclaimed");
+    assert!(!Path::new(report["workspace_path"].as_str().unwrap()).exists());
+    verified_manifest(&fixture, &report);
+    let restored = restored_workspace(&fixture, &report);
+    assert_eq!(
+        fs::read_to_string(restored.join("tracked")).unwrap(),
+        "alternate target"
+    );
+    let calls: Vec<serde_json::Value> =
+        fs::read_to_string(fixture.0.join("target-alternate.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let prepared = calls
+        .iter()
+        .find(|call| {
+            call["method"] == "target.completed"
+                && call["params"]["evidence"].get("copied_files").is_some()
+        })
+        .unwrap();
+    assert_eq!(prepared["params"]["evidence"]["cloned_files"], 0);
+    assert!(
+        prepared["params"]["evidence"]["copied_files"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    for (method, evidence) in [
+        ("start", "exit_code"),
+        ("inspect", "exited"),
+        ("cancel", "termination_requested"),
+        ("collect", "artifact_count"),
+        ("reclaim", "removed"),
+    ] {
+        assert!(
+            calls
+                .iter()
+                .any(|call| call["method"] == format!("target.{method}"))
+        );
+        assert!(calls.iter().any(|call| call["method"] == "target.completed"
+            && call["params"]["evidence"].get(evidence).is_some()));
+    }
 }
 
 #[test]
@@ -287,17 +408,44 @@ fn crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed() {
         let output = fixture.run(0);
         assert!(!output.status.success(), "{output:?}");
         assert!(start.elapsed() < std::time::Duration::from_secs(6));
-        let runs = json(&fixture.cli().args(["runs","list","--json"]).output().unwrap());
+        let runs = json(
+            &fixture
+                .cli()
+                .args(["runs", "list", "--json"])
+                .output()
+                .unwrap(),
+        );
         let id = runs[0]["run_id"].as_str().unwrap();
-        let before = json(&fixture.cli().args(["runs","show",id,"--json"]).output().unwrap());
+        let before = json(
+            &fixture
+                .cli()
+                .args(["runs", "show", id, "--json"])
+                .output()
+                .unwrap(),
+        );
         assert_ne!(before["run"]["state"], "SUCCEEDED");
         assert!(before["run"]["artifact_manifest_id"].is_null());
         assert!(before["run"]["capture"].is_null());
         let tree = Path::new(before["workspace"]["managed_path"].as_str().unwrap());
         assert!(tree.exists());
-        let result = json(&fixture.cli().args(["recover",id,"--apply","--json"]).output().unwrap());
+        let result = json(
+            &fixture
+                .cli()
+                .args(["recover", id, "--apply", "--json"])
+                .output()
+                .unwrap(),
+        );
         assert_ne!(result["action"], "reclaimed");
-        assert_eq!(json(&fixture.cli().args(["runs","show",id,"--json"]).output().unwrap()), before);
+        assert_eq!(
+            json(
+                &fixture
+                    .cli()
+                    .args(["runs", "show", id, "--json"])
+                    .output()
+                    .unwrap()
+            ),
+            before
+        );
         assert!(tree.exists());
     }
 }

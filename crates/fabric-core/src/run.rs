@@ -285,8 +285,18 @@ pub(crate) fn execute_prepared(
             .checked_add(3600)
             .ok_or_else(|| error("Timestamp overflow"))?,
     };
-    let backend = crate::target::Environment { root: &root, run: &run_id, target: &target };
-    let workspace = create_workspace_bound(&root, &backend, &request, options.copy_limit_bytes, Some(&pin))?;
+    let backend = crate::target::Environment {
+        root: &root,
+        run: &run_id,
+        target: &target,
+    };
+    let workspace = create_workspace_bound(
+        &root,
+        &backend,
+        &request,
+        options.copy_limit_bytes,
+        Some(&pin),
+    )?;
     let harness_id = harness.id();
     let mut attempt = WorkerAttempt {
         attempt_id: format!("a-{run_id}"),
@@ -367,15 +377,19 @@ pub(crate) fn execute_prepared(
             });
             let result = target.execute(
                 run_id.as_str(),
-                &command,
-                fresh.path(),
-                capture,
-                &options.limits,
-                &token,
-                Some(reservation.file()),
+                fabric_runner::ExecutionRequest {
+                    spec: &command,
+                    cwd: fresh.path(),
+                    capture,
+                    limits: &options.limits,
+                    cancellation: &token,
+                    owner_lease: Some(reservation.file()),
+                },
                 || {
                     let validated = runner_workspace(&root, &run_id)?;
-                    if validated.path() != fresh.path() { return Err(error("Workspace changed before launch.")); }
+                    if validated.path() != fresh.path() {
+                        return Err(error("Workspace changed before launch."));
+                    }
                     crate::workspace::storage::check_launch(&root, &storage)?;
                     crate::onboarding::revalidate(&root, plan, consent.as_deref())
                 },
@@ -452,20 +466,28 @@ pub(crate) fn execute_prepared(
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
         store.record_capture(&run_id, &capture).map_err(error)?;
-        target.operation("inspect", run_id.as_str())?;
-        target.operation("collect", run_id.as_str())?;
-        target.finish()?;
         progress.artifact_capture_started_at_ms = Some(fabric_runner::activity::timestamp_ms());
         progress.save(&store, &run_id, &activity)?;
-        let (manifest, artifacts) = crate::artifacts::capture(
-            &root,
-            &store,
-            &run_id,
-            state,
-            &capture,
-            &plan.profile,
-            options.max_artifact_bytes,
+        let (manifest, artifacts) = target.drive(
+            "collect",
+            run_id.as_str(),
+            &[fabric_runner::target::Action::Capture],
+            serde_json::json!({"max_bytes":options.max_artifact_bytes}),
+            |_| {
+                let captured = crate::artifacts::capture(
+                    &root,
+                    &store,
+                    &run_id,
+                    state,
+                    &capture,
+                    &plan.profile,
+                    options.max_artifact_bytes,
+                )?;
+                let evidence = serde_json::json!({"artifact_count":captured.1.len()});
+                Ok((captured, evidence))
+            },
         )?;
+        target.finish()?;
         progress.artifacts_captured_at_ms = Some(fabric_runner::activity::timestamp_ms());
         progress.save(&store, &run_id, &activity)?;
         store

@@ -202,7 +202,8 @@ fn plugins(root: PathBuf, command: PluginCommands) -> Result<(), FabricError> {
                     host.harness_info(&manifest, &token.token())?;
                 }
                 PluginKind::Target => {
-                    let pin = fabric_runner::target::TargetPin::from_manifest(manifest, id.as_str())?;
+                    let pin =
+                        fabric_runner::target::TargetPin::from_manifest(manifest, id.as_str())?;
                     pin.open(&token.token())?.finish()?;
                 }
                 PluginKind::Connector => {

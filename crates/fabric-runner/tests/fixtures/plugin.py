@@ -16,6 +16,8 @@ if '--fabric-plugin-run' in sys.argv:
 for line in sys.stdin:
     req = json.loads(line)
     method = req['method']
+    with open(pidfile + '.calls', 'a') as f:
+        f.write(method + '\n')
     if mode == 'hang' or (mode == 'health-hang' and method == 'health'):
         time.sleep(60)
     if mode == 'crash':
@@ -38,8 +40,17 @@ for line in sys.stdin:
         result = {'placements': ['external-target'], 'operations': ['prepare', 'start', 'inspect', 'cancel', 'collect', 'reclaim'], 'optional': []}
         if mode == 'reclaim':
             result.update({'reclaim': True, 'path': '/SECRET_CANARY', 'artifacts_verified': True})
+    elif method == 'target.placement':
+        result = {'backend': 'host.local' if mode in ('concrete', 'ack-only', 'wrong-grant') else 'unsupported'}
+    elif method == 'target.completed':
+        result = {'received': req['params']['grant']}
     elif method.startswith('target.'):
-        result = {'operation': 'unsupported'}
+        job = req['params']
+        result = {'grant': job['grant'], 'action': job['actions'][0]}
+        if mode == 'wrong-grant':
+            result['grant'] = 'unissued'
+        elif mode == 'ack-only':
+            result = {'operation': 'local.' + method.split('.')[1]}
     elif method == 'connector.evidence':
         result = {'available': True}
     elif method == 'harness.normalize':

@@ -76,6 +76,19 @@ for (const kind of ['harness', 'target', 'connector']) {
   });
 }
 
+test('a third-party target can select concrete host plans without using the local ID', async t => {
+  const root = temporary(t);
+  const project = create('target', join(root, 'alternate'));
+  rawPlugin(project, `import {defineTarget,serve,TARGET_OPERATIONS} from './sdk/index.mjs';
+    const choose = ({grant,actions}) => ({grant,action:actions.at(-1)});
+    await serve(defineTarget({id:'alternate',version:'1.0.0',
+      capabilities:()=>({placements:['alternate'],operations:[...TARGET_OPERATIONS],optional:[]}),
+      placement:()=>({backend:'host.local'}),completed:({grant})=>({received:grant}),
+      prepare:choose,start:choose,inspect:choose,cancel:choose,collect:choose,reclaim:choose}));`);
+  const proof = await conformance(project);
+  assert.deepEqual(proof.result, { placements: ['alternate'], operations: TARGET_OPERATIONS, optional: [] });
+});
+
 test('pin/version/trust and SDK/protocol mismatches fail before any plugin execution', async t => {
   const root = temporary(t);
   const project = create('target', join(root, 'target'));
@@ -141,7 +154,7 @@ test('SDK rejects malformed, oversized and out-of-order host requests without re
 test('callback errors and invalid target/connector results are fixed protocol failures', async t => {
   const root = temporary(t);
   for (const [kind, callback, code] of [
-    ['target', `capabilities: () => ({placements:['target'],operations:['prepare','start','inspect','cancel','collect','reclaim'],optional:[]}), prepare: () => ({operation:'local.prepare',reclaim:true}), start: () => ({operation:'unsupported'}), inspect: () => ({operation:'unsupported'}), cancel: () => ({operation:'unsupported'}), collect: () => ({operation:'unsupported'}), reclaim: () => ({operation:'unsupported'})`, 'closed_output'],
+    ['target', `capabilities: () => ({placements:['target'],operations:['prepare','start','inspect','cancel','collect','reclaim'],optional:[]}), placement:()=>({backend:'host.local'}), completed:({grant})=>({received:grant}), prepare: ({grant}) => ({grant,action:{primitive:'workspace.fork',strategy:'copy'},reclaim:true}), start: ({grant}) => ({grant,action:{primitive:'unsupported'}}), inspect: ({grant}) => ({grant,action:{primitive:'unsupported'}}), cancel: ({grant}) => ({grant,action:{primitive:'unsupported'}}), collect: ({grant}) => ({grant,action:{primitive:'unsupported'}}), reclaim: ({grant}) => ({grant,action:{primitive:'unsupported'}})`, 'closed_output'],
     ['connector', `evidence: () => { throw new Error('SECRET_CANARY'); }`, 'remote_error'],
   ]) {
     const project = create(kind, join(root, kind));
@@ -238,7 +251,11 @@ test('actual Core: scaffold -> conformance -> local package install/check, tampe
     const tarball = join(root, `${kind}.tgz`);
     writeFileSync(tarball, pack(first));
     run(['install', tarball, '--registry', registry, '--fabric', host, '--version', '1.0.0', '--sha256', first.hash, '--trust'], root);
-    assert.deepEqual(JSON.parse(fabric(['check', kind]).stdout), { compatible: true, healthy: true });
+    if (kind === 'target') {
+      assert.equal(JSON.parse(fabric(['check', kind], 1).stderr).error.kind, 'unsupported_placement');
+    } else {
+      assert.deepEqual(JSON.parse(fabric(['check', kind]).stdout), { compatible: true, healthy: true });
+    }
     const entry = join(registry, 'packages', first.hash, 'plugin.ts');
     const source = readFileSync(entry);
     writeFileSync(entry, 'SECRET_CANARY: tampered');
@@ -248,7 +265,8 @@ test('actual Core: scaffold -> conformance -> local package install/check, tampe
     rawPlugin(project, readFileSync(join(project, 'plugin.ts'), 'utf8').replace("version: '1.0.0'", "version: '1.0.1'"));
     const next = directory(project);
     install(project, { registry, fabric: host, version: '1.0.1', sha256: next.hash, trust: true, upgrade: true });
-    fabric(['check', kind]);
+    if (kind === 'target') assert.equal(JSON.parse(fabric(['check', kind], 1).stderr).error.kind, 'unsupported_placement');
+    else fabric(['check', kind]);
     fabric(['revoke', kind]);
     assert.match(fabric(['check', kind], 1).stderr, /revoked/);
   }

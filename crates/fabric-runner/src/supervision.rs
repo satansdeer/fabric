@@ -208,7 +208,7 @@ impl ProcessGroup {
         }
     }
 
-    fn signal(&mut self, signal: i32) -> io::Result<()> {
+    pub(crate) fn signal(&mut self, signal: i32) -> io::Result<()> {
         // SAFETY: the unreaped, owned group leader reserves this PID until our last signal.
         // Never consult persisted PID metadata or signal after wait/reap.
         let result = unsafe { libc::kill(-(self.child.id() as i32), signal) };
@@ -228,7 +228,7 @@ impl ProcessGroup {
         Ok(())
     }
 
-    fn exited(&mut self) -> io::Result<bool> {
+    pub(crate) fn exited(&mut self) -> io::Result<bool> {
         // WNOWAIT observes exit without releasing the PID/group identity anchor.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
@@ -263,14 +263,19 @@ impl ProcessGroup {
         cancellation: &CancellationToken,
         observed_alive: impl Fn(),
     ) -> Result<(ExitStatus, Option<StopReason>), FabricError> {
-        self.supervise_observed(limits, cancellation, |stopping| { if !stopping { observed_alive(); } Ok(()) })
+        self.supervise_observed(limits, cancellation, |_, stopping| {
+            if !stopping {
+                observed_alive();
+            }
+            Ok(())
+        })
     }
 
     pub fn supervise_observed(
         &mut self,
         limits: &ExecutionLimits,
         cancellation: &CancellationToken,
-        mut observed: impl FnMut(bool) -> Result<(), FabricError>,
+        mut observed: impl FnMut(&mut Self, bool) -> Result<(), FabricError>,
     ) -> Result<(ExitStatus, Option<StopReason>), FabricError> {
         let start = self.launched;
         let mut next_observation = Duration::ZERO;
@@ -282,7 +287,7 @@ impl ProcessGroup {
                 break None;
             }
             if start.elapsed() >= next_observation {
-                observed(false)?;
+                observed(self, false)?;
                 next_observation = start.elapsed() + Duration::from_millis(250);
             }
             if cancellation.is_cancelled() {
@@ -293,7 +298,7 @@ impl ProcessGroup {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        if reason.is_some() { observed(true)?; }
+        observed(self, true)?;
         // Also clean up background descendants after a natural leader exit.
         self.signal(libc::SIGTERM).map_err(execution_error)?;
         std::thread::sleep(limits.term_grace);

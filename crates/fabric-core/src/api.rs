@@ -318,8 +318,13 @@ pub(crate) fn preflight_workers(
             task.limits.clone().unwrap_or_default(),
         )?;
         options.harness_request.placement = request.placement.clone();
-        let (plan, _) =
-            crate::run::plan_task(root, &task.harness_id, &mut options, &harnesses, &mut adapters)?;
+        let (plan, _) = crate::run::plan_task(
+            root,
+            &task.harness_id,
+            &mut options,
+            &harnesses,
+            &mut adapters,
+        )?;
         crate::run::validate_durable_plan(&plan)?;
     }
     Ok(())

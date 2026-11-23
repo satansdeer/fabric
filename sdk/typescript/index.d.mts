@@ -5,11 +5,18 @@ export type Json = null | boolean | number | string | Json[] | { [key: string]: 
 export interface PluginIdentity { id: string; version: string; kind: PluginKind }
 export interface Ready { ready: boolean }
 /** Opaque host-owned run identity, never a path, command, environment or deletion grant. */
-export interface TargetJob { placement: string; run_id: string }
+export type TargetAction =
+  | { primitive: 'workspace.fork'; strategy: 'clone_or_copy' | 'copy' }
+  | { primitive: 'process.spawn' | 'process.inspect' | 'process.terminate' | 'artifacts.capture' | 'artifacts.recover' | 'workspace.reclaim' | 'unsupported' };
+export interface TargetJob { placement: string; run_id: string; grant: string; actions: TargetAction[]; context: { [key: string]: Json } }
+export interface TargetPlacement { placement: string; backends: ['host.local'] }
+export interface TargetCompleted { grant: string; evidence: { [key: string]: Json } }
 export type TargetOperation = 'prepare' | 'start' | 'inspect' | 'cancel' | 'collect' | 'reclaim';
 export const TARGET_OPERATIONS: readonly TargetOperation[];
 export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: string[] }
-export interface TargetProposal { operation: `local.${TargetOperation}` | 'unsupported' }
+export interface TargetProposal { grant: string; action: TargetAction }
+export const TARGET_ACTIONS: Readonly<Record<TargetOperation, readonly TargetAction[]>>;
+export function validTargetPlan(plan: unknown, job: TargetJob): boolean;
 /** Evidence is availability only, never a credential or authorization. */
 export interface ConnectorPayload { available: boolean }
 export type HarnessEvent = { type: string; [key: string]: Json };
@@ -22,6 +29,8 @@ export interface HarnessDefinition extends Identity {
 }
 export type TargetDefinition = Identity & {
   capabilities(): Result<TargetCapabilities>;
+  placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'unsupported' }>;
+  completed(result: TargetCompleted): Result<{ received: string }>;
 } & { [K in TargetOperation]: (job: TargetJob) => Result<TargetProposal> };
 export interface ConnectorDefinition extends Identity { evidence(params: Record<string, never>): Result<ConnectorPayload> }
 export type Harness = Readonly<HarnessDefinition & { kind: 'harness' }>;
@@ -32,11 +41,13 @@ export function defineTarget(options: TargetDefinition): Target;
 export function defineConnector(options: ConnectorDefinition): Connector;
 export function serve(plugin: Harness | NativeHarness | Target | Connector): Promise<void>;
 export interface InitializeResult extends PluginIdentity { protocol: 1 }
-export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | `target.${TargetOperation}` | 'connector.evidence' | 'shutdown';
+export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.evidence' | 'shutdown';
 export type ControlRequest = { jsonrpc: '2.0'; id: number } & (
   { method: 'initialize'; params: { protocol: 1 } } |
   { method: `target.${TargetOperation}`; params: TargetJob } |
-  { method: Exclude<ControlMethod, 'initialize' | `target.${TargetOperation}`>; params: Record<string, never> }
+  { method: 'target.placement'; params: TargetPlacement } |
+  { method: 'target.completed'; params: TargetCompleted } |
+  { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | `target.${TargetOperation}`>; params: Record<string, never> }
 );
 export type ControlResponse<T> = { jsonrpc: '2.0'; id: number } & ({ result: T; error?: never } | { error: { code: number; message: string }; result?: never });
 export interface PluginManifest extends PluginIdentity {

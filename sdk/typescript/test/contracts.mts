@@ -2,9 +2,14 @@ import { defineHarness, defineTarget, defineConnector, serve, TARGET_OPERATIONS,
 
 const target = defineTarget({ id: 'typed-target', version: '1.0.0',
   capabilities: () => ({ placements: ['typed-target'], operations: TARGET_OPERATIONS, optional: [] }),
-  prepare: () => ({ operation: 'unsupported' }), start: () => ({ operation: 'unsupported' }),
-  inspect: () => ({ operation: 'unsupported' }), cancel: () => ({ operation: 'unsupported' }),
-  collect: () => ({ operation: 'unsupported' }), reclaim: () => ({ operation: 'unsupported' }),
+  placement: () => ({ backend: 'host.local' }),
+  completed: ({ grant }) => ({ received: grant }),
+  prepare: ({ grant }) => ({ grant, action: { primitive: 'workspace.fork', strategy: 'copy' } }),
+  start: ({ grant }) => ({ grant, action: { primitive: 'process.spawn' } }),
+  inspect: ({ grant }) => ({ grant, action: { primitive: 'process.inspect' } }),
+  cancel: ({ grant }) => ({ grant, action: { primitive: 'process.terminate' } }),
+  collect: ({ grant }) => ({ grant, action: { primitive: 'artifacts.capture' } }),
+  reclaim: ({ grant }) => ({ grant, action: { primitive: 'workspace.reclaim' } }),
 });
 const connector = defineConnector({ id: 'typed-connector', version: '1.0.0', evidence: () => ({ available: false }) });
 const harness = defineHarness({ id: 'typed-harness', version: '1.0.0', plan: () => ({ ready: true }), run: async ({ prompt, emit }) => { await emit({ type: 'text', text: prompt }); } });
