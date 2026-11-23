@@ -647,3 +647,50 @@ artifact, lease, queue, WAL and foreign-key assertions. Read-only inspection
 now covers both v15 and v14 through v5, requiring exact version and byte
 preservation in each fixture. All 28 store tests and formatting passed locally.
 This correction still requires green exact-head CI before merge.
+
+### Cancellation acceptance diagnostics (source `c93537e47c6e578c066ea07dfd4ce8010bee32e3`)
+
+Exact-head CI `45119600623` failed the twenty-worker recovery test at its
+running-cancellation assertion: one of labels 8/9 was `NEEDS_ATTENTION`, not
+`CANCELLED`. The old assertion emitted neither the shown Run nor batch errors;
+the fixture was deleted and CI uploaded no artifacts. Its exact cause remains
+unknown; a passing sibling run would not resolve this failure.
+
+Traced durable cancellation through manager tokens, target start/inspect/cancel
+grants and receipts, process-group supervision, raw capture, exit accounting,
+artifact collection and reclamation. No evidence identifies the 250 ms RPC
+bound as the cause. Production behavior is unchanged: independent cancellation,
+bounded target communication, fresh authority checks, no fallback, owned
+process-group signaling, real exit/capture evidence and failure precedence
+remain intact. No speculative cancellation-success workaround was applied.
+
+The existing assertions now print label/Run ID, the complete shown Run
+(including worker attempts and capture), workspace retention reason and batch
+results/errors before fixture teardown. Both `CANCELLED` and `RECLAIMED`
+requirements and existing artifact verification are unchanged.
+
+One local diagnostic run reproduced the failure for label 9:
+`Operation not permitted (os error 1)`, `harness_execution`,
+`RECOVERY_REQUIRED`, no recorded exit code/signal or capture, and no artifacts.
+The batch error was `Run r-1795413377628649000-30082-11: Operation not permitted
+(os error 1) (workspace retained)`. Label 8 was `CANCELLED` with actual exit code
+143, verified artifacts and reclaimed workspace. The failing syscall and its
+relationship to the CI failure are not established. The local reproduction is
+not cancellation acceptance or evidence that a target timeout occurred.
+
+Exact narrow command (run once; exit 101, 0 passed / 1 failed / 1 filtered):
+
+```sh
+export PATH=/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:$PATH
+export RUSTUP_TOOLCHAIN=1.91.0 CARGO_HOME=/Users/maksimivanov/.cargo
+export CARGO_TARGET_DIR=/Users/maksimivanov/.local/share/fabric/reviews/issue-38-source/target
+cargo test --offline --locked -p fabric-cli --test recovery twenty_real_workers_recover_only_proven_captureable_inactive_work_and_explain_retention -- --exact --nocapture
+```
+
+With the same environment, `cargo fmt --all --check` exited 0. Rustup emitted
+channel-sync and six-component download messages during that command despite
+the explicit installed-toolchain PATH; it was not repeated.
+
+No workspace suite or protocol/security regression was rerun: only test failure
+diagnostics changed, not the production protocol or security boundaries. This
+patch does not fix or close cancellation acceptance; no CI-green claim is made.
