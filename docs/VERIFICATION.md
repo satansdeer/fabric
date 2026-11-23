@@ -12,71 +12,122 @@
 
 No cloud readiness or full model-driven skill-routing claim is made. Later sections preserve historical verification records; their counts and blockers are not current release gates.
 
-## Issue 5: installed trusted-local target correction
+## Issue 5: committed effects and usable target contracts
 
-Immutable source baseline: `52a086a1ed59958629f17b4d6e53484504e15932`
-(unaccepted review checkpoint, not released code). Reviewed issue-body SHA-256:
-`c637767c4dd99297177eb515357e6da088c7b91922d41c75d2b4667181d2f7e9`.
-Manager plan: <https://github.com/satansdeer/fabric/issues/5#issuecomment-7089448737>.
-The executing worker runtime is independently managed public Fabric v0.1.1;
-it is not evidence that this source candidate has shipped.
+Source baseline: `289c26ab163f3d3fe8040ddfe4013e16c51d7fea`, a private,
+unaccepted checkpoint, not merged/released. Executing runtime remains the
+manager-independently verified public Fabric v0.1.1. Earlier source/acceptance
+descriptions are superseded by this correction brief. Rust package versions remain 0.1.2.
 
-Installed targets select concrete, request-scoped host primitives, not lifecycle
-acknowledgments. Placement negotiates `host.local` for any admitted installed ID.
-Each operation receives an opaque grant and bounded offered actions; only an exact
-granted action executes against captured validated Rust objects. Preparation can
-select clone-or-copy or copy; start spawns the supervised process; inspection
-observes it; cancellation signals it; collection captures/reconstructs artifacts;
-reclaim deletes through the validated open workspace descriptor.
-`target.completed` carries independently observed evidence, never plugin-authored
-exit status, ownership, paths, argv, seals or cleanup proof. No local fallback
-follows a refused, crashed, unavailable or malformed target.
+Installed targets choose concrete offered host primitives for all six operations
+under Core-issued grants; any admitted ID can negotiate `host.local`. Core retains
+ownership, pins, admission, launch checks, leases, seals and descriptor-anchored
+reclaim. No target receipt supplies process status or cleanup proof.
 
-Core retains pins, admission, leases, launch checks, ownership, artifact
-sealing/hash checks and durable cleanup state. Start revalidates cancellation and
-authority before dispatch and again before spawn. GC dispatches reclaim only
-after apply, validated ownership/lease and durable cleanup intent; dry-run
-dispatches none. Mandatory process-tree stop/reap remains host-owned even if
-target communication fails.
+Before-action rejection executes nothing. After-action receipt failure retains
+the committed result and records `target_protocol`, never success. Preparation
+commits ownership/usage before its receipt; collection commits artifact references;
+reclaim commits actual deletion. Post-spawn protocol failure still stops/reaps the
+owned tree, drains capture and records actual terminal status/capture. Recovery
+can reclaim independently verified evidence; unknown evidence still refuses.
+Schema 15 permits only failure annotation after cleanup intent, leaving process,
+capture, ownership, artifact and timestamp evidence immutable.
 
-Consumer-visible regressions exercise a separately installed non-`local` target
-selecting copy, executing a worker, restoring verified artifacts and reclaiming;
-fake-remote refusal without allocation/launch; crash/forged/hung target retention;
-recovery with an unavailable target; pre-dispatch and pre-spawn authority loss;
-acknowledgment-only/wrong-grant refusal; and dry-run/owner-mismatch non-dispatch.
-SDK conformance accepts concrete third-party plans but is only transport proof;
-the actual installed CLI worker tests supply execution evidence.
+Generated/sample SDK targets now offer concrete `host.local` behavior. Conformance
+requires offered plans and matching receipts for every operation; fake-remote
+refusal is a separate negative fixture. Public TypeScript requests/proposals are
+operation-keyed. Rust and SDK drivers reject malformed and session-replayed grants
+before action selection/callbacks, including unsupported/completed operations.
 
-The implementation worker reported focused Rust, formatting, strict lint and SDK
-checks. Manager-independent verification on macOS arm64 with Rust 1.91.0:
+Manager previously observed six focused Rust regressions and all 17 SDK tests
+passing on the checkpoint. Those observations were not rerun for confirmation.
+The rejected null-capture target-crash contract has been replaced, not accepted.
+
+Current worker verification (macOS arm64, Rust 1.91.0, deterministic providers):
 
 ```sh
+export PATH=/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:/bin
+export RUSTUP_TOOLCHAIN=1.91.0
+export CARGO_HOME=/Users/maksimivanov/.cargo
+export CARGO_TARGET_DIR=/Users/maksimivanov/.local/share/fabric/reviews/issue-38-source/target
 cargo build --locked -p fabric-cli -p fabric-reference-harnesses --bins
 export FABRIC_REFERENCE_PLUGIN_BINARY="$CARGO_TARGET_DIR/debug/fabric-reference-harnesses"
 export FABRIC_LOCAL_TARGET_BINARY="$CARGO_TARGET_DIR/debug/fabric-local-target"
 export FABRIC_PLUGIN_TEST_HOST="$CARGO_TARGET_DIR/debug/fabric"
 export FABRIC_PLUGIN_TEST_NODE=/opt/homebrew/bin/node RUST_TEST_THREADS=4
-cargo test --locked -p fabric-cli --test run installed_
+cargo test --locked -p fabric-cli --test run target_failure_ -- --nocapture
 cargo test --locked -p fabric-cli --test run \
-  crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed -- --exact
-cargo test --locked -p fabric-runner --test plugins target_
-cargo test --locked -p fabric-core --lib \
-  dry_run_and_owner_mismatch_never_dispatch_target_reclaim
+  local_target_rejects_invalid_and_replayed_grants_before_a_second_plan -- --exact
+cargo test --locked -p fabric-runner --test plugins \
+  typescript_scaffolds_use_existing_native_host -- --exact
+cargo fmt --all --check
+cargo clippy --locked -p fabric-runner -p fabric-core -p fabric-store -p fabric-cli \
+  --all-targets -- -D warnings
 cd sdk/typescript
 npm ci --ignore-scripts
-npm test
+./node_modules/.bin/tsc --project test/tsconfig.json
+/opt/homebrew/bin/node --test \
+  --test-name-pattern='target conformance requires|target grants are' test/sdk.test.mjs
+node --test --test-name-pattern='actual Core:|generated third-party target executes' \
+  test/sdk.test.mjs
+node --test --test-name-pattern='generated third-party target executes' test/sdk.test.mjs
 ```
 
-Build passed; all six selected Rust regressions and all 17 SDK tests passed.
-The SDK command includes TypeScript contract checking and actual Core integration.
-The manager used an explicit shared `CARGO_TARGET_DIR`; binaries were built from
-this candidate, not represented as a published release.
+Build, formatting, strict Clippy and TypeScript contracts passed. Five selected
+Rust regressions passed: post-effect failures across all six operations; spawned
+worker inspect/cancel failure with actual exit/capture and verified recovery;
+recovery-receipt failure retaining committed artifacts; local grant replay; and
+generated SDK target negotiation through the Rust host.
 
-Release tooling bundles the concrete `fabric-local-target` executable and pinned
-installable package; CI supplies its path to SDK runtime checks. Candidate release
-archive/download proof and exact-head CI remain required before publication.
-No cloud, PTY, persistent-environment, infrastructure-security or isolation claim
-is made.
+Four selected SDK tests passed: all-six concrete plan/receipt requirements with
+separate remote refusal; effect-counted replay rejection; actual Core registry
+install/check/tamper/revoke; and generated third-party worker execution with
+verified artifact hashes and actual reclaim. Public declaration checks include
+positive consumers and `@ts-expect-error` start/fork and start/reclaim pairings.
+
+The initial focused run exposed a missed read-only schema bound after migration
+15; corrected, then only failed checks and checks not yet reached were run.
+No timeout, ownership or cleanup assertion was weakened. LSP references were
+attempted but unavailable (Rust analyzer missing; no `.mts` server); source callers
+were traced directly and final compiler/type checks passed.
+
+Scope limits: no live provider/model calls, cloud, PTY, persistent environment,
+remote isolation or security claims. No broad workspace suite, CI, release archive
+or downloaded-install proof in this pass. Manager owns review, CI, PR, merge and
+release; this checkpoint and worker execution are not acceptance or release approval.
+
+Manager verification of the sealed third correction: all 14 registered artifact
+payload lengths and SHA256 hashes matched; the owned workspace was absent.
+Ten focused Rust tests initially passed: three committed-effect/recovery failures, local
+grant replay, two installed-target lifecycle/refusal checks, two target authority
+checks, generated SDK/native-host negotiation, and dry-run/owner-mismatch reclaim.
+`npm test` passed all 19 SDK tests and TypeScript contracts, including actual Core
+execution, sealed artifact hashes and reclamation.
+
+The first generated-host invocation inherited the manager's live
+`FABRIC_PLUGIN_REGISTRY` and correctly rejected an uninstalled content-pinned
+scaffold. Only that failed check and checks not yet reached were run in an
+isolated environment with the registry unset; registry enforcement was unchanged.
+
+Independent review found a combined-failure gap: fallible capture persistence
+could erase target-protocol evidence. The manager correction records that
+evidence before exit/capture accounting and preserves it through exit recording.
+`Execution.target_failed` is independent of the primary host error, including
+simultaneous start-accounting and start-receipt failures. A PREPARING run can
+record its observed exit only with matching finished worker-attempt evidence.
+
+The five `target_failure_` CLI tests passed after correction (12 distinct focused
+Rust tests across the iteration). Two new regressions inject actual SQLite
+capture/start-accounting failures. The accounting test additionally passed with
+activity-observation failures, both with a healthy target and a simultaneous
+bad start receipt. Monitor errors propagate only after actual reaped status and
+capture are persisted. Healthy-target timeout classification remains unchanged.
+The checks require safe retention without invented artifacts when capture
+metadata was never persisted. Initial manager test assumptions about reclaim
+without metadata, the `runs show` envelope and timeout classification were
+corrected; production recovery was not weakened. Formatting passed. Independent
+reviews found no remaining blocking defect in the reviewed paths. Exact-head CI,
+merge and release remain separate gates.
 
 ## Issue 42: native capture drain accounting
 

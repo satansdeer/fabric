@@ -285,17 +285,16 @@ pub(crate) fn execute_prepared(
             .checked_add(3600)
             .ok_or_else(|| error("Timestamp overflow"))?,
     };
-    let backend = crate::target::Environment {
-        root: &root,
-        run: &run_id,
-        target: &target,
-    };
+    let backend = fabric_workspace::LocalWorkspaceBackend::new(
+        &root,
+        fabric_workspace::ForkStrategy::CloneOrCopy,
+    )?;
     let workspace = create_workspace_bound(
         &root,
         &backend,
         &request,
         options.copy_limit_bytes,
-        Some(&pin),
+        Some((&pin, &target)),
     )?;
     let harness_id = harness.id();
     let mut attempt = WorkerAttempt {
@@ -368,7 +367,7 @@ pub(crate) fn execute_prepared(
         let done = std::sync::atomic::AtomicBool::new(false);
         crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
         let observation_store = open_store(&root)?.1;
-        let (mut result, meter_failure) = std::thread::scope(|scope| {
+        let (mut result, meter_failure, monitor_failure) = std::thread::scope(|scope| {
             let monitor = scope.spawn(|| {
                 crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done)
             });
@@ -407,14 +406,17 @@ pub(crate) fn execute_prepared(
             done.store(true, std::sync::atomic::Ordering::Release);
             monitor.thread().unpark();
             observations.thread().unpark();
-            let meter_failure = monitor
+            let (meter_failure, meter_error) = match monitor.join() {
+                Ok(failure) => (failure, None),
+                Err(_) => (None, Some(error("Storage monitor panicked"))),
+            };
+            let observation_error = observations
                 .join()
-                .map_err(|_| error("Storage monitor panicked"))?;
-            observations
-                .join()
-                .map_err(|_| error("Activity monitor panicked"))??;
-            Ok::<_, FabricError>((result, meter_failure))
-        })?;
+                .map_err(|_| error("Activity monitor panicked"))
+                .and_then(|result| result)
+                .err();
+            (result, meter_failure, meter_error.or(observation_error))
+        });
         progress.storage_meter_failure = meter_failure;
         // A fast zero-exit worker must not hide an oversized or unmeasurable workspace.
         if let Ok(result) = &mut result {
@@ -430,9 +432,9 @@ pub(crate) fn execute_prepared(
                 });
             }
         }
-        // Save before exit/capture: finalization failure must not erase meter evidence.
-        if progress.storage_meter_failure.is_some() {
-            progress.save(&store, &run_id, &activity)?;
+        // Persist protocol failure before fallible exit/capture accounting.
+        if result.as_ref().is_ok_and(|result| result.target_failed) {
+            store.record_target_failure(&run_id).map_err(error)?;
         }
         let result = result?;
         let finished_at = now()?;
@@ -466,9 +468,16 @@ pub(crate) fn execute_prepared(
             .map_err(error)?;
         let capture = result.capture.map_err(error)?;
         store.record_capture(&run_id, &capture).map_err(error)?;
+        // Monitoring errors must not discard reaped status or finalized capture.
+        if progress.storage_meter_failure.is_some() {
+            progress.save(&store, &run_id, &activity)?;
+        }
+        if let Some(failure) = result.failure.or(monitor_failure) {
+            return Err(failure);
+        }
         progress.artifact_capture_started_at_ms = Some(fabric_runner::activity::timestamp_ms());
         progress.save(&store, &run_id, &activity)?;
-        let (manifest, artifacts) = target.drive(
+        let committed = target.drive(
             "collect",
             run_id.as_str(),
             &[fabric_runner::target::Action::Capture],
@@ -483,16 +492,19 @@ pub(crate) fn execute_prepared(
                     &plan.profile,
                     options.max_artifact_bytes,
                 )?;
+                store
+                    .finish_run(&run_id, &capture, &captured.0, &captured.1, now()?)
+                    .map_err(error)?;
                 let evidence = serde_json::json!({"artifact_count":captured.1.len()});
                 Ok((captured, evidence))
             },
         )?;
-        target.finish()?;
+        if let Some(failure) = committed.failure.or_else(|| target.finish().err()) {
+            store.record_target_failure(&run_id).map_err(error)?;
+            return Err(failure);
+        }
         progress.artifacts_captured_at_ms = Some(fabric_runner::activity::timestamp_ms());
         progress.save(&store, &run_id, &activity)?;
-        store
-            .finish_run(&run_id, &capture, &manifest, &artifacts, now()?)
-            .map_err(error)?;
         Ok::<_, FabricError>(capture)
     })();
     let capture = match execution {
@@ -505,20 +517,26 @@ pub(crate) fn execute_prepared(
             } else {
                 None
             };
-            store
-                .fail_run_execution(
-                    &run_id,
-                    &plan.manifest.exact_version,
-                    &failure.message,
-                    now()?,
-                    options.cancellation.is_cancelled(),
-                )
-                .map_err(|persist| {
-                    error(format!(
-                        "{}; could not persist run failure: {persist}",
-                        failure.message
-                    ))
-                })?;
+            if store
+                .run(&run_id)
+                .map_err(error)?
+                .is_some_and(|run| run.artifact_manifest_id.is_none())
+            {
+                store
+                    .fail_run_execution(
+                        &run_id,
+                        &plan.manifest.exact_version,
+                        &failure.message,
+                        now()?,
+                        options.cancellation.is_cancelled(),
+                    )
+                    .map_err(|persist| {
+                        error(format!(
+                            "{}; could not persist run failure: {persist}",
+                            failure.message
+                        ))
+                    })?;
+            }
             if let Some(persist) = attempt_failure {
                 return Err(error(format!(
                     "Run {run_id}: {}; could not persist worker attempt failure: {persist} (workspace retained)",
@@ -543,6 +561,12 @@ pub(crate) fn execute_prepared(
     });
     progress.cleanup_observed_at_ms = Some(fabric_runner::activity::timestamp_ms());
     progress.save(&store, &run_id, &activity)?;
+    if cleanup.reason == "target_protocol_failed" {
+        return Err(error(format!(
+            "Run {run_id}: target communication failed (cleanup: {})",
+            cleanup.action
+        )));
+    }
     let run = store
         .run(&run_id)
         .map_err(error)?

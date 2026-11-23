@@ -65,7 +65,10 @@ pub(crate) fn create_workspace_bound(
     backend: &impl WorkspaceBackend,
     request: &WorkspaceRequest,
     copy_limit_bytes: u64,
-    target: Option<&fabric_runner::target::TargetPin>,
+    target: Option<(
+        &fabric_runner::target::TargetPin,
+        &fabric_runner::target::Target,
+    )>,
 ) -> Result<RunnerWorkspace, FabricError> {
     if request.created_at < 0 || request.lease_expires_at <= timestamp(request.created_at)? {
         return Err(storage_error(
@@ -131,46 +134,87 @@ pub(crate) fn create_workspace_bound(
         )
         .map_err(storage_error)?;
     let result = (|| {
-        if let Some(target) = target {
+        if let Some((pin, _)) = target {
             store
                 .record_run_target(
                     &run.run_id,
-                    &serde_json::to_string(target).map_err(storage_error)?,
+                    &serde_json::to_string(pin).map_err(storage_error)?,
                 )
                 .map_err(storage_error)?;
         }
-        let fork = backend.fork(&state, &request.workspace_id, copy_limit_bytes)?;
-        if fork.path != path || fork.size_bytes != state.size_bytes {
-            return Err(storage_error(
-                "Backend returned an unexpected workspace path or size.",
-            ));
+        let mut prepare = |backend: &dyn WorkspaceBackend| {
+            let fork = backend.fork(&state, &request.workspace_id, copy_limit_bytes)?;
+            if fork.path != path || fork.size_bytes != state.size_bytes {
+                return Err(storage_error(
+                    "Backend returned an unexpected workspace path or size.",
+                ));
+            }
+            validate_directories(&root, &workspace)?;
+            let container = path
+                .parent()
+                .ok_or_else(|| storage_error("Missing workspace container."))?;
+            let mut marker = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(container.join(".fabric-owner"))
+                .map_err(storage_error)?;
+            marker
+                .write_all(marker_contents(&root, &workspace).as_bytes())
+                .map_err(storage_error)?;
+            marker.sync_all().map_err(storage_error)?;
+            File::open(container)
+                .and_then(|dir| dir.sync_all())
+                .map_err(storage_error)?;
+            store
+                .finish_workspace_fork(
+                    &run.run_id,
+                    Ok(fork.size_bytes),
+                    timestamp(request.created_at)?,
+                )
+                .map_err(storage_error)?;
+            let evidence = serde_json::json!({"size_bytes":fork.size_bytes,
+                "cloned_files":fork.cloned_files,"copied_files":fork.copied_files});
+            Ok((runner_workspace(&root, &run.run_id)?, evidence))
+        };
+        if let Some((_, target)) = target {
+            use fabric_runner::target::{Action, ForkMode};
+            use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend};
+            let committed = target.drive(
+                "prepare",
+                run.run_id.as_str(),
+                &[
+                    Action::Fork {
+                        strategy: ForkMode::CloneOrCopy,
+                    },
+                    Action::Fork {
+                        strategy: ForkMode::Copy,
+                    },
+                ],
+                serde_json::json!({"size_bytes":state.size_bytes,"copy_limit":copy_limit_bytes}),
+                |action| {
+                    let strategy = match action {
+                        Action::Fork {
+                            strategy: ForkMode::CloneOrCopy,
+                        } => ForkStrategy::CloneOrCopy,
+                        Action::Fork {
+                            strategy: ForkMode::Copy,
+                        } => ForkStrategy::Copy,
+                        _ => unreachable!("validated offered action"),
+                    };
+                    prepare(&LocalWorkspaceBackend::new(&root, strategy)?)
+                },
+            )?;
+            if committed.failure.is_some() {
+                store
+                    .record_target_failure(&run.run_id)
+                    .map_err(storage_error)?;
+            }
+            committed.into_result()
+        } else {
+            prepare(backend).map(|(workspace, _)| workspace)
         }
-        validate_directories(&root, &workspace)?;
-        let container = path
-            .parent()
-            .ok_or_else(|| storage_error("Missing workspace container."))?;
-        let mut marker = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(container.join(".fabric-owner"))
-            .map_err(storage_error)?;
-        marker
-            .write_all(marker_contents(&root, &workspace).as_bytes())
-            .map_err(storage_error)?;
-        marker.sync_all().map_err(storage_error)?;
-        File::open(container)
-            .and_then(|dir| dir.sync_all())
-            .map_err(storage_error)?;
-        store
-            .finish_workspace_fork(
-                &run.run_id,
-                Ok(fork.size_bytes),
-                timestamp(request.created_at)?,
-            )
-            .map_err(storage_error)?;
-        runner_workspace(&root, &run.run_id)
     })();
     if let Err(error) = &result {
         store
@@ -546,14 +590,15 @@ fn recover_one(
             "inspect",
             fabric_runner::target::Action::Inspect,
             serde_json::json!({}),
-            || {
+            |_| {
                 validate_owned_workspace(root, &run, &workspace)?;
                 Ok((
                     (),
                     serde_json::json!({"owner_inactive":true,"ownership_valid":true}),
                 ))
             },
-        )?;
+        )?
+        .into_result()?;
         let owned = validate_owned_workspace(root, &run, &workspace)?;
         item.reason = if run.capture.is_some() {
             "incomplete_or_invalid_capture"
@@ -567,24 +612,27 @@ fn recover_one(
             "collect",
             fabric_runner::target::Action::Recover,
             serde_json::json!({"apply":apply}),
-            || {
+            |store| {
                 let captured = crate::artifacts::recover_capture(root, store, &run, &owned, apply)?;
                 let evidence = serde_json::json!({"captured":captured.is_some(),"applied":apply});
+                if apply {
+                    let (manifest, artifacts) = captured.as_ref().ok_or_else(|| {
+                        storage_error("Recovery did not establish a complete capture")
+                    })?;
+                    validate_owned_workspace(root, &run, &workspace)?;
+                    store
+                        .recover_artifacts(&run, &workspace, manifest, artifacts)
+                        .map_err(storage_error)?;
+                }
                 Ok((captured, evidence))
             },
         )?;
+        captured.into_result()?;
         if !apply {
             item.action = "would_recover".into();
             item.reason = "captureable_inactive_workspace".into();
             return Ok(());
         }
-        let (manifest, artifacts) = captured
-            .ok_or_else(|| storage_error("Recovery did not establish a complete capture"))?;
-        validate_owned_workspace(root, &run, &workspace)?;
-        item.reason = "recovery_association_conflict".into();
-        store
-            .recover_artifacts(&run, &workspace, &manifest, &artifacts)
-            .map_err(storage_error)?;
         // The root guard remains held. Release our run flock before the existing
         // descriptor cleanup engine acquires that same authority independently.
         drop(owner);
@@ -798,22 +846,26 @@ fn clean_one(
         report.reason = "cleanup_interrupted".into();
         hook(CleanupStep::Intent)?;
         report.reason = "target_unavailable".into();
-        crate::target::drive(
+        let committed = crate::target::drive(
             store,
             &run.run_id,
             "reclaim",
             fabric_runner::target::Action::Reclaim,
             serde_json::json!({"cleanup_intent":true}),
-            || {
+            |store| {
                 report.reason = "cleanup_interrupted".into();
                 opened.delete(id, hook)?;
+                hook(CleanupStep::Deleted)?;
+                store
+                    .finish_cleanup(id, &authority)
+                    .map_err(storage_error)?;
                 Ok(((), serde_json::json!({"removed":true})))
             },
         )?;
-        hook(CleanupStep::Deleted)?;
-        store
-            .finish_cleanup(id, &authority)
-            .map_err(storage_error)?;
+        if let Some(failure) = committed.failure {
+            report.detail = Some(failure.message);
+            return Ok(("reclaimed", "target_protocol_failed"));
+        }
         Ok(("reclaimed", "verified_capture"))
     })();
     match result {
@@ -822,6 +874,12 @@ fn clean_one(
             report.reason = reason.into();
         }
         Err(failure) => {
+            if apply && report.reason == "target_unavailable" {
+                store
+                    .record_target_failure(&workspace.run_id)
+                    .map_err(storage_error)?;
+                report.reason = "target_protocol_failed".into();
+            }
             report.detail = Some(failure.message);
         }
     }

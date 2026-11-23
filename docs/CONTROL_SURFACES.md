@@ -56,7 +56,10 @@ completion evidence; receipts are not success evidence. Core validates launch
 authority before start dispatch and spawn. Reclaim requires apply, validated
 ownership and durable intent; dry-run never invokes target reclaim.
 Unavailable, changed, crashed or malformed target drivers cannot report success
-or authorize cleanup; recovery retains unknown evidence and refuses reclaim.
+or authorize cleanup. Committed host exit/capture, ownership, artifact and deletion
+evidence survives failed receipts; failures are durably recorded separately.
+Recovery refuses unknown evidence but can reclaim independently verified effects
+under the existing policy; a failed target receipt is never cleanup proof.
 The bundled `fabric-local-target` is used only when no registry local entry exists;
 a revoked or broken installed entry never triggers a bundled/local fallback.
 Unsupported PTY, persistent-environment and infrastructure-evidence capabilities

@@ -33,6 +33,7 @@ fn serve() -> Result<(), ()> {
     let mut frame = Vec::with_capacity(1024);
     let mut id = 1u64;
     let mut pending = BTreeSet::new();
+    let mut seen = BTreeSet::new();
     loop {
         frame.clear();
         input
@@ -91,7 +92,17 @@ fn serve() -> Result<(), ()> {
                 return Err(());
             }
             let job: Job = serde_json::from_value(request.params).map_err(|_| ())?;
-            if job.placement != "local" || job.run_id.is_empty() || job.run_id.len() > 128 {
+            if job.placement != "local"
+                || job.run_id.is_empty()
+                || job.run_id.len() > 128
+                || job.grant.is_empty()
+                || job.grant.len() > 128
+                || !job
+                    .grant
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                || !seen.insert(job.grant.clone())
+            {
                 return Err(());
             }
             let action = match operation {

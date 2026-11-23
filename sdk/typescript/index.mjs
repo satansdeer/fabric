@@ -78,6 +78,7 @@ export function validTargetPlan(plan, job) {
 async function serveTarget(plugin) {
   let id = 1;
   const pending = new Set();
+  const seen = new Set();
   for await (const request of frames(process.stdin)) {
     if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== id) fail('invalid_request');
     const { method, params } = request;
@@ -115,10 +116,11 @@ async function serveTarget(plugin) {
       if (!TARGET_OPERATIONS.includes(operation) || !exact(params, ['placement', 'run_id', 'grant', 'actions', 'context']) ||
           params.placement !== plugin.id || typeof params.run_id !== 'string' ||
           !params.run_id.length || params.run_id.length > 128 || typeof params.grant !== 'string' ||
-          !params.grant.length || pending.has(params.grant) || !Array.isArray(params.actions) ||
+          !params.grant.length || params.grant.length > 128 || /[^A-Za-z0-9_-]/.test(params.grant) || seen.has(params.grant) || !Array.isArray(params.actions) ||
           !params.actions.length || !params.actions.every(action => TARGET_ACTIONS[operation].some(
             allowed => exact(action, Object.keys(allowed)) && Object.keys(allowed).every(key => allowed[key] === action[key]))) ||
           !params.context || Array.isArray(params.context) || typeof params.context !== 'object') fail('invalid_params');
+      seen.add(params.grant);
       result = await plugin[operation](params);
       if (!validTargetPlan(result, params)) fail('invalid_target_proposal');
       if (result.action.primitive !== 'unsupported') pending.add(params.grant);

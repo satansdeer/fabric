@@ -463,10 +463,7 @@ fn typescript_scaffolds_use_existing_native_host() {
                 );
             }
             PluginKind::Target => {
-                assert_eq!(
-                    host.target(&plugin, &cancel).err().unwrap().kind,
-                    fabric_domain::ErrorKind::UnsupportedPlacement
-                );
+                host.target(&plugin, &cancel).unwrap().finish().unwrap();
             }
             PluginKind::Connector => {
                 assert!(!host.connector_evidence(&plugin, &cancel).unwrap().available);

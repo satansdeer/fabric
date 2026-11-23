@@ -234,6 +234,22 @@ pub struct Target {
     session: Mutex<Option<PluginSession>>,
     next_grant: AtomicU64,
 }
+/// A host effect committed even if its target receipt failed. Callers must account
+/// for `value` before surfacing `failure`; an error here is never a successful receipt.
+pub struct Committed<T> {
+    pub value: T,
+    pub failure: Option<FabricError>,
+}
+
+impl<T> Committed<T> {
+    pub fn into_result(self) -> Result<T, FabricError> {
+        match self.failure {
+            Some(failure) => Err(failure),
+            None => Ok(self.value),
+        }
+    }
+}
+
 impl Target {
     /// A grant exists for this call only. No plugin paths, PIDs, argv, outcome or
     /// deletion claims are accepted. Only the supplied executor can produce evidence.
@@ -244,7 +260,7 @@ impl Target {
         actions: &[Action],
         context: serde_json::Value,
         execute: impl FnOnce(Action) -> Result<(T, serde_json::Value), FabricError>,
-    ) -> Result<T, FabricError> {
+    ) -> Result<Committed<T>, FabricError> {
         if !OPERATIONS.contains(&operation) || actions.is_empty() {
             return Err(failure("unsupported_target_operation"));
         }
@@ -276,15 +292,21 @@ impl Target {
         struct Received {
             received: String,
         }
-        let received: Received = serde_json::from_value(self.call(
-            "target.completed",
-            json!({"grant":grant,"evidence":evidence}),
-        )?)
-        .map_err(|_| failure("invalid_target_receipt"))?;
-        if received.received != grant {
-            return Err(failure("target_receipt_mismatch"));
-        }
-        Ok(value)
+        let receipt = (|| {
+            let received: Received = serde_json::from_value(self.call(
+                "target.completed",
+                json!({"grant":grant,"evidence":evidence}),
+            )?)
+            .map_err(|_| failure("invalid_target_receipt"))?;
+            if received.received != grant {
+                return Err(failure("target_receipt_mismatch"));
+            }
+            Ok(())
+        })();
+        Ok(Committed {
+            value,
+            failure: receipt.err(),
+        })
     }
 
     fn call(
@@ -326,26 +348,41 @@ impl Target {
         };
         // No concrete start request reaches installed code before fresh authority checks.
         validate(&mut validate_launch)?;
-        self.drive("start", run, &[Action::Spawn], json!({}), |_| {
+        let mut target_failed = false;
+        let committed = self.drive("start", run, &[Action::Spawn], json!({}), |_| {
             validate(&mut validate_launch)?;
             let execution = crate::execute_observed(request, started, |group, stopping| {
-                if stopping {
+                let mut host_failed = false;
+                let result = if stopping {
                     self.drive("cancel", run, &[Action::Terminate], json!({}), |_| {
-                        group.signal(libc::SIGTERM).map_err(crate::execution_error)?;
+                        let result = group.signal(libc::SIGTERM).map_err(crate::execution_error);
+                        host_failed = result.is_err();
+                        result?;
                         Ok(((), json!({"termination_requested":true})))
                     })
                 } else {
                     self.drive("inspect", run, &[Action::Inspect], json!({}), |_| {
-                        let exited = group.exited().map_err(crate::execution_error)?;
+                        let result = group.exited().map_err(crate::execution_error);
+                        host_failed = result.is_err();
+                        let exited = result?;
                         Ok(((), json!({"exited":exited})))
                     })
-                }
+                };
+                target_failed |= match &result {
+                    Ok(committed) => committed.failure.is_some(),
+                    Err(_) => !host_failed,
+                };
+                result?.into_result()
             })?;
             use std::os::unix::process::ExitStatusExt;
             let evidence = json!({"exit_code":execution.status.code(),"exit_signal":execution.status.signal(),
                 "stop_reason":execution.stop_reason.map(|reason| reason.as_str())});
             Ok((execution, evidence))
-        })
+        })?;
+        let mut execution = committed.value;
+        execution.target_failed = target_failed || committed.failure.is_some();
+        execution.failure = execution.failure.or(committed.failure);
+        Ok(execution)
     }
 }
 

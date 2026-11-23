@@ -133,9 +133,10 @@ impl Fixture {
         use std::os::unix::fs::PermissionsExt;
         let executable = self.0.canonicalize().unwrap().join(format!("target-{id}"));
         fs::write(&executable, format!(r#"#!/usr/bin/python3
-import json, os, sys
+import json, os, sys, time
 identity = {id:?}
 started = False
+grants = {{}}
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
@@ -149,20 +150,39 @@ for line in sys.stdin:
     elif method == 'target.placement':
         result = dict(backend='unsupported' if {behavior:?} == 'unsupported' else 'host.local')
     elif method == 'target.completed':
-        result = dict(received=request['params']['grant'])
+        grant = request['params']['grant']
+        op = grants[grant]
+        behavior = {behavior:?}
+        marker = {failure_marker:?}
+        if (behavior.startswith('receipt-' + op + '-') or (behavior == 'recovery-collect' and op == 'collect')) and not os.path.exists(marker):
+            open(marker, 'w').close()
+            mode = behavior.rsplit('-', 1)[1]
+            if mode == 'disconnect': os._exit(0)
+            result = dict(received='wrong') if mode == 'wrong' else dict(ready=True)
+        else:
+            result = dict(received=grant)
     else:
         op = method.split('.')[1]
         if op == 'start': started = True
+        if started and op in ('inspect', 'cancel') and os.path.exists({await_worker:?}):
+            deadline = time.monotonic() + .15
+            while not os.path.exists({worker_ready:?}) and time.monotonic() < deadline: time.sleep(.001)
+        if started and op == 'cancel' and {behavior:?} == 'cancel-crash': os._exit(0)
+        if started and op == 'inspect' and {behavior:?} == 'recovery-collect': os._exit(0)
         if started and op == 'inspect' and {behavior:?} == 'crash': os._exit(0)
         if started and op == 'inspect' and {behavior:?} == 'hang': __import__('time').sleep(10)
         job = request['params']
+        grants[job['grant']] = op
         action = job['actions'][-1] if op == 'prepare' and {behavior:?} == 'copy' else job['actions'][0]
         result = dict(grant=job['grant'], action=action)
         if started and op == 'inspect' and {behavior:?} == 'forge':
             result['exit_code'] = 0
     print(json.dumps(dict(jsonrpc='2.0', id=request['id'], result=result)), flush=True)
     if method == 'shutdown': break
-"#, log=self.0.join(format!("target-{id}.jsonl")).to_str().unwrap())).unwrap();
+"#, log=self.0.join(format!("target-{id}.jsonl")).to_str().unwrap(),
+            failure_marker=self.0.join("receipt-failed").to_str().unwrap(),
+            await_worker=self.0.join("await-worker").to_str().unwrap(),
+            worker_ready=self.0.join("worker-ready").to_str().unwrap())).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let manifest = self.0.join("target.json");
         fs::write(
@@ -399,14 +419,29 @@ fn installed_nonlocal_id_selects_copy_and_drives_real_worker_artifacts_and_recla
 }
 
 #[test]
-fn crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed() {
-    for behavior in ["crash", "forge", "hang"] {
+fn target_failure_after_spawn_preserves_terminal_capture_and_safe_recovery() {
+    for behavior in ["crash", "forge", "hang", "cancel-crash"] {
         let fixture = Fixture::new();
         fixture.setup();
         fixture.target("local", behavior);
+        fs::write(fixture.0.join("await-worker"), "").unwrap();
+        let binary = fixture.script_fake(&format!(
+            "printf '{{\"type\":\"text\",\"text\":\"host observed\"}}\\n'\nprintf 'host stderr\\n' >&2\nprintf '%s' $$ > parent.pid\n/bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' &\nprintf '%s' $! > child.pid\ntouch '{}'\nwhile :; do sleep 1; done",
+            fixture.0.join("worker-ready").display()
+        ));
+        let prompt = fixture.0.join("prompt.json");
+        fs::write(&prompt, "{}").unwrap();
         let start = std::time::Instant::now();
-        let output = fixture.run(0);
-        assert!(!output.status.success(), "{output:?}");
+        let output = fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(binary)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args(["--timeout-seconds", "1", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{behavior}: {output:?}");
         assert!(start.elapsed() < std::time::Duration::from_secs(6));
         let runs = json(
             &fixture
@@ -423,11 +458,34 @@ fn crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed() {
                 .output()
                 .unwrap(),
         );
-        assert_ne!(before["run"]["state"], "SUCCEEDED");
-        assert!(before["run"]["artifact_manifest_id"].is_null());
-        assert!(before["run"]["capture"].is_null());
+        assert_eq!(before["run"]["state"], "NEEDS_ATTENTION");
+        assert_eq!(before["run"]["error_kind"], "target_protocol");
+        assert!(before["run"]["exit_signal"].is_number());
+        assert!(
+            before["run"]["capture"]["stdout_bytes_seen"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            before["run"]["capture"]["stderr_bytes_seen"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         let tree = Path::new(before["workspace"]["managed_path"].as_str().unwrap());
-        assert!(tree.exists());
+        for name in ["parent.pid", "child.pid"] {
+            let pid = fs::read_to_string(tree.join(name)).unwrap();
+            let state = Command::new("/bin/ps")
+                .args(["-p", &pid, "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8(state.stdout).unwrap();
+            assert!(
+                state.trim().is_empty() || state.trim().starts_with('Z'),
+                "{pid} survived: {state}"
+            );
+        }
         let result = json(
             &fixture
                 .cli()
@@ -435,18 +493,361 @@ fn crashed_or_forging_target_retains_unknown_cleanup_and_cannot_succeed() {
                 .output()
                 .unwrap(),
         );
-        assert_ne!(result["action"], "reclaimed");
+        assert_eq!(result["action"], "reclaimed", "{result}");
+        let after = json(
+            &fixture
+                .cli()
+                .args(["runs", "show", id, "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(after["run"]["state"], "NEEDS_ATTENTION");
+        for key in ["exit_code", "exit_signal", "capture", "error_kind"] {
+            assert_eq!(after["run"][key], before["run"][key]);
+        }
+        assert!(after["run"]["artifact_manifest_id"].is_string());
+        assert!(!tree.exists());
+        assert_sealed_artifacts(&fixture, id);
+    }
+}
+
+#[test]
+fn target_failure_survives_capture_persistence_failure() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("local", "crash");
+    fs::write(fixture.0.join("await-worker"), "").unwrap();
+    let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER injected_capture_failure BEFORE UPDATE OF capture_metadata ON runs
+         WHEN NEW.capture_metadata IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'injected capture persistence failure'); END;",
+    )
+    .unwrap();
+    let binary = fixture.script_fake(&format!(
+        "printf 'retained output\\n'\ntouch '{}'\nwhile :; do sleep 1; done",
+        fixture.0.join("worker-ready").display()
+    ));
+    let prompt = fixture.0.join("prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    let output = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--fake-binary"])
+        .arg(binary)
+        .arg("--prompt-file")
+        .arg(prompt)
+        .args(["--timeout-seconds", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let (id, state, error, signal, capture): (String, String, String, i64, Option<String>) = db
+        .query_row(
+            "SELECT run_id, state, error_kind, exit_signal, capture_metadata FROM runs",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(state, "NEEDS_ATTENTION");
+    assert_eq!(error, "target_protocol");
+    assert!(signal > 0);
+    assert!(capture.is_none());
+    db.execute_batch("DROP TRIGGER injected_capture_failure;")
+        .unwrap();
+    let recovered = json(
+        &fixture
+            .cli()
+            .args(["recover", &id, "--apply", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(recovered["action"], "retained", "{recovered}");
+    assert_eq!(recovered["reason"], "capture_metadata_unavailable");
+    let after = json(
+        &fixture
+            .cli()
+            .args(["runs", "show", &id, "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(after["run"]["error_kind"], "target_protocol");
+    assert_eq!(after["run"]["exit_signal"], signal);
+    assert!(after["run"]["capture"].is_null());
+    assert!(Path::new(after["workspace"]["managed_path"].as_str().unwrap()).exists());
+    let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+    assert!(store.artifacts(&id.parse().unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn target_failure_classification_excludes_start_accounting_failure() {
+    for (fault, behavior, expected) in [
+        ("start", "healthy", "artifact_capture"),
+        ("start", "receipt-start-wrong", "target_protocol"),
+        ("observation", "healthy", "timeout"),
+        ("observation", "receipt-start-wrong", "target_protocol"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        fixture.target("local", behavior);
+        let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+        db.execute_batch(match fault {
+            "start" => {
+                "CREATE TRIGGER injected_start_failure BEFORE UPDATE ON worker_attempts
+                 WHEN NEW.started_at IS NOT NULL AND NEW.finished_at IS NULL
+                 BEGIN SELECT RAISE(ABORT, 'injected start accounting failure'); END;"
+            }
+            _ => {
+                "CREATE TRIGGER injected_observation_failure BEFORE INSERT ON run_observations
+                 WHEN EXISTS(SELECT 1 FROM worker_attempts WHERE started_at IS NOT NULL)
+                 BEGIN SELECT RAISE(ABORT, 'injected observation failure'); END;"
+            }
+        })
+        .unwrap();
+        let binary = fixture.script_fake("while :; do sleep 1; done");
+        let prompt = fixture.0.join("prompt.json");
+        fs::write(&prompt, "{}").unwrap();
+        let output = fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(binary)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args(["--timeout-seconds", "1", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let (state, error, signal, capture): (String, String, i64, String) = db
+            .query_row(
+                "SELECT state, error_kind, exit_signal, capture_metadata FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "NEEDS_ATTENTION");
+        assert_eq!(error, expected);
+        assert!(signal > 0);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&capture)
+                .unwrap()
+                .is_object()
+        );
+    }
+}
+
+fn assert_sealed_artifacts(fixture: &Fixture, id: &str) {
+    use sha2::{Digest, Sha256};
+    let root = fixture.0.join("storage");
+    let store = fabric_store::Store::open(root.join("fabric.db")).unwrap();
+    let artifacts = store.artifacts(&id.parse().unwrap()).unwrap();
+    assert!(artifacts.iter().any(|file| file.kind == "manifest"));
+    for file in artifacts {
+        let bytes = fs::read(root.join(file.relative_path)).unwrap();
+        assert_eq!(bytes.len() as u64, file.size_bytes);
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), file.sha256);
+    }
+}
+
+#[test]
+fn target_failure_after_committed_effect_never_loses_host_evidence() {
+    for (operation, mode) in [
+        ("prepare", "disconnect"),
+        ("start", "wrong"),
+        ("inspect", "malformed"),
+        ("cancel", "disconnect"),
+        ("collect", "malformed"),
+        ("reclaim", "wrong"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        fixture.target("local", &format!("receipt-{operation}-{mode}"));
+        let output = fixture.run(0);
+        assert!(!output.status.success(), "{operation}: {output:?}");
+        let runs = json(
+            &fixture
+                .cli()
+                .args(["runs", "list", "--json"])
+                .output()
+                .unwrap(),
+        );
+        let id = runs[0]["run_id"].as_str().unwrap();
+        let before = json(
+            &fixture
+                .cli()
+                .args(["runs", "show", id, "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_ne!(before["run"]["state"], "SUCCEEDED", "{operation}: {before}");
         assert_eq!(
-            json(
+            before["run"]["error_kind"], "target_protocol",
+            "{operation}: {before}"
+        );
+        let tree = Path::new(before["workspace"]["managed_path"].as_str().unwrap());
+        if operation == "prepare" {
+            assert!(tree.parent().unwrap().join(".fabric-owner").is_file());
+            assert!(before["run"]["capture"].is_null());
+            assert!(before["run"]["started_at"].is_null());
+            assert!(before["workspace"]["usage_bytes"].as_u64().unwrap() > 0);
+            continue;
+        }
+        assert!(
+            before["run"]["capture"].is_object(),
+            "{operation}: {before}"
+        );
+        assert!(before["run"]["exit_code"].is_number() || before["run"]["exit_signal"].is_number());
+        if operation == "start" || operation == "collect" || operation == "reclaim" {
+            assert_eq!(before["run"]["exit_code"], 0);
+        }
+        if operation == "reclaim" {
+            assert_eq!(before["workspace"]["state"], "RECLAIMED");
+            assert!(!tree.exists());
+            let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+            for change in [
+                "state='SUCCEEDED'",
+                "capture_metadata=NULL",
+                "exit_code=99",
+                "artifact_manifest_id=NULL",
+                "workspace_id='forged'",
+            ] {
+                assert!(
+                    db.execute(&format!("UPDATE runs SET {change} WHERE run_id=?1"), [id])
+                        .is_err()
+                );
+            }
+        } else {
+            assert!(tree.exists());
+            let recovered = json(
                 &fixture
                     .cli()
-                    .args(["runs", "show", id, "--json"])
+                    .args(["recover", id, "--apply", "--json"])
                     .output()
-                    .unwrap()
-            ),
-            before
-        );
-        assert!(tree.exists());
+                    .unwrap(),
+            );
+            assert_eq!(recovered["action"], "reclaimed", "{operation}: {recovered}");
+            assert!(!tree.exists());
+        }
+        assert_sealed_artifacts(&fixture, id);
+    }
+}
+
+#[test]
+fn target_failure_during_recovery_receipt_keeps_committed_artifacts() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("local", "recovery-collect");
+    assert!(!fixture.run(0).status.success());
+    let runs = json(
+        &fixture
+            .cli()
+            .args(["runs", "list", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let id = runs[0]["run_id"].as_str().unwrap();
+    let first = json(
+        &fixture
+            .cli()
+            .args(["recover", id, "--apply", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(first["action"], "retained", "{first}");
+    assert!(first["artifact_manifest_id"].is_string(), "{first}");
+    let before = json(
+        &fixture
+            .cli()
+            .args(["runs", "show", id, "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(before["workspace"]["state"], "CLEANUP_PENDING");
+    let second = json(
+        &fixture
+            .cli()
+            .args(["recover", id, "--apply", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(second["action"], "reclaimed", "{second}");
+    assert_eq!(
+        second["artifact_manifest_id"],
+        first["artifact_manifest_id"]
+    );
+    assert_sealed_artifacts(&fixture, id);
+}
+
+#[test]
+fn local_target_rejects_invalid_and_replayed_grants_before_a_second_plan() {
+    use std::io::Write;
+    use std::process::Stdio;
+    for (grant, completed, repeat, expected_plans) in [
+        ("", false, "", 0),
+        ("bad grant", false, "", 0),
+        ("bad\n", false, "", 0),
+        ("valid", false, "valid", 1),
+        ("valid", true, "valid", 1),
+        ("valid", true, "distinct", 2),
+    ] {
+        let mut frames = vec![
+            ("initialize", serde_json::json!({"protocol":1})),
+            ("health", serde_json::json!({})),
+        ];
+        let job = |grant: &str| {
+            serde_json::json!({
+                "placement":"local","run_id":"fixture","grant":grant,
+                "actions":[{"primitive":"process.spawn"}],"context":{}
+            })
+        };
+        frames.push(("target.start", job(grant)));
+        if completed {
+            frames.push((
+                "target.completed",
+                serde_json::json!({"grant":grant,"evidence":{}}),
+            ));
+        }
+        if !repeat.is_empty() {
+            frames.push(("target.start", job(repeat)));
+        }
+        let valid = repeat == "distinct";
+        if valid {
+            frames.push((
+                "target.completed",
+                serde_json::json!({"grant":repeat,"evidence":{}}),
+            ));
+            frames.push(("shutdown", serde_json::json!({})));
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fabric-local-target"))
+            .arg("--fabric-plugin-stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = Vec::new();
+        for (index, (method, params)) in frames.into_iter().enumerate() {
+            writeln!(
+                input,
+                "{}",
+                serde_json::json!({"jsonrpc":"2.0","id":index+1,"method":method,"params":params})
+            )
+            .unwrap();
+        }
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.success(), valid);
+        let plans = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|response| response["result"]["action"]["primitive"] == "process.spawn")
+            .count();
+        assert_eq!(plans, expected_plans);
     }
 }
 

@@ -1,67 +1,21 @@
 //! Target operations execute here against Core-owned inputs, never plugin-provided paths or PIDs.
-use fabric_domain::{FabricError, RunId, WorkspaceId};
+use fabric_domain::{FabricError, RunId};
 use fabric_runner::{
     CancellationToken,
-    target::{Action, ForkMode, Target, TargetPin},
+    target::{Action, Committed, TargetPin},
 };
-use fabric_store::{PreparedState, Store};
-use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend, PreparedFork, WorkspaceBackend};
-use std::path::Path;
-
-pub(crate) struct Environment<'a> {
-    pub root: &'a Path,
-    pub run: &'a RunId,
-    pub target: &'a Target,
-}
-impl WorkspaceBackend for Environment<'_> {
-    fn fork(
-        &self,
-        state: &PreparedState,
-        id: &WorkspaceId,
-        limit: u64,
-    ) -> Result<PreparedFork, FabricError> {
-        self.target.drive(
-            "prepare",
-            self.run.as_str(),
-            &[
-                Action::Fork {
-                    strategy: ForkMode::CloneOrCopy,
-                },
-                Action::Fork {
-                    strategy: ForkMode::Copy,
-                },
-            ],
-            serde_json::json!({"size_bytes":state.size_bytes,"copy_limit":limit}),
-            |action| {
-                let strategy = match action {
-                    Action::Fork {
-                        strategy: ForkMode::CloneOrCopy,
-                    } => ForkStrategy::CloneOrCopy,
-                    Action::Fork {
-                        strategy: ForkMode::Copy,
-                    } => ForkStrategy::Copy,
-                    _ => unreachable!("validated offered action"),
-                };
-                let fork =
-                    LocalWorkspaceBackend::new(self.root, strategy)?.fork(state, id, limit)?;
-                let evidence = serde_json::json!({"size_bytes":fork.size_bytes,
-                "cloned_files":fork.cloned_files,"copied_files":fork.copied_files});
-                Ok((fork, evidence))
-            },
-        )
-    }
-}
+use fabric_store::Store;
 
 /// Historical non-target workspaces retain their existing Core-only recovery rules.
 /// New executions always have an immutable target binding before a runnable fork exists.
 pub(crate) fn drive<T>(
-    store: &Store,
+    store: &mut Store,
     run: &RunId,
     operation: &str,
     action: Action,
     context: serde_json::Value,
-    execute: impl FnOnce() -> Result<(T, serde_json::Value), FabricError>,
-) -> Result<T, FabricError> {
+    execute: impl FnOnce(&mut Store) -> Result<(T, serde_json::Value), FabricError>,
+) -> Result<Committed<T>, FabricError> {
     if let Some(json) = store
         .run_target(run)
         .map_err(fabric_runner::execution_error)?
@@ -69,11 +23,21 @@ pub(crate) fn drive<T>(
         let pin: TargetPin = serde_json::from_str(&json)
             .map_err(|_| fabric_runner::execution_error("Invalid target binding."))?;
         let target = pin.open(&CancellationToken::default())?;
-        let value = target.drive(operation, run.as_str(), &[action], context, |_| execute())?;
-        target.finish()?;
-        Ok(value)
+        let mut committed = target.drive(operation, run.as_str(), &[action], context, |_| {
+            execute(store)
+        })?;
+        committed.failure = committed.failure.or_else(|| target.finish().err());
+        if committed.failure.is_some() {
+            store
+                .record_target_failure(run)
+                .map_err(fabric_runner::execution_error)?;
+        }
+        Ok(committed)
     } else {
-        execute().map(|(value, _)| value)
+        execute(store).map(|(value, _)| Committed {
+            value,
+            failure: None,
+        })
     }
 }
 

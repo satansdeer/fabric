@@ -33,3 +33,16 @@ const command: NativeCommand = { program: '/fixture', args: ['--', { prompt: tru
 // @ts-expect-error Native IPC receives availability booleans, never credential strings.
 const secret: NativeControlRequest = { jsonrpc: '2.0', id: 3, method: 'harness.probe', params: { context: { environment: {}, credentials: { KEY: 'secret' } } } };
 void native; void command; void secret;
+import type { TargetJob, TargetProposal, ControlRequest, TargetDefinition } from '../index.mjs';
+const startJob: TargetJob<'start'> = { placement: 'typed-target', run_id: 'run', grant: 'grant', actions: [{ primitive: 'process.spawn' }], context: {} };
+const startPlan: TargetProposal<'start'> = { grant: startJob.grant, action: startJob.actions[0]! };
+const startRequest: ControlRequest = { jsonrpc: '2.0', id: 4, method: 'target.start', params: startJob };
+// @ts-expect-error Start offers cannot fork a workspace.
+const forkJob: TargetJob<'start'> = { ...startJob, actions: [{ primitive: 'workspace.fork', strategy: 'copy' }] };
+// @ts-expect-error Start proposals cannot reclaim a workspace.
+const reclaimPlan: TargetProposal<'start'> = { grant: 'grant', action: { primitive: 'workspace.reclaim' } };
+// @ts-expect-error The public request union must correlate method and offered actions.
+const reclaimRequest: ControlRequest = { jsonrpc: '2.0', id: 5, method: 'target.start', params: { ...startJob, actions: [{ primitive: 'workspace.reclaim' }] } };
+// @ts-expect-error The actual target callback cannot return a fork plan for start.
+const badStart: TargetDefinition['start'] = ({ grant }) => ({ grant, action: { primitive: 'workspace.fork', strategy: 'copy' } });
+void startPlan; void startRequest; void forkJob; void reclaimPlan; void reclaimRequest; void badStart;

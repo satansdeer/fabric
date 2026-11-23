@@ -299,13 +299,17 @@ impl ProcessGroup {
             std::thread::sleep(Duration::from_millis(5));
         };
         observed(self, true)?;
+        Ok((self.stop_and_reap(limits.term_grace)?, reason))
+    }
+
+    pub(crate) fn stop_and_reap(&mut self, grace: Duration) -> Result<ExitStatus, FabricError> {
         // Also clean up background descendants after a natural leader exit.
         self.signal(libc::SIGTERM).map_err(execution_error)?;
-        std::thread::sleep(limits.term_grace);
+        std::thread::sleep(grace);
         self.signal(libc::SIGKILL).map_err(execution_error)?;
         let status = self.child.wait().map_err(execution_error)?;
         self.reaped = true;
-        Ok((status, reason))
+        Ok(status)
     }
 }
 impl Drop for ProcessGroup {

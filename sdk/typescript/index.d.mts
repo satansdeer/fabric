@@ -4,18 +4,24 @@ export type PluginKind = 'harness' | 'target' | 'connector';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface PluginIdentity { id: string; version: string; kind: PluginKind }
 export interface Ready { ready: boolean }
-/** Opaque host-owned run identity, never a path, command, environment or deletion grant. */
-export type TargetAction =
-  | { primitive: 'workspace.fork'; strategy: 'clone_or_copy' | 'copy' }
-  | { primitive: 'process.spawn' | 'process.inspect' | 'process.terminate' | 'artifacts.capture' | 'artifacts.recover' | 'workspace.reclaim' | 'unsupported' };
-export interface TargetJob { placement: string; run_id: string; grant: string; actions: TargetAction[]; context: { [key: string]: Json } }
+/** Grants are opaque session-unique identifiers, never paths or launch authority. */
+export type TargetActionByOperation = {
+  prepare: { primitive: 'workspace.fork'; strategy: 'clone_or_copy' | 'copy' };
+  start: { primitive: 'process.spawn' };
+  inspect: { primitive: 'process.inspect' };
+  cancel: { primitive: 'process.terminate' };
+  collect: { primitive: 'artifacts.capture' | 'artifacts.recover' };
+  reclaim: { primitive: 'workspace.reclaim' };
+};
+export type TargetAction = TargetActionByOperation[TargetOperation] | { primitive: 'unsupported' };
+export interface TargetJob<K extends TargetOperation = TargetOperation> { placement: string; run_id: string; grant: string; actions: TargetActionByOperation[K][]; context: { [key: string]: Json } }
 export interface TargetPlacement { placement: string; backends: ['host.local'] }
 export interface TargetCompleted { grant: string; evidence: { [key: string]: Json } }
 export type TargetOperation = 'prepare' | 'start' | 'inspect' | 'cancel' | 'collect' | 'reclaim';
 export const TARGET_OPERATIONS: readonly TargetOperation[];
 export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: string[] }
-export interface TargetProposal { grant: string; action: TargetAction }
-export const TARGET_ACTIONS: Readonly<Record<TargetOperation, readonly TargetAction[]>>;
+export interface TargetProposal<K extends TargetOperation = TargetOperation> { grant: string; action: TargetActionByOperation[K] | { primitive: 'unsupported' } }
+export const TARGET_ACTIONS: { readonly [K in TargetOperation]: readonly TargetActionByOperation[K][] };
 export function validTargetPlan(plan: unknown, job: TargetJob): boolean;
 /** Evidence is availability only, never a credential or authorization. */
 export interface ConnectorPayload { available: boolean }
@@ -31,7 +37,7 @@ export type TargetDefinition = Identity & {
   capabilities(): Result<TargetCapabilities>;
   placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'unsupported' }>;
   completed(result: TargetCompleted): Result<{ received: string }>;
-} & { [K in TargetOperation]: (job: TargetJob) => Result<TargetProposal> };
+} & { [K in TargetOperation]: (job: TargetJob<K>) => Result<TargetProposal<K>> };
 export interface ConnectorDefinition extends Identity { evidence(params: Record<string, never>): Result<ConnectorPayload> }
 export type Harness = Readonly<HarnessDefinition & { kind: 'harness' }>;
 export type Target = Readonly<TargetDefinition & { kind: 'target' }>;
@@ -44,7 +50,7 @@ export interface InitializeResult extends PluginIdentity { protocol: 1 }
 export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.evidence' | 'shutdown';
 export type ControlRequest = { jsonrpc: '2.0'; id: number } & (
   { method: 'initialize'; params: { protocol: 1 } } |
-  { method: `target.${TargetOperation}`; params: TargetJob } |
+  { [K in TargetOperation]: { method: `target.${K}`; params: TargetJob<K> } }[TargetOperation] |
   { method: 'target.placement'; params: TargetPlacement } |
   { method: 'target.completed'; params: TargetCompleted } |
   { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | `target.${TargetOperation}`>; params: Record<string, never> }

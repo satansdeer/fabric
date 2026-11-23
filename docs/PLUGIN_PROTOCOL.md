@@ -52,10 +52,14 @@ Provider-free regression command: `cargo test -p fabric-runner --test plugins` p
 Target initialization, health and capability exchanges retain the five-second
 per-request startup bound. After negotiation, lifecycle operations and shutdown
 are limited to 250 ms each so a blocked driver cannot stall Core supervision
-for the startup timeout. Any overrun fails closed, terminates owned processes
-and retains incomplete cleanup evidence; there is no retry or local fallback.
+for the startup timeout. Any overrun fails closed; owned processes are stopped
+and reaped, committed host evidence is retained, and no retry or local fallback occurs.
 
 Each `target.OP` receives `{placement,run_id,grant,actions,context}`. The opaque grant is scoped to that request and the offered actions; context contains bounded nonsecret inputs, not authority. The exact reply is `{grant,action}` selecting one offered action, or `{grant,action:{primitive:"unsupported"}}`. Unknown fields, stale grants, unoffered actions, paths, commands, PIDs and plugin-supplied outcomes fail closed. Core executes the selected primitive against captured validated objects inside this boundary, not after an acknowledgment. A separate target can, for example, select `copy` rather than `clone_or_copy` for preparation without rebuilding Core.
+
+Grant identifiers are 1–128 ASCII letters, digits, `_` or `-`. Drivers reject every
+previously seen grant for the lifetime of the session, before invoking callbacks
+or selecting actions, including unsupported proposals and completed operations.
 
 | Operation | Offered concrete primitive |
 | --- | --- |
@@ -67,6 +71,16 @@ Each `target.OP` receives `{placement,run_id,grant,actions,context}`. The opaque
 | reclaim | `workspace.reclaim` |
 
 After executing a primitive Core sends `target.completed {grant,evidence}` with observed facts; the exact receipt is `{received:grant}`. Receipts do not create successful outcomes. Actual Rust workspace/process/capture results, independently committed pins, status and artifact hashes remain authoritative. Start revalidates workspace, consent, command, storage and cancellation before dispatch and again immediately before spawn. Cancellation drives process-group termination; mandatory host stop/reap remains in force even on driver failure. Reclaim is offered only after apply, sealed hashes, owner and lease checks and durable cleanup intent; deletion remains descriptor-anchored. Dry-run never dispatches reclaim. Shutdown must exit successfully before successful finalization.
+
+Before-action rejection executes no primitive. After-action receipt failure
+returns the committed host result separately from the communication error.
+Preparation records the ownership marker and fork usage before the receipt;
+collection commits sealed artifact references and reclaim commits actual deletion
+before receipts. Post-spawn inspect/cancel failures still stop/reap the owned tree,
+drain/finalize capture, and persist actual exit and capture metadata. Durable
+`target_protocol` failure prevents a successful run, including after reclaim;
+it never erases committed evidence. Recovery may reclaim only from independently
+verified evidence and the existing ownership/lease/artifact policy, not a receipt.
 
 A separately installed fake remote refuses placement before allocating runs/workspaces; no local fallback occurs. Only the trusted-local host primitive backend is implemented. Actual remote execution requires a separately specified verifiable backend, not acceptance of remote status assertions.
 

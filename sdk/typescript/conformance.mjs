@@ -125,7 +125,7 @@ export async function conformance(path, { timeout = 5000 } = {}) {
           JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
           !Array.isArray(result.optional) || result.optional.length) fail('unsupported_target_capabilities');
       const placement = await call('target.placement', { placement: info.id, backends: ['host.local'] });
-      if (!exact(placement, ['backend']) || !['host.local', 'unsupported'].includes(placement.backend)) fail('invalid_target_placement');
+      if (!exact(placement, ['backend']) || placement.backend !== 'host.local') fail('unsupported_target_placement');
       // Transport fixtures only. Real execution/ownership evidence comes from Core, not this probe.
       const evidence = {
         prepare: { size_bytes: 1, cloned_files: 0, copied_files: 1 },
@@ -137,12 +137,9 @@ export async function conformance(path, { timeout = 5000 } = {}) {
         const job = { placement: info.id, run_id: 'conformance', grant: String(id + 1),
           actions: TARGET_ACTIONS[op], context: {} };
         const plan = await call(`target.${op}`, job);
-        if (!validTargetPlan(plan, job)) fail('invalid_target_proposal');
-        if (placement.backend === 'unsupported' && plan.action.primitive !== 'unsupported') fail('invalid_target_proposal');
-        if (plan.action.primitive !== 'unsupported') {
-          const received = await call('target.completed', { grant: job.grant, evidence: evidence[op] });
-          if (!exact(received, ['received']) || received.received !== job.grant) fail('invalid_target_receipt');
-        }
+        if (!validTargetPlan(plan, job) || plan.action.primitive === 'unsupported') fail('unsupported_target_operation');
+        const received = await call('target.completed', { grant: job.grant, evidence: evidence[op] });
+        if (!exact(received, ['received']) || received.received !== job.grant) fail('invalid_target_receipt');
       }
     } else {
       result = resultFor(info.kind, await call(method, {}));
