@@ -255,6 +255,7 @@ struct Control {
     tokens: HashMap<RunId, CancellationToken>,
     batches: HashSet<BatchId>,
     pending: VecDeque<BatchId>,
+    completed: VecDeque<BatchId>,
     generation: u64,
     stopping: bool,
 }
@@ -278,6 +279,25 @@ impl Drop for OwnedTask<'_> {
             .unwrap_or_else(|p| p.into_inner());
         control.tokens.remove(self.run);
         control.generation = control.generation.wrapping_add(1);
+        self.manager.changed.notify_all();
+    }
+}
+
+// Wake the scheduler even on panic; it joins the batch before releasing ownership.
+struct BatchCompletion<'a> {
+    manager: &'a Manager,
+    batch: Option<BatchId>,
+}
+impl Drop for BatchCompletion<'_> {
+    fn drop(&mut self) {
+        let mut control = self
+            .manager
+            .control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        control
+            .completed
+            .push_back(self.batch.take().expect("owned batch"));
         self.manager.changed.notify_all();
     }
 }
@@ -450,29 +470,69 @@ impl Manager {
     }
 
     fn run_scheduler(&self) {
-        loop {
-            let batch = {
-                let mut control = self.control.lock().unwrap_or_else(|p| p.into_inner());
-                while control.pending.is_empty() && !control.stopping {
-                    control = self
-                        .changed
-                        .wait(control)
-                        .unwrap_or_else(|p| p.into_inner());
+        std::thread::scope(|scope| {
+            let mut workers = HashMap::new();
+            loop {
+                let (completed, pending) = {
+                    let mut control = self.control.lock().unwrap_or_else(|p| p.into_inner());
+                    while control.pending.is_empty()
+                        && control.completed.is_empty()
+                        && !control.stopping
+                    {
+                        control = self
+                            .changed
+                            .wait(control)
+                            .unwrap_or_else(|p| p.into_inner());
+                    }
+                    if control.stopping {
+                        break;
+                    }
+                    (control.completed.pop_front(), control.pending.pop_front())
+                };
+                if let Some(batch) = completed {
+                    let worker: std::thread::ScopedJoinHandle<'_, Result<(), FabricError>> =
+                        workers.remove(&batch).expect("owned batch");
+                    let outcome = worker
+                        .join()
+                        .unwrap_or_else(|_| Err(error("Manager batch panicked.")));
+                    self.finish_batch(&batch, outcome);
                 }
-                if control.stopping {
-                    return;
+                if let Some(batch) = pending {
+                    let id = batch.clone();
+                    // ponytail: per-batch pools, no global task cap; a global cap needs
+                    // dependency-aware admission so waiting controllers cannot starve children.
+                    match std::thread::Builder::new()
+                        .name(format!("fabric-{batch}"))
+                        .spawn_scoped(scope, move || {
+                            let completion = BatchCompletion {
+                                manager: self,
+                                batch: Some(id),
+                            };
+                            self.execute_batch(completion.batch.as_ref().expect("owned batch"))
+                        }) {
+                        Ok(worker) => {
+                            workers.insert(batch, worker);
+                        }
+                        Err(failure) => self.finish_batch(&batch, Err(error(failure))),
+                    }
                 }
-                control.pending.pop_front().expect("pending batch")
-            };
-            if let Err(failure) = self.execute_batch(&batch) {
-                // All pool workers have joined; only uncompleted claims are now uncertain.
-                let _ = self.recover_batch(&batch, Some(&failure.message));
             }
-            let mut control = self.control.lock().unwrap_or_else(|p| p.into_inner());
-            control.batches.remove(&batch);
-            control.generation = control.generation.wrapping_add(1);
-            self.changed.notify_all();
+            // Stop is admitted only after every batch has joined and released ownership.
+            debug_assert!(workers.is_empty());
+        });
+    }
+
+    fn finish_batch(&self, batch: &BatchId, outcome: Result<(), FabricError>) {
+        if let Err(failure) = outcome {
+            // All pool workers have joined; only uncompleted claims are now uncertain.
+            if let Err(recovery) = self.recover_batch(batch, Some(&failure.message)) {
+                eprintln!("fabric manager batch {batch} recovery failed: {recovery}");
+            }
         }
+        let mut control = self.control.lock().unwrap_or_else(|p| p.into_inner());
+        control.batches.remove(batch);
+        control.generation = control.generation.wrapping_add(1);
+        self.changed.notify_all();
     }
 
     fn execute_batch(&self, id: &BatchId) -> Result<(), FabricError> {
@@ -579,6 +639,11 @@ impl Manager {
             }
             let run = store.run(&task.run_id).map_err(error)?;
             if task.queue_state == RunState::Queued && run.is_none() {
+                if let Some(failure) = failure {
+                    store
+                        .complete_async_task(&task.run_id, RunState::Failed, Err(failure), false)
+                        .map_err(error)?;
+                }
                 continue;
             }
             // A committed terminal run is proof, even when the queue-result commit was interrupted.
@@ -799,7 +864,6 @@ pub fn serve(
     for batch in batches {
         manager.schedule(batch)?;
     }
-    // ponytail: one batch at a time; interleave batches only when fairness matters.
     let scheduler_manager = Arc::clone(&manager);
     let scheduler = std::thread::Builder::new()
         .name("fabric-scheduler".into())

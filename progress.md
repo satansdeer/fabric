@@ -280,3 +280,10 @@
 - Added provider-free Bun conformance and documented native setup, mixed-harness pstack consumption, unchanged native task schemas, controller-loss limits and design-only MCP mapping. No second scheduler, daemon or automatic retry/resume was added.
 - Parent GREEN: fmt, workspace clippy `-D warnings`, 181 tests/29 suites, workspace binary build and Bun CLI/tool/slash conformance. Corrected the fixture's macOS read-only WAL inspection and the throwaway RPC proof's acknowledgement/completion distinction.
 - Actual installed OMP 19.1.0 `/fabric` RPC completed fake-a/fake-b runs with `prompt_result.agentInvoked=false`, verified all 28 artifact hashes/sizes and sealed profiles, reclaimed both workspaces and exited 0. No model/provider call; live OMP/Codex workers remain NOT_VERIFIED. Missing predecessor AC/RC gates and original AT-15 are not claimed.
+
+## Issue #50 — same-root controller/child scheduling
+
+- Replaced scheduler-blocking batch execution with scheduler-owned, joined batch threads; durable admission, single-manager ownership and each batch's bounded task pool remain shared. Panic or thread-start failure triggers durable failure reconciliation before releasing batch ownership.
+- Same-root managed controllers can await admitted children without exiting. Aggregate concurrency is the sum of live per-batch limits (bounded by task counts), not a global worker cap; one supervisor thread is added per live batch. Storage/admission policies are unchanged.
+- Added an actual manager/CLI fake-controller regression: four same-root fake-a children with concurrency two settle and expose verified artifacts while their parent remains running, then the parent is released and all processes/workspaces are cleaned up. Updated the obsolete cross-batch serialization contract.
+- This is provider-free scheduling coverage, not native model parity or release acceptance. The v0.1.5 BLOCKED ledger stays closed; review, CI, release and fresh independent consumer authority remain manager-owned. Connector issue #6 is unchanged.
