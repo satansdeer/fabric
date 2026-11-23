@@ -28,7 +28,9 @@ XDG/home defaults. Relative paths are interpreted from the OMP invocation cwd;
 absolute overrides are recommended. Prepare/register a project before submitting
 workers. These overrides do not select worker profiles or authorize credentials.
 
-The default export registers five typed tools:
+The default export registers five typed tools with `loadMode: "essential"`, so
+command-capable OMP hosts retain their original top-level names and schemas.
+The generic `fabric` tool retains its default load mode:
 
 | Tool | Arguments and behavior |
 | --- | --- |
@@ -268,10 +270,16 @@ is a separate installed-OMP check recorded by the coordinating verification.
 progress delivery, controller reconnect, independent worker failure/artifacts,
 cancel and fail-closed remote rejection. `host-smoke.ts` drives the installed
 OMP 19.1.0 RPC host with private HOME and real tool registration/schema parsing;
-it proves four-worker handles, progress, reconnect, artifact digests/reclaim and
+it asserts the five original active names with Bash enabled and validates their
+registered native parameter schemas; it proves four-worker handles, progress,
+reconnect, artifact digests/reclaim and
 cancellation without an agent/provider turn. Passing the generated pstack plugin
 directory also checks actual `/skill:swarm` discovery. This does not prove a model
-chooses the route or that a live worker can authenticate.
+chooses the route or that a live worker can authenticate. The public darwin-arm64
+OMP 19.1.0 binary reports all five originals active even before the explicit load
+mode, and its `getAllTools()` metadata omits schemas. This check uses the actual
+registered native parsers, not that metadata; it does not attest provider-wire
+schemas or reproduce the source-tag command partition in this binary.
 
 ## Explicit local pstack swarm
 
