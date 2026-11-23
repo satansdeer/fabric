@@ -991,3 +991,19 @@ asserts subprocess errors and reports command/stdout/stderr instead of
 discarding evidence. Its focused test passed locally on the same verified
 Node 22.23.2 runtime in 20.29 s. Neither outer fixture timeout is changed.
 One green workflow does not override its failed exact-head partner.
+
+At diagnostic head `dbbe48e6a33a4c21dc91f59ffae5ba4369715de7`, push CI
+`45161150206` exposed `spawnSync ... ETIMEDOUT` in both Core fixtures.
+The generated-target fixture's read-only run evidence recorded `SUCCEEDED`,
+exit 0, no error, and an artifact manifest before the outer 30 s timer
+interrupted the CLI without its JSON result. These failures were fixture
+timeouts, not evidence of a hung worker or a target-RPC deadline failure.
+Core fixture commands no longer have these incidental whole-command timers,
+including the reference-package checks using the same path. Core still
+bounds each RPC; the generated fake worker now explicitly has a 60 s worker
+budget, and the macOS CI job retains its 30 minute ceiling. SDK conformance
+timeout rejection and the real hung-target/cancellation/recovery assertions
+remain unchanged. Neither a passing local check nor a previous green workflow
+replaces exact-head CI.
+The four affected actual-Core SDK fixtures passed locally on the verified
+Node 22.23.2 runtime in 41.00 s, including artifact retrieval and reclaim.
