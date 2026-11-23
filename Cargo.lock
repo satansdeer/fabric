@@ -243,6 +243,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-reference-harnesses"
+version = "0.1.0"
+dependencies = [
+ "fabric-domain",
+ "fabric-runner",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "fabric-runner"
 version = "0.1.0"
 dependencies = [

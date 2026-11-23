@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, writeFileSync, lstatSync, realpathSync, readdirSync, rmSync, renameSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, writeFileSync, lstatSync, realpathSync, readdirSync, rmSync, renameSync, mkdtempSync, chmodSync } from 'node:fs';
 import { dirname, basename, resolve, join, isAbsolute } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
@@ -28,6 +28,25 @@ export function create(kind, path, id = basename(resolve(path))) {
     fabricPlugin: { id, kind, entry: 'plugin.ts', sdk: SDK_VERSION, protocol: 1 },
   }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, module: 'NodeNext', target: 'ES2022' }, include: ['plugin.ts'] }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  return root;
+}
+/** Package the separately built reference executable; never builds or probes a provider. */
+export function reference(id, path, binary) {
+  const roots = { omp: ['PI_CODING_AGENT_DIR'], codex: ['CODEX_HOME'] };
+  const fingerprints = {
+    omp: { domain: 'omp-native-config-v1', files: ['config.yml', 'config.yaml', 'settings.json', 'models.yml', 'models.yaml', 'mcp.json', '.mcp.json'], roots: [['native-agent-dir', ''], ['native-home', '.omp/agent']] },
+    codex: { domain: 'codex-native-config-v1', files: ['config.toml'], roots: [['native-config-dir', '']] },
+  };
+  if (!Object.hasOwn(roots, id) || !binary) fail('invalid_identity');
+  const root = resolve(path);
+  if (realpathSync(dirname(root)) !== dirname(root)) fail('unsafe_package_path');
+  const bytes = readBounded(realpathSync(binary), MAX_PACKAGE - 65_536);
+  mkdirSync(root, { mode: 0o700 });
+  writeFileSync(join(root, 'plugin'), bytes, { mode: 0o700, flag: 'wx' });
+  writeFileSync(join(root, 'package.json'), JSON.stringify({
+    name: id, version: '0.1.0', files: ['plugin'],
+    fabricPlugin: { id, kind: 'harness', entry: 'plugin', sdk: SDK_VERSION, protocol: 1, runtime: 'native', args: [id], native: { executable: id, root_environment: roots[id], fingerprint: fingerprints[id] } },
+  }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return root;
 }
 function privateDirectory(path) {
@@ -97,13 +116,16 @@ export function install(path, { registry, fabric, version, sha256, trust = false
         mkdirSync(dirname(full), { recursive: true, mode: 0o700 });
         writeFileSync(full, bytes, { mode: 0o600, flag: 'wx' });
       }
+      if (snapshot.info.runtime === 'native') chmodSync(join(staged, snapshot.info.entry), 0o700);
       renameSync(staged, destination);
       staged = undefined;
     }
     const manifest = {
       id: snapshot.info.id, version, protocol: { min: 1, max: 1 }, kind: snapshot.info.kind,
-      executable: realpathSync(process.execPath), args: [join(destination, snapshot.info.entry)],
+      executable: snapshot.info.runtime === 'native' ? join(destination, snapshot.info.entry) : realpathSync(process.execPath),
+      args: snapshot.info.runtime === 'native' ? snapshot.info.args ?? [] : [join(destination, snapshot.info.entry), ...(snapshot.info.args ?? [])],
       capabilities: [kinds[snapshot.info.kind]], integrity: { root: destination, sha256 },
+      ...(snapshot.info.native ? { native: snapshot.info.native } : {}),
     };
     // Kept outside the hashed package, removed after Core persists the manifest.
     const pendingManifest = join(registry, `.manifest-${process.pid}-${Date.now()}.json`);
@@ -134,7 +156,7 @@ const diagnostics = {
 };
 export async function main(args) {
   const command = args.shift();
-  const allowed = { create: ['id'], dev: ['once'], test: [], hash: [], pack: ['out'], install: ['registry', 'fabric', 'version', 'sha256', 'trust', 'upgrade'] };
+  const allowed = { create: ['id'], reference: ['binary'], dev: ['once'], test: [], hash: [], pack: ['out'], install: ['registry', 'fabric', 'version', 'sha256', 'trust', 'upgrade'] };
   if (!Object.hasOwn(allowed, command)) fail('usage');
   const options = {};
   const positional = [];
@@ -149,8 +171,11 @@ export async function main(args) {
       options[key] = args[++i];
     }
   }
-  if (positional.length !== (command === 'create' ? 2 : 1)) fail('usage');
-  if (command === 'create') {
+  if (positional.length !== (['create', 'reference'].includes(command) ? 2 : 1)) fail('usage');
+  if (command === 'reference') {
+    reference(positional[0], positional[1], options.binary);
+    console.log('Packaged reference harness; installation still requires explicit content-pinned trust.');
+  } else if (command === 'create') {
     create(positional[0], positional[1], options.id);
     console.log('Created provider-free TypeScript plugin. Run npm test in the project.');
   } else if (command === 'test' || command === 'dev' && options.once) {
@@ -179,7 +204,7 @@ export async function main(args) {
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   main(process.argv.slice(2)).catch(error => {
     const code = typeof error?.message === 'string' ? error.message.split(':')[0] : '';
-    const message = code === 'usage' ? 'Usage: fabric-plugin create KIND DIR [--id ID] | dev DIR [--once] | test DIR | hash PATH | pack DIR --out FILE.tgz | install PATH --registry DIR --fabric BINARY --version VERSION --sha256 HASH --trust [--upgrade]' : diagnostics[code] ?? 'Invalid package/input or failed plugin operation. No remote error details are displayed.';
+    const message = code === 'usage' ? 'Usage: fabric-plugin create KIND DIR [--id ID] | reference omp|codex DIR --binary BINARY | dev DIR [--once] | test DIR | hash PATH | pack DIR --out FILE.tgz | install PATH --registry DIR --fabric BINARY --version VERSION --sha256 HASH --trust [--upgrade]' : diagnostics[code] ?? 'Invalid package/input or failed plugin operation. No remote error details are displayed.';
     process.stderr.write(`Fabric plugin: ${message}\n`);
     process.exitCode = 1;
   });

@@ -197,9 +197,9 @@ fn unattested_adapters_default_to_unsupported_and_registry_ids_are_sorted() {
             .kind,
         ErrorKind::UnsupportedCapability
     );
-    let ids = HarnessRegistry::default().ids();
+    let ids = HarnessRegistry::default().ids().unwrap();
     assert_eq!(
         ids.iter().map(HarnessId::as_str).collect::<Vec<_>>(),
-        ["codex", "fake", "fake-a", "fake-b", "omp"]
+        ["fake", "fake-a", "fake-b"]
     );
 }

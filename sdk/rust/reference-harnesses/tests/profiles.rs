@@ -1,7 +1,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use fabric_runner::{HarnessAdapter, OmpHarness};
+use fabric_reference_harnesses::OmpHarness;
+use fabric_runner::HarnessAdapter;
 
 #[test]
 fn ambient_profile_environment_is_not_a_probe_or_worker_authorization() {

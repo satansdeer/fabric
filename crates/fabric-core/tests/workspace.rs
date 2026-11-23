@@ -783,6 +783,7 @@ fn external_plugin_reclaim_claim_cannot_bypass_artifacts_or_ownership() {
         ],
         capabilities: vec!["target.plan".into()],
         integrity: None,
+        native: None,
     };
     let error = PluginHost::default()
         .target_plan(&manifest, &fabric_runner::CancellationToken::default())

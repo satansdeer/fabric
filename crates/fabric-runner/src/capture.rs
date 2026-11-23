@@ -18,6 +18,7 @@ pub struct Capture<'a> {
     state: Mutex<State>,
     decode_events: bool,
     harness: Option<&'a dyn HarnessAdapter>,
+    cancellation: crate::CancellationToken,
 }
 
 impl<'a> Capture<'a> {
@@ -36,6 +37,7 @@ impl<'a> Capture<'a> {
         Ok(Self {
             decode_events: events.is_some(),
             harness: None,
+            cancellation: crate::CancellationToken::default(),
             state: Mutex::new(State {
                 files: [
                     Sink::new(Some(stdout)),
@@ -50,6 +52,7 @@ impl<'a> Capture<'a> {
                 activity: None,
                 normalized_event_count: 0,
                 native_failure: None,
+                normalization_timed_out: false,
             }),
         })
     }
@@ -57,6 +60,14 @@ impl<'a> Capture<'a> {
     pub fn with_harness(mut self, harness: &'a dyn HarnessAdapter) -> Self {
         self.harness = Some(harness);
         self
+    }
+    pub(crate) fn with_cancellation(mut self, cancellation: crate::CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    pub(crate) fn normalization_timed_out(&self) -> bool {
+        self.state.lock().unwrap().normalization_timed_out
     }
 
     pub fn with_activity(self, activity: crate::activity::SharedActivity) -> Self {
@@ -112,6 +123,7 @@ impl<'a> Capture<'a> {
         let mut events = Events::with_format(BufReader::new(reader), format);
         // Reuse one bounded serialization buffer, never retain event values.
         let mut encoded = Vec::new();
+        let mut normalization_failed = false;
         while let Some(event) = events.next() {
             let event = event?;
             let (status, value, text) = match &event {
@@ -133,12 +145,39 @@ impl<'a> Capture<'a> {
                 }
             };
             // Keep decoding and inspecting bounded frames after persistence is full.
-            let normalized = self.harness.and_then(|harness| match &event {
-                Event::Parsed(value) => harness.normalize_event(NativeEvent::Json(value)),
-                Event::Text(text) => harness.normalize_event(NativeEvent::Text(text)),
-                Event::Invalid | Event::Oversized => None,
-            });
+            let normalized = if normalization_failed || self.cancellation.is_cancelled() {
+                None
+            } else {
+                let result = match (self.harness, &event) {
+                    (Some(harness), Event::Parsed(value)) => {
+                        harness.try_normalize_event(NativeEvent::Json(value), &self.cancellation)
+                    }
+                    (Some(harness), Event::Text(text)) => {
+                        harness.try_normalize_event(NativeEvent::Text(text), &self.cancellation)
+                    }
+                    _ => Ok(None),
+                };
+                match result {
+                    Ok(event) => event,
+                    Err(_) => {
+                        normalization_failed = true;
+                        if self.cancellation.is_cancelled() {
+                            None
+                        } else {
+                            Some(AgentEvent::Failure {
+                                code: "external-plugin-normalization".into(),
+                                message:
+                                    "External harness normalization failed; raw capture continues."
+                                        .into(),
+                            })
+                        }
+                    }
+                }
+            };
             let mut state = self.state.lock().unwrap();
+            if self.harness.is_some() && self.cancellation.deadline_expired() {
+                state.normalization_timed_out = true;
+            }
             if let Some(activity) = &state.activity {
                 activity.lock().unwrap().frames += 1;
             }
@@ -255,6 +294,7 @@ struct State {
     error: Option<io::Error>,
     normalized_event_count: u64,
     native_failure: Option<String>,
+    normalization_timed_out: bool,
     activity: Option<crate::activity::SharedActivity>,
 }
 impl State {

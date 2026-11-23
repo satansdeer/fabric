@@ -8,6 +8,8 @@ import time
 kind, mode, pidfile = sys.argv[1:4]
 with open(pidfile, 'w') as f:
     f.write(str(os.getpid()))
+with open(pidfile + '.starts', 'a') as f:
+    f.write('start\n')
 if '--fabric-plugin-run' in sys.argv:
     print(json.dumps({'type': 'output', 'text': 'external fixture ran'}), flush=True)
     sys.exit(0)
@@ -38,6 +40,19 @@ for line in sys.stdin:
             result.update({'reclaim': True, 'path': '/SECRET_CANARY', 'artifacts_verified': True})
     elif method == 'connector.evidence':
         result = {'available': True}
+    elif method == 'harness.normalize':
+        with open(pidfile + '.normalizing', 'w') as f:
+            f.write('active')
+        if mode == 'normalize-slow':
+            time.sleep(0.4)
+        if mode == 'normalize-hang':
+            time.sleep(60)
+        event = {'type': 'output', 'stream': 'stdout', 'text': 'normalized fixture'}
+        if mode == 'normalize-spoof':
+            event = {'type': 'completed', 'exit_code': 0, 'exit_signal': None, 'success': True}
+        elif mode == 'normalize-extra':
+            event['SECRET_CANARY'] = 'not an event field'
+        result = {'result': {'event': event}, 'failure': None}
     else:
         sys.exit(9)
     print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)

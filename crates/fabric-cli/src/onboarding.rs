@@ -186,7 +186,7 @@ pub fn init(
         Some(fabric_core::onboarding::inspect(&id)?)
     } else {
         let mut selected = None;
-        for id in fabric_runner::HarnessRegistry::default().ids() {
+        for id in fabric_runner::HarnessRegistry::default().ids()? {
             match fabric_core::onboarding::inspect(&id) {
                 Ok(context) => {
                     selected = Some(context);

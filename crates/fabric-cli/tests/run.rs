@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
+mod reference_plugins;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -18,6 +20,7 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        reference_plugins::install(&path);
         Self(path)
     }
     fn cli(&self) -> Command {
@@ -26,6 +29,10 @@ impl Fixture {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.0)
+            .env(
+                "FABRIC_PLUGIN_REGISTRY",
+                self.0.canonicalize().unwrap().join("plugin-registry"),
+            )
             .env("UNSELECTED_SECRET", "must-not-leak")
             .arg("--root")
             .arg(self.0.join("storage"));
@@ -2142,7 +2149,7 @@ fn missing_omp_is_actionable_and_does_not_allocate_a_run() {
         diagnostic["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("OMP executable not found on PATH")
+            .contains("Harness executable 'omp' not found on PATH")
     );
     assert!(!fixture.0.join("storage/fork-staging").exists());
 }

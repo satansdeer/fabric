@@ -116,3 +116,48 @@ This is **not a sandbox or code-signing system**. The Node binary and system imp
 ## Maintainer checks
 
 `npm ci --ignore-scripts && npm test` checks typed contracts, compiles generated projects, runs all three real stdio kinds, malformed/version/pin/archive boundaries, npm-packaged scaffolding and macOS watch mode without providers. `FABRIC_PLUGIN_TEST_HOST=/absolute/fabric npm test` additionally exercises actual Core registry installation, check, tamper rejection, upgrade and revoke for all kinds. That test explicitly skips when no host is supplied or TMPDIR is inside a Git checkout; CI supplies a built host and an external temporary directory. In restricted workers, `FABRIC_PLUGIN_TEST_NODE=/absolute/node cargo test -p fabric-runner --test plugins typescript_scaffolds_use_existing_native_host` proves generated SDK processes through the actual host/admission boundary without writing an on-disk registry inside the checkout.
+
+## Native reference harness plugins
+
+OMP and Codex are separate SDK executables, not Core built-ins. Build the release executable explicitly; the default Cargo members build only Fabric. Release binaries also fit the SDK's 32 MiB package limit.
+
+```sh
+cargo build --locked -p fabric-cli --bins
+cargo build --locked --release -p fabric-reference-harnesses --bin fabric-reference-harnesses
+```
+
+Choose existing canonical, owner-private package and registry directories outside every Git checkout. The package destination must not already exist. Package OMP and run provider-free conformance, then explicitly install the reviewed package. Before the final Core check, install the supported native CLI version listed below; that check executes its version probe without a model request.
+
+```sh
+PACKAGES=/canonical/owner/private/plugin-packages
+REGISTRY=/canonical/owner/private/fabric-plugins
+FABRIC=/canonical/path/to/fabric
+node sdk/typescript/cli.mjs reference omp "$PACKAGES/omp" \
+  --binary "$PWD/target/release/fabric-reference-harnesses"
+node sdk/typescript/cli.mjs test "$PACKAGES/omp"
+node sdk/typescript/cli.mjs hash "$PACKAGES/omp"
+# Review the content and preceding hash before granting trust:
+node sdk/typescript/cli.mjs install "$PACKAGES/omp" \
+  --registry "$REGISTRY" --fabric "$FABRIC" \
+  --version 0.1.0 --sha256 REVIEWED_CONTENT_SHA256 --trust
+export FABRIC_PLUGIN_REGISTRY="$REGISTRY"
+"$FABRIC" plugins --registry "$REGISTRY" check omp
+```
+
+Repeat with `codex` and its separately reviewed package hash when needed. The plugins retain native CLI IDs and pinned versions: `omp/19.1.0` and `codex-cli 0.171.0`. Install/configure the actual CLI separately before native discovery or consent; packaging and conformance use local doubles and do not authenticate or spend provider funds.
+
+Set `FABRIC_PLUGIN_REGISTRY` in both controller and manager environments. Drain and stop an old manager before changing its binary or environment; follow the main README's upgrade procedure. Then use `fabric init --harness omp --check` and explicit `harness connect` as documented there. Missing, revoked or tampered installs fail closed without a built-in vendor fallback.
+
+Native adapter authors use `defineNativeHarness` and the [native control contract](../../docs/PLUGIN_PROTOCOL.md); ordinary `defineHarness` samples remain provider-free executable harnesses.
+
+For the complete local maintainer checks, build both executables above, then supply their canonical paths:
+
+```sh
+export FABRIC_REFERENCE_PLUGIN_BINARY="$PWD/target/release/fabric-reference-harnesses"
+export FABRIC_PLUGIN_TEST_HOST="$PWD/target/debug/fabric"
+export FABRIC_PLUGIN_TEST_NODE="$(command -v node)"
+RUST_TEST_THREADS=4 cargo test --offline --locked --workspace
+(cd sdk/typescript && npm ci --ignore-scripts && npm test)
+```
+
+Without `FABRIC_REFERENCE_PLUGIN_BINARY`, native SDK conformance is explicitly skipped. CI supplies it and builds reference plugins before workspace tests; neither these checks nor plugin installation imply live provider acceptance.

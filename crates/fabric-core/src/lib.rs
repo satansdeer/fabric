@@ -24,7 +24,7 @@ pub struct PlatformReport {
 
 #[derive(Debug, Serialize)]
 pub struct ToolReport {
-    pub name: &'static str,
+    pub name: String,
     pub path: Option<PathBuf>,
 }
 
@@ -34,23 +34,23 @@ pub struct DoctorReport {
     pub tools: Vec<ToolReport>,
 }
 
-pub fn doctor() -> DoctorReport {
+pub fn doctor() -> Result<DoctorReport, fabric_domain::FabricError> {
     let path = env::var_os("PATH");
-    DoctorReport {
+    Ok(DoctorReport {
         platform: PlatformReport {
             os: env::consts::OS,
             arch: env::consts::ARCH,
             supported: cfg!(target_os = "macos"),
             primary_supported_os: "macos",
         },
-        tools: std::iter::once("git")
-            .chain(fabric_runner::HarnessRegistry::default().doctor_executables())
+        tools: std::iter::once("git".to_owned())
+            .chain(fabric_runner::HarnessRegistry::default().doctor_executables()?)
             .map(|name| ToolReport {
-                name,
                 path: path
                     .as_ref()
-                    .and_then(|path| fabric_runner::discover_executable(name, path)),
+                    .and_then(|path| fabric_runner::discover_executable(&name, path)),
+                name,
             })
             .collect(),
-    }
+    })
 }

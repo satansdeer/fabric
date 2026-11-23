@@ -46,6 +46,9 @@ impl Drop for Process {
     }
 }
 
+#[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
+mod reference_plugins;
+
 struct Fixture {
     path: PathBuf,
     repo: PathBuf,
@@ -67,6 +70,7 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        reference_plugins::install(&path);
         let path = fs::canonicalize(path).unwrap();
         let mut fixture = Self {
             repo: path.join("repo ; literal"),
@@ -121,6 +125,7 @@ impl Fixture {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.path)
+            .env("FABRIC_PLUGIN_REGISTRY", self.path.join("plugin-registry"))
             .env("UNSELECTED_SECRET", "must-not-leak")
             .arg("--root")
             .arg(self.path.join("storage"));

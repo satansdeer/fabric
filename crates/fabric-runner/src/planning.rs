@@ -17,7 +17,7 @@ pub fn negotiate(
     negotiate_profile(&effective, manifest, supports_cost_limit, profile)
 }
 
-pub(crate) fn negotiate_profile(
+pub fn negotiate_profile(
     request: &HarnessRequest,
     manifest: HarnessCapabilityManifest,
     supports_cost_limit: bool,
@@ -45,6 +45,19 @@ pub(crate) fn negotiate_profile(
             ),
         });
     }
+    validate_required_capabilities(request, &manifest)?;
+    Ok(HarnessPlan {
+        request: request.clone(),
+        manifest,
+        model_resolved: None,
+        profile,
+    })
+}
+
+pub(crate) fn validate_required_capabilities(
+    request: &HarnessRequest,
+    manifest: &HarnessCapabilityManifest,
+) -> Result<(), FabricError> {
     let required = [
         Capability::HeadlessRun,
         Capability::WorkspaceExternal,
@@ -81,15 +94,10 @@ pub(crate) fn negotiate_profile(
             });
         }
     }
-    Ok(HarnessPlan {
-        request: request.clone(),
-        manifest,
-        model_resolved: None,
-        profile,
-    })
+    Ok(())
 }
 
-pub(crate) fn check_version(
+pub fn check_version(
     harness_id: &str,
     version: &str,
     supported_version: &str,
@@ -106,7 +114,7 @@ pub(crate) fn check_version(
     Ok(())
 }
 
-pub(crate) fn local_manifest(
+pub fn local_manifest(
     harness_id: HarnessId,
     info: &HarnessInfo,
     supported_version: &str,

@@ -371,6 +371,12 @@ fn failure(error: impl std::fmt::Display) -> FabricError {
 
 #[cfg(test)]
 mod tests {
+    mod reference_plugins {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fabric-runner/tests/support/reference_plugins.rs"
+        ));
+    }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -705,6 +711,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "onboarding::tests::native_consent_drives_shared_run_and_blocks_command_time_revocation", "--nocapture"])
                 .env_clear().env(CHILD, name).env("HOME", home).env(variable, native)
+                .env("FABRIC_PLUGIN_REGISTRY", reference_plugins::install(temporary.path()))
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .env("OPENAI_API_KEY", "unapproved-fixture").env("CODEX_API_KEY", "unapproved-fixture")
                 .env("AWS_SECRET_ACCESS_KEY", "unapproved-fixture").output().unwrap();
