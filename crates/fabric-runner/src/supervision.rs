@@ -309,7 +309,7 @@ impl Drop for ProcessGroup {
 pub(crate) struct PipeReader<'a, R> {
     pipe: R,
     stopped: &'a AtomicBool,
-    stopped_at: Option<Instant>,
+    drain_time: Duration,
 }
 impl<'a, R: Read + AsRawFd> PipeReader<'a, R> {
     pub fn new(pipe: R, stopped: &'a AtomicBool) -> io::Result<Self> {
@@ -324,15 +324,18 @@ impl<'a, R: Read + AsRawFd> PipeReader<'a, R> {
         Ok(Self {
             pipe,
             stopped,
-            stopped_at: None,
+            drain_time: Duration::ZERO,
         })
     }
 }
 impl<R: Read> Read for PipeReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        // Normalization runs between reads; it has its own execution deadline.
+        // Charge only time inside reads, cumulatively even for a busy writer.
+        let mut draining_since = None;
         loop {
             if self.stopped.load(Ordering::Acquire)
-                && self.stopped_at.get_or_insert_with(Instant::now).elapsed()
+                && self.drain_time + draining_since.get_or_insert_with(Instant::now).elapsed()
                     >= Duration::from_millis(250)
             {
                 return Err(io::Error::new(
@@ -345,7 +348,12 @@ impl<R: Read> Read for PipeReader<'_, R> {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5))
                 }
-                result => return result,
+                result => {
+                    if let Some(start) = draining_since {
+                        self.drain_time += start.elapsed();
+                    }
+                    return result;
+                }
             }
         }
     }
@@ -355,7 +363,29 @@ impl<R: Read> Read for PipeReader<'_, R> {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::io::Write;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn stopped_capture_excludes_time_between_reads_from_drain_budget() {
+        let mut descriptors = [0; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: each newly created descriptor is adopted exactly once.
+        let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+        let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+        writer.write_all(b"ab").unwrap();
+        drop(writer);
+        let stopped = AtomicBool::new(true);
+        let mut reader = PipeReader::new(reader, &stopped).unwrap();
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, *b"a");
+        // Deterministically put consumer work beyond the old wall-clock budget.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, *b"b");
+        assert_eq!(reader.read(&mut byte).unwrap(), 0);
+    }
 
     #[test]
     fn stopped_capture_returns_error_when_a_writer_keeps_pipe_open() {
