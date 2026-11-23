@@ -287,3 +287,11 @@
 - Same-root managed controllers can await admitted children without exiting. Aggregate concurrency is the sum of live per-batch limits (bounded by task counts), not a global worker cap; one supervisor thread is added per live batch. Storage/admission policies are unchanged.
 - Added an actual manager/CLI fake-controller regression: four same-root fake-a children with concurrency two settle and expose verified artifacts while their parent remains running, then the parent is released and all processes/workspaces are cleaned up. Updated the obsolete cross-batch serialization contract.
 - This is provider-free scheduling coverage, not native model parity or release acceptance. The v0.1.5 BLOCKED ledger stays closed; review, CI, release and fresh independent consumer authority remain manager-owned. Connector issue #6 is unchanged.
+
+## Issue #52 — complete native plugin integrity bounds
+
+- Raised only the shared Core integrity walk's caps from 256 regular files/512 entries to 4096 regular files/8192 total entries. Controller pins, manifest installation, target admission, control launches and harness command revalidation share the corrected boundary.
+- Retained sorted full-tree content pins, 32 MiB aggregate bytes, depth 16, canonical owner-only roots, ASCII names, regular-file/type checks and no-follow opens. The TypeScript SDK's separate import limits are unchanged.
+- Added deterministic provider-free coverage for a complete-plugin-sized nested tree (542 files/119 directories/depth 6), sorted full-content pins, tail-byte tampering, added/deleted/renamed content, inclusive caps and overflow, and byte/depth/name/private-root/symlink/special-file rejection.
+- This source correction does not establish native skill parity or complete-plugin consumer acceptance. No failed consumer setup or model execution was rerun; review, selective commit, CI, release and fresh public-artifact admission remain manager-owned.
+- Manager recovery: the single native worker failed workspace/artifact limits while copying Cargo caches; no retry was admitted. The retained source was independently reviewed and the private-root fixture corrected. Five targeted package-integrity checks passed. Workspace/lock versions are aligned for the next v0.1.7 public release; release and consumer acceptance remain separate gates.
