@@ -168,7 +168,14 @@ export default function proof(pi:ExtensionAPI) {
  }});
  fabric(forwarded);
  pi.registerCommand("fabric-proof",{description:"Disposable deterministic provider-free actual-tool proof",async handler(args,ctx){
-  const input=JSON.parse(args);const tool=tools.get(input.tool);if(!tool) throw new Error("Missing actual registered tool "+input.tool);
+  const input=JSON.parse(args);
+  if(input.tool==="__active") {
+   const active=pi.getActiveTools();
+   const result={active};
+   pi.sendMessage({customType:"fabric-proof-answer",content:JSON.stringify(result),display:true,details:{call:input.call,result}},{triggerTurn:false});
+   return;
+  }
+  const tool=tools.get(input.tool);if(!tool) throw new Error("Missing actual registered tool "+input.tool);
   const schema=tool.parameters as unknown as NativeSchema;
   const result=input.validate?{valid:schema.safeParse(input.params).success}:await tool.execute(input.call,schema.parse(input.params),new AbortController().signal,undefined,ctx);
   pi.sendMessage({customType:"fabric-proof-answer",content:JSON.stringify(result),display:true,details:{call:input.call,result}},{triggerTurn:false});
@@ -180,6 +187,13 @@ export default function proof(pi:ExtensionAPI) {
 	assert.ok(available.some(command => command.name === "fabric-proof"));
 	assert.ok(available.some(command => command.name === "fabric"));
 	if (plugin) assert.ok(available.some(command => command.name === "skill:swarm"), "actual installed OMP did not discover the staged pstack /skill:swarm");
+	const active = await first.invoke("__active", {});
+	const typed = ["fabric_spawn", "fabric_status", "fabric_results", "fabric_cancel", "fabric_wait"];
+	assert.ok(Array.isArray(active.active) && active.active.includes("bash"), "default command projection requires active bash");
+	for (const name of typed) {
+		assert.ok(active.active.includes(name), `original typed tool is not active: ${name}`);
+	}
+	console.log(`PASS: actual installed-host active original typed names (native schemas validated below): ${typed.join(", ")}`);
 	assert.equal((await first.invoke("fabric_wait", { batch_id: "batch", timeout_seconds: 11 }, true)).valid, false, "native wait schema is unbounded");
 	assert.equal((await first.invoke("fabric_spawn", { project: "demo", tasks: [{ task_id: "x", harness_id: "fake-a", prompt: "literal", unexpected: true }] }, true)).valid, false, "native task schema accepts unknown intent");
 	for (const [fields, valid] of [
