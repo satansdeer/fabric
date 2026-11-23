@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Explicit outbound-only consumer for the owner-provisioned Fabric GitHub inbox."""
+"""Explicit outbound-only consumer for a claimed Fabric GitHub inbox."""
 
 import argparse
 import contextlib
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,8 @@ import urllib.request
 spec = importlib.util.spec_from_file_location("fabric_issue", Path(__file__).with_name("fabric-issue.py"))
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
-PREFIX = "/v1/projects/satansdeer/fabric/automations/issues"
+LEGACY_IDENTITY = {"account": "satansdeer", "project": "fabric", "automation": "issues"}
+SEGMENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 WORKER = re.compile(r"[A-Za-z0-9_-]{8,100}\Z")
 UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z")
@@ -47,11 +49,21 @@ class Client:
     def __init__(self, args):
         # Do not resolve the final component: open_private rejects symlinks.
         path = Path(args.connection)
-        self.connection = bridge.read_state(path)
+        with os.fdopen(bridge.open_private(path, os.O_RDONLY), "rb") as source:
+            raw = source.read(bridge.MAX_JSON + 1)
+        require(len(raw) <= bridge.MAX_JSON, "Connection configuration exceeded the size limit.")
+        self.connection = json.loads(raw)
+        require(isinstance(self.connection, dict), "Invalid connection configuration.")
         value = self.connection
-        require(set(value) == {"schema_version", "endpoint", "worker_id", "token"}
-                and type(value.get("schema_version")) is int and value["schema_version"] == 1,
+        legacy = (set(value) == {"schema_version", "endpoint", "worker_id", "token"}
+                  and type(value.get("schema_version")) is int and value["schema_version"] == 1)
+        require(legacy or (set(value) == {"schema_version", "endpoint", "worker_id", "token", "identity"}
+                          and type(value.get("schema_version")) is int and value["schema_version"] == 2),
                 "Invalid connection configuration.")
+        identity = LEGACY_IDENTITY.copy() if legacy else value["identity"]
+        require(isinstance(identity, dict) and set(identity) == {"account", "project", "automation"}
+                and all(isinstance(part, str) and SEGMENT.fullmatch(part) for part in identity.values()),
+                "Invalid connection route identity.")
         endpoint = value.get("endpoint")
         require(isinstance(endpoint, str), "Invalid connection endpoint.")
         parsed = urllib.parse.urlsplit(endpoint)
@@ -71,13 +83,20 @@ class Client:
         self.endpoint = endpoint.rstrip("/")
         self.worker_id = value["worker_id"]
         self.token = token
+        self.identity = identity
+        self.prefix = ("/v1/projects/" + identity["account"] + "/" + identity["project"]
+                       + "/automations/" + identity["automation"])
+        if legacy:
+            # Explicit local data migration; the deployed URL, token and journal stay unchanged.
+            value.update(schema_version=2, identity=identity)
+            bridge.save_state(path, value)
         # Never send owner credentials through a proxy selected by ambient environment.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def request(self, suffix, payload=None):
         data = None if payload is None else bridge.canonical({"worker_id": self.worker_id, **payload}).encode()
         request = urllib.request.Request(
-            self.endpoint + PREFIX + suffix, data=data,
+            self.endpoint + self.prefix + suffix, data=data,
             headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json",
                      "User-Agent": "Fabric-Connect (+https://github.com/satansdeer/fabric)"},
             method="GET" if payload is None else "POST")
@@ -106,9 +125,9 @@ def safe_id(value):
     return value
 
 
-def event_record(value, issue=None, leased=False):
+def event_record(value, issue=None, leased=False, repo=bridge.REPO):
     require(isinstance(value, dict) and value.get("schema_version") == 1
-            and value.get("source") == "github" and value.get("repo") == bridge.REPO
+            and value.get("source") == "github" and value.get("repo") == repo
             and isinstance(value.get("event_id"), str) and HEX.fullmatch(value["event_id"])
             and type(value.get("issue_number")) is int and 0 < value["issue_number"] <= 2147483647
             and (issue is None or value["issue_number"] == issue)
@@ -143,14 +162,24 @@ def worker_record(value, client):
 
 def status(client):
     value = client.request("/status")
-    require(value.get("schema_version") == 1 and value.get("owner") == "satansdeer"
-            and value.get("project") == "fabric" and value.get("automation") == "issues"
+    identity = client.identity
+    require(value.get("schema_version") == 1 and value.get("owner") == identity["account"]
+            and value.get("project") == identity["project"] and value.get("automation") == identity["automation"]
+            and value.get("url") == client.endpoint + client.prefix
             and isinstance(value.get("events"), list) and len(value["events"]) <= 256,
             "Invalid remote status identity.")
-    events = [event_record(event) for event in value["events"]]
-    return {"schema_version": 1, "owner": "satansdeer", "project": "fabric", "automation": "issues",
-            "worker": worker_record(value.get("worker"), client), "events": events,
-            "counts": {state: sum(event["status"] == state for event in events) for state in sorted(STATES)}}
+    policy = value.get("policy")
+    require(isinstance(policy, dict) and set(policy) == {"repo", "author", "sender", "label"}
+            and isinstance(policy.get("repo"), str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", policy["repo"])
+            and all(isinstance(policy.get(key), str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", policy[key])
+                    for key in ("author", "sender", "label")),
+            "Invalid remote repository policy.")
+    events = [event_record(event, repo=policy["repo"]) for event in value["events"]]
+    return {"schema_version": 1, "owner": identity["account"], "project": identity["project"],
+            "automation": identity["automation"], "url": value["url"], "policy": policy,
+            "worker": worker_record(value.get("worker"), client),
+            "events": events, "counts": {state: sum(event["status"] == state for event in events) for state in sorted(STATES)}}
 
 
 @contextlib.contextmanager
@@ -180,7 +209,7 @@ def configuration(args, client):
     args.fabric = str(bridge.absolute(args.fabric, "--fabric"))
     if args.fake_binary:
         args.fake_binary = str(bridge.absolute(args.fake_binary, "--fake-binary"))
-    return {"endpoint": client.endpoint, "worker_id": client.worker_id, "issue_number": args.issue,
+    return {"endpoint": client.endpoint, "identity": client.identity, "worker_id": client.worker_id, "issue_number": args.issue,
             "approval_sha256": args.approve, "root": args.root, "fabric": args.fabric,
             "project": args.project, "source": {"kind": "prepared", "state_id": args.prepared_state},
             "harness": args.harness, "fake_binary": args.fake_binary,
@@ -247,6 +276,10 @@ def save_handles(mapping, path, state, output):
 def once(args, client, output):
     config = configuration(args, client)  # Spend gate before even polling.
     output["limits"] = config["limits"]
+    remote = status(client)
+    require(remote["policy"] == {"repo": bridge.REPO, "author": args.allow_author,
+                                 "sender": args.allow_author, "label": args.allow_label},
+            "Route policy differs from this local issue bridge; no event was leased.")
     response = client.request("/poll", {"issue_number": args.issue})
     worker_record(response.get("worker"), client)
     require("event" in response, "Invalid remote poll response.")
@@ -256,10 +289,13 @@ def once(args, client, output):
     event = event_record(response["event"], args.issue, leased=True)
     output.update(event_id=event["event_id"], status=event["status"])
     directory = Path(args.root) / "connect-bridge"
+    if client.identity != LEGACY_IDENTITY:
+        namespace = hashlib.sha256(bridge.canonical(client.identity).encode()).hexdigest()
+        directory = directory / namespace
     bridge.private_directory(directory)
     path = directory / (event["event_id"] + ".json")
     provenance = {key: event[key] for key in ("schema_version", "source", "event_id", "repo", "issue_number", "action", "delivery_id")}
-    # ponytail: one local lock serializes this bounded route; use per-event locks for multiple routes.
+    # One local lock per stable route; connection secrets never enter the mapping.
     with bridge.locked(directory / "route.json"), subprocess_environment(client):
         if path.exists():
             mapping = bridge.read_state(path)
@@ -267,6 +303,9 @@ def once(args, client, output):
             saved_config = mapping.get("configuration")
             if isinstance(saved_config, dict) and "limits" not in saved_config:
                 saved_config["limits"] = {name: bounds[0] for name, bounds in bridge.LIMITS.items()}
+                bridge.save_state(path, mapping)
+            if isinstance(saved_config, dict) and "identity" not in saved_config and client.identity == LEGACY_IDENTITY:
+                saved_config["identity"] = LEGACY_IDENTITY.copy()
                 bridge.save_state(path, mapping)
             require(mapping.get("configuration") == config and mapping.get("event") == provenance,
                     "Saved event configuration differs; repeat the original command to reconnect.")

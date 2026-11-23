@@ -53,7 +53,8 @@ export class ConnectInbox extends DurableObject {
 export default {
   async fetch(request, env) {
     try {
-      // Every endpoint for this single configured route shares the same durable state.
+      // Keep the deployed object identity: changing it would strand acknowledged v1 events.
+      // Each claimed automation has its own CAS record inside this existing SQLite object.
       return await env.CONNECT_INBOX.getByName("satansdeer/fabric/issues").fetch(request);
     } catch {
       return new Response('{"error":"Service unavailable"}', {

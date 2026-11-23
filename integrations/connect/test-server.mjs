@@ -23,12 +23,16 @@ export class FileStore {
     this.path = path;
     this.pending = Promise.resolve();
   }
-  async snapshot(key) {
+  async records() {
     let stored;
     try { stored = await readPrivateJSON(this.path); }
-    catch (error) { if (error.code === "ENOENT") return null; throw error; }
-    if (stored.key !== key || typeof stored.etag !== "string") throw new Error("Invalid fixture state");
-    return stored;
+    catch (error) { if (error.code === "ENOENT") return {}; throw error; }
+    if (stored.schema_version === 2 && stored.records && typeof stored.records === "object") return stored.records;
+    if (typeof stored.key !== "string" || typeof stored.etag !== "string") throw new Error("Invalid fixture state");
+    return { [stored.key]: { data: stored.data, etag: stored.etag } };
+  }
+  async snapshot(key) {
+    return (await this.records())[key] || null;
   }
   async getWithMetadata(key) {
     const stored = await this.snapshot(key);
@@ -36,7 +40,8 @@ export class FileStore {
   }
   async setJSON(key, data, options) {
     const update = this.pending.then(async () => {
-      const current = await this.snapshot(key);
+      const records = await this.records();
+      const current = records[key];
       if ((options.onlyIfNew && current) || (options.onlyIfMatch && current?.etag !== options.onlyIfMatch)) return { modified: false };
       if (!options.onlyIfNew && !options.onlyIfMatch) throw new Error("Conditional fixture writes required");
       const etag = randomUUID();
@@ -45,7 +50,8 @@ export class FileStore {
       let file;
       try {
         file = await open(temporary, "wx", 0o600);
-        await file.writeFile(JSON.stringify({ key, etag, data }));
+        records[key] = { etag, data };
+        await file.writeFile(JSON.stringify({ schema_version: 2, records }));
         await file.sync();
         await file.close();
         file = null;
@@ -78,10 +84,11 @@ async function main() {
     FABRIC_CONNECT_WEBHOOK_SECRET: secrets.webhook_secret,
     FABRIC_CONNECT_WORKER_TOKEN_SHA256: secrets.worker_token_sha256,
     FABRIC_CONNECT_WORKER_ID: secrets.worker_id,
+    FABRIC_CONNECT_PRINCIPALS: JSON.stringify(secrets.principals || []),
   } });
   const server = createServer(async (incoming, outgoing) => {
     try {
-      const request = new Request(`http://127.0.0.1${incoming.url}`, {
+      const request = new Request(`http://127.0.0.1:${server.address().port}${incoming.url}`, {
         method: incoming.method, headers: incoming.headers,
         ...(["GET", "HEAD"].includes(incoming.method) ? {} : { body: Readable.toWeb(incoming), duplex: "half" }),
       });
