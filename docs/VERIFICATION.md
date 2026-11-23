@@ -783,3 +783,46 @@ The final narrow-check results above are the worker's report, not a claim
 that the manager recovered their complete raw tool output. Final acceptance
 requires exact-head CI on this actual production correction; the green
 diagnostic-only CI run 45121442039 is not proof of the new correction.
+
+### Exact-main plugin timeout diagnostics (base `12adf2d1b88a5be8fb2a40e2c168cdc1ff577ece`)
+
+Main CI `45124969084`, job `137527110997`, failed with
+`Run r-1795415966251164000-13196-0: Plugin: timeout. (workspace retained)`.
+The GC safety fixture failed during its successful-run prerequisite, before
+its ownership/manifest/state refusal assertions. The historical error lacks
+the RPC method and byte progress; its root cause remains unproven.
+
+The shared exchange timeout now includes the host-selected method, actual
+request ID, request-write/response-read phase and byte counts, without
+payloads, paths, environment or remote error text. The new external-plugin
+regression withholds an inspect response after negotiation, forbids a host
+effect and verifies bounded failure and actual plugin reap. Existing
+blocked-write and health-hang checks distinguish their timeout context.
+No deadline, authority, cancellation, receipt, capture/reclaim or owned-child
+reap behavior changed. This is diagnostic work, not the historical fix.
+
+Released v0.1.1 native OMP worker `r-1795416363008236000-76187-10` ran
+the following once with installed Rust 1.91.0, offline/locked Cargo, real
+CLI/reference/local-target/Node binaries, `RUST_TEST_THREADS=4` and no
+`FABRIC_PLUGIN_REGISTRY`:
+
+```sh
+rustfmt --edition 2024 --check crates/fabric-runner/src/plugin.rs crates/fabric-runner/tests/plugins.rs
+cargo clippy --offline --locked -p fabric-runner --lib --test plugins -- -D warnings
+cargo build --offline --locked -p fabric-cli --bins
+cargo test --offline --locked -p fabric-runner --lib plugin::tests::blocked_request_write_obeys_exchange_deadline -- --exact --nocapture
+cargo test --offline --locked -p fabric-runner --test plugins target_timeout_identifies_rpc_and_exchange_phase_without_host_effects -- --exact --nocapture
+cargo test --offline --locked -p fabric-runner --test plugins protocol_failures_are_bounded_reaped_and_secret_free -- --exact --nocapture
+cargo test --offline --locked -p fabric-cli --test run gc_refuses_unsafe_ownership_paths_manifests_and_noneligible_states -- --exact --nocapture
+```
+
+All exited 0; focused tests each ran one test (0.06 s, 1.25 s, 8.09 s,
+65.10 s respectively). All 13 GC safety cases remain unchanged. Clippy
+unexpectedly emitted rustup sync/download messages despite the explicit
+toolchain PATH; it was not repeated. Manager verified all 14 sealed
+artifact hashes, including complete `.parity/verification.txt` output in
+`untracked.tar` (SHA-256
+`2909671cd88b5ac29363d1146bbc03e4d5212d9b6a45558082b45f09825ab3c2`).
+Capture was not truncated. Passing local GC checks do not explain the
+historical failure; v0.1.2 remains held pending a proven correction and
+manager-observed exact-main acceptance.

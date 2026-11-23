@@ -18,7 +18,9 @@ for line in sys.stdin:
     method = req['method']
     with open(pidfile + '.calls', 'a') as f:
         f.write(method + '\n')
-    if mode == 'hang' or (mode == 'health-hang' and method == 'health'):
+    if (mode == 'hang'
+            or (mode == 'health-hang' and method == 'health')
+            or (mode == 'inspect-hang' and method == 'target.inspect')):
         time.sleep(60)
     if mode == 'crash':
         sys.exit(7)
@@ -41,7 +43,7 @@ for line in sys.stdin:
         if mode == 'reclaim':
             result.update({'reclaim': True, 'path': '/SECRET_CANARY', 'artifacts_verified': True})
     elif method == 'target.placement':
-        result = {'backend': 'host.local' if mode in ('concrete', 'ack-only', 'wrong-grant') else 'unsupported'}
+        result = {'backend': 'host.local' if mode in ('concrete', 'ack-only', 'wrong-grant', 'inspect-hang') else 'unsupported'}
     elif method == 'target.completed':
         result = {'received': req['params']['grant']}
     elif method.startswith('target.'):
