@@ -564,14 +564,25 @@ fn native_capture_respects_the_execution_deadline_and_preserves_cancellation() {
             }),
         );
         assert_eq!(cancel.is_cancelled(), cancel_during_normalize);
+        assert_eq!(result.status.success(), !cancel_during_normalize);
+        if cancel_during_normalize {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(matches!(
+                result.status.signal(),
+                Some(libc::SIGTERM | libc::SIGKILL)
+            ));
+        }
         assert_eq!(
             std::fs::read_to_string(&output).unwrap(),
             "{\"fixture\":1}\n{\"fixture\":2}\n{\"fixture\":3}\n{\"fixture\":4}\n{\"fixture\":5}\n{\"fixture\":6}\n",
         );
-        assert!(result.capture.unwrap().native_failure.is_none());
+        let metadata = result.capture.unwrap();
+        assert!(metadata.native_failure.is_none());
+        assert_eq!(metadata.event_counts.parsed, 6);
         let captured = std::fs::read_to_string(events).unwrap();
         assert!(!captured.contains("external-plugin-normalization"));
         assert!(captured.contains("\"success\":false"));
+        reaped(dir.path());
         drop(adapter);
         reaped(dir.path());
     }

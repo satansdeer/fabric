@@ -12,6 +12,81 @@
 
 No cloud readiness claim is made. Native installed-host loading and fake workers do not establish authentication/model access or model-driven skill routing.
 
+## Issue 42: native capture drain accounting
+
+Source baseline: `ebaad083626f8d9b6fcef35d9ffaaabe29d357f7`.
+Approved issue-body SHA-256:
+`cdfbcaf43ae399bbd34dfa4ccdb3d305590804e25de4eb2bb3424f2bc21fd620`.
+The reported reproduction is [merged-main macOS acceptance run 45097474252](https://github.com/satansdeer/fabric/actions/runs/45097474252):
+`native_capture_respects_the_execution_deadline_and_preserves_cancellation`
+returned `Capture pipe remained open after group termination; capture incomplete.`
+That failure was not rerun merely to reproduce it.
+
+Source trace: runs, version probes and Git artifact capture share `execute` and
+`PipeReader`. Execution terminates/reaps its owned group, sets `stopped`, then
+joins both drains. Stdout decodes buffered frames and synchronously normalizes
+them through a separately owned persistent `PluginSession`. Normalization RPCs
+observe the execution-local deadline/cancellation token; a failed RPC drops and
+reaps that session, while adapter drop finishes any retained session.
+
+The old `PipeReader::stopped_at` starts on the first read observing `stopped`.
+Time spent normalizing **between** subsequent reads then consumes its 250 ms
+budget. A read after that pause fails before attempting to read buffered pipe
+bytes or EOF, even with no writer left. This source-proven false-timeout path
+depends on whether the first read observes group termination; the CI log does
+not record the exact thread interleaving. It is not evidence of a leaked writer.
+
+The shared reader now accounts cumulative time **inside** post-stop reads,
+excluding consumer processing. The same 250 ms drain budget still bounds waiting
+on an open writer and continuously readable output. Execution/RPC deadlines,
+TERM/KILL, owned PID anchoring, reaping and incomplete-capture errors are unchanged.
+The deterministic pipe regression closes its writer, reads one byte after stop,
+pauses beyond the old budget, then requires the remaining byte and real EOF.
+The existing native regression retains both slow/deadline and hanging/cancellation
+branches, and additionally checks real OS status, all six decoded frames and
+normalizer reaping before adapter destruction.
+
+Worker verification on macOS arm64, each command attempted once:
+
+```sh
+PATH="/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:$PATH" FABRIC_REFERENCE_PLUGIN_BINARY=/Users/maksimivanov/.local/share/fabric/releases/v0.1.0/install/fabric-v0.1.0-macos-arm64/plugins/omp/plugin cargo test --offline --locked -p fabric-runner --lib --test plugins capture -- --nocapture
+PATH="/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:$PATH" cargo fmt --all -- --check
+```
+
+- Regression command: exit 101 **before compilation**, `no matching package named
+  serde_json found` in the offline crates.io index, required by `fabric-domain`.
+  No tests executed; no retry or dependency/configuration change was made.
+- Format check: exit 0, no output.
+- Rust LSP references were attempted but unavailable: the installed rustup shim
+  could not launch rust-analyzer, and the supplied toolchain has no rust-analyzer
+  binary. Callers were traced through source searches/reads instead; no exported
+  API changed.
+
+Worker status was **IMPLEMENTED, behavior NOT_VERIFIED** because its private
+offline dependency cache prevented compilation.
+
+Manager verification on macOS arm64 used the recovered candidate, the existing
+host dependency cache and shared build output. The cancellation status assertion
+accepts either owned TERM or grace-period KILL, rather than assuming scheduling
+always permits graceful termination. LSP resolved both production stdout/stderr
+`PipeReader` callers; no exported API changed.
+
+```sh
+export PATH="/Users/maksimivanov/.rustup/toolchains/1.91.0-aarch64-apple-darwin/bin:$PATH" CARGO_TARGET_DIR=/Users/maksimivanov/.local/share/fabric/reviews/issue-38-source/target FABRIC_REFERENCE_PLUGIN_BINARY=/Users/maksimivanov/.local/share/fabric/releases/v0.1.0/install/fabric-v0.1.0-macos-arm64/plugins/omp/plugin
+cargo test --locked -p fabric-runner --lib --test plugins capture -- --nocapture
+cargo fmt --all -- --check
+```
+
+Both commands passed once. Regression result: **8 passed**, two suites, 16
+filtered out; tests completed in 2.43 seconds. This covers buffered bytes/EOF
+after delayed consumption, held-open writer failure, and native
+deadline/cancellation/frame/reaping paths. Status: **TESTED_WITH_FAKE** for this
+capture path. No full local suite, lint, release package, live-provider capture
+proof or actual-route timing proof was run.
+This candidate does not diagnose the unrelated issue #38 storage-meter failure.
+Published runtime remains v0.1.0; review, exact-head and merged-main acceptance,
+v0.1.1 publication and independent downloaded-release smoke remain manager-owned.
+
 ## Issue 39: content-free storage meter diagnostics
 
 Source baseline verified before editing: `a8448f5a04dee05ffda801157655685e6eb01cf9`.
