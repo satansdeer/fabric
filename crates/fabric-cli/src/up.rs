@@ -16,6 +16,11 @@ use super::onboarding::{approve, exposure, invalid};
 
 #[derive(clap::Args)]
 pub struct UpArgs {
+    /// Attach an already prepared trusted automation instead of performing native setup.
+    #[arg(long, conflicts_with_all = ["harness", "controller", "plugin_dir", "recipe", "source_only"])]
+    connect: bool,
+    #[command(flatten)]
+    connection: super::connect::Options,
     #[arg(long)]
     harness: Option<HarnessId>,
     /// Enable isolated packaged OMP tools; native user configuration is never edited.
@@ -162,6 +167,12 @@ fn bundled_plugins(bundle: &Path, release: &Value, registry: &Path) -> Result<()
 }
 
 pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
+    if args.connect {
+        return super::connect::run(root, args.connection);
+    }
+    if args.connection.selected() {
+        return Err(invalid("Connection options require --connect."));
+    }
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let root = if root.is_absolute() {
         root

@@ -44,6 +44,11 @@ pub enum Request {
         trigger: fabric_domain::NormalizedTrigger,
         delivery: fabric_domain::ConnectorDelivery,
     },
+    Connect {
+        automation: Box<crate::connector::Automation>,
+        trigger: fabric_domain::NormalizedTrigger,
+        fake_binary: Option<PathBuf>,
+    },
     Status {
         id: String,
         after: u64,
@@ -351,6 +356,39 @@ impl Manager {
                 let batch = crate::api::translate_workers(request)?;
                 self.submit(batch, None, Some(key), digest, true, Some(delivery))
             }
+            Request::Connect {
+                automation,
+                trigger,
+                fake_binary,
+            } => {
+                let (request, key) = automation.connect_route(&trigger)?;
+                let digest = request_digest(&(&trigger, &request), &fake_binary)?;
+                let (_, store) = open_store(&self.root)?;
+                // Only new admission needs source preflight. Durable retries survive source cleanup.
+                if store.async_idempotency(&key).map_err(error)?.is_none() {
+                    let Some(fabric_domain::SourceRef::Prepared { state_id }) =
+                        &automation.worker.source_ref
+                    else {
+                        return Err(invalid("Connect requires a prepared source."));
+                    };
+                    let id = fabric_domain::PreparedStateId::try_from(state_id.clone())?;
+                    let prepared = store
+                        .prepared_state(&id)
+                        .map_err(error)?
+                        .ok_or_else(|| invalid("Connect prepared source is missing."))?;
+                    if prepared.size_bytes > 134217728 {
+                        return Err(invalid("Connect prepared source exceeds 128 MiB."));
+                    }
+                }
+                let batch = crate::api::translate_workers(request)?;
+                let delivery = fabric_domain::ConnectorDelivery {
+                    namespace: automation.namespace(),
+                    nonce: trigger.event_id,
+                    expires_at: now()?.saturating_add(300),
+                    rate_limit: automation.rate_limit_per_minute,
+                };
+                self.submit(batch, fake_binary, Some(key), digest, true, Some(delivery))
+            }
             Request::Status { id, after } => self.status(&id, after),
             Request::Results { id } => self.results(&id),
             Request::Cancel { id } => self.cancel(&id),
@@ -392,13 +430,17 @@ impl Manager {
             return Err(invalid("Async --fake-binary must be an absolute path."));
         }
         let (_, mut store) = open_store(&self.root)?;
+        // Hosted identity is permanent business idempotency, not a one-shot connector nonce.
+        let hosted = key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("connect:"));
         if let Some(prior) = key
             .as_deref()
             .map(|key| idempotent_batch(&store, key, &digest))
             .transpose()?
             .flatten()
         {
-            if let Some(delivery) = &delivery {
+            if let Some(delivery) = delivery.as_ref().filter(|_| !hosted) {
                 store
                     .accept_connector_batch(
                         &prior,
@@ -473,14 +515,22 @@ impl Manager {
             return Err(invalid("Manager is stopping; reconnect and submit again."));
         }
         let id = match &delivery {
-            Some(delivery) => store.accept_connector_batch(
-                &batch,
-                key.as_deref().expect("connector key"),
-                &tasks,
-                delivery,
-                now()?,
-            ),
-            None => store.accept_async_batch(&batch, key.as_deref(), &tasks, now()?),
+            Some(delivery)
+                if !hosted
+                    || store
+                        .async_idempotency(key.as_deref().expect("connector key"))
+                        .map_err(error)?
+                        .is_none() =>
+            {
+                store.accept_connector_batch(
+                    &batch,
+                    key.as_deref().expect("connector key"),
+                    &tasks,
+                    delivery,
+                    now()?,
+                )
+            }
+            _ => store.accept_async_batch(&batch, key.as_deref(), &tasks, now()?),
         }
         .map_err(|failure| {
             if matches!(failure, fabric_store::StoreError::Conflict) {

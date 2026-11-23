@@ -2,7 +2,7 @@
 import { createServer } from "node:http";
 import { constants } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
@@ -73,12 +73,13 @@ async function main() {
   const options = {};
   for (let index = 2; index < process.argv.length; index += 2) {
     const name = process.argv[index];
-    if (!["--port", "--state", "--secret-file"].includes(name) || options[name] !== undefined || !process.argv[index + 1]) throw new Error("Invalid fixture arguments");
+    if (!["--port", "--state", "--secret-file", "--drop-ack-dir"].includes(name) || options[name] !== undefined || !process.argv[index + 1]) throw new Error("Invalid fixture arguments");
     options[name] = process.argv[index + 1];
   }
   if (!/^\d+$/.test(options["--port"] || "") || Number(options["--port"]) > 65535 ||
       !isAbsolute(options["--state"] || "") || !isAbsolute(options["--secret-file"] || "") ||
-      options["--state"] === options["--secret-file"]) throw new Error("Invalid fixture arguments");
+      options["--state"] === options["--secret-file"] ||
+      (options["--drop-ack-dir"] && !isAbsolute(options["--drop-ack-dir"]))) throw new Error("Invalid fixture arguments");
   const secrets = await readPrivateJSON(options["--secret-file"]);
   const handler = createHandler({ store: new FileStore(options["--state"]), env: {
     FABRIC_CONNECT_WEBHOOK_SECRET: secrets.webhook_secret,
@@ -93,6 +94,18 @@ async function main() {
         ...(["GET", "HEAD"].includes(incoming.method) ? {} : { body: Readable.toWeb(incoming), duplex: "half" }),
       });
       const response = await handler(request);
+      // Fault injection only after the real durable handler has committed acknowledgement.
+      if (response.ok && incoming.url.endsWith("/ack") && options["--drop-ack-dir"]) {
+        const receipt = await response.clone().json();
+        const status = receipt.event?.status;
+        if (["running", "completed", "failed"].includes(status)) {
+          try {
+            await unlink(join(options["--drop-ack-dir"], "drop-" + status));
+            outgoing.destroy();
+            return;
+          } catch (error) { if (error.code !== "ENOENT") throw error; }
+        }
+      }
       outgoing.writeHead(response.status, Object.fromEntries(response.headers));
       outgoing.end(Buffer.from(await response.arrayBuffer()));
     } catch {

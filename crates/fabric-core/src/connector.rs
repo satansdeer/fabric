@@ -191,6 +191,41 @@ impl Automation {
         Ok((request, key))
     }
 
+    /// Hosted authentication has already happened. Local policy still owns all execution authority.
+    pub fn connect_route(
+        &self,
+        trigger: &NormalizedTrigger,
+    ) -> Result<(WorkerBatchRequest, String), FabricError> {
+        let limits = self.worker.limits.as_ref().ok_or_else(invalid)?;
+        if !matches!(
+            self.worker.source_ref,
+            Some(fabric_domain::SourceRef::Prepared { .. })
+        ) || self.placement != "local"
+            || !limits
+                .timeout_seconds
+                .is_some_and(|n| (1..=604800).contains(&n))
+            || [
+                limits.copy_limit_bytes,
+                limits.max_log_bytes,
+                limits.max_artifact_bytes,
+            ]
+            .iter()
+            .any(|n| !n.is_some_and(|n| (1..=134217728).contains(&n)))
+            || trigger.event_id.len() != 64
+            || !trigger
+                .event_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || trigger.idempotency_key != trigger.event_id
+        {
+            return Err(invalid());
+        }
+        let (request, _) = self.route(trigger)?;
+        // Unlike legacy connectors, hosted receipt identity is scoped to the whole route.
+        let key = format!("connect:{}:{}", self.namespace(), trigger.event_id);
+        Ok((request, key))
+    }
+
     pub fn namespace(&self) -> String {
         let p = &self.policy;
         format!(
