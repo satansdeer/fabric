@@ -182,7 +182,10 @@ fn target_delayed_inspection_does_not_kill_a_healthy_worker() {
     assert!(execution.failure.is_none());
     assert!(!execution.target_failed);
     assert!(execution.capture.is_ok());
-    assert_eq!(std::fs::read(dir.path().join("result")).unwrap(), b"completed");
+    assert_eq!(
+        std::fs::read(dir.path().join("result")).unwrap(),
+        b"completed"
+    );
     drop(target);
     reaped(dir.path());
 }
