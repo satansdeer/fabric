@@ -223,7 +223,7 @@ fn integrity_files(
     for entry in fs::read_dir(root).map_err(|_| failure("integrity_mismatch"))? {
         let entry = entry.map_err(|_| failure("integrity_mismatch"))?;
         *entries += 1;
-        if *entries > 512 {
+        if *entries > 8192 {
             return Err(failure("integrity_mismatch"));
         }
         let name = entry.file_name();
@@ -240,7 +240,7 @@ fn integrity_files(
             .map_err(|_| failure("integrity_mismatch"))?;
         if kind.is_dir() {
             integrity_files(&entry.path(), depth + 1, entries, files)?;
-        } else if kind.is_file() && files.len() < 256 {
+        } else if kind.is_file() && files.len() < 4096 {
             files.push(entry.path());
         } else {
             return Err(failure("integrity_mismatch"));

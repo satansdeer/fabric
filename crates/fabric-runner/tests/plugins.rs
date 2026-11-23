@@ -1,6 +1,7 @@
 use fabric_domain::HarnessRequest;
 use fabric_runner::plugin::*;
 use fabric_runner::{CancellationToken, HarnessAdapter};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -444,6 +445,193 @@ fn manifest_versions_and_file_inputs_fail_closed() {
     assert!(PluginManifest::load(Path::new("/dev/zero")).is_err());
     std::fs::write(&path, vec![b'x'; MAX_FRAME + 1]).unwrap();
     assert!(PluginManifest::load(&path).is_err());
+}
+
+fn integrity_pin(
+    root: &Path,
+    files: &std::collections::BTreeMap<String, String>,
+) -> PluginIntegrity {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (name, hash) in files {
+        digest.update(format!("{name}\0{hash}\n"));
+    }
+    PluginIntegrity {
+        root: root.canonicalize().unwrap(),
+        sha256: format!("{:x}", digest.finalize()),
+    }
+}
+
+#[test]
+fn package_integrity_accepts_complete_plugin_and_pins_all_content() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // 119 directories, 542 files, 661 entries; deepest directory is six levels.
+    let mut directories: Vec<_> = (0..113).map(|i| format!("module-{i:03}")).collect();
+    let mut nested = String::new();
+    for _ in 0..6 {
+        if !nested.is_empty() {
+            nested.push('/');
+        }
+        nested.push_str("nested");
+        directories.push(nested.clone());
+    }
+    for name in &directories {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+    let name = |i| format!("{}/file-{i:03}.bin", directories[i % directories.len()]);
+    let mut files = std::collections::BTreeMap::new();
+    // Reverse creation order; expected records are sorted independently of the walk.
+    for i in (0..542).rev() {
+        let content = format!("file-{i:03}\n").repeat(if i == 541 { 2048 } else { 1 });
+        std::fs::write(root.join(name(i)), &content).unwrap();
+        files.insert(name(i), format!("{:x}", Sha256::digest(content)));
+    }
+    let pin = integrity_pin(root, &files);
+    pin.verify().unwrap();
+    for kind in [
+        PluginKind::Harness,
+        PluginKind::Target,
+        PluginKind::Connector,
+    ] {
+        let mut plugin = manifest(kind, "ok", root);
+        plugin.integrity = Some(pin.clone());
+        PluginRegistry::default().install(plugin, false).unwrap();
+    }
+    // Include a deeply nested file and a tail byte beyond the read buffer/old cap.
+    for i in [0, 118, 541] {
+        let path = root.join(name(i));
+        let mut changed = std::fs::read(&path).unwrap();
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &changed).unwrap();
+        assert_eq!(
+            pin.verify().unwrap_err().message,
+            "Plugin: integrity_mismatch."
+        );
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(path, changed).unwrap();
+    }
+    let path = root.join(name(541));
+    let original = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(pin.verify().is_err());
+    std::fs::write(&path, original).unwrap();
+    std::fs::rename(&path, root.join("renamed")).unwrap();
+    assert!(pin.verify().is_err());
+    std::fs::rename(root.join("renamed"), &path).unwrap();
+    std::fs::write(root.join("added"), b"extra content").unwrap();
+    assert!(pin.verify().is_err());
+    std::fs::remove_file(root.join("added")).unwrap();
+    pin.verify().unwrap();
+}
+
+#[test]
+fn package_integrity_file_and_entry_caps_are_inclusive_and_bounded() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let empty_hash = format!("{:x}", Sha256::digest(b""));
+    let mut files = std::collections::BTreeMap::new();
+    for i in 0..4096 {
+        let name = format!("file-{i:04}");
+        std::fs::write(root.join(&name), b"").unwrap();
+        files.insert(name, empty_hash.clone());
+    }
+    integrity_pin(root, &files).verify().unwrap();
+    std::fs::write(root.join("overflow"), b"").unwrap();
+    files.insert("overflow".into(), empty_hash);
+    // Even the correct full-tree pin cannot admit file 4097.
+    assert!(integrity_pin(root, &files).verify().is_err());
+    std::fs::remove_file(root.join("overflow")).unwrap();
+    files.remove("overflow");
+    for i in 0..4096 {
+        std::fs::create_dir(root.join(format!("dir-{i:04}"))).unwrap();
+    }
+    let pin = integrity_pin(root, &files);
+    pin.verify().unwrap(); // Exactly 8192 entries, including empty directories.
+    std::fs::create_dir(root.join("overflow")).unwrap();
+    assert!(pin.verify().is_err());
+}
+
+#[test]
+fn package_integrity_retains_tree_safety_checks() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.join("entry"), b"content").unwrap();
+    let mut files = std::collections::BTreeMap::from([(
+        "entry".into(),
+        format!("{:x}", Sha256::digest(b"content")),
+    )]);
+    let pin = integrity_pin(&root, &files);
+    pin.verify().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(pin.verify().is_err());
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut unsafe_pin = pin.clone();
+    unsafe_pin.root = root.join("entry"); // Root must be a directory.
+    assert!(unsafe_pin.verify().is_err());
+    symlink(root.join("entry"), root.join("link")).unwrap();
+    files.insert("link".into(), files["entry"].clone());
+    assert!(integrity_pin(&root, &files).verify().is_err());
+    std::fs::remove_file(root.join("link")).unwrap();
+    files.remove("link");
+    symlink(&root, root.join("link")).unwrap();
+    unsafe_pin.root = root.join("link");
+    assert!(unsafe_pin.verify().is_err()); // No symlink roots or directory following.
+    assert!(pin.verify().is_err());
+    std::fs::remove_file(root.join("link")).unwrap();
+    for name in ["unsafe name", "non-ascii-é"] {
+        std::fs::write(root.join(name), b"").unwrap();
+        files.insert(name.into(), format!("{:x}", Sha256::digest(b"")));
+        assert!(integrity_pin(&root, &files).verify().is_err());
+        std::fs::remove_file(root.join(name)).unwrap();
+        files.remove(name);
+    }
+    let fifo = std::ffi::CString::new(root.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(pin.verify().is_err());
+    std::fs::remove_file(root.join("fifo")).unwrap();
+    let mut nested = root.clone();
+    for _ in 0..16 {
+        nested.push("nested");
+        std::fs::create_dir(&nested).unwrap();
+    }
+    unsafe_pin.root = root.join("nested/..");
+    assert!(unsafe_pin.verify().is_err()); // Non-canonical spelling of the same tree.
+    pin.verify().unwrap();
+    std::fs::create_dir(nested.join("overflow")).unwrap();
+    assert!(pin.verify().is_err());
+}
+
+#[test]
+fn package_integrity_byte_cap_remains_aggregate_and_inclusive() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut content = Sha256::new();
+    for _ in 0..2048 {
+        content.update([0; 8192]);
+    }
+    let hash = format!("{:x}", content.finalize());
+    let mut files = std::collections::BTreeMap::new();
+    for name in ["a", "b"] {
+        std::fs::File::create(dir.path().join(name))
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        files.insert(name.into(), hash.clone());
+    }
+    let pin = integrity_pin(dir.path(), &files);
+    pin.verify().unwrap(); // 32 MiB spread over two files.
+    std::fs::write(dir.path().join("extra"), b"x").unwrap();
+    files.insert("extra".into(), format!("{:x}", Sha256::digest(b"x")));
+    assert!(integrity_pin(dir.path(), &files).verify().is_err());
 }
 
 #[test]
