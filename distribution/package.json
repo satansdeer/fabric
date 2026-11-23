@@ -1,0 +1,16 @@
+{
+  "name": "@fabric-distribution-unpublished/cli",
+  "version": "0.1.2",
+  "private": true,
+  "description": "Unpublished, unowned namespace candidate: optional launcher for reviewed native Fabric releases",
+  "type": "module",
+  "engines": { "node": ">=22.18.0" },
+  "bin": { "fabric-native": "launcher.mjs" },
+  "files": [
+    "launcher.mjs",
+    "install.rb",
+    "fabric.rb",
+    "fabric-v0.1.2-macos-arm64.json",
+    "fabric-v0.1.2-macos-arm64.tar.gz.sha256"
+  ]
+}

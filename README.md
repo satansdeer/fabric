@@ -71,11 +71,28 @@ node "$BASE/smoke-release.mjs" "$TAG" "$HASH" "$SOURCE_SHA" "$BASE/install" \
 "$BASE/install/fabric-$TAG-macos-arm64/bin/fabric" --version
 ```
 
-The installer/smoke uses Node 22.18+, system Git/curl/tar and public network downloads; installed native Core/plugins need neither Node nor Rust. The smoke checks the archive hash, payload/plugin identities, CLI/version, disposable project/preparation and provider-free OMP 19.1.0 discovery with Cargo/Rust absent from runtime PATH. It starts no manager and changes no existing installation or user config.
+The release-artifact smoke uses Node 22.18+, system Git/curl/tar and public network downloads; installed native Core/plugins need neither Node nor Rust. The smoke checks the archive hash, payload/plugin identities, CLI/version, disposable project/preparation and provider-free OMP 19.1.0 discovery with Cargo/Rust absent from runtime PATH. It starts no manager and changes no existing installation or user config.
 
 For actual workers, separately install the supported OMP/Codex host and explicitly trust the selected plugin using the packaged `sdk/cli.mjs install`, `release.json` version/content pins and an owner-private registry outside Git. Set the same registry in controller and manager environments; follow the drain/upgrade rule above.
 
-The bundled extension/fake fixture supports later consumer checks; `host-smoke.ts` additionally needs Bun, pinned OMP and pstack. Neither installed-host checks nor model-driven swarm routing are established by the release smoke. No Apple signing/notarization, Intel/Linux, npm/npx/Homebrew or full [issue #7](https://github.com/satansdeer/fabric/issues/7) claim.
+For a Node-free native installation, use the reviewed [`distribution/install.rb`](distribution/install.rb) and its adjacent public v0.1.2 inventory/checksum from this source tree. Do not pipe an unreviewed installer download into a shell. On macOS arm64, system Ruby and curl suffice:
+
+```sh
+/usr/bin/ruby distribution/install.rb --version 0.1.2 --platform macos-arm64 \
+  --prefix /absolute/new/private/fabric-0.1.2
+```
+
+This downloads the actual GitHub release, verifies its pinned archive SHA-256 before parsing, then verifies exact source/version, every payload, official package content pins and extension before installation. It does not run downloaded code. Offline, append `--archive /absolute/fabric-v0.1.2-macos-arm64.tar.gz`; the same pins apply. Existing destinations, symlinks, unsupported versions/platforms and corrupt input fail closed. No Intel/Linux artifacts or source-build fallback. Add `--trust-plugins` only to explicitly authorize the installed Core to register the verified default native packages; set `FABRIC_PLUGIN_REGISTRY` to the printed registry in controller and manager environments. For upgrades, drain and stop the old manager first, then select a new prefix; never replace a live installation.
+
+The existing installation parent and every ancestor must be canonical, owned by your user or root, and not group/other-writable unless sticky-protected. Unsafe ancestry could let another user replace the verified staging directory; it is rejected before download or execution. Use a protected directory under your home; the installer never changes shared directory permissions.
+
+The reviewed [Homebrew formula](distribution/fabric.rb) uses the same installer and real pinned public archive, not a second extraction convention. Create a local tap with `brew tap-new local/fabric-reviewed`, then copy the reviewed files with `cp -R distribution "$(brew --repo local/fabric-reviewed)/distribution"` and `cp distribution/fabric.rb "$(brew --repo local/fabric-reviewed)/Formula/fabric.rb"`. Run `brew install local/fabric-reviewed/fabric`. This is not a published tap and does not invent an immutable URL for installer code that has not shipped. Current Homebrew disallows installing arbitrary formula paths; use the explicit local tap. Keep both copies reviewed together; the formula resolves the shared installer and pins from the tap's sibling `distribution` directory, not an environment variable removed by Homebrew.
+
+This protection also applies to Homebrew's Cellar ancestry. A group-writable, non-sticky Cellar (including this development host's default `0775` Cellar) is deliberately rejected; the native private-prefix installation is available without modifying Homebrew. The private-prefix formula proof is not a global Homebrew installation claim.
+
+The optional [`distribution`](distribution/package.json) npm package requires Node only for its launcher, has no dependencies or install/postinstall hooks, and is deliberately private under the **unowned, unpublished candidate** `@fabric-distribution-unpublished/cli`. Local packaging: `npm pack ./distribution --ignore-scripts --pack-destination /private/temporary/directory`. Invoke that tarball with `npx --yes --package /absolute/package.tgz fabric-native up --version 0.1.2 --platform macos-arm64 --prefix /absolute/new/private/install -- --check`. `up` explicitly installs then invokes existing native `init`; it is not a new daemon or issue-8 swarm implementation. `install` only installs; `exec` with selectors followed by `-- <native arguments>` explicitly invokes the verified native CLI. Every invocation uses a new prefix; no silent cache reuse or overwrite.
+
+The bundled extension/fake fixture supports later consumer checks; `host-smoke.ts` additionally needs Bun, pinned OMP and pstack. Neither installed-host checks nor model-driven swarm routing are established by the release smoke. **Issue #7 remains open:** actual npm namespace ownership, an authenticated publishing identity, publication and clean-machine registry `npx` proof are prerequisites, not established by a local tarball test. Developer ID Application signing/notarization credentials and actual signed-release proof are separately unavailable; checksums and linker/ad-hoc signatures are not Developer ID/notarization.
 
 See [publication and evidence](docs/VERIFICATION.md#issue-38-native-release-bootstrap).
 

@@ -59,6 +59,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22.23.2
+      - name: Prove optional distribution against its committed public release pins
+        run: |
+          set -euo pipefail
+          # This tests the existing published version, independently of the new candidate TAG.
+          # Update distribution pins only after independently verifying a later public release.
+          node scripts/test-distribution.mjs | tee "$RUNNER_TEMP/distribution-proof.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinned-distribution-proof
+          path: ${{ runner.temp }}/distribution-proof.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Package reviewed source and prove provider-free installation
         id: package
         env:

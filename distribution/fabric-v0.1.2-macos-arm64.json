@@ -1,0 +1,74 @@
+{
+  "version": "0.1.2",
+  "tag": "v0.1.2",
+  "source_sha": "14f2d44b40f8489d38537e31eda41dd8752463df",
+  "build_kind": "release",
+  "platform": "macos-arm64",
+  "archive": "fabric-v0.1.2-macos-arm64.tar.gz",
+  "cli_version": "fabric 0.1.2 (source 14f2d44b40f8489d38537e31eda41dd8752463df; macos-arm64; release)",
+  "source_url": "https://github.com/satansdeer/fabric/tree/14f2d44b40f8489d38537e31eda41dd8752463df",
+  "build": {
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+    "cargo_lock_sha256": "118ca68f1feb1818874b3f0ad5bb4a01b6b76b848879f15e4435e4cab6e461a2"
+  },
+  "plugins": [
+    {
+      "id": "omp",
+      "version": "0.1.0",
+      "protocol": 1,
+      "sha256": "6fd07f8d826eae83bf58284a73b6fcb9d428fe9b9b1d6234a1a6b00dc25ed235",
+      "supported_cli": "omp/19.1.0"
+    },
+    {
+      "id": "codex",
+      "version": "0.1.0",
+      "protocol": 1,
+      "sha256": "bc83afb6087ba5fd470d26859bb9f375d84b18fa15cf61e316a5b2d8b9a5edbb",
+      "supported_cli": "codex-cli 0.171.0"
+    }
+  ],
+  "omp": {
+    "version": "omp/19.1.0",
+    "url": "https://github.com/can1357/oh-my-pi/releases/download/v19.1.0/omp-darwin-arm64",
+    "sha256": "dca5643669ed5e553f707bd065499babd0fe3030696bbb24c9da09c798af5abb",
+    "bundled": false
+  },
+  "omp_extension": {
+    "path": "integrations/omp/fabric.ts",
+    "sha256": "7c32cef109e91feb8f20af98ea0f8bfa66cfbf2ea25feb0f8fffb9656b9ffa00",
+    "source_url": "https://github.com/satansdeer/fabric/blob/14f2d44b40f8489d38537e31eda41dd8752463df/integrations/omp/fabric.ts"
+  },
+  "fixture": {
+    "path": "bin/fabric-fake-harness",
+    "sha256": "a80096d891f8ed8a1c2443593c9c0cd2c147a1a7e8fe8a73246baaeeabd6b303",
+    "purpose": "provider-free fake-a/fake-b only; not a native model worker"
+  },
+  "target_plugins": [
+    {
+      "id": "local",
+      "version": "0.1.0",
+      "protocol": 1,
+      "sha256": "716bec85042cd34c006fde774721604675ccfc967807521c00a6036798c58fb8"
+    }
+  ],
+  "files": {
+    "bin/fabric": "40c99cc7f0e1d6284736b40dad8c54eab1ea365d85955edaa314909356712ea3",
+    "bin/fabric-fake-harness": "a80096d891f8ed8a1c2443593c9c0cd2c147a1a7e8fe8a73246baaeeabd6b303",
+    "bin/fabric-local-target": "90e30da679e67c242d373ad906cc9aff1cc323075e8c56abfcfe5aeeb3f061d2",
+    "plugins/omp/package.json": "66955f86aa433eb4e36c6f2358db1bb262daf4b68660611443e7fd3acd23e814",
+    "plugins/omp/plugin": "0dc9575cfbe0ae3f067d70af88cb18469aaada2bd4df414fb980389c78531a1d",
+    "plugins/codex/package.json": "9019d4d72478f4ea4c2eeb5065df519ff08a438cb0bef3986b2301f7d852145b",
+    "plugins/codex/plugin": "0dc9575cfbe0ae3f067d70af88cb18469aaada2bd4df414fb980389c78531a1d",
+    "plugins/local/package.json": "8a454304fa35d40232cc4d04d9e7332d2a3a97247bdb67a18736bd741b22b99a",
+    "plugins/local/plugin": "90e30da679e67c242d373ad906cc9aff1cc323075e8c56abfcfe5aeeb3f061d2",
+    "sdk/cli.mjs": "420d7171e88e1c36d349c306181b0424054f9d09b316653b746972ec631130b0",
+    "sdk/package.mjs": "abac8428336586ca2267df1cd2bf5311e2588ca559eb086f16394d987d3a17ae",
+    "sdk/protocol.mjs": "0bd33a06bdf8aa2485fda3ad3f93bafbcca665c4a69e4d3a2326c17450b45603",
+    "sdk/conformance.mjs": "a94954e5c81b87c5159cc8f5434163bf68694623e2571799e3bc60399e0db609",
+    "sdk/index.mjs": "7968209be1dc4202c6a2595bdb281c5c70ebc33a1d9eb1b2d4468064788ac0ed",
+    "integrations/omp/fabric.ts": "7c32cef109e91feb8f20af98ea0f8bfa66cfbf2ea25feb0f8fffb9656b9ffa00",
+    "integrations/omp/host-smoke.ts": "4b7832ffb025acb9946b3cfee4d308c629dd534aa0993480f6bba733659a7efc",
+    "scripts/smoke-release.mjs": "32a1eb77be1c311118c1a145791418605c843e2658e03016c4af627184c61a23"
+  }
+}
