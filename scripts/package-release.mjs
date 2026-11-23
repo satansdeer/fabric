@@ -70,8 +70,9 @@ try {
     if (id === 'local') targetPlugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash });
     else plugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash, supported_cli: id === 'omp' ? 'omp/19.1.0' : 'codex-cli 0.171.0' });
   }
-  // Existing SDK installer and its imports; no npm dependencies or lifecycle hooks.
-  for (const file of ['cli.mjs', 'package.mjs', 'protocol.mjs', 'conformance.mjs', 'index.mjs', 'webhook.mjs']) copy(join(repo, 'sdk/typescript', file), `sdk/${file}`);
+  // SDK installer/scaffolder runtime, types and samples; no npm lifecycle hooks.
+  for (const file of ['cli.mjs', 'package.mjs', 'protocol.mjs', 'conformance.mjs', 'index.mjs', 'index.d.mts', 'webhook.mjs']) copy(join(repo, 'sdk/typescript', file), `sdk/${file}`);
+  for (const kind of ['connector', 'harness', 'target']) copy(join(repo, 'sdk/typescript/samples', `${kind}.ts`), `sdk/samples/${kind}.ts`);
   for (const file of ['fabric.ts', 'host-smoke.ts', 'up-smoke.ts']) copy(join(repo, 'integrations/omp', file), `integrations/omp/${file}`);
   for (const file of ['smoke-release.mjs', 'fabric-webhook.mjs']) copy(join(repo, 'scripts', file), `scripts/${file}`);
   // The smoke's SDK imports are dynamic and resolve inside the extracted bundle.

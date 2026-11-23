@@ -105,6 +105,11 @@ try {
   chmodSync(omp, 0o700);
   assert.equal(run(omp, ['--version']), manifest.omp.version);
   for (const plugin of [...manifest.plugins, ...manifest.target_plugins]) run(process.execPath, [join(installed, 'sdk/cli.mjs'), 'install', join(installed, 'plugins', plugin.id), '--registry', env.FABRIC_PLUGIN_REGISTRY, '--fabric', binary, '--version', plugin.version, '--sha256', plugin.sha256, '--trust']);
+  const generated = join(fixture, 'generated-harness');
+  run(process.execPath, [join(installed, 'sdk/cli.mjs'), 'create', 'harness', generated, '--id', 'release-sdk-proof']);
+  const sdkProof = JSON.parse(run(process.execPath, [join(installed, 'sdk/cli.mjs'), 'test', generated]));
+  assert.equal(sdkProof.id, 'release-sdk-proof');
+  assert.equal(sdkProof.conformance, 'passed');
   assert.deepEqual(JSON.parse(run(binary, ['plugins', '--registry', env.FABRIC_PLUGIN_REGISTRY, 'check', 'local'])), { compatible: true, healthy: true });
   assert.deepEqual(JSON.parse(run(binary, ['plugins', '--registry', env.FABRIC_PLUGIN_REGISTRY, 'check', 'omp'])), { compatible: true, healthy: true });
   const native = JSON.parse(run(binary, ['harnesses', '--json', 'doctor', 'omp']));

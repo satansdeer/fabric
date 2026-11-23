@@ -107,4 +107,5 @@ Focused checks, fmt, warning-denying clippy, all 190 tests across 31 suites, bin
 - Exact-head CI found the new manager request variant was oversized; boxed only its automation payload, preserving the serialized protocol and routing behavior.
 - CI's historical-schema regression exposed fixtures that reset `user_version` while retaining the new connector table. Reconstructed those legacy boundaries by removing schema-16 receipts, including the shared migration helper, and extended read-only inspection through schema 16. Production migrations remain fail-closed.
 - Release packaging includes the SDK's new webhook runtime dependency and the standalone HTTP reference, both covered by manifest hashes. Source SDK checks alone do not prove the downloaded bundle's import closure.
+- Actual bundle scaffolding exposed omitted SDK declarations and samples. Included those required inputs and extended the release smoke to generate and execute a provider-free harness through the packaged SDK conformance command.
 
