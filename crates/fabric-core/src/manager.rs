@@ -40,7 +40,7 @@ pub enum Request {
         idempotency_key: Option<String>,
     },
     Trigger {
-        automation: crate::connector::Automation,
+        automation: Box<crate::connector::Automation>,
         trigger: fabric_domain::NormalizedTrigger,
         delivery: fabric_domain::ConnectorDelivery,
     },

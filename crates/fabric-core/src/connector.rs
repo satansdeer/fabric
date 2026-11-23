@@ -227,7 +227,7 @@ pub fn receive(
     let accepted = crate::manager::request(
         root,
         crate::manager::Request::Trigger {
-            automation,
+            automation: Box::new(automation),
             trigger,
             delivery,
         },
