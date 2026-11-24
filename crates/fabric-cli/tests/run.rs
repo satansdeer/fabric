@@ -164,6 +164,15 @@ for line in sys.stdin:
     else:
         op = method.split('.')[1]
         if op == 'start': started = True
+        if op == 'start' and {behavior:?} in ('source-witness', 'source-mismatch'):
+            import sqlite3
+            db = sqlite3.connect({database:?})
+            row = db.execute('SELECT receipt_json, r.state, r.started_at, a.started_at FROM run_launch_receipts l JOIN runs r USING(run_id) JOIN worker_attempts a USING(run_id)').fetchone()
+            assert row is not None and row[1:] == ('PREPARING', None, None), row
+            with open({source_snapshot:?}, 'w') as out: json.dump(json.loads(row[0]), out)
+            if {behavior:?} == 'source-mismatch':
+                with open(os.path.join(json.loads(row[0])['workspace_path'], 'tracked'), 'w') as out: out.write('tampered')
+            db.close()
         if started and op in ('inspect', 'cancel') and os.path.exists({await_worker:?}):
             deadline = time.monotonic() + .15
             while not os.path.exists({worker_ready:?}) and time.monotonic() < deadline: time.sleep(.001)
@@ -180,6 +189,8 @@ for line in sys.stdin:
     print(json.dumps(dict(jsonrpc='2.0', id=request['id'], result=result)), flush=True)
     if method == 'shutdown': break
 "#, log=self.0.join(format!("target-{id}.jsonl")).to_str().unwrap(),
+            database=self.0.join("storage/fabric.db").to_str().unwrap(),
+            source_snapshot=self.0.join("prestart-source.json").to_str().unwrap(),
             failure_marker=self.0.join("receipt-failed").to_str().unwrap(),
             await_worker=self.0.join("await-worker").to_str().unwrap(),
             worker_ready=self.0.join("worker-ready").to_str().unwrap())).unwrap();
@@ -306,6 +317,125 @@ fn success(out: &Output) {
 fn json(out: &Output) -> serde_json::Value {
     success(out);
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn actual_fork_source_receipt_precedes_start_and_launch_fails_closed() {
+    for fault in ["none", "source-mismatch", "receipt-persistence"] {
+        let fixture = Fixture::new();
+        let (_, prepared) = fixture.setup();
+        fixture.target(
+            "local",
+            if fault == "source-mismatch" {
+                fault
+            } else {
+                "source-witness"
+            },
+        );
+        let database = fixture.0.join("storage/fabric.db");
+        let db = rusqlite::Connection::open(&database).unwrap();
+        if fault == "receipt-persistence" {
+            db.execute_batch(
+                "CREATE TRIGGER injected_receipt_failure BEFORE INSERT ON run_launch_receipts
+                 BEGIN SELECT RAISE(ABORT, 'injected receipt persistence failure'); END;",
+            )
+            .unwrap();
+        }
+        let observed = fixture.0.join("worker-source.json");
+        // First harness action reads the manager's receipt. The target snapshot proves
+        // the identical durable row existed while both run and attempt were unstarted.
+        let binary = fixture.script_fake(&format!(
+            r#"exec /usr/bin/python3 - <<'PY'
+import json, os, sqlite3
+db = sqlite3.connect({database:?})
+receipt = json.loads(db.execute('SELECT receipt_json FROM run_launch_receipts').fetchone()[0])
+with open({snapshot:?}) as f: assert receipt == json.load(f)
+assert os.path.samefile(receipt['workspace_path'], os.getcwd())
+st = os.stat('.')
+assert (st.st_dev, st.st_ino) == (receipt['workspace_device'], receipt['workspace_inode'])
+assert receipt['source_commit_sha'] == {commit:?}
+assert receipt['prepared_state_id'] == {state:?}
+assert receipt['actual_sha256'] == receipt['source']['prepared_sha256']
+assert receipt['source']['checkout_sha256'] != receipt['source']['prepared_sha256']
+with open('tracked') as f: assert f.read() == 'original'
+with open('.deps/ready') as f: assert f.read() == 'ready'
+with open({observed:?}, 'w') as f: json.dump(receipt, f)
+PY"#,
+            database = database.to_str().unwrap(),
+            snapshot = fixture.0.join("prestart-source.json").to_str().unwrap(),
+            commit = prepared["source_commit_sha"].as_str().unwrap(),
+            state = prepared["state_id"].as_str().unwrap(),
+            observed = observed.to_str().unwrap(),
+        ));
+        let prompt = fixture.0.join("prompt.json");
+        fs::write(&prompt, "{}").unwrap();
+        let output = fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(binary)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap();
+        if fault == "none" {
+            let report = json(&output);
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&observed).unwrap()).unwrap();
+            let id = report["run_id"].as_str().unwrap();
+            let retained = json(
+                &fixture
+                    .cli()
+                    .args(["runs", "show", id, "--json"])
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(retained["launch_receipt"], receipt);
+            assert_eq!(retained["workspace"]["state"], "RECLAIMED");
+            assert!(!Path::new(receipt["workspace_path"].as_str().unwrap()).exists());
+            let artifacts = json(
+                &fixture
+                    .cli()
+                    .args(["runs", "artifacts", id, "--json"])
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(artifacts["launch_receipt"], receipt);
+        } else {
+            assert!(!output.status.success(), "{output:?}");
+            assert!(!observed.exists(), "{fault} started the harness");
+            let (run_started, attempt_started): (Option<i64>, Option<i64>) = db.query_row(
+                "SELECT r.started_at, a.started_at FROM runs r JOIN worker_attempts a USING(run_id)",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!((run_started, attempt_started), (None, None));
+            let path: String = db
+                .query_row("SELECT managed_path FROM workspaces", [], |r| r.get(0))
+                .unwrap();
+            assert!(Path::new(&path).is_dir(), "actual fork must be retained");
+            assert_ne!(path, prepared["prepared_path"].as_str().unwrap());
+            if fault == "source-mismatch" {
+                assert_eq!(
+                    fs::read(Path::new(&path).join("tracked")).unwrap(),
+                    b"tampered"
+                );
+                assert_eq!(
+                    fs::read(
+                        Path::new(prepared["prepared_path"].as_str().unwrap()).join("tracked")
+                    )
+                    .unwrap(),
+                    b"original"
+                );
+                assert!(fixture.0.join("prestart-source.json").exists());
+            } else {
+                let count: i64 = db
+                    .query_row("SELECT count(*) FROM run_launch_receipts", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0);
+                assert!(!fixture.0.join("prestart-source.json").exists());
+            }
+        }
+    }
 }
 
 #[test]
@@ -4711,9 +4841,9 @@ fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compat
                 .unwrap();
         }
         if case == "legacy" {
-            // Historical runs predate the immutable prelaunch capture context.
+            // Historical runs predate immutable capture contexts and source receipts.
             db.execute_batch(
-                "DROP TABLE connector_deliveries; DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
+                "DROP TABLE run_launch_receipts; DROP TABLE prepared_source_evidence; DROP TABLE connector_deliveries; DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
             )
             .unwrap();
         }

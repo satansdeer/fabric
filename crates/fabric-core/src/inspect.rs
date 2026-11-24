@@ -11,6 +11,7 @@ pub struct RunReport {
     pub workspace: Workspace,
     pub prepared_state: PreparedState,
     pub worker_attempts: Vec<WorkerAttempt>,
+    pub launch_receipt: Option<fabric_store::LaunchReceipt>,
 }
 
 #[derive(Serialize)]
@@ -18,6 +19,7 @@ pub struct ArtifactReport {
     pub run_id: RunId,
     pub artifact_manifest_id: Option<ArtifactManifestId>,
     pub artifacts: Vec<Artifact>,
+    pub launch_receipt: Option<fabric_store::LaunchReceipt>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +56,7 @@ pub fn show(root: &Path, id: &RunId) -> Result<RunReport, FabricError> {
         workspace,
         prepared_state,
         worker_attempts: store.worker_attempts(id).map_err(storage_error)?,
+        launch_receipt: store.launch_receipt(id).map_err(storage_error)?,
     })
 }
 
@@ -64,6 +67,7 @@ pub fn artifacts(root: &Path, id: &RunId) -> Result<ArtifactReport, FabricError>
         artifacts: store.artifacts(id).map_err(storage_error)?,
         run_id: run.run_id,
         artifact_manifest_id: run.artifact_manifest_id,
+        launch_receipt: store.launch_receipt(id).map_err(storage_error)?,
     })
 }
 

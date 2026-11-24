@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -367,6 +367,7 @@ pub(crate) fn execute_prepared(
         let done = std::sync::atomic::AtomicBool::new(false);
         crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
         let observation_store = open_store(&root)?.1;
+        let launch_attempt_id = attempt.attempt_id.clone();
         let (mut result, meter_failure, monitor_failure) = std::thread::scope(|scope| {
             let monitor = scope.spawn(|| {
                 crate::workspace::storage::monitor(&root, fresh.path(), &storage, &token, &done)
@@ -390,7 +391,51 @@ pub(crate) fn execute_prepared(
                         return Err(error("Workspace changed before launch."));
                     }
                     crate::workspace::storage::check_launch(&root, &storage)?;
-                    crate::onboarding::revalidate(&root, plan, consent.as_deref())
+                    crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
+                    let source = store
+                        .source_evidence(&state.state_id)
+                        .map_err(error)?
+                        .ok_or_else(|| error("Missing pinned preparation content evidence."))?;
+                    let identity = std::fs::symlink_metadata(validated.path()).map_err(error)?;
+                    let actual_sha256 = fabric_project::prepare::content_digest(
+                        validated.path(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(1200),
+                    )?;
+                    if actual_sha256 != source.prepared_sha256 {
+                        return Err(error(
+                            "Assigned workspace source content mismatch; refusing launch.",
+                        ));
+                    }
+                    let final_workspace = runner_workspace(&root, &run_id)?;
+                    let final_identity =
+                        std::fs::symlink_metadata(final_workspace.path()).map_err(error)?;
+                    if (identity.dev(), identity.ino())
+                        != (final_identity.dev(), final_identity.ino())
+                    {
+                        return Err(error(
+                            "Assigned workspace identity changed during source verification.",
+                        ));
+                    }
+                    store
+                        .record_launch_receipt(&fabric_store::LaunchReceipt {
+                            run_id: run_id.clone(),
+                            attempt_id: launch_attempt_id.clone(),
+                            workspace_id: workspace_id.clone(),
+                            workspace_path: validated
+                                .path()
+                                .to_str()
+                                .ok_or_else(|| error("Workspace path must be UTF-8"))?
+                                .to_owned(),
+                            workspace_device: identity.dev(),
+                            workspace_inode: identity.ino(),
+                            prepared_state_id: state.state_id.clone(),
+                            source_commit_sha: state.source_commit_sha.clone(),
+                            preparation_key: state.preparation_key.clone(),
+                            recipe_digest: state.recipe_digest.clone(),
+                            source,
+                            actual_sha256,
+                        })
+                        .map_err(error)
                 },
                 |pid| {
                     let started_at = now()?;

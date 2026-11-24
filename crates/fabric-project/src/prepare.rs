@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{FabricError, PreparedStateId, PreparedStateStatus};
 use fabric_store::PreparedState;
+use sha2::{Digest, Sha256};
 
 use crate::recipe::Recipe;
 use crate::{NEXT_ID, git_text, open_store, project_not_found, source_error, storage_error};
@@ -203,6 +205,11 @@ pub fn prepare_with_admission(
         )?;
         // Local config is private, and no developer/global/template hooks are imported.
         git_output(&tree, &["config", "core.hooksPath", "/dev/null"], deadline)?;
+        // Pin the fresh committed checkout before any declared recipe can modify it.
+        // Never manufacture this baseline from a reused READY tree.
+        store
+            .pin_checkout(&state.state_id, &content_digest(&tree, deadline)?)
+            .map_err(storage_error)?;
         for step in recipe.steps() {
             validate_container(&container, &state.state_id)?;
             private_git(&tree)?;
@@ -228,6 +235,9 @@ pub fn prepare_with_admission(
             ));
         }
         let size = verify_tree(&tree, &tree, deadline, true)?;
+        store
+            .pin_prepared_content(&state.state_id, &content_digest(&tree, deadline)?)
+            .map_err(storage_error)?;
         fs::set_permissions(
             container.join(".fabric-owner"),
             fs::Permissions::from_mode(0o400),
@@ -367,6 +377,17 @@ fn verify_ready(root: &Path, state: &PreparedState, deadline: Instant) -> Result
     if git_text(&head)? != state.source_commit_sha {
         return Err(source_error(
             "Cached READY HEAD does not match its recorded source.",
+        ));
+    }
+    let evidence = crate::open_store(root, false)?
+        .source_evidence(&state.state_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| source_error(
+            "READY source content evidence is absent; legacy states cannot be admitted. Prepare a new key.",
+        ))?;
+    if content_digest(&tree, deadline)? != evidence.prepared_sha256 {
+        return Err(source_error(
+            "READY source content does not match its pinned preparation.",
         ));
     }
     Ok(())
@@ -736,4 +757,107 @@ fn verify_tree(
             .map_err(storage_error)?;
     }
     Ok(size)
+}
+
+/// Versioned full-tree witness, including ignored recipe output and private Git metadata.
+/// Paths and symlink targets are raw Unix bytes; write bits are deliberately not hashed
+/// because preparation freezes them and the fork restores owner write permission.
+pub fn content_digest(tree: &Path, deadline: Instant) -> Result<String, FabricError> {
+    fn unchanged(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.mode() == b.mode()
+            && a.uid() == b.uid()
+            && a.nlink() == b.nlink()
+            && a.len() == b.len()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
+    }
+    fn field(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    fn visit(
+        tree: &Path,
+        path: &Path,
+        deadline: Instant,
+        hash: &mut Sha256,
+        buffer: &mut [u8; 64 * 1024],
+    ) -> Result<(), FabricError> {
+        check_deadline(deadline)?;
+        let before = fs::symlink_metadata(path).map_err(storage_error)?;
+        // SAFETY: geteuid has no preconditions.
+        if before.uid() != unsafe { libc::geteuid() } {
+            return Err(source_error("Source witness found an unexpected owner."));
+        }
+        field(
+            hash,
+            path.strip_prefix(tree)
+                .map_err(storage_error)?
+                .as_os_str()
+                .as_bytes(),
+        );
+        if before.is_dir() {
+            hash.update(b"d");
+            let mut names = fs::read_dir(path)
+                .map_err(storage_error)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage_error)?;
+            names.sort();
+            hash.update((names.len() as u64).to_be_bytes());
+            for name in names {
+                visit(tree, &path.join(name), deadline, hash, buffer)?;
+            }
+        } else if before.file_type().is_symlink() && before.nlink() == 1 {
+            hash.update(b"l");
+            field(
+                hash,
+                fs::read_link(path)
+                    .map_err(storage_error)?
+                    .as_os_str()
+                    .as_bytes(),
+            );
+        } else if before.is_file() && before.nlink() == 1 {
+            hash.update(b"f");
+            hash.update((before.mode() & 0o100).to_be_bytes());
+            hash.update(before.len().to_be_bytes());
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(storage_error)?;
+            if !unchanged(&before, &file.metadata().map_err(storage_error)?) {
+                return Err(source_error("Source changed before hashing."));
+            }
+            let mut remaining = before.len();
+            while remaining > 0 {
+                check_deadline(deadline)?;
+                let size = remaining.min(buffer.len() as u64) as usize;
+                let count = file.read(&mut buffer[..size]).map_err(storage_error)?;
+                if count == 0 {
+                    return Err(source_error("Source shortened during hashing."));
+                }
+                hash.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            if !unchanged(&before, &file.metadata().map_err(storage_error)?) {
+                return Err(source_error("Source changed during hashing."));
+            }
+        } else {
+            return Err(source_error(
+                "Source witness refuses special or hardlinked files.",
+            ));
+        }
+        if !unchanged(&before, &fs::symlink_metadata(path).map_err(storage_error)?) {
+            return Err(source_error("Source changed during traversal."));
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"fabric.full-tree.v1\0");
+    visit(tree, tree, deadline, &mut hash, &mut [0u8; 64 * 1024])?;
+    Ok(format!("{:x}", hash.finalize()))
 }
