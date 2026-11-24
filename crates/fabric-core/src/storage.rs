@@ -34,12 +34,15 @@ impl DiskMeter for NativeDiskMeter {
 #[derive(Clone)]
 pub struct StorageOptions {
     pub policy: StoragePolicy,
+    /// Per-tree accounting budget; zero or an unrepresentable deadline fails closed.
+    pub scan_timeout: Duration,
     pub meter: Arc<dyn DiskMeter>,
 }
 impl Default for StorageOptions {
     fn default() -> Self {
         Self {
             policy: StoragePolicy::default(),
+            scan_timeout: Duration::from_secs(30),
             meter: Arc::new(NativeDiskMeter),
         }
     }
@@ -105,18 +108,26 @@ impl From<MeterCause> for FabricError {
 
 /// Logical file lengths, including symlink text, never APFS exclusive physical bytes.
 /// ponytail: bounded full scan; use incremental accounting if large trees need it.
-pub fn usage(path: &Path) -> Result<u64, FabricError> {
-    measured_usage(path).map_err(Into::into)
+pub fn usage(path: &Path, options: &StorageOptions) -> Result<u64, FabricError> {
+    measured_usage(path, options.scan_timeout).map_err(Into::into)
 }
 
-fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
+fn measured_usage(path: &Path, timeout: Duration) -> Result<u64, MeterCause> {
+    measured_usage_with_clock(path, timeout, Instant::now)
+}
+
+fn measured_usage_with_clock(
+    path: &Path,
+    timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+) -> Result<u64, MeterCause> {
     use MeterOperation::{Metadata, OpenDirectory, ReadDirectory};
+    let deadline = now().checked_add(timeout).ok_or(MeterCause::TimeLimit)?;
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(path)
         .map_err(|error| MeterCause::io(OpenDirectory, error))?;
-    let deadline = Instant::now() + Duration::from_secs(2);
     let mut remaining = 200_000usize;
     fn scan(
         dir: &File,
@@ -124,6 +135,7 @@ fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
         depth: usize,
         remaining: &mut usize,
         deadline: Instant,
+        now: &mut impl FnMut() -> Instant,
     ) -> Result<u64, MeterCause> {
         if depth > 64 {
             return Err(MeterCause::DepthLimit);
@@ -159,7 +171,7 @@ fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
             if *remaining == 0 {
                 return Err(MeterCause::EntryLimit);
             }
-            if Instant::now() >= deadline {
+            if now() >= deadline {
                 return Err(MeterCause::TimeLimit);
             }
             #[cfg(target_os = "macos")]
@@ -229,7 +241,7 @@ fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
                 })?;
                 check_identity(&metadata, &Identity::of(&stat))
                     .map_err(|_| MeterCause::IdentityChanged)?;
-                scan(&child, device, depth + 1, remaining, deadline)?
+                scan(&child, device, depth + 1, remaining, deadline, now)?
             } else {
                 u64::try_from(stat.st_size).map_err(|_| MeterCause::InvalidSize)?
             };
@@ -246,6 +258,7 @@ fn measured_usage(path: &Path) -> Result<u64, MeterCause> {
         0,
         &mut remaining,
         deadline,
+        &mut now,
     )
 }
 
@@ -286,7 +299,7 @@ fn headroom(
     let additional = reserved
         .checked_add(requested)
         .ok_or_else(|| storage_error("Storage reservation overflow"))?;
-    Ok(usage(root)?
+    Ok(usage(root, options)?
         .checked_add(additional)
         .is_some_and(|total| total <= options.policy.max_managed_bytes)
         && options
@@ -467,9 +480,9 @@ pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, Fa
                 .and_then(|()| {
                     if container {
                         private_directory(&expected)?;
-                        usage(expected.parent().unwrap())
+                        usage(expected.parent().unwrap(), options)
                     } else {
-                        usage(&expected)
+                        usage(&expected, options)
                     }
                 })
         };
@@ -551,7 +564,7 @@ pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, Fa
     workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.usage_bytes));
     Ok(StorageReport {
         accounting: "logical_bytes_best_effort_not_exclusive",
-        managed_bytes: usage(&root)?,
+        managed_bytes: usage(&root, options)?,
         free_bytes: options.meter.free_bytes(&root)?,
         reserved_bytes: store.reserved_storage_bytes().map_err(storage_error)?,
         policy: options.policy.clone(),
@@ -562,7 +575,7 @@ pub fn status(root: &Path, options: &StorageOptions) -> Result<StorageReport, Fa
 
 pub(crate) fn check_launch(root: &Path, options: &StorageOptions) -> Result<(), FabricError> {
     if options.meter.free_bytes(root)? < options.policy.min_free_bytes
-        || usage(root)? > options.policy.max_managed_bytes
+        || usage(root, options)? > options.policy.max_managed_bytes
     {
         return Err(storage_error(
             "storage_admission: pressure before process launch",
@@ -577,7 +590,7 @@ pub(crate) fn violation(
     options: &StorageOptions,
 ) -> Result<Option<fabric_runner::StopReason>, MeterFailure> {
     use fabric_runner::StopReason;
-    let bytes = measured_usage(workspace).map_err(|cause| MeterFailure {
+    let bytes = measured_usage(workspace, options.scan_timeout).map_err(|cause| MeterFailure {
         stage: MeterStage::WorkspaceUsage,
         cause,
     })?;
@@ -595,7 +608,7 @@ pub(crate) fn violation(
             cause,
         })?;
     if free < options.policy.min_free_bytes
-        || measured_usage(root).map_err(|cause| MeterFailure {
+        || measured_usage(root, options.scan_timeout).map_err(|cause| MeterFailure {
             stage: MeterStage::ManagedUsage,
             cause,
         })? > options.policy.max_managed_bytes
@@ -626,4 +639,37 @@ pub(crate) fn monitor(
         return failure;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_tolerates_initialization_pause_but_enforces_its_own_budget() {
+        let tree = tempfile::tempdir().unwrap();
+        let nested = tree.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("value"), b"metered").unwrap();
+        for (timeout, expected) in [
+            (StorageOptions::default().scan_timeout, Ok(7)),
+            (Duration::from_secs(1), Err(MeterCause::TimeLimit)),
+            (Duration::ZERO, Err(MeterCause::TimeLimit)),
+            (Duration::MAX, Err(MeterCause::TimeLimit)),
+        ] {
+            let started = Instant::now();
+            let mut first = true;
+            let clock = || {
+                if std::mem::take(&mut first) {
+                    started
+                } else {
+                    started + Duration::from_secs(3)
+                }
+            };
+            assert_eq!(
+                measured_usage_with_clock(tree.path(), timeout, clock),
+                expected
+            );
+        }
+    }
 }

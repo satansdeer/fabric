@@ -401,7 +401,7 @@ mod tests {
         child.wait().unwrap();
         let mut limits = options();
         limits.policy.max_managed_bytes =
-            storage::usage(&fixture.root).unwrap() + 3 * 1024 * 1024 + 128 * 1024;
+            storage::usage(&fixture.root, &limits).unwrap() + 3 * 1024 * 1024 + 128 * 1024;
         let next = storage::admit(&fixture.root, &limits, &state, "r-next").unwrap();
         assert_eq!(store.reserved_storage_bytes().unwrap(), 3 * 1024 * 1024);
         drop(next);
