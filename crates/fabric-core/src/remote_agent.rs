@@ -7,12 +7,65 @@ use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, BufRead, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+const HOME_ROOTS: [&str; 6] = ["", ".config", ".cache", ".local", ".local/share", ".local/state"];
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RootIdentity { device: u64, inode: u64, birth_seconds: u64, birth_nanos: u32 }
+
+fn root_identity(path: &Path) -> Result<RootIdentity, FabricError> {
+    let meta = fs::symlink_metadata(path).map_err(error)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(error("unsafe home root"));
+    }
+    // Birth time disambiguates inode reuse; filesystems without it refuse.
+    let birth = meta.created().map_err(error)?.duration_since(std::time::UNIX_EPOCH).map_err(error)?;
+    Ok(RootIdentity { device:meta.dev(), inode:meta.ino(), birth_seconds:birth.as_secs(), birth_nanos:birth.subsec_nanos() })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeOwner { environment: Value, container: RootIdentity, roots: [RootIdentity; 6] }
+
+fn home_owner(container: &Path, environment: &Value) -> Result<HomeOwner, FabricError> {
+    let tree = container.join("tree");
+    let [home, config, cache, local, data, state] = HOME_ROOTS.map(|path| {
+        if path.is_empty() { root_identity(&tree) } else { root_identity(&tree.join(path)) }
+    });
+    Ok(HomeOwner { environment:environment.clone(), container:root_identity(container)?,
+        roots:[home?, config?, cache?, local?, data?, state?] })
+}
+fn initialize_home(container: &Path, environment: &Value) -> Result<(), FabricError> {
+    match fs::symlink_metadata(container) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().mode(0o700).create(container).map_err(error)?;
+            let tree = container.join("tree");
+            directory(&tree)?;
+            for path in HOME_ROOTS.iter().skip(1) { directory(&tree.join(path))?; }
+            let record = home_owner(container,environment)?;
+            let mut marker = remote::private_file(&container.join(".fabric-owner"))?;
+            marker.write_all(&serde_json::to_vec(&record).map_err(error)?).and_then(|()|marker.sync_all()).map_err(error)?;
+            File::open(container).and_then(|f|f.sync_all()).map_err(error)?;
+        }
+        Err(e) => return Err(error(e)),
+        Ok(_) => return Err(error("persistent HOME already exists")),
+    }
+    Ok(())
+}
+/// Explicit one-time authority from the target's persistent-storage owner.
+/// Ordinary agent startup and every validation path are non-creating.
+pub fn initialize_persistent_home(home: &Path, environment: &Value) -> Result<(), FabricError> {
+    let env_id: fabric_domain::EnvironmentId = id(environment,"environment_id")?.parse()?;
+    directory(home)?;
+    directory(&home.join("environments"))?;
+    initialize_home(&home.join("environments").join(env_id.as_str()),environment)
+}
 fn directory(path: &Path) -> Result<(), FabricError> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => (), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (), Err(e) => return Err(error(e)),
@@ -53,6 +106,7 @@ impl Drop for Worker {
 struct Agent {
     home: PathBuf, work: PathBuf, environment: Value, instance: String,
     pty: Option<fabric_runner::pty::LocalPty>, worker: Option<Worker>, destroy: Option<File>,
+    export: Option<(Value, File, File)>,
 }
 impl Agent {
     fn env_id(&self) -> Result<fabric_domain::EnvironmentId, FabricError> { id(&self.environment, "environment_id")?.parse() }
@@ -63,12 +117,14 @@ impl Agent {
     }
     fn validate_home(&self) -> Result<(), FabricError> {
         let home = self.home()?;
-        directory(home.parent().unwrap())?;
-        directory(&home)?;
-        let marker = home.parent().unwrap().join(".fabric-owner");
-        let bytes = private_read(&marker, 8192)?;
-        if bytes != serde_json::to_vec(&self.environment).map_err(error)? { return Err(error("home binding changed")); }
-        for path in [".config", ".cache", ".local", ".local/share", ".local/state"] { directory(&home.join(path))?; }
+        root_identity(&self.home)?;
+        root_identity(&self.home.join("environments"))?;
+        let container = home.parent().unwrap();
+        let recorded: HomeOwner = serde_json::from_slice(&private_read(&container.join(".fabric-owner"), 8192)?).map_err(error)?;
+        let current = home_owner(container, &self.environment)?;
+        if recorded.environment != self.environment || recorded.container != current.container || recorded.roots != current.roots {
+            return Err(error("home binding or root identity changed"));
+        }
         Ok(())
     }
     fn resource(&self, input: &Value) -> Result<(Value, PathBuf), FabricError> {
@@ -135,6 +191,7 @@ impl Agent {
                 Ok(json!({"opened":true}))
             }
             "pty.exchange" => {
+                self.validate_home()?;
                 let request = serde_json::from_value(input).map_err(error)?;
                 serde_json::to_value(self.pty.as_mut().ok_or_else(|| error("no PTY"))?.exchange(&request)?).map_err(error)
             }
@@ -249,6 +306,7 @@ impl Agent {
                         let value = json!({"resource":resource,"exit_code":execution.status.code(),"exit_signal":execution.status.signal(),"stop_reason":execution.stop_reason.map(|r|r.as_str()),"harness_failed":execution.failure.is_some(),"capture":execution.capture.map_err(error)?});
                         let mut file = remote::private_file(&container.join("result.json"))?;
                         file.write_all(&serde_json::to_vec(&value).map_err(error)?).and_then(|()|file.sync_all()).map_err(error)?;
+                        File::open(&container).and_then(|f|f.sync_all()).map_err(error)?;
                         Ok(value)
                     })();
                     *output.lock().unwrap_or_else(|p|p.into_inner()) = Some(outcome);
@@ -258,6 +316,7 @@ impl Agent {
                 Ok(json!({"started":true}))
             }
             "worker.poll" | "worker.cancel" => {
+                if operation == "worker.poll" { self.validate_home()?; }
                 let (_, container) = self.resource(&input)?;
                 if let Some(worker) = &self.worker {
                     if operation == "worker.cancel" { worker.token.cancel(); }
@@ -266,36 +325,48 @@ impl Agent {
                     }
                     Ok(json!({"state":"running"}))
                 } else {
+                    let _inactive = lock(&container,true)?;
                     let result: Value = serde_json::from_slice(&private_read(&container.join("result.json"), 65536)?).map_err(error)?;
                     Ok(json!({"state":"complete","result":result}))
                 }
             }
             "workspace.export" => {
-                let (_, container) = self.resource(&input)?;
-                let _result: Value = serde_json::from_slice(&private_read(&container.join("result.json"), 65536)?).map_err(error)?;
+                self.validate_home()?;
+                let (resource, container) = self.resource(&input)?;
+                let result: Value = serde_json::from_slice(&private_read(&container.join("result.json"), 65536)?).map_err(error)?;
+                remote::completion(result, &resource)?;
                 if self.worker.as_ref().is_some_and(|w| w.result.lock().unwrap_or_else(|p|p.into_inner()).is_none()) { return Err(error("worker active")); }
-                let path = container.join("result.tar");
+                let lease = lock(&container, true)?;
+                // Unlinked private staging: inspection never adds retained evidence.
+                let path = self.work.join(format!(".export-{}", id(&resource,"run_id")?));
+                let output = remote::private_file(&path)?;
+                fs::remove_file(&path).map_err(error)?;
                 let names = ["tree","stdout.log","stderr.log","events.jsonl"];
-                let paths: Vec<_> = names.iter().map(|n|container.join(n)).collect();
-                let entries: Vec<_> = paths.iter().zip(names.iter()).map(|(p,n)|(p.as_path(),Path::new(n))).collect();
-                match fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.is_file() && meta.nlink() == 1 && meta.uid() == unsafe {libc::geteuid()}
-                        && meta.mode() & 0o077 == 0 => (),
-                    Ok(_) => return Err(error("unsafe existing export")),
-                    Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
-                        drop(remote::archive(&entries,remote::private_file(&path)?,input["limit"].as_u64().ok_or_else(|| error("export limit"))?)?);
-                    }
-                    Err(failure) => return Err(error(failure)),
-                }
-                Ok(json!({"size":fs::metadata(&path).map_err(error)?.len(),"sha256":remote::digest(&path)?}))
+                let paths = names.map(|n|container.join(n));
+                let entries: [(&Path,&Path);4] = [(&paths[0],Path::new(names[0])),(&paths[1],Path::new(names[1])),
+                    (&paths[2],Path::new(names[2])),(&paths[3],Path::new(names[3]))];
+                let mut output = remote::archive(&entries,output,input["limit"].as_u64().ok_or_else(|| error("export limit"))?)?;
+                output.seek(SeekFrom::Start(0)).map_err(error)?;
+                use sha2::{Digest, Sha256};
+                let mut hash = Sha256::new();
+                let mut buffer = [0;65536];
+                loop { let n = output.read(&mut buffer).map_err(error)?; if n == 0 { break; } hash.update(&buffer[..n]); }
+                let witness: Value = serde_json::from_slice(&private_read(&container.join("witness.json"),16384)?).map_err(error)?;
+                if witness["resource"] != resource { return Err(error("source witness changed")); }
+                let reply = json!({"size":output.metadata().map_err(error)?.len(),"sha256":format!("{:x}",hash.finalize()),"witness":witness});
+                self.export = Some((resource,output,lease));
+                Ok(reply)
             }
             "workspace.read" => {
-                let (_, container) = self.resource(&input)?;
-                let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(container.join("result.tar")).map_err(error)?;
-                let meta = file.metadata().map_err(error)?;
-                if !meta.is_file() || meta.nlink() != 1 || meta.uid() != unsafe {libc::geteuid()} || meta.mode() & 0o077 != 0 || meta.len() > remote::TRANSFER_LIMIT { return Err(error("unsafe export")); }
-                file.seek(SeekFrom::Start(input["offset"].as_u64().ok_or_else(|| error("offset"))?)).map_err(error)?;
+                let (resource, _) = self.resource(&input)?;
+                let (bound, file, _) = self.export.as_mut().ok_or_else(||error("no export"))?;
+                if bound != &resource { return Err(error("export binding changed")); }
+                let offset = input["offset"].as_u64().ok_or_else(|| error("offset"))?;
+                let size = file.metadata().map_err(error)?.len();
+                if offset >= size { return Err(error("export offset")); }
+                file.seek(SeekFrom::Start(offset)).map_err(error)?;
                 let mut bytes = vec![0;remote::CHUNK]; let n = file.read(&mut bytes).map_err(error)?; bytes.truncate(n);
+                if offset + n as u64 == size { self.export = None; }
                 Ok(json!({"bytes":bytes}))
             }
             "workspace.reclaim" => {
@@ -326,27 +397,20 @@ impl Agent {
 /// here, in the execution environment, and reaped on transport EOF or heartbeat loss.
 pub fn serve(home: PathBuf, work: PathBuf, environment: Value, instance: String) -> Result<(), FabricError> {
     if !home.is_absolute() || !work.is_absolute() || home == work || instance.is_empty() || instance.len() > 128 { return Err(error("agent roots")); }
-    directory(&home)?;
-    directory(&home.join("environments"))?;
     directory(&work)?;
     let env_id: fabric_domain::EnvironmentId = id(&environment,"environment_id")?.parse()?;
     let container = home.join("environments").join(env_id.as_str());
     let tree = container.join("tree");
-    if !container.exists() {
-        fs::DirBuilder::new().mode(0o700).create(&container).map_err(error)?;
-        let mut marker = remote::private_file(&container.join(".fabric-owner"))?;
-        marker.write_all(&serde_json::to_vec(&environment).map_err(error)?).and_then(|()|marker.sync_all()).map_err(error)?;
-        directory(&tree)?;
-        for path in [".config",".cache",".local",".local/share",".local/state"] { directory(&tree.join(path))?; }
-    }
+    root_identity(&home)?;
+    root_identity(&home.join("environments"))?;
+    let mut agent = Agent {home,work,environment,instance,pty:None,worker:None,destroy:None,export:None};
+    agent.validate_home()?;
     // Set only the remote agent's roots, before any thread is created. Native
     // adapters resolve their own installed context here; no controller auth input.
     unsafe {
         std::env::set_var("HOME", &tree);
         for (key,path) in [("XDG_CONFIG_HOME",".config"),("XDG_CACHE_HOME",".cache"),("XDG_DATA_HOME",".local/share"),("XDG_STATE_HOME",".local/state")] { std::env::set_var(key, tree.join(path)); }
     }
-    let mut agent = Agent {home,work,environment,instance,pty:None,worker:None,destroy:None};
-    agent.validate_home()?;
     let (tx,rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
@@ -366,7 +430,6 @@ pub fn serve(home: PathBuf, work: PathBuf, environment: Value, instance: String)
             Err(mpsc::RecvTimeoutError::Timeout) if heartbeat.elapsed() < Duration::from_secs(10) => continue,
             Err(_) => break,
         };
-        heartbeat = Instant::now();
         let request: Value = serde_json::from_slice(&bytes).map_err(error)?;
         let sequence = request["id"].as_u64().ok_or_else(|| error("request id"))?;
         if sequence != expected || request.as_object().is_none_or(|v| v.len() != 3 || !v.contains_key("operation") || !v.contains_key("input")) {
@@ -383,4 +446,112 @@ pub fn serve(home: PathBuf, work: PathBuf, environment: Value, instance: String)
     }
     drop(agent);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn fixture() -> (tempfile::TempDir,Agent) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let work = temp.path().join("work");
+        directory(&work).unwrap();
+        let environment = json!({"environment_id":"env-roots","owner":"owned",
+            "resource":{"resource_id":"persistent-storage-original"}});
+        initialize_persistent_home(&home,&environment).unwrap();
+        let agent = Agent {home,work,environment,instance:"first-pod".into(),
+            pty:None,worker:None,destroy:None,export:None};
+        agent.validate_home().unwrap();
+        (temp,agent)
+    }
+    #[test]
+    fn home_and_each_xdg_root_are_never_recreated_or_adopted() {
+        for root in HOME_ROOTS {
+            for replacement in ["absent","directory","symlink"] {
+                let (temp,agent) = fixture();
+                let container = agent.home().unwrap().parent().unwrap().to_path_buf();
+                let marker = fs::read(container.join(".fabric-owner")).unwrap();
+                let home = agent.home().unwrap();
+                let path = if root.is_empty() { home } else { home.join(root) };
+                let retained = temp.path().join("retained-original");
+                fs::rename(&path,&retained).unwrap();
+                if replacement == "directory" {
+                    directory(&path).unwrap();
+                    // Restore the original child roots; only the selected root
+                    // identity differs, with unchanged private ownership bytes.
+                    for child in fs::read_dir(&retained).unwrap() {
+                        let child = child.unwrap();
+                        fs::rename(child.path(),path.join(child.file_name())).unwrap();
+                    }
+                } else if replacement == "symlink" {
+                    std::os::unix::fs::symlink(&retained,&path).unwrap();
+                }
+                assert!(agent.validate_home().is_err(),"{root}: {replacement}");
+                assert_eq!(fs::read(container.join(".fabric-owner")).unwrap(),marker);
+                if replacement == "absent" { assert!(fs::symlink_metadata(&path).is_err()); }
+                // Read-only environment operations cannot repair validation.
+                assert!(agent.validate_environment(&agent.environment).is_err());
+                if replacement == "absent" { assert!(fs::symlink_metadata(&path).is_err()); }
+            }
+        }
+    }
+    #[test]
+    fn unchanged_restart_and_same_storage_relocation_preserve_home_not_instance() {
+        let (temp,mut agent) = fixture();
+        let home = agent.home().unwrap();
+        fs::write(home.join("retained"),b"persistent config").unwrap();
+        // Native auth contents are not inspected, copied, or dereferenced.
+        std::os::unix::fs::symlink(temp.path().join("never-accessed"),home.join(".config/native-auth")).unwrap();
+        agent.instance = "replacement-pod".into();
+        agent.validate_home().unwrap();
+        let moved = temp.path().join("same-storage");
+        fs::rename(&agent.home,&moved).unwrap();
+        agent.home = moved;
+        agent.validate_home().unwrap();
+        assert_eq!(fs::read(agent.home().unwrap().join("retained")).unwrap(),b"persistent config");
+        assert!(initialize_persistent_home(&agent.home,&agent.environment).is_err());
+    }
+    #[test]
+    fn incomplete_tampered_or_unsafe_home_records_refuse() {
+        for corruption in ["legacy","tampered","permissions"] {
+            let (_temp,agent) = fixture();
+            let marker = agent.home().unwrap().parent().unwrap().join(".fabric-owner");
+            if corruption == "permissions" {
+                fs::set_permissions(agent.home().unwrap(),fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                let mut value: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+                if corruption == "legacy" { value = json!({"environment":agent.environment}); }
+                else { value["roots"][0]["inode"] = json!(0); }
+                fs::write(&marker,serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            assert!(agent.validate_home().is_err());
+        }
+    }
+    #[test]
+    fn removed_persistent_container_or_parent_is_not_recreated_by_restart() {
+        for parent in ["container","environments","home"] {
+            let (temp,agent)=fixture();
+            let removed=match parent {
+                "container"=>agent.home().unwrap().parent().unwrap().to_owned(),
+                "environments"=>agent.home.join("environments"),
+                _=>agent.home.clone(),
+            };
+            fs::rename(&removed,temp.path().join("retained")).unwrap();
+            assert!(agent.validate_home().is_err());
+            assert!(serve(agent.home.clone(),agent.work.clone(),agent.environment.clone(),"replacement".into()).is_err());
+            assert!(fs::symlink_metadata(removed).is_err());
+        }
+    }
+    #[test]
+    fn shared_worker_and_shell_home_leases_exclude_explicit_destroy() {
+        for _owner in ["worker","shell"] {
+            let (_temp,mut agent)=fixture();
+            let owner=lock(&agent.home.join("environments"),false).unwrap();
+            assert!(agent.call("environment.prepare_destroy",agent.environment.clone()).is_err());
+            assert!(agent.destroy.is_none());
+            drop(owner);
+            assert_eq!(agent.call("environment.prepare_destroy",agent.environment.clone()).unwrap(),json!({"exclusive":true}));
+        }
+    }
 }

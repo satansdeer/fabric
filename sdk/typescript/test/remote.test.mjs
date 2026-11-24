@@ -7,12 +7,12 @@ import { once } from 'node:events';
 function session(t, optional) {
   const source = `import {defineTarget,serve,TARGET_OPERATIONS} from ${JSON.stringify(new URL('../index.mjs', import.meta.url).href)};
     process.argv = [process.execPath,'fixture','--fabric-plugin-stdio'];
-    const grant = j => ({grant:j.grant, action:j.actions[0]});
+    function grant(j) { if(this.id !== 'remote-proof') throw Error('plugin receiver lost'); return {grant:j.grant, action:j.actions[0]}; }
     await serve(defineTarget({id:'remote-proof',version:'1.0.0',
       capabilities:()=>({placements:['remote-proof'],operations:TARGET_OPERATIONS,optional:${JSON.stringify(optional)}}),
       placement:p=>({backend:p.backends[0]}),
       ...Object.fromEntries(TARGET_OPERATIONS.map(k=>[k,grant])), completed:j=>({received:j.grant}),
-      environment:{ensure:grant,inspect:grant,destroy:grant,workspace:grant},
+      environment:{state:'environment-owner',ensure(j){if(this.state !== 'environment-owner') throw Error('environment receiver lost');return {grant:j.grant,action:j.actions[0]};},inspect:grant,destroy:grant,workspace:grant},
       remote:async()=>{throw Object.assign(Error('PRIVATE_SENTINEL'),{scope:'harness',kind:'unsupported_version'});}
     }));`;
   const child = spawn(process.execPath, ['--input-type=module', '-e', source, '--', '--fabric-plugin-stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -54,10 +54,15 @@ for (const optional of [[],['environment.v1'],['environment.v1','pty.v1']]) {
     const s = session(t,optional); await negotiate(s,false);
     const environment = optional.length > 0;
     if (environment) await s.call('target.environment.capabilities',{version:1});
-    const action = {primitive:environment?'environment.ensure':'process.spawn'};
-    const job = {placement:'remote-proof',[environment?'environment_id':'run_id']:'proof',grant:'once',actions:[action],context:{}};
-    assert.deepEqual(await s.call(environment?'target.environment.ensure':'target.start',job),{grant:'once',action});
-    assert.deepEqual(await s.call('target.completed',{grant:'once',evidence:{observed:true}}),{received:'once'});
+    const actions = [{method:'target.start',key:'run_id',primitive:'process.spawn'}];
+    if (environment) actions.push({method:'target.environment.ensure',key:'environment_id',primitive:'environment.ensure'});
+    for (const [i, operation] of actions.entries()) {
+      const action = {primitive:operation.primitive};
+      const grant = `once_${i}`;
+      const job = {placement:'remote-proof',[operation.key]:'proof',grant,actions:[action],context:{}};
+      assert.deepEqual(await s.call(operation.method,job),{grant,action});
+      assert.deepEqual(await s.call('target.completed',{grant,evidence:{observed:true}}),{received:grant});
+    }
     const closed = once(s.child,'close'); await s.call('shutdown'); await closed; assert.equal(s.child.exitCode,0);
   });
 }

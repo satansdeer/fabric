@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod local_target;
 #[path = "../../fabric-runner/tests/support/reference_plugins.rs"]
 mod reference_plugins;
+#[path = "support/remote_recovery.rs"]
+mod remote_recovery;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 

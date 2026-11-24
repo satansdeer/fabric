@@ -47,6 +47,26 @@ def wait_until(predicate, seconds, label):
             raise AssertionError(label)
         time.sleep(0.1)
 
+def process_identity(raw):
+    """Linux comm may contain spaces and ')'; fields follow its LAST ') '."""
+    head, separator, tail = raw.rstrip(b"\n").rpartition(b") ")
+    require(separator and b" (" in head, "malformed proc stat")
+    pid, _, comm = head.partition(b" (")
+    fields = tail.split()
+    require(pid.isdigit() and len(fields) >= 20 and len(fields[0]) == 1
+            and fields[0] in (b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I")
+            and fields[1].isdigit() and fields[19].isdigit(), "malformed proc identity")
+    return int(pid), int(fields[19]), fields[0], int(fields[1])
+
+
+def original_gone(raw, original):
+    if raw == b"ABSENT\n":
+        return True
+    pid, start, _, _ = process_identity(raw)
+    require(pid == original[0], "proc PID evidence changed")
+    # A matching zombie is still the original process. Never signal a reused PID.
+    return start != original[1]
+
 
 class Terminal:
     def __init__(self, proof):
@@ -209,6 +229,41 @@ class Proof:
                 process.wait()
             self.target.forget(process)
 
+    def process_stat(self, pid):
+        require(type(pid) is int and pid > 0, "actual positive PID")
+        return self.exec_bytes("/bin/sh", "-c",
+                               'if test -e "/proc/$1/stat"; then cat "/proc/$1/stat"; '
+                               'elif test -d "/proc/$1"; then exit 1; else printf "ABSENT\\n"; fi',
+                               "sh", str(pid))
+
+    def process_witness(self, pid):
+        identity = process_identity(self.process_stat(pid))
+        require(identity[0] == pid, "original process identity")
+        return identity[:2]
+
+    def orphan_reaping(self):
+        # Actual ordinary adopted descendants, twice: the reaper must keep running.
+        terminal = Terminal(self)
+        home = "/home/fabric/fabric/environments/" + self.environment + "/tree/"
+        try:
+            for batch in range(2):
+                terminal.send(b"(sh -c 'while test ! -f \"$HOME/orphan-release\"; do sleep 0.1; done' & printf '%s\\n' \"$!\" > \"$HOME/orphan-process\"); printf 'ADOPTED\\n'\n")
+                terminal.expect(b"ADOPTED\r\n")
+                pid = int(self.exec_bytes("/bin/cat", home + "orphan-process").strip())
+                original = self.process_witness(pid)
+                def adopted():
+                    require(terminal.process.poll() is None, "terminal failed during adoption")
+                    observed = process_identity(self.process_stat(pid))
+                    require(observed[:2] == original, "orphan exited before adoption evidence")
+                    return observed[3] == 1
+                wait_until(adopted, 15, "ordinary child adopted by actual PID1")
+                self.exec_bytes("/bin/sh", "-c", 'printf release > "$1"', "sh", home + "orphan-release")
+                wait_until(lambda: original_gone(self.process_stat(pid), original), 15, "adopted child actually reaped")
+                self.exec_bytes("/bin/rm", home + "orphan-release")
+            self.exec_bytes("/bin/rm", home + "orphan-process")
+        finally:
+            terminal.close("disconnect")
+
     def prepare(self):
         repo = self.directory / "repo"
         repo.mkdir(mode=0o700)
@@ -268,19 +323,20 @@ class Proof:
         terminal = Terminal(self)
         try:
             self.destroy(ok=False)
-            # The shell supplies its ACTUAL PID and Linux start time, not a guessed PID.
-            terminal.send(b"printf '%s ' \"$$\" > \"$HOME/session-process\"; cut -d ' ' -f 22 /proc/$$/stat >> \"$HOME/session-process\"; sleep 120\n")
+            # Disable job control so ordinary child stays in the owned session group.
+            terminal.send(b"set +m; sleep 120 & printf '%s %s\\n' \"$$\" \"$!\" > \"$HOME/session-process\"; wait\n")
             home = "/home/fabric/fabric/environments/" + self.environment + "/tree/"
             def witness():
+                require(terminal.process.poll() is None, "terminal failed before process witness")
                 value = self.exec_bytes("/bin/sh", "-c", 'test ! -f "$1" || cat "$1"', "sh", home + "session-process").split()
                 return value if len(value) == 2 else None
-            pid, start = wait_until(witness, 15, "actual shell PID witness")
-            require(pid.isdigit() and start.isdigit(), "Linux process witness")
+            pids = wait_until(witness, 15, "actual shell and descendant PID witness")
+            require(all(pid.isdigit() for pid in pids), "Linux process witness")
+            originals = [self.process_witness(int(pid)) for pid in pids]
             terminal.close(how)
-            def gone():
-                state = self.exec_bytes("/bin/sh", "-c", 'test ! -e "/proc/$1/stat" || cat "/proc/$1/stat"', "sh", pid.decode()).split()
-                return not state or state[2] == b"Z" or state[21] != start
-            wait_until(gone, 30, "ordinary shell process stopped after " + how)
+            for original in originals:
+                wait_until(lambda: original_gone(self.process_stat(original[0]), original),
+                           30, "ordinary session descendant disappeared after " + how)
             self.exec_bytes("/bin/rm", home + "session-process")
         finally:
             terminal.close("disconnect")
@@ -318,10 +374,12 @@ class Proof:
         require(recreated["metadata"]["uid"] != original["metadata"]["uid"] and self.binding["resource"]["pvc_uid"] == pvc_uid, "same PVC, new actual Pod")
         second = self.verify_artifacts(self.call(*self.run_args(prompt)))
         require(second["marker"] == first["marker"] and second["instance"] != first["instance"], "persistent bytes across real recreation")
+        self.orphan_reaping()
         cancel = self.prompt("cancel.json", {"process_tree": {"ignore_child_term": True}})
         child = subprocess.Popen(self.command(*self.run_args(cancel)), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.children.append(child)
         def active():
+            require(child.poll() is None, "worker terminated before running evidence")
             runs = self.call("runs", "list", "--json")
             return next((r for r in runs if r["state"] == "RUNNING"), None)
         running = wait_until(active, 60, "actual remote run started")
@@ -333,12 +391,12 @@ class Proof:
         for filename in ("parent.heartbeat", "child.heartbeat"):
             def witness():
                 data = self.exec_bytes("/bin/sh", "-c", 'test ! -f "$1" || head -n 1 "$1"', "sh", remote_tree + "/" + filename).strip()
+                require(child.poll() is None, "worker failed before heartbeat evidence")
                 if not data.startswith(b"pid="):
                     return None
                 pid = data[4:]
                 require(pid.isdigit(), "actual worker PID")
-                stat = self.exec_bytes("/bin/cat", "/proc/" + pid.decode() + "/stat").split()
-                return (pid.decode(), stat[21])
+                return self.process_witness(int(pid))
             witnesses.append(wait_until(witness, 15, "actual heartbeat process"))
         child.send_signal(signal.SIGTERM)
         output, _ = child.communicate(timeout=60)
@@ -348,11 +406,9 @@ class Proof:
         require(cancelled["workspace"]["state"] == "RECLAIMED", "cancel reclaims only disposable workspace")
         self.terminal_process("cancel")
         self.terminal_process("disconnect")
-        for pid, start in witnesses:
-            def stopped():
-                state = self.exec_bytes("/bin/sh", "-c", 'test ! -e "/proc/$1/stat" || cat "/proc/$1/stat"', "sh", pid).split()
-                return not state or state[2] == b"Z" or state[21] != start
-            wait_until(stopped, 15, "owned worker process stopped")
+        for original in witnesses:
+            wait_until(lambda: original_gone(self.process_stat(original[0]), original),
+                       15, "owned worker descendant disappeared")
         self.destroy(ok=False, confirmation="wrong")
         self.destroy()
         name = self.target.names(self.binding)

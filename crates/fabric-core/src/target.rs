@@ -40,13 +40,17 @@ pub(crate) fn drive<T>(
                     if reply["state"] != "complete" {
                         return Err(fabric_runner::execution_error("Remote process inactivity unproven"));
                     }
+                    crate::remote::completion(reply["result"].clone(),&receipt.resource)?;
                 }
                 _ => return Err(fabric_runner::execution_error("Unsupported remote ownership operation")),
             }
             // Remote acknowledgement is never evidence of a controller filesystem effect.
             let (value, _) = execute(store)?;
             let failure = target.finish().err();
-            if failure.is_some() { store.record_target_failure(run).map_err(fabric_runner::execution_error)?; }
+            if failure.is_some() && !matches!(action, Action::Inspect)
+                && context["apply"] != false {
+                store.record_target_failure(run).map_err(fabric_runner::execution_error)?;
+            }
             return Ok(Committed {value, failure});
         }
         let mut committed = target.drive(operation, run.as_str(), &[action], context, |_| {

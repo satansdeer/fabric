@@ -15,6 +15,56 @@ pub(crate) const CHUNK: usize = 8192;
 pub(crate) fn error(_: impl std::fmt::Display) -> FabricError {
     fabric_runner::execution_error("Remote target operation failed; no local execution fallback")
 }
+pub(crate) fn protocol_error(reason: impl std::fmt::Display) -> FabricError {
+    let mut failure = error(reason);
+    failure.kind = fabric_domain::ErrorKind::TargetProtocol;
+    failure
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Completion {
+    pub resource: Value,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub stop_reason: Option<String>,
+    pub harness_failed: bool,
+    pub capture: fabric_domain::CaptureMetadata,
+}
+impl Completion {
+    pub fn reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref().or_else(|| (self.harness_failed || self.capture.native_failure.is_some()).then_some("native_failure"))
+    }
+}
+pub(crate) fn completion(value: Value, resource: &Value) -> Result<Completion, FabricError> {
+    let keys = ["resource","exit_code","exit_signal","stop_reason","harness_failed","capture"];
+    if !value.as_object().is_some_and(|o| o.len() == keys.len() && keys.iter().all(|k|o.contains_key(*k))) {
+        return Err(protocol_error("incomplete result"));
+    }
+    let result: Completion = serde_json::from_value(value).map_err(protocol_error)?;
+    let capture = &result.capture;
+    let sum = capture.stdout.size_bytes.checked_add(capture.stderr.size_bytes)
+        .and_then(|n|n.checked_add(capture.events.size_bytes));
+    if result.resource != *resource || result.exit_code.is_some() == result.exit_signal.is_some()
+        || result.exit_code.is_some_and(|n| !(0..=255).contains(&n))
+        || result.exit_signal.is_some_and(|n| !(1..=64).contains(&n))
+        || result.stop_reason.as_deref().is_some_and(|r| !["timeout","cancelled","workspace_limit","storage_pressure","storage_meter_failed"].contains(&r))
+        || capture.limit_bytes > TRANSFER_LIMIT || sum != Some(capture.persisted_bytes)
+        || capture.persisted_bytes > capture.limit_bytes {
+        return Err(protocol_error("invalid remote completion"));
+    }
+    Ok(result)
+}
+pub(crate) fn verify_output(container: &Path, capture: &fabric_domain::CaptureMetadata) -> Result<(), FabricError> {
+    for (name, expected) in [("stdout.log",&capture.stdout),("stderr.log",&capture.stderr),("events.jsonl",&capture.events)] {
+        let path = container.join(name);
+        let meta = fs::symlink_metadata(&path).map_err(error)?;
+        if !meta.is_file() || meta.nlink() != 1 || meta.len() != expected.size_bytes || digest(&path)? != expected.sha256 {
+            return Err(protocol_error("capture mismatch"));
+        }
+    }
+    Ok(())
+}
 pub(crate) fn private_file(path: &Path) -> Result<File, FabricError> {
     OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
         .custom_flags(libc::O_NOFOLLOW).open(path).map_err(error)
@@ -175,48 +225,65 @@ pub(crate) fn upload(target: &Target, environment: &Value, run: &str, tree: &Pat
     loop { let n = input.read(&mut buffer).map_err(error)?; if n == 0 { break; }
         let reply = target.remote_call("source.write", json!({"resource":resource,"offset":offset,"bytes":&buffer[..n]}))?;
         offset += n as u64;
-        if reply["offset"].as_u64() != Some(offset) { return Err(error("source offset")); }
+        if reply["offset"].as_u64() != Some(offset) { return Err(protocol_error("source offset")); }
     }
     let reply = target.remote_call("source.seal", json!({"resource":resource}))?;
     fs::remove_file(path).map_err(error)?;
     Ok(json!({"resource":resource,"witness":reply}))
 }
 
-pub(crate) fn download(target: &Target, resource: &Value, container: &Path, limit: u64) -> Result<(), FabricError> {
+pub(crate) struct Staging { pub path: PathBuf, pub witness: Value }
+impl Staging {
+    pub fn new(parent: &Path) -> Result<Self, FabricError> {
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(error)?.as_nanos();
+        let path = parent.join(format!(".fabric-transfer-{}-{nonce}-{}",std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)));
+        fs::DirBuilder::new().mode(0o700).create(&path).map_err(error)?;
+        Ok(Self {path,witness:Value::Null})
+    }
+}
+impl Drop for Staging { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
+
+pub(crate) fn download_staged(target: &Target, resource: &Value, parent: &Path, limit: u64) -> Result<Staging, FabricError> {
+    let mut staging = Staging::new(parent)?;
     let export = target.remote_call("workspace.export", json!({"resource":resource,"limit":limit.min(TRANSFER_LIMIT)}))?;
-    let size = export["size"].as_u64().filter(|n| *n <= TRANSFER_LIMIT).ok_or_else(|| error("export bounds"))?;
-    let path = container.join("result.transfer.tar");
+    let size = export["size"].as_u64().filter(|n| *n > 0 && *n <= limit.min(TRANSFER_LIMIT)).ok_or_else(|| protocol_error("export bounds"))?;
+    let path = staging.path.join("result.transfer.tar");
     let mut output = private_file(&path)?;
     let mut offset = 0;
     while offset < size {
         let reply = target.remote_call("workspace.read", json!({"resource":resource,"offset":offset}))?;
-        let bytes: Vec<u8> = serde_json::from_value(reply["bytes"].clone()).map_err(error)?;
-        if bytes.is_empty() || bytes.len() > CHUNK || offset + bytes.len() as u64 > size { return Err(error("export chunk")); }
+        let bytes: Vec<u8> = serde_json::from_value(reply["bytes"].clone()).map_err(protocol_error)?;
+        if bytes.is_empty() || bytes.len() > CHUNK || offset + bytes.len() as u64 > size { return Err(protocol_error("export chunk")); }
         output.write_all(&bytes).map_err(error)?; offset += bytes.len() as u64;
     }
     output.sync_all().map_err(error)?; drop(output);
-    if digest(&path)? != export["sha256"].as_str().ok_or_else(|| error("export digest"))? { return Err(error("export hash mismatch")); }
-    let staging = container.join("remote-return");
-    fs::create_dir(&staging).map_err(error)?;
-    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).map_err(error)?;
-    unpack(File::open(&path).map_err(error)?, &staging, limit)?;
-    if !fs::symlink_metadata(staging.join("tree")).map_err(error)?.is_dir() {
-        return Err(error("returned workspace is not a directory"));
+    if digest(&path)? != export["sha256"].as_str().ok_or_else(|| protocol_error("export digest"))? { return Err(protocol_error("export hash mismatch")); }
+    unpack(File::open(&path).map_err(error)?, &staging.path, limit)?;
+    fs::remove_file(path).map_err(error)?;
+    if !fs::symlink_metadata(staging.path.join("tree")).map_err(error)?.is_dir() { return Err(protocol_error("returned tree type")); }
+    for name in ["stdout.log","stderr.log","events.jsonl"] {
+        if !fs::symlink_metadata(staging.path.join(name)).map_err(error)?.is_file() { return Err(protocol_error("capture file type")); }
     }
-    // Both names are Core-derived inside the already validated private container;
-    // remote names never select a controller path. No host process runs in either tree.
+    if fs::read_dir(&staging.path).map_err(error)?.count() != 4 { return Err(protocol_error("unexpected export entry")); }
+    staging.witness = export["witness"].clone();
+    Ok(staging)
+}
+pub(crate) fn install_download(staging: &Staging, container: &Path) -> Result<(), FabricError> {
+    for name in ["stdout.log","stderr.log","events.jsonl","transfer-previous"] {
+        match fs::symlink_metadata(container.join(name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            _ => return Err(error("existing partial download; retain evidence")),
+        }
+    }
     let previous = container.join("transfer-previous");
     fs::rename(container.join("tree"), &previous).map_err(error)?;
-    fs::rename(staging.join("tree"), container.join("tree")).map_err(error)?;
-    for name in ["stdout.log", "stderr.log", "events.jsonl"] {
-        let source = staging.join(name);
-        if !fs::symlink_metadata(&source).map_err(error)?.is_file() { return Err(error("capture file type")); }
-        fs::rename(source, container.join(name)).map_err(error)?;
-    }
+    fs::rename(staging.path.join("tree"), container.join("tree")).map_err(error)?;
+    for name in ["stdout.log","stderr.log","events.jsonl"] { fs::rename(staging.path.join(name),container.join(name)).map_err(error)?; }
+    File::open(container).and_then(|f|f.sync_all()).map_err(error)?;
     fs::remove_dir_all(previous).map_err(error)?;
-    fs::remove_dir(staging).map_err(error)?;
-    fs::remove_file(path).map_err(error)?;
-    File::open(container).and_then(|f| f.sync_all()).map_err(error)
+    File::open(container).and_then(|f|f.sync_all()).map_err(error)
 }
 
 #[cfg(test)]

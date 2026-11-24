@@ -282,6 +282,12 @@ impl<T> Committed<T> {
     }
 }
 
+fn remote_protocol_error(mut error: FabricError) -> FabricError {
+    error.kind = ErrorKind::TargetProtocol;
+    error
+}
+fn remote_failure(code: &'static str) -> FabricError { remote_protocol_error(failure(code)) }
+
 impl Target {
     /// Remote effects are owned by the explicitly negotiated target, never host grants.
     pub fn is_remote(&self) -> bool {
@@ -292,28 +298,29 @@ impl Target {
     /// existing target deadline; healthy remote work has no implicit wall-clock stop.
     pub fn remote_call(&self, operation: &str, input: Value) -> Result<Value, FabricError> {
         if !self.remote {
-            return Err(failure("remote_backend_not_negotiated"));
+            return Err(remote_failure("remote_backend_not_negotiated"));
         }
-        let reply = self.call("target.remote.invoke", json!({"version":1,"operation":operation,"input":input}))?;
+        let reply = self.call("target.remote.invoke", json!({"version":1,"operation":operation,"input":input}))
+            .map_err(remote_protocol_error)?;
         let ticket = reply.get("ticket").and_then(Value::as_str)
             .filter(|s| !s.is_empty() && s.len() <= 128)
-            .ok_or_else(|| failure("invalid_remote_ticket"))?;
+            .ok_or_else(|| remote_failure("invalid_remote_ticket"))?;
         loop {
-            let reply = self.call("target.remote.poll", json!({"ticket":ticket}))?;
+            let reply = self.call("target.remote.poll", json!({"ticket":ticket})).map_err(remote_protocol_error)?;
             match reply.get("state").and_then(Value::as_str) {
                 Some("pending") if reply.as_object().is_some_and(|v| v.len() == 1) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Some("complete") if reply.as_object().is_some_and(|v| v.len() == 2) => {
-                    return reply.get("result").cloned().ok_or_else(|| failure("invalid_remote_result"));
+                    return reply.get("result").cloned().ok_or_else(|| remote_failure("invalid_remote_result"));
                 }
                 Some("failed") if reply["scope"] == "harness" => {
                     let kind = serde_json::from_value(reply["kind"].clone())
-                        .map_err(|_| failure("invalid_remote_error"))?;
+                        .map_err(|_| remote_failure("invalid_remote_error"))?;
                     return Err(FabricError { kind, message:"Remote harness operation failed.".into() });
                 }
-                Some("failed") => return Err(failure("remote_target_failed")),
-                _ => return Err(failure("invalid_remote_result")),
+                Some("failed") => return Err(remote_failure("remote_target_failed")),
+                _ => return Err(remote_failure("invalid_remote_result")),
             }
         }
     }

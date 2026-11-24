@@ -17,15 +17,19 @@ The manager-reported private fixture used Colima 0.10.3/VZ arm64 on macOS, kubec
 
 Supply an explicit Linux image **digest**, for the node architecture, with these executable paths:
 
-* `/opt/fabric/fabric-remote-agent`, built from the same compatible reviewed source;
+* `/opt/fabric/fabric-remote-agent`, built from the same compatible reviewed source, including Linux PID1 `--init` and explicit initial HOME creation;
 * `/opt/fabric/fabric` and `/opt/fabric/fabric-fake-harness` for provider-free proof and optional native setup; put them on `/usr/local/bin` through ordinary image installation if desired;
-* `/bin/sh`, `/bin/sleep` supporting `infinity`, `/usr/bin/git`, and ordinary POSIX tools (`stty`, `cat`, `cut`, `head`, `rm`, `test`). Linux procfs and Unix PTYs must be available. The fake harness must be a sibling of the agent unless its explicit registry configuration selects another reviewed binary.
+* `/bin/sh`, `/bin/sleep`, `/usr/bin/git`, and ordinary POSIX tools (`stty`, `cat`, `cut`, `head`, `rm`, `test`). Linux procfs and Unix PTYs must be available. The fake harness must be a sibling of the agent unless its explicit registry configuration selects another reviewed binary.
 
 Build/publish/review this image separately; this plugin neither builds images nor downloads tools. For an authorized native harness, include its supported CLI/runtime and reviewed Fabric adapter, or install/configure it manually inside the Pod. Do not copy controller credentials, SSH agents, kubeconfig or user mounts into the image/Pod.
 
+The sole pinned Pod command is exactly `["/opt/fabric/fabric-remote-agent","--init"]`, with no arguments, fallback or assumed image init. The already-required agent acts as Linux PID1, repeatedly reaping adopted exited ordinary children; TERM/INT/HUP exits without cross-session signaling. Changed command/image/mount/isolation fails closed. It does not replace owned worker/session cancellation or contain hostile detached code. The external package pins `target.py` and launcher; the separately reviewed image digest binds this generic binary. Image build/digest validation and actual PID1 adoption/reaping proof belong to manager QA, not source-implementation admission.
+
 The Pod uses explicit positive UID/GID, `runAsNonRoot`, `fsGroup`, `OnRootMismatch`, RuntimeDefault seccomp, dropped capabilities, read-only root filesystem, no privilege escalation, no privileged container, no hostPath/hostNetwork/hostPID/hostIPC, no init/ephemeral containers and no service-account token. `/home/fabric` is a single ReadWriteOnce PVC; `/work` and `/tmp` are separate bounded emptyDir volumes. The agent creates private owner-only child directories; the storage driver must support the requested fsGroup/access semantics. It fails closed instead of chmodding/adopting foreign HOME contents.
 
-Persistent HOME is `/home/fabric/fabric/environments/ENV/tree`; five HOME/XDG roots and native configuration/consent live there. Each run has fresh `/work/fabric/RUN` source/tree/log state. Ordinary run/session cleanup never deletes HOME or PVC. Pod recreation with the same proven PVC retains HOME but loses disposable emptyDir data. Loss of a Pod during unfinished capture is not successful artifact recovery.
+Persistent HOME is `/home/fabric/fabric/environments/ENV/tree`; HOME, XDG roots and their private `.local` parent and native configuration/consent live there. Each run has fresh `/work/fabric/RUN` source/tree/log state. Ordinary run/session cleanup never deletes HOME or PVC. Pod recreation with the same proven PVC retains HOME but loses disposable emptyDir data. Loss of a Pod during unfinished capture is not successful artifact recovery.
+
+First agent startup claims `fabric.sh/home-state:new` on the proven PVC with resourceVersion-conditional replacement, persists `initializing` before explicit `--initialize-home`, then `ready` after verified agent identity. No automatic retry: lost/failed claims stay refused for owner inspection. All subsequent startup/inspect/ensure/probe/plan/PTY/worker/destroy validation is non-creating. A private complete owner record binds environment, container, HOME and every XDG root by device/inode/birth time, independent of Pod UID and disposable workspace. Missing/replaced/symlinked/unsafe roots, old records or unavailable identity evidence fail closed without reading credentials. A new Pod on the same independently verified storage uses existing roots only. Filesystems without birth time or remounts/device changes that cannot preserve/prove identities refuse continuity; this is not a portable storage identity or backup guarantee.
 
 `storage_size`, `workspace_size` and `memory` are explicit positive `Mi` quantities; CPU uses positive millicores. Requests/limits and emptyDir limits are Kubernetes best-effort enforcement, not an application sandbox/hard dollar or aggregate disk cap. Core's existing source/log/artifact/storage bounds also apply. HOME usage is persistent and owner-managed; do not fill the PVC with disposable source. Provision enough node ephemeral storage for transfer/archive copies as well as the expanded tree.
 
@@ -45,14 +49,17 @@ metadata:
   namespace: OWNER_NAMESPACE
 rules:
 - apiGroups: [""]
-  resources: [pods, persistentvolumeclaims]
+  resources: [pods]
   verbs: [get, create, delete]
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [get, create, update, delete]
 - apiGroups: [""]
   resources: [pods/exec]
   verbs: [get, create]
 ```
 
-Bind this Role only to the kubeconfig's intended user/group via a namespaced RoleBinding. Modern kubectl transports can use GET or POST for exec; both verbs are explicit. No list/watch/patch/update, secrets, deployments, jobs, node, PV or cluster-admin access is required by normal operation. The plugin addresses individual deterministic resource names and uses API-server UID preconditions for deletion, never namespace sweeping.
+Bind this Role only to the kubeconfig's intended user/group via a namespaced RoleBinding. Modern kubectl transports can use GET or POST for exec; both verbs are explicit. Only PVC `update` is required for the one-time resourceVersion-conditional HOME claim; no list/watch/patch, Pod update, secrets, deployments, jobs, node, PV or cluster-admin access is required by normal operation. The plugin addresses individual deterministic resource names and uses API-server UID preconditions for deletion, never namespace sweeping.
 
 Namespace identity checking needs one separately bootstrapped ClusterRole/ClusterRoleBinding restricted to `get` on **that exact namespace name**:
 
@@ -134,6 +141,8 @@ Use normal `fabric run` with explicit `--harness fake --placement kubernetes --e
 
 The controller uploads a bounded traversal/link-safe archive and verifies observed portable source/prompt hashes before launch. The prelaunch receipt records actual Linux/architecture/hostname/Pod UID plus the exact target/environment/workspace binding; it invents no remote inode/device witness. Actual remote tree/log bytes return through bounded size/SHA-verified transfer and existing artifact sealing. Ordinary cancellation waits for actual owned group termination before collecting/reclaiming disposable storage. Concurrent worker/shell shared HOME leases exclude explicit destruction, including independent controller processes via the remote lease.
 
+After a controller crash between remote result sync and local capture, recovery validates the complete original receipt and positive remote inactivity, downloads retained tree/log bytes with bounded digest verification, then seals them without rerunning. Inspect stages privately and removes staging without changing durable local/remote evidence. Apply records actual wait/capture metadata and refreshes the run before capture; partial or foreign local output is retained, never overwritten/adopted. Verified download followed by a local artifact cap remains `artifact_capture`, not `target_protocol`.
+
 Kubernetes API scheduling/termination status is separate from harness status. `Unschedulable` waits only the explicit provisioning budget. `OOMKilled` is reported only when an actual terminated environment container has that exact structured reason; exit 137 or arbitrary harness stderr does not prove OOM. Pod identity evidence is bounded and omits raw Kubernetes messages, credentials and harness stderr. Failure before durable capture or changed/lost resources retains unknown state for inspection rather than inventing successful recovery. No automatic retry/replay or healthy-run global timeout was added; issue #76 wire budgets and cancellation/reaping remain.
 
 Explicit irreversible destruction requires the exact environment confirmation, immutable binding, proven owned resources and no active run/shell:
@@ -145,6 +154,8 @@ fabric --root /canonical/private/fabric-root environments destroy proof-env \
 
 Only that environment's proven Pod/PVC are deleted with UID preconditions; the namespace is never deleted. Normal shell/task cleanup and Pod-only recreation retain HOME/PVC. Failed partial provisioning remains explicitly destroyable once ownership is persisted. If PVC creation succeeds but its reply is lost before Core persists the UID binding, the resource is retained for owner inspection: a new unbound request never adopts an existing claim, even with matching annotations. If API ownership or original pins cannot be verified, stop: restore the original reviewed configuration/target or have the owner inspect the retained resources. Do not sweep or relabel foreign resources.
 
+Confirmed-owned Pending failed starts permit absent statuses or exclusively valid waiting/terminated container states (including ImagePullBackOff/CreateContainerConfigError); malformed/unknown/mixed/running states, including `running:{}`, refuse. The phase itself grants no lease: Core run/shell exclusion, namespace/PVC/config/owner identity, exact Pod security and absence of owned exec streams still apply. Failed-start Pod deletion requires both the original UID and the resourceVersion of that exact validated status snapshot; a scheduling/status race conflicts and retains the PVC. Running environments require the existing exclusive agent destroy proof. Deletion is original Pod first, then original PVC UID, using API-server preconditions; replacements are never adopted.
+
 ## Manager-owned narrow QA (not run by worker)
 
 Provider-free deterministic checks; no cluster/provider emulation is represented as E2E:
@@ -152,7 +163,12 @@ Provider-free deterministic checks; no cluster/provider emulation is represented
 ```sh
 node --test sdk/typescript/test/remote.test.mjs
 python3 -m unittest discover -s plugins/kubernetes -p test_target.py
-cargo test --locked -p fabric-core remote::tests
+cargo test --locked -p fabric-core remote::
+cargo test --locked -p fabric-core remote_agent::tests
+cargo test --locked -p fabric-cli --bin fabric-remote-agent
+# Build the required CLI/reference sibling binaries once before CLI integration tests:
+cargo build --locked -p fabric-cli -p fabric-reference-harnesses --bins
+cargo test --locked -p fabric-cli --test run remote_recovery::
 ```
 
 Also run existing Runner target/plugin and CLI environment/shell ownership tests after building the required CLI/reference siblings once. The sealed worker summary lists exact proposed commands. The Python tests inject API status objects solely to test normalization and reject security/ownership/config boundaries before any kubectl execution. Real OOM remains **NOT_VERIFIED** unless an authorized owner separately obtains reliable actual container termination evidence; a memory-limit kill is not universally reproducible.
@@ -168,5 +184,7 @@ The explicitly opt-in real scenario uses installed target + actual CLI/Core/Pod 
 ```
 
 The script exercises real shell binary bytes/control/resize/exit/cancel/disconnect, rejects active destruction, writes a non-secret private HOME marker, executes a first fake worker, UID-deletes only its owned Pod, recreates it with the same PVC, executes a second worker observing identical marker bytes and a different actual Pod identity, verifies all returned artifact sizes/SHA256 and remote workspace disappearance, cancels an actual parent/child worker group using observed PID/start-time witnesses, and explicitly destroys owned Pod/PVC. It checks bounded real scheduling failure with the second config and leaves the namespace untouched. It never invokes a model/provider/OAuth flow. Success output is emitted only after actual assertions; failures retain exact owned resources for inspection/explicit confirmed destruction, never guessed cleanup. Private fixture files/output must not be uploaded as public artifacts.
+
+Process success requires the original observed PID/start-time identity to disappear, not merely become `Z`; matching zombies fail while present. `/proc/PID/stat` parsing handles spaces/parentheses in comm, rejects malformed/unreadable evidence and treats only a changed start time as a replacement (never signaled/adopted). Ordinary descendants are observed before terminal cancel, disconnect and worker cancel. Two explicit ordinary orphan batches demonstrate actual adoption by PID1 and eventual disappearance, with finite waits and immediate terminal-error checks. These scenarios remain manager-only, not a unit fixture or universal containment proof.
 
 **Current source-only verification: NOT_RUN_BY_WORKER. Real Kubernetes E2E, real OOM, native OAuth and release/runtime compatibility are not established by this delivery.**

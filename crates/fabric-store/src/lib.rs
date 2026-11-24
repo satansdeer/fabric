@@ -1604,6 +1604,39 @@ impl Store {
         }
         Ok(())
     }
+    /// Caller holds the root/run leases and has verified the pinned inactive remote
+    /// result and downloaded bytes. Recovery never invents a terminal success.
+    pub fn record_recovered_capture(
+        &mut self, expected: &Run, capture: &CaptureMetadata,
+        exit_code: Option<i32>, exit_signal: Option<i32>, reason: Option<&str>,
+    ) -> Result<()> {
+        if expected.state != RunState::NeedsAttention || expected.capture.is_some()
+            || expected.artifact_manifest_id.is_some()
+            || exit_code.is_some() == exit_signal.is_some()
+            || expected.exit_code.is_some_and(|code| Some(code) != exit_code)
+            || expected.exit_signal.is_some_and(|signal| Some(signal) != exit_signal)
+            || !matches!(reason, None | Some("timeout" | "cancelled" | "workspace_limit" | "storage_pressure" | "storage_meter_failed" | "native_failure")) {
+            return Err(StoreError::InvalidRecord("Remote recovery result differs"));
+        }
+        let encoded = serde_json::to_string(capture).map_err(|_|StoreError::InvalidRecord("Invalid capture"))?;
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::query_run(&transaction,&expected.run_id)?.as_ref() != Some(expected) {
+            return Err(StoreError::Conflict);
+        }
+        if transaction.execute(
+            "UPDATE runs SET capture_metadata=?2, exit_code=?3, exit_signal=?4,
+             error_kind=CASE WHEN error_kind IS NOT NULL AND error_kind NOT IN ('harness_execution','artifact_capture') THEN error_kind
+               WHEN ?5 IS NOT NULL THEN ?5 WHEN ?3 IS NOT 0 THEN 'harness_exit' ELSE error_kind END
+             WHERE run_id=?1 AND state='NEEDS_ATTENTION' AND capture_metadata IS NULL
+             AND EXISTS (SELECT 1 FROM workspaces w WHERE w.run_id=?1 AND w.state='RECOVERY_REQUIRED')
+             AND NOT EXISTS (SELECT 1 FROM cleanup_intents c JOIN workspaces w USING(workspace_id) WHERE w.run_id=?1)
+             AND EXISTS (SELECT 1 FROM run_launch_receipts l WHERE l.run_id=?1 AND json_type(l.receipt_json,'$.remote')='object')",
+            params![expected.run_id.as_str(),encoded,exit_code,exit_signal,reason],
+        )? != 1 { return Err(StoreError::Conflict); }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Register verified promoted files and terminal completion in one transaction.
     /// Complete tracked and non-ignored untracked capture precedes cleanup eligibility.
     pub fn finish_run(

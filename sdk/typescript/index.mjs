@@ -166,7 +166,8 @@ async function serveTarget(plugin) {
       const operation = method.slice(environment ? 'target.environment.'.length : 7);
       const actions = environment ? TARGET_ENVIRONMENT_ACTIONS : TARGET_ACTIONS;
       const identityKey = environment && operation !== 'workspace' ? 'environment_id' : 'run_id';
-      const callback = environment ? plugin.environment?.[operation] : plugin[operation];
+      const receiver = environment ? plugin.environment : plugin;
+      const callback = receiver?.[operation];
       if (!Object.hasOwn(actions, operation) || typeof callback !== 'function' ||
           environment && (!selected || !optional.includes('environment.v1')) ||
           !exact(params, ['placement', identityKey, 'grant', 'actions', 'context']) ||
@@ -177,7 +178,7 @@ async function serveTarget(plugin) {
             allowed => exact(action, Object.keys(allowed)) && Object.keys(allowed).every(key => allowed[key] === action[key]))) ||
           !params.context || Array.isArray(params.context) || typeof params.context !== 'object') fail('invalid_params');
       seen.add(params.grant);
-      result = await callback(params);
+      result = await callback.call(receiver, params);
       if (!validTargetPlan(result, params)) fail('invalid_target_proposal');
       if (result.action.primitive !== 'unsupported') pending.add(params.grant);
     }

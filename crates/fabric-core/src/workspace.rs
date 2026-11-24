@@ -599,6 +599,19 @@ fn recover_one(
         }
         item.reason = "unsafe_path_or_owner".into();
         validate_owned_workspace(root, &run, &workspace)?;
+        if run.capture.is_none() && store.launch_receipt(&run.run_id).map_err(storage_error)?
+            .is_some_and(|receipt|receipt.remote.is_some()) {
+            item.reason = "remote_capture_unavailable".into();
+            recover_remote_output(root,store,&run,&workspace,apply)?;
+            if !apply {
+                item.action = "would_recover".into();
+                item.reason = "captureable_inactive_workspace".into();
+                return Ok(());
+            }
+            drop(owner);
+            item = clean_one(root,store,id,true,&mut |_|Ok(()))?;
+            return Ok(());
+        }
         item.reason = "target_unavailable".into();
         crate::target::drive(
             store,
@@ -659,6 +672,81 @@ fn recover_one(
         item.detail = Some(failure.message);
     }
     Ok(item)
+}
+
+fn recover_remote_output(root: &Path, store: &mut Store, run: &Run, workspace: &Workspace, apply: bool) -> Result<(), FabricError> {
+    use crate::remote;
+    let owned = validate_owned_workspace(root,run,workspace)?;
+    let receipt = store.launch_receipt(&run.run_id).map_err(storage_error)?.ok_or_else(||remote::error("missing receipt"))?;
+    let remote = receipt.remote.as_ref().ok_or_else(||remote::error("missing remote receipt"))?;
+    let pin_json = store.run_target(&run.run_id).map_err(storage_error)?.ok_or_else(||remote::error("missing target"))?;
+    let prepared = store.prepared_state(&run.prepared_state_id).map_err(storage_error)?.ok_or_else(||remote::error("missing source"))?;
+    let source = store.source_evidence(&run.prepared_state_id).map_err(storage_error)?.ok_or_else(||remote::error("missing source evidence"))?;
+    let environment = store.environment(&remote.environment_id).map_err(storage_error)?.ok_or_else(||remote::error("missing environment"))?;
+    if remote.target_json != pin_json || receipt.run_id != run.run_id || receipt.workspace_id != workspace.workspace_id
+        || receipt.prepared_state_id != run.prepared_state_id || receipt.source_commit_sha != run.base_commit_sha
+        || receipt.source_commit_sha != prepared.source_commit_sha || receipt.preparation_key != prepared.preparation_key
+        || receipt.recipe_digest != prepared.recipe_digest || receipt.source != source || receipt.actual_sha256 != source.prepared_sha256
+        || remote.resource["run_id"] != run.run_id.as_str() || remote.resource["instance"] != remote.instance
+        || remote.resource["resource_id"] != receipt.workspace_path
+        || environment.destroy_intent || environment.owner_uid != unsafe {libc::geteuid()}
+        || remote.resource["environment"] != crate::environment::remote_input(&environment)? {
+        return Err(remote::protocol_error("remote recovery binding changed"));
+    }
+    // An untouched transfer tree is not a recovered worker result. Partial local
+    // downloads/captures are retained, never adopted or overwritten.
+    let container = owned.path().parent().ok_or_else(||remote::error("missing container"))?;
+    for path in [root.join("artifacts").join(format!("a-{}",run.run_id)),
+        root.join("artifact-staging").join(format!("a-{}",run.run_id)),
+        container.join("stdout.log"),container.join("stderr.log"),container.join("events.jsonl"),
+        container.join("transfer-previous"),container.join("result.transfer.tar"),container.join("remote-return")] {
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            _ => return Err(remote::error("partial local capture; retain evidence")),
+        }
+    }
+    if fabric_project::prepare::content_digest(owned.path(),std::time::Instant::now()+std::time::Duration::from_secs(1200))? != receipt.actual_sha256 {
+        return Err(remote::protocol_error("local source staging changed"));
+    }
+    let pin: fabric_runner::target::TargetPin = serde_json::from_str(&pin_json).map_err(remote::error)?;
+    let target = pin.open(&fabric_runner::CancellationToken::default())?;
+    if !target.is_remote() { return Err(remote::protocol_error("remote backend changed")); }
+    let reply = target.remote_call("worker.poll",serde_json::json!({"resource":remote.resource}))?;
+    if reply["state"] != "complete" { return Err(remote::error("remote inactivity unproven")); }
+    let result = remote::completion(reply["result"].clone(),&remote.resource)?;
+    if run.exit_code.is_some_and(|code|Some(code)!=result.exit_code) || run.exit_signal.is_some_and(|signal|Some(signal)!=result.exit_signal) {
+        return Err(remote::protocol_error("remote wait result changed"));
+    }
+    let temporary = std::env::temp_dir();
+    let staging = remote::download_staged(&target,&remote.resource,if apply {container} else {&temporary},remote::TRANSFER_LIMIT)?;
+    let witness = &staging.witness;
+    if witness["resource"] != remote.resource || witness["actual_sha256"] != receipt.actual_sha256
+        || witness["instance"] != remote.instance || witness["os"] != remote.os
+        || witness["arch"] != remote.arch || witness["hostname"] != remote.hostname {
+        return Err(remote::protocol_error("retained source witness changed"));
+    }
+    remote::verify_output(&staging.path,&result.capture)?;
+    let mut prompt = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(container.join("prompt.input")).map_err(storage_error)?;
+    if !prompt.metadata().map_err(storage_error)?.is_file() { return Err(remote::error("prompt type")); }
+    let mut copied = remote::private_file(&staging.path.join("prompt.input"))?;
+    if std::io::copy(&mut (&mut prompt).take(remote::TRANSFER_LIMIT+1),&mut copied).map_err(storage_error)? > remote::TRANSFER_LIMIT {
+        return Err(remote::error("prompt bound"));
+    }
+    copied.sync_all().map_err(storage_error)?;
+    let staged_workspace = RunnerWorkspace {run_id:run.run_id.clone(),path:staging.path.join("tree")};
+    let mut observed = run.clone();
+    observed.capture = Some(result.capture.clone());
+    crate::artifacts::recover_capture(root,store,&observed,&staged_workspace,false)?;
+    // Shutdown must succeed before any durable recovery effect.
+    target.finish()?;
+    if !apply { return Ok(()); }
+    validate_owned_workspace(root,run,workspace)?;
+    remote::install_download(&staging,container)?;
+    store.record_recovered_capture(run,&result.capture,result.exit_code,result.exit_signal,result.reason()).map_err(storage_error)?;
+    let current = store.run(&run.run_id).map_err(storage_error)?.ok_or_else(||remote::error("run disappeared"))?;
+    let captured = crate::artifacts::recover_capture(root,store,&current,&owned,true)?
+        .ok_or_else(||remote::error("capture not established"))?;
+    store.recover_artifacts(&current,workspace,&captured.0,&captured.1).map_err(storage_error)
 }
 
 pub(super) fn reclaim_run(root: &Path, id: &RunId) -> Result<GcItem, FabricError> {

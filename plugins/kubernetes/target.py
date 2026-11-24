@@ -134,12 +134,14 @@ class UnixHTTP(http.client.HTTPConnection):
 
 
 class Agent:
-    def __init__(self, target, pod, binding):
+    def __init__(self, target, pod, binding, initialize=False):
         self.target, self.binding, self.instance = target, binding, pod["metadata"]["uid"]
         self.lock, self.closed, self.next_id = threading.Lock(), threading.Event(), 0
-        self.process = target.spawn(["exec", "-i", pod["metadata"]["name"], "-c", "environment", "--",
-                                     "/opt/fabric/fabric-remote-agent", "/home/fabric/fabric", "/work/fabric"],
-                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        argv = ["exec", "-i", pod["metadata"]["name"], "-c", "environment", "--",
+                "/opt/fabric/fabric-remote-agent", "/home/fabric/fabric", "/work/fabric"]
+        if initialize:
+            argv.append("--initialize-home")
+        self.process = target.spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.process.stdin.write(encoded(binding) + b"\n")
         self.process.stdin.flush()
         self.heartbeat = threading.Thread(target=self.keepalive, daemon=True)
@@ -273,7 +275,7 @@ class Target:
                                 "fsGroup": self.c["gid"], "fsGroupChangePolicy": "OnRootMismatch",
                                 "seccompProfile": {"type": "RuntimeDefault"}},
             "containers": [{"name": "environment", "image": self.c["image"], "imagePullPolicy": "IfNotPresent",
-                            "command": ["/bin/sleep", "infinity"],
+                            "command": ["/opt/fabric/fabric-remote-agent", "--init"],
                             "env": [{"name": "FABRIC_TARGET_INSTANCE", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.uid"}}},
                                     {"name": "FABRIC_PLUGIN_REGISTRY", "value": "/home/fabric/fabric/environments/" + identifier(environment["environment_id"]) + "/tree/.fabric/plugins"}],
                             "securityContext": {"allowPrivilegeEscalation": False, "privileged": False,
@@ -322,9 +324,11 @@ class Target:
             # No saved UID means no authority to adopt even matching annotations.
             # A lost create reply leaves an orphan for explicit owner inspection.
             require(create and pvc is None and self.get("pod", name) is None)
+            metadata = self.metadata(name, incoming)
+            metadata["annotations"]["fabric.sh/home-state"] = "new"
             pvc = self.kubectl(["create", "-f", "-", "-o", "json"], dict(apiVersion="v1", kind="PersistentVolumeClaim",
-                metadata=self.metadata(name, incoming), spec={"accessModes": ["ReadWriteOnce"], "storageClassName": self.c["storage_class"],
-                                                            "resources": {"requests": {"storage": self.c["storage_size"]}}}))
+                metadata=metadata, spec={"accessModes": ["ReadWriteOnce"], "storageClassName": self.c["storage_class"],
+                                       "resources": {"requests": {"storage": self.c["storage_size"]}}}))
         require(pvc is not None)
         pvc_uid = self.owned(pvc, incoming, name)
         require(pvc["spec"]["storageClassName"] == self.c["storage_class"] and pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
@@ -369,21 +373,43 @@ class Target:
             require(agent.instance == pod["metadata"]["uid"] and agent.binding == binding)
         else:
             require(not self.agents)
-            agent = Agent(self, pod, binding)
+            pvc = self.get("pvc", binding["resource"]["name"])
+            require(pvc and self.owned(pvc, binding, binding["resource"]["name"]) == binding["resource"]["pvc_uid"])
+            state = pvc["metadata"].get("annotations", {}).get("fabric.sh/home-state")
+            require(state in ("new", "ready"))
+            initialize = state == "new"
+            if initialize:
+                # resourceVersion makes this a single, non-retryable creation
+                # claim. A lost/failing claim never grants restart adoption.
+                require(pvc["metadata"].get("resourceVersion"))
+                pvc["metadata"]["annotations"]["fabric.sh/home-state"] = "initializing"
+                pvc = self.kubectl(["replace", "-f", "-", "-o", "json"], pvc)
+                require(self.owned(pvc, binding, binding["resource"]["name"]) == binding["resource"]["pvc_uid"]
+                        and pvc["metadata"]["annotations"]["fabric.sh/home-state"] == "initializing")
+            agent = Agent(self, pod, binding, initialize=initialize)
             try:
                 identity = agent.call("agent.identity", {})
                 require(identity["instance"] == pod["metadata"]["uid"] and identity["os"] == "linux"
                         and identity["environment"] == binding)
+                if initialize:
+                    pvc["metadata"]["annotations"]["fabric.sh/home-state"] = "ready"
+                    saved = self.kubectl(["replace", "-f", "-", "-o", "json"], pvc)
+                    require(self.owned(saved, binding, binding["resource"]["name"]) == binding["resource"]["pvc_uid"]
+                            and saved["metadata"]["annotations"]["fabric.sh/home-state"] == "ready")
                 self.agents[key] = agent
             except Exception:
                 agent.close()
                 raise
         return agent
 
-    def delete_uid(self, kind, name, uid):
-        """DELETE with API-server UID precondition; kubectl owns authentication/TLS."""
+    def delete_uid(self, kind, name, uid, resource_version=None):
+        """DELETE exact UID; failed-start deletion also fences observed Pod state."""
         plural = {"pod": "pods", "pvc": "persistentvolumeclaims"}[kind]
         path = "/api/v1/namespaces/" + self.c["namespace"] + "/" + plural + "/" + name
+        preconditions = {"uid": uid}
+        if resource_version is not None:
+            require(isinstance(resource_version, str) and resource_version)
+            preconditions["resourceVersion"] = resource_version
         with tempfile.TemporaryDirectory(prefix="fabric-k8s-") as directory:
             endpoint = os.path.join(directory, "api.sock")
             proxy = self.spawn(["proxy", "--unix-socket=" + endpoint, "--accept-hosts=^localhost$", "--accept-paths=^/api/v1/namespaces/" + self.c["namespace"] + "/"], stdout=subprocess.DEVNULL)
@@ -394,7 +420,7 @@ class Target:
                     time.sleep(0.01)
                 connection = UnixHTTP(endpoint)
                 try:
-                    connection.request("DELETE", path, encoded({"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}}),
+                    connection.request("DELETE", path, encoded({"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": preconditions}),
                                        {"Content-Type": "application/json", "Host": "localhost"})
                     response = connection.getresponse()
                     require(response.status in (200, 202, 404))
@@ -430,12 +456,32 @@ class Target:
         if pod is not None:
             self.validate_pod(pod, name, binding)
             phase = pod.get("status", {}).get("phase")
-            if phase in ("Failed", "Succeeded"):
-                require(all(not item.get("state", {}).get("running") for item in pod.get("status", {}).get("containerStatuses", [])))
-                self.delete_uid("pod", name, pod["metadata"]["uid"])
-            elif phase == "Pending":
-                require(not pod.get("status", {}).get("containerStatuses"))
-                self.delete_uid("pod", name, pod["metadata"]["uid"])
+            if phase in ("Failed", "Succeeded", "Pending"):
+                statuses = pod.get("status", {}).get("containerStatuses", [])
+                require(isinstance(statuses, list))
+                # Presence, not truthiness: running:{} is an active container.
+                for item in statuses:
+                    require(isinstance(item, dict) and item.get("name") == "environment")
+                    state = item.get("state")
+                    require(isinstance(state, dict) and len(state) == 1
+                            and set(state) <= {"waiting", "terminated"}
+                            and all(isinstance(value, dict) for value in state.values()))
+                    kind, detail = next(iter(state.items()))
+                    if kind == "waiting":
+                        require(set(detail) <= {"reason", "message"}
+                                and all(isinstance(value, str) for value in detail.values()))
+                    else:
+                        require(set(detail) <= {"exitCode", "signal", "reason", "message", "startedAt", "finishedAt", "containerID"}
+                                and type(detail.get("exitCode")) is int
+                                and -(2 ** 31) <= detail["exitCode"] < 2 ** 31
+                                and ("signal" not in detail or (type(detail["signal"]) is int and 0 <= detail["signal"] < 2 ** 31))
+                                and all(isinstance(value, str) for key, value in detail.items() if key not in ("exitCode", "signal")))
+                require(len(statuses) <= 1)
+                # An already-owned exec stream precludes the failed-start shortcut.
+                require(binding["resource"]["resource_id"] not in self.agents)
+                version = pod["metadata"].get("resourceVersion")
+                require(isinstance(version, str) and version)
+                self.delete_uid("pod", name, pod["metadata"]["uid"], version)
             else:
                 agent = self.agent(binding, pod)
                 require(agent.call("environment.prepare_destroy", binding) == {"exclusive": True})

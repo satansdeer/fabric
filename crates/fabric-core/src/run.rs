@@ -708,23 +708,31 @@ fn execute_remote(
                 if reply["state"] == "target_failed" {
                     store.record_remote_observation(run_id, &reply["evidence"]).map_err(error)?;
                 }
-                return Err(error("Remote environment unavailable"));
+                return Err(crate::remote::protocol_error("Remote environment unavailable"));
             }
             crate::remote::upload(target, &binding, run_id.as_str(), tree, transfer_limit)
         });
     let uploaded = match uploaded { Ok(value) => value, Err(failure) => {
-        store.record_target_failure(run_id).map_err(error)?; return Err(failure);
+        if failure.kind == fabric_domain::ErrorKind::TargetProtocol { store.record_target_failure(run_id).map_err(error)?; }
+        return Err(failure);
     }};
     let resource = uploaded["resource"].clone();
     let witness = &uploaded["witness"];
-    if witness["resource"] != resource || witness["actual_sha256"] != source.prepared_sha256 {
+    if witness["resource"] != resource || witness["actual_sha256"] != source.prepared_sha256
+        || resource["environment"] != binding || resource["run_id"] != run_id.as_str()
+        || resource["instance"] != witness["instance"]
+        || !resource["resource_id"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control)) {
         store.record_target_failure(run_id).map_err(error)?;
-        return Err(error("Remote source content mismatch; refusing launch"));
+        return Err(crate::remote::protocol_error("Remote source content mismatch; refusing launch"));
     }
     let string = |key: &str, bound: usize| -> Result<String, FabricError> {
-        witness[key].as_str().filter(|s| !s.is_empty() && s.len() <= bound
-            && !s.chars().any(char::is_control)).map(str::to_owned)
-            .ok_or_else(|| error("Invalid remote source witness"))
+        match witness[key].as_str().filter(|s| !s.is_empty() && s.len() <= bound && !s.chars().any(char::is_control)) {
+            Some(value) => Ok(value.to_owned()),
+            None => {
+                store.record_target_failure(run_id).map_err(error)?;
+                Err(crate::remote::protocol_error("Invalid remote source witness"))
+            }
+        }
     };
     store.record_launch_receipt(&fabric_store::LaunchReceipt {
         run_id:run_id.clone(), attempt_id:attempt.attempt_id.clone(),
@@ -752,7 +760,7 @@ fn execute_remote(
             "storage_policy":options.storage.policy,
             "scan_timeout_ms":options.storage.scan_timeout.as_millis() as u64
         }))?;
-        if started["started"] != true { return Err(error("Remote worker not started")); }
+        if started["started"] != true { return Err(crate::remote::protocol_error("Remote worker not started")); }
         attempt.started_at = Some(now()?);
         store.record_worker_attempt(attempt).map_err(error)?;
         store.start_remote_run(run_id, &plan.manifest.exact_version, attempt.started_at.unwrap()).map_err(error)?;
@@ -768,35 +776,33 @@ fn execute_remote(
                 Some("complete") => break reply["result"].clone(),
                 Some("target_failed") => {
                     if reply["evidence"]["instance"] != witness["instance"] {
-                        return Err(error("Remote diagnostic binding changed"));
+                        return Err(crate::remote::protocol_error("Remote diagnostic binding changed"));
                     }
                     store.record_remote_observation(run_id,&reply["evidence"]).map_err(error)?;
-                    return Err(error("Remote target terminated"));
+                    return Err(crate::remote::protocol_error("Remote target terminated"));
                 }
-                _ => return Err(error("Invalid remote worker state")),
+                _ => return Err(crate::remote::protocol_error("Invalid remote worker state")),
             }
         };
-        if result["resource"] != resource { return Err(error("Remote result binding changed")); }
-        let capture: fabric_domain::CaptureMetadata = serde_json::from_value(result["capture"].clone()).map_err(error)?;
-        let exit_code: Option<i32> = serde_json::from_value(result["exit_code"].clone()).map_err(error)?;
-        let exit_signal: Option<i32> = serde_json::from_value(result["exit_signal"].clone()).map_err(error)?;
-        if exit_code.is_some() == exit_signal.is_some() { return Err(error("Invalid remote wait status")); }
-        let reason = result["stop_reason"].as_str();
-        if reason.is_some_and(|r| !["timeout","cancelled","workspace_limit","storage_pressure","storage_meter_failed"].contains(&r)) { return Err(error("Invalid remote stop reason")); }
-        attempt.finished_at = Some(now()?); attempt.exit_code = exit_code; attempt.exit_signal = exit_signal;
-        attempt.event_cursor = capture.normalized_event_count;
-        attempt.termination_reason = reason.or_else(||(result["harness_failed"] == true || capture.native_failure.is_some()).then_some("native_failure")).map(str::to_owned);
+        let result = crate::remote::completion(result, &resource)?;
+        attempt.finished_at = Some(now()?); attempt.exit_code = result.exit_code; attempt.exit_signal = result.exit_signal;
+        attempt.event_cursor = result.capture.normalized_event_count;
+        attempt.termination_reason = result.reason().map(str::to_owned);
         store.record_worker_attempt(attempt).map_err(error)?;
-        store.observe_run_exit(run_id,exit_code,exit_signal,attempt.termination_reason.as_deref(),attempt.finished_at.unwrap()).map_err(error)?;
-        crate::remote::download(target,&resource,tree.parent().ok_or_else(||error("Container absent"))?,
-            crate::remote::TRANSFER_LIMIT)?;
+        store.observe_run_exit(run_id,result.exit_code,result.exit_signal,result.reason(),attempt.finished_at.unwrap()).map_err(error)?;
+        let capture = result.capture;
+        let container = tree.parent().ok_or_else(||error("Container absent"))?;
+        let staging = crate::remote::download_staged(target,&resource,container,crate::remote::TRANSFER_LIMIT)?;
+        if staging.witness != *witness { return Err(crate::remote::protocol_error("Export source witness changed")); }
+        crate::remote::verify_output(&staging.path,&capture)?;
+        crate::remote::install_download(&staging,container)?;
         store.record_capture(run_id,&capture).map_err(error)?;
         let captured = crate::artifacts::capture(root,store,run_id,state,&capture,&plan.profile,options.max_artifact_bytes)?;
         store.finish_run(run_id,&capture,&captured.0,&captured.1,now()?).map_err(error)?;
-        target.finish()?;
+        target.finish().map_err(crate::remote::protocol_error)?;
         Ok(capture)
     })();
-    if outcome.as_ref().is_err_and(|failure|failure.message != "Remote harness operation failed.") {
+    if outcome.as_ref().is_err_and(|failure|failure.kind == fabric_domain::ErrorKind::TargetProtocol) {
         store.record_target_failure(run_id).map_err(error)?;
     }
     outcome
