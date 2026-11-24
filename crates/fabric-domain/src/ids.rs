@@ -62,6 +62,7 @@ ids!(
     RunId,
     BatchId,
     WorkspaceId,
+    EnvironmentId,
     ArtifactId,
     ArtifactManifestId
 );

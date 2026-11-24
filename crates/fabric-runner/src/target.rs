@@ -170,7 +170,7 @@ impl TargetPin {
                 .map_err(|_| failure("invalid_target_capabilities"))?;
         if caps.placements != [self.placement.as_str()]
             || caps.operations != OPERATIONS
-            || !caps.optional.is_empty()
+            || !(caps.optional.is_empty() || caps.optional == ["environment.v1"])
         {
             return Err(failure("unsupported_target_capabilities"));
         }
@@ -190,11 +190,27 @@ impl TargetPin {
                 message: "Target refused available placement; no execution fallback.".into(),
             });
         }
+        let environment = if caps.optional == ["environment.v1"] {
+            let capabilities: fabric_domain::EnvironmentCapabilities = serde_json::from_value(
+                session.call("target.environment.capabilities", json!({"version":1}))?,
+            )
+            .map_err(|_| failure("invalid_environment_capabilities"))?;
+            // Only Core's local primitives exist. A target cannot invent host support.
+            if capabilities != fabric_domain::EnvironmentCapabilities::local() {
+                return Err(unsupported_environment(
+                    "unsupported environment capability negotiation",
+                ));
+            }
+            Some(capabilities)
+        } else {
+            None
+        };
         session.bound_target_operations();
         Ok(Target {
             pin: self.clone(),
             session: Mutex::new(Some(session)),
             next_grant: AtomicU64::new(1),
+            environment,
         })
     }
 }
@@ -218,6 +234,12 @@ pub enum Action {
     Recover,
     #[serde(rename = "workspace.reclaim")]
     Reclaim,
+    #[serde(rename = "environment.ensure")]
+    EnsureEnvironment,
+    #[serde(rename = "environment.inspect")]
+    InspectEnvironment,
+    #[serde(rename = "environment.destroy")]
+    DestroyEnvironment,
     #[serde(rename = "unsupported")]
     Unsupported,
 }
@@ -233,6 +255,7 @@ pub struct Target {
     pin: TargetPin,
     session: Mutex<Option<PluginSession>>,
     next_grant: AtomicU64,
+    environment: Option<fabric_domain::EnvironmentCapabilities>,
 }
 /// A host effect committed even if its target receipt failed. Callers must account
 /// for `value` before surfacing `failure`; an error here is never a successful receipt.
@@ -251,6 +274,24 @@ impl<T> Committed<T> {
 }
 
 impl Target {
+    pub fn environment_capabilities(
+        &self,
+    ) -> Result<&fabric_domain::EnvironmentCapabilities, FabricError> {
+        self.environment.as_ref().ok_or_else(|| unsupported_environment(
+            "Target did not negotiate environment.v1; persistent_home and interactive_exec_pty are unsupported",
+        ))
+    }
+
+    pub fn require_environment(&self, pty: bool) -> Result<(), FabricError> {
+        let capabilities = self.environment_capabilities()?;
+        if !capabilities.persistent_home || (pty && !capabilities.interactive_exec_pty) {
+            return Err(unsupported_environment(
+                "Requested persistent_home/interactive_exec_pty is unsupported",
+            ));
+        }
+        Ok(())
+    }
+
     /// A grant exists for this call only. No plugin paths, PIDs, argv, outcome or
     /// deletion claims are accepted. Only the supplied executor can produce evidence.
     pub fn drive<T>(
@@ -261,7 +302,20 @@ impl Target {
         context: serde_json::Value,
         execute: impl FnOnce(Action) -> Result<(T, serde_json::Value), FabricError>,
     ) -> Result<Committed<T>, FabricError> {
-        if !OPERATIONS.contains(&operation) || actions.is_empty() {
+        let environment_operation = operation.strip_prefix("environment.");
+        if let Some(operation) = environment_operation {
+            let caps = self.environment_capabilities()?;
+            if !caps
+                .operations
+                .iter()
+                .any(|supported| supported == operation)
+            {
+                return Err(unsupported_environment("Unsupported environment operation"));
+            }
+        } else if !OPERATIONS.contains(&operation) {
+            return Err(failure("unsupported_target_operation"));
+        }
+        if actions.is_empty() {
             return Err(failure("unsupported_target_operation"));
         }
         let grant = self.next_grant.fetch_add(1, Ordering::Relaxed).to_string();
@@ -271,15 +325,22 @@ impl Target {
             grant: String,
             action: Action,
         }
-        let plan: Plan = serde_json::from_value(self.call(
-            &format!("target.{operation}"),
+        let params = if environment_operation.is_some() && operation != "environment.workspace" {
+            json!({"placement":self.pin.placement,"environment_id":run,"grant":grant,
+                "actions":actions,"context":context})
+        } else {
             json!({"placement":self.pin.placement,"run_id":run,"grant":grant,
-                "actions":actions,"context":context}),
-        )?)
-        .map_err(|_| failure("invalid_target_plan"))?;
+                "actions":actions,"context":context})
+        };
+        let plan: Plan = serde_json::from_value(self.call(&format!("target.{operation}"), params)?)
+            .map_err(|_| failure("invalid_target_plan"))?;
         if plan.action == Action::Unsupported {
             return Err(FabricError {
-                kind: ErrorKind::UnsupportedPlacement,
+                kind: if environment_operation.is_some() {
+                    ErrorKind::UnsupportedCapability
+                } else {
+                    ErrorKind::UnsupportedPlacement
+                },
                 message: "Target refused the granted operation; no execution fallback.".into(),
             });
         }
@@ -396,5 +457,12 @@ impl Drop for Target {
                 let _ = session.finish();
             }
         }
+    }
+}
+
+fn unsupported_environment(message: &str) -> FabricError {
+    FabricError {
+        kind: ErrorKind::UnsupportedCapability,
+        message: message.into(),
     }
 }

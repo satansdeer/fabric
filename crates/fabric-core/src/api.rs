@@ -49,6 +49,8 @@ pub struct Options {
     pub copy_limit_bytes: Option<u64>,
     pub max_log_bytes: Option<u64>,
     pub max_artifact_bytes: Option<u64>,
+    #[serde(default)]
+    pub environment: Option<fabric_domain::EnvironmentSelection>,
 }
 
 impl Options {
@@ -58,6 +60,7 @@ impl Options {
             copy_limit_bytes: Some(options.copy_limit_bytes),
             max_log_bytes: Some(options.max_log_bytes),
             max_artifact_bytes: Some(options.max_artifact_bytes),
+            environment: options.environment.clone(),
         }
     }
 }
@@ -237,6 +240,7 @@ pub(crate) fn translate_workers(
                 task.limits.unwrap_or_default(),
             )?;
             options.harness_request.placement = request.placement.clone();
+            options.environment = task.environment;
             Ok(ExecutionTask {
                 id: task.task_id,
                 prompt: Some(task.prompt.into_bytes()),
@@ -266,6 +270,7 @@ fn worker_options(
             copy_limit_bytes: limits.copy_limit_bytes,
             max_log_bytes: limits.max_log_bytes,
             max_artifact_bytes: limits.max_artifact_bytes,
+            environment: None,
         },
         CancellationToken::default(),
     )?;
@@ -318,6 +323,7 @@ pub(crate) fn preflight_workers(
             task.limits.clone().unwrap_or_default(),
         )?;
         options.harness_request.placement = request.placement.clone();
+        options.environment = task.environment.clone();
         let (plan, _) = crate::run::plan_task(
             root,
             &task.harness_id,
@@ -376,6 +382,7 @@ pub(crate) fn run_options(
         cancellation,
         ..RunOptions::default()
     };
+    options.environment = request.environment.clone();
     if let Some(seconds) = request.timeout_seconds {
         options.limits.timeout = Duration::from_secs(seconds);
     }

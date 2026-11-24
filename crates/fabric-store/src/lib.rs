@@ -9,7 +9,9 @@ use fabric_domain::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
+mod environments;
 mod queue;
+pub use environments::EnvironmentRecord;
 use queue::insert_task_source;
 pub use queue::{
     AsyncBatch, AsyncEvent, AsyncLogIdentity, AsyncTask, AsyncTaskStatus, NewAsyncTask,
@@ -263,7 +265,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=17 => {}
+            1..=18 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -572,6 +574,10 @@ impl Store {
             transaction.execute_batch(include_str!("source_receipts.sql"))?;
             transaction.pragma_update(None, "user_version", 17)?;
         }
+        if version < 18 {
+            transaction.execute_batch(include_str!("environments.sql"))?;
+            transaction.pragma_update(None, "user_version", 18)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -644,7 +650,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=17) {
+        if !matches!(version, 5..=18) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -2193,7 +2199,9 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_launch_receipts;
+            "DROP TABLE run_environments;
+             DROP TABLE environments;
+             DROP TABLE run_launch_receipts;
              DROP TABLE prepared_source_evidence;
              DROP TABLE connector_deliveries;
              DROP TABLE run_targets;

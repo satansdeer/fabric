@@ -25,6 +25,8 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 pub struct RunReport {
     pub run_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub environment_id: Option<fabric_domain::EnvironmentId>,
     pub prepared_state_id: String,
     pub base_commit_sha: String,
     #[serde(default)]
@@ -68,6 +70,7 @@ pub struct RunOptions {
     pub max_cost_usd: Option<f64>,
     pub harness_request: HarnessRequest,
     pub target_pin: Option<fabric_runner::target::TargetPin>,
+    pub environment: Option<fabric_domain::EnvironmentSelection>,
 }
 
 impl Default for RunOptions {
@@ -82,6 +85,7 @@ impl Default for RunOptions {
             max_cost_usd: None,
             harness_request: HarnessRequest::default(),
             target_pin: None,
+            environment: None,
         }
     }
 }
@@ -117,16 +121,32 @@ impl RunOptions {
             request.max_cost_usd = Some(cost);
         }
         request.validate()?;
+        if self.environment.is_some()
+            && request.profile.as_ref().is_some_and(|profile| {
+                !profile.native_config_refs.is_empty() || !profile.connection_refs.is_empty()
+            })
+        {
+            return Err(FabricError {
+                kind: ErrorKind::UnsupportedCapability,
+                message: "Persistent environment HOME cannot import a native config/auth context"
+                    .into(),
+            });
+        }
         Ok(request)
     }
 
-    fn select_target(&mut self, placement: &str) -> Result<(), FabricError> {
+    fn select_target(&mut self, root: &Path, plan: &HarnessPlan) -> Result<(), FabricError> {
+        let placement = plan.request.placement.as_str();
         let pin = match self.target_pin.take() {
             Some(pin) if pin.placement == placement => pin,
             Some(_) => return Err(error("Accepted target placement changed.")),
             None => fabric_runner::target::TargetPin::select(placement)?,
         };
-        pin.preflight(&self.cancellation)?;
+        let target = pin.open(&self.cancellation)?;
+        if let Some(selection) = &self.environment {
+            crate::environment::for_run(root, selection, &pin, &target, plan)?;
+        }
+        target.finish()?;
         self.target_pin = Some(pin);
         Ok(())
     }
@@ -143,7 +163,7 @@ pub fn foreground(
     let request = options.request()?;
     let mut options = options.clone();
     let plan = crate::onboarding::plan(root, harness, request, &harness.probe()?)?;
-    options.select_target(&plan.0.request.placement)?;
+    options.select_target(root, &plan.0)?;
     let (root, state, source) = select_prepared(root, project_name, &SourceRef::CurrentHead {})?;
     let mut report = foreground_prepared(
         &root,
@@ -265,6 +285,11 @@ pub(crate) fn execute_prepared(
         None => fabric_runner::target::TargetPin::select(&plan.request.placement)?,
     };
     let target = pin.open(&options.cancellation)?;
+    let environment = options
+        .environment
+        .as_ref()
+        .map(|selection| crate::environment::for_run(root, selection, &pin, &target, plan))
+        .transpose()?;
     let mut storage = options.storage.clone();
     storage.policy.max_log_bytes_per_run = options.max_log_bytes;
     storage.policy.max_artifact_bytes_per_run = options.max_artifact_bytes;
@@ -295,6 +320,10 @@ pub(crate) fn execute_prepared(
         &request,
         options.copy_limit_bytes,
         Some((&pin, &target)),
+        options
+            .environment
+            .as_ref()
+            .map(|selection| &selection.environment_id),
     )?;
     let harness_id = harness.id();
     let mut attempt = WorkerAttempt {
@@ -353,12 +382,15 @@ pub(crate) fn execute_prepared(
             .and_then(|file| file.sync_all())
             .map_err(error)?;
         crate::onboarding::revalidate(&root, plan, consent.as_deref())?;
-        let command = harness.command(&AgentSpec {
+        let mut command = harness.command(&AgentSpec {
             prompt_file: &prompt_path,
             request: &plan.request,
             max_cost_usd: plan.request.max_cost_usd,
             profile: &plan.profile,
         })?;
+        if let Some(environment) = &environment {
+            environment.configure(&mut command)?;
+        }
         // This validation must remain immediately before launch, not merely at fork time.
         let fresh = runner_workspace(&root, &run_id)?;
         crate::workspace::storage::check_launch(&root, &storage)?;
@@ -387,6 +419,9 @@ pub(crate) fn execute_prepared(
                 },
                 || {
                     let validated = runner_workspace(&root, &run_id)?;
+                    if let Some(environment) = &environment {
+                        environment.validate()?;
+                    }
                     if validated.path() != fresh.path() {
                         return Err(error("Workspace changed before launch."));
                     }
@@ -619,6 +654,7 @@ pub(crate) fn execute_prepared(
     Ok(RunReport {
         run_id: run.run_id.to_string(),
         workspace_id: run.workspace_id.to_string(),
+        environment_id: store.run_environment(&run_id).map_err(error)?,
         prepared_state_id: run.prepared_state_id.to_string(),
         base_commit_sha: run.base_commit_sha,
         source: store.task_source(&run_id).map_err(error)?,
@@ -929,7 +965,7 @@ pub(crate) fn plan_task(
         }
     };
     let plan = crate::onboarding::plan(root, adapter.as_ref(), request, probe)?;
-    options.select_target(&plan.0.request.placement)?;
+    options.select_target(root, &plan.0)?;
     Ok(plan)
 }
 

@@ -23,6 +23,16 @@ struct Job {
     context: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentJob {
+    placement: String,
+    environment_id: fabric_domain::EnvironmentId,
+    grant: String,
+    actions: Vec<Action>,
+    context: Value,
+}
+
 fn serve() -> Result<(), ()> {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some("--fabric-plugin-stdio") || args.next().is_some() {
@@ -68,12 +78,17 @@ fn serve() -> Result<(), ()> {
             if request.params != json!({}) {
                 return Err(());
             }
-            json!({"placements":["local"],"operations":fabric_runner::target::OPERATIONS,"optional":[]})
+            json!({"placements":["local"],"operations":fabric_runner::target::OPERATIONS,"optional":["environment.v1"]})
         } else if request.method == "target.placement" {
             if request.params != json!({"placement":"local","backends":["host.local"]}) {
                 return Err(());
             }
             json!({"backend":"host.local"})
+        } else if request.method == "target.environment.capabilities" {
+            if request.params != json!({"version":1}) {
+                return Err(());
+            }
+            serde_json::to_value(fabric_domain::EnvironmentCapabilities::local()).map_err(|_| ())?
         } else if request.method == "target.completed" {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -88,10 +103,31 @@ fn serve() -> Result<(), ()> {
             json!({"received":completed.grant})
         } else {
             let operation = request.method.strip_prefix("target.").ok_or(())?;
-            if !fabric_runner::target::OPERATIONS.contains(&operation) {
+            if !fabric_runner::target::OPERATIONS.contains(&operation)
+                && ![
+                    "environment.ensure",
+                    "environment.inspect",
+                    "environment.destroy",
+                    "environment.workspace",
+                ]
+                .contains(&operation)
+            {
                 return Err(());
             }
-            let job: Job = serde_json::from_value(request.params).map_err(|_| ())?;
+            let job: Job = if operation.starts_with("environment.")
+                && operation != "environment.workspace"
+            {
+                let env: EnvironmentJob = serde_json::from_value(request.params).map_err(|_| ())?;
+                Job {
+                    placement: env.placement,
+                    run_id: env.environment_id.to_string(),
+                    grant: env.grant,
+                    actions: env.actions,
+                    context: env.context,
+                }
+            } else {
+                serde_json::from_value(request.params).map_err(|_| ())?
+            };
             if job.placement != "local"
                 || job.run_id.is_empty()
                 || job.run_id.len() > 128
@@ -106,7 +142,7 @@ fn serve() -> Result<(), ()> {
                 return Err(());
             }
             let action = match operation {
-                "prepare" => Action::Fork {
+                "prepare" | "environment.workspace" => Action::Fork {
                     strategy: ForkMode::CloneOrCopy,
                 },
                 "start" => Action::Spawn,
@@ -115,6 +151,9 @@ fn serve() -> Result<(), ()> {
                 "collect" if job.actions.contains(&Action::Capture) => Action::Capture,
                 "collect" => Action::Recover,
                 "reclaim" => Action::Reclaim,
+                "environment.ensure" => Action::EnsureEnvironment,
+                "environment.inspect" => Action::InspectEnvironment,
+                "environment.destroy" => Action::DestroyEnvironment,
                 _ => return Err(()),
             };
             if !job.context.is_object()

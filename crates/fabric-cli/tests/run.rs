@@ -146,7 +146,11 @@ for line in sys.stdin:
     elif method in ('health', 'shutdown'):
         result = dict(ready=True)
     elif method == 'target.capabilities':
-        result = dict(placements=[identity], operations=['prepare','start','inspect','cancel','collect','reclaim'], optional=[])
+        result = dict(placements=[identity], operations=['prepare','start','inspect','cancel','collect','reclaim'], optional=['environment.v1'] if {behavior:?}.startswith('environment') else [])
+    elif method == 'target.environment.capabilities':
+        assert request['params'] == dict(version=1)
+        result = dict(version=1, persistent_home=True, interactive_exec_pty=False, infrastructure_diagnostics=False, operations=['ensure','inspect','destroy','workspace'])
+        if {behavior:?} == 'environment-unknown': result['invented_authority'] = True
     elif method == 'target.placement':
         result = dict(backend='unsupported' if {behavior:?} == 'unsupported' else 'host.local')
     elif method == 'target.completed':
@@ -162,12 +166,12 @@ for line in sys.stdin:
         else:
             result = dict(received=grant)
     else:
-        op = method.split('.')[1]
+        op = method[len('target.'):]
         if op == 'start': started = True
-        if op == 'start' and {behavior:?} in ('source-witness', 'source-mismatch'):
+        if op == 'start' and {behavior:?} in ('source-witness', 'source-mismatch', 'environment'):
             import sqlite3
             db = sqlite3.connect({database:?})
-            row = db.execute('SELECT receipt_json, r.state, r.started_at, a.started_at FROM run_launch_receipts l JOIN runs r USING(run_id) JOIN worker_attempts a USING(run_id)').fetchone()
+            row = db.execute('SELECT receipt_json, r.state, r.started_at, a.started_at FROM run_launch_receipts l JOIN runs r USING(run_id) JOIN worker_attempts a USING(run_id) WHERE r.run_id=?', (request['params']['run_id'],)).fetchone()
             assert row is not None and row[1:] == ('PREPARING', None, None), row
             with open({source_snapshot:?}, 'w') as out: json.dump(json.loads(row[0]), out)
             if {behavior:?} == 'source-mismatch':
@@ -178,7 +182,7 @@ for line in sys.stdin:
             while not os.path.exists({worker_ready:?}) and time.monotonic() < deadline: time.sleep(.001)
         if started and op == 'cancel' and {behavior:?} == 'cancel-crash': os._exit(0)
         if started and op == 'inspect' and {behavior:?} == 'recovery-collect': os._exit(0)
-        if started and op == 'inspect' and {behavior:?} == 'crash': os._exit(0)
+        if started and op == 'inspect' and {behavior:?} in ('crash', 'environment-crash'): os._exit(0)
         if started and op == 'inspect' and {behavior:?} == 'hang': __import__('time').sleep(10)
         job = request['params']
         grants[job['grant']] = op
@@ -4843,7 +4847,7 @@ fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compat
         if case == "legacy" {
             // Historical runs predate immutable capture contexts and source receipts.
             db.execute_batch(
-                "DROP TABLE run_launch_receipts; DROP TABLE prepared_source_evidence; DROP TABLE connector_deliveries; DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
+                "DROP TABLE run_environments; DROP TABLE environments; DROP TABLE run_launch_receipts; DROP TABLE prepared_source_evidence; DROP TABLE connector_deliveries; DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
             )
             .unwrap();
         }
@@ -5340,4 +5344,813 @@ fn api_sigterm_cancels_owned_worker_seals_evidence_and_reclaims() {
         fabric_domain::WorkspaceState::Reclaimed
     );
     assert!(!prompt.parent().unwrap().exists());
+}
+
+fn environment_command(
+    fixture: &Fixture,
+    operation: &str,
+    id: &str,
+    owner: &str,
+    target: &str,
+    extra: &[&str],
+) -> Output {
+    fixture
+        .cli()
+        .args([
+            "environments",
+            operation,
+            id,
+            "--owner",
+            owner,
+            "--target",
+            target,
+            "--json",
+        ])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn assert_environment_error(output: &Output, kind: &str) {
+    assert!(!output.status.success(), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], kind, "{output:?}");
+}
+
+#[test]
+fn environment_persists_across_cli_and_target_recreation_without_capturing_home() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new();
+    let (_, prepared) = fixture.setup();
+    fixture.target("env-local", "environment");
+    let first = json(&environment_command(
+        &fixture,
+        "ensure",
+        "durable-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    let home = PathBuf::from(first["home"].as_str().unwrap());
+    let identity = fs::metadata(&home).unwrap();
+    let observed = fixture.0.join("environment-observed.jsonl");
+    let binary = fixture.script_fake(&format!(r#"exec /usr/bin/python3 - <<'PY'
+import json, os, sqlite3
+home = os.environ['HOME']
+assert home == {home:?}
+assert os.environ['XDG_CONFIG_HOME'] == os.path.join(home, '.config')
+assert os.environ['XDG_DATA_HOME'] == os.path.join(home, '.local/share')
+assert os.environ['XDG_STATE_HOME'] == os.path.join(home, '.local/state')
+assert os.environ['XDG_CACHE_HOME'] == os.path.join(home, '.cache')
+assert 'UNSELECTED_SECRET' not in os.environ
+assert not os.path.exists('only-this-run')
+with open('tracked') as f: assert f.read() == 'original'
+with open('.deps/ready') as f: assert f.read() == 'ready'
+db = sqlite3.connect({database:?})
+receipt = json.loads(db.execute('SELECT receipt_json FROM run_launch_receipts WHERE json_extract(receipt_json, "$.workspace_path")=?', (os.getcwd(),)).fetchone()[0])
+with open({snapshot:?}) as f: assert receipt == json.load(f)
+assert receipt['actual_sha256'] == receipt['source']['prepared_sha256']
+assert receipt['source_commit_sha'] == {commit:?}
+marker = os.path.join(home, '.config', 'private-marker')
+existed = os.path.exists(marker)
+if existed:
+    with open(marker) as f: assert f.read() == 'private-home-secret-sentinel'
+else:
+    with open(marker, 'w') as f: f.write('private-home-secret-sentinel')
+with open('only-this-run', 'w') as f: f.write(receipt['run_id'])
+with open({observed:?}, 'a') as f: f.write(json.dumps(dict(receipt=receipt, home=home, existed=existed)) + '\n')
+PY"#,
+        home = home.to_str().unwrap(),
+        database = fixture.0.join("storage/fabric.db").to_str().unwrap(),
+        snapshot = fixture.0.join("prestart-source.json").to_str().unwrap(),
+        commit = prepared["source_commit_sha"].as_str().unwrap(),
+        observed = observed.to_str().unwrap()));
+    let prompt = fixture.0.join("env-prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    let mut reports = Vec::new();
+    for _ in 0..2 {
+        let report = json(
+            &fixture
+                .cli()
+                .args(["run", "test", "--harness", "fake", "--fake-binary"])
+                .arg(&binary)
+                .arg("--prompt-file")
+                .arg(&prompt)
+                .args([
+                    "--placement",
+                    "env-local",
+                    "--environment",
+                    "durable-home",
+                    "--environment-owner",
+                    "alice",
+                    "--copy-limit-bytes",
+                    "10485760",
+                    "--json",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(report["state"], "SUCCEEDED");
+        assert_eq!(report["environment_id"], "durable-home");
+        verified_manifest(&fixture, &report);
+        let captured = restored_workspace(&fixture, &report);
+        assert_eq!(
+            fs::read(captured.join("only-this-run")).unwrap(),
+            report["run_id"].as_str().unwrap().as_bytes()
+        );
+        assert!(!captured.join(".config/private-marker").exists());
+        let store = fabric_store::Store::open(fixture.0.join("storage/fabric.db")).unwrap();
+        let run = report["run_id"].as_str().unwrap().parse().unwrap();
+        for artifact in store.artifacts(&run).unwrap() {
+            let bytes = fs::read(fixture.0.join("storage").join(artifact.relative_path)).unwrap();
+            assert!(
+                !bytes
+                    .windows(b"private-home-secret-sentinel".len())
+                    .any(|bytes| bytes == b"private-home-secret-sentinel")
+            );
+        }
+        assert_eq!(
+            fs::read(home.join(".config/private-marker")).unwrap(),
+            b"private-home-secret-sentinel"
+        );
+        let reopened = json(&environment_command(
+            &fixture,
+            "ensure",
+            "durable-home",
+            "alice",
+            "env-local",
+            &[],
+        ));
+        assert_eq!(reopened["environment_id"], first["environment_id"]);
+        assert_eq!(reopened["home"], first["home"]);
+        let metadata = fs::metadata(&home).unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (identity.dev(), identity.ino())
+        );
+        reports.push(report);
+    }
+    assert_ne!(reports[0]["run_id"], reports[1]["run_id"]);
+    assert_ne!(reports[0]["workspace_id"], reports[1]["workspace_id"]);
+    assert_ne!(reports[0]["workspace_path"], reports[1]["workspace_path"]);
+    assert_ne!(reports[0]["run_id"], reports[0]["workspace_id"]);
+    let observations: Vec<serde_json::Value> = String::from_utf8(fs::read(observed).unwrap())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(observations[0]["existed"], false);
+    assert_eq!(observations[1]["existed"], true);
+    for (observation, report) in observations.iter().zip(&reports) {
+        assert_eq!(observation["receipt"]["run_id"], report["run_id"]);
+        assert_eq!(
+            observation["receipt"]["workspace_path"],
+            report["workspace_path"]
+        );
+        assert_eq!(
+            observation["receipt"]["prepared_state_id"],
+            prepared["state_id"]
+        );
+        let retained = json(
+            &fixture
+                .cli()
+                .args(["runs", "show", report["run_id"].as_str().unwrap(), "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(retained["environment_id"], "durable-home");
+        assert_eq!(retained["launch_receipt"], observation["receipt"]);
+    }
+    let inspected = json(&environment_command(
+        &fixture,
+        "inspect",
+        "durable-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    assert_eq!(inspected["runtime"], "available");
+    assert_eq!(inspected["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fs::read(Path::new(prepared["prepared_path"].as_str().unwrap()).join("tracked")).unwrap(),
+        b"original"
+    );
+    assert!(
+        !Path::new(prepared["prepared_path"].as_str().unwrap())
+            .join("only-this-run")
+            .exists()
+    );
+    let destroyed = json(&environment_command(
+        &fixture,
+        "destroy",
+        "durable-home",
+        "alice",
+        "env-local",
+        &["--confirm", "durable-home"],
+    ));
+    assert_eq!(destroyed["desired"], "destroyed");
+    assert_eq!(destroyed["runtime"], "absent");
+    assert!(!home.parent().unwrap().exists());
+    let reconciled = json(&environment_command(
+        &fixture,
+        "inspect",
+        "durable-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    assert_eq!(reconciled["runtime"], "absent");
+    assert_environment_error(
+        &environment_command(
+            &fixture,
+            "ensure",
+            "durable-home",
+            "alice",
+            "env-local",
+            &[],
+        ),
+        "storage",
+    );
+}
+
+#[test]
+fn environment_destroy_requires_matching_owner_target_confirmation_and_native_lease() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("env-local", "environment");
+    fixture.target("other-target", "environment");
+    let report = json(&environment_command(
+        &fixture,
+        "ensure",
+        "owned-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    let home = PathBuf::from(report["home"].as_str().unwrap());
+    fs::write(home.join("private-marker"), "retain").unwrap();
+    for (owner, target, confirmation) in [
+        ("bob", "env-local", "owned-home"),
+        ("alice", "other-target", "owned-home"),
+        ("alice", "env-local", "yes"),
+    ] {
+        assert_environment_error(
+            &environment_command(
+                &fixture,
+                "destroy",
+                "owned-home",
+                owner,
+                target,
+                &["--confirm", confirmation],
+            ),
+            "authorization_required",
+        );
+        assert_eq!(fs::read(home.join("private-marker")).unwrap(), b"retain");
+    }
+    let prompt = fixture.0.join("env-prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    let run = json(
+        &fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--prompt-file"])
+            .arg(prompt)
+            .args([
+                "--placement",
+                "env-local",
+                "--environment",
+                "owned-home",
+                "--environment-owner",
+                "alice",
+                "--copy-limit-bytes",
+                "10485760",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let token = run["run_id"].as_str().unwrap();
+    let lease = fixture.0.join("storage/leases").join(token);
+    let retained = lease.with_extension("original");
+    fs::rename(&lease, &retained).unwrap();
+    fs::copy(&retained, &lease).unwrap();
+    let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+    db.execute(
+        "UPDATE worker_leases SET expires_at=0 WHERE token=?1",
+        [token],
+    )
+    .unwrap();
+    assert_environment_error(
+        &environment_command(
+            &fixture,
+            "destroy",
+            "owned-home",
+            "alice",
+            "env-local",
+            &["--confirm", "owned-home"],
+        ),
+        "storage",
+    );
+    assert_eq!(fs::read(home.join("private-marker")).unwrap(), b"retain");
+    fs::remove_file(&lease).unwrap();
+    fs::rename(retained, lease).unwrap();
+    let destroyed = json(&environment_command(
+        &fixture,
+        "destroy",
+        "owned-home",
+        "alice",
+        "env-local",
+        &["--confirm", "owned-home"],
+    ));
+    assert_eq!(destroyed["runtime"], "absent");
+}
+
+#[test]
+fn environment_reconciliation_and_destroy_refuse_symlink_unowned_and_replaced_resources() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for fault in [
+        "symlink",
+        "config-symlink",
+        "unowned",
+        "replaced",
+        "replaced:.config",
+        "replaced:.cache",
+        "replaced:.local",
+        "replaced:.local/share",
+        "replaced:.local/state",
+    ] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        fixture.target("env-local", "environment");
+        let report = json(&environment_command(
+            &fixture,
+            "ensure",
+            "guarded-home",
+            "alice",
+            "env-local",
+            &[],
+        ));
+        let home = PathBuf::from(report["home"].as_str().unwrap());
+        let protected = fixture.0.join("protected");
+        fs::create_dir(&protected).unwrap();
+        fs::write(protected.join("sentinel"), "external").unwrap();
+        match fault {
+            "symlink" => {
+                fs::rename(&home, home.with_extension("original")).unwrap();
+                symlink(&protected, &home).unwrap();
+            }
+            "config-symlink" => {
+                fs::rename(home.join(".config"), home.join(".config-original")).unwrap();
+                symlink(&protected, home.join(".config")).unwrap();
+            }
+            "unowned" => fs::remove_file(home.parent().unwrap().join(".fabric-owner")).unwrap(),
+            "replaced" => {
+                fs::rename(&home, home.with_extension("original")).unwrap();
+                fs::create_dir(&home).unwrap();
+                fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fault if fault.starts_with("replaced:") => {
+                let relative = fault.strip_prefix("replaced:").unwrap();
+                let directory = home.join(relative);
+                fs::rename(&directory, fixture.0.join("saved-config-root")).unwrap();
+                fs::create_dir(&directory).unwrap();
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+                if relative == ".local" {
+                    for name in ["share", "state"] {
+                        let child = directory.join(name);
+                        fs::create_dir(&child).unwrap();
+                        fs::set_permissions(child, fs::Permissions::from_mode(0o700)).unwrap();
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let inspected = json(&environment_command(
+            &fixture,
+            "inspect",
+            "guarded-home",
+            "alice",
+            "env-local",
+            &[],
+        ));
+        assert_eq!(inspected["runtime"], "unknown", "{fault}");
+        assert!(inspected["home"].is_null());
+        assert_environment_error(
+            &environment_command(
+                &fixture,
+                "destroy",
+                "guarded-home",
+                "alice",
+                "env-local",
+                &["--confirm", "guarded-home"],
+            ),
+            "storage",
+        );
+        assert_eq!(fs::read(protected.join("sentinel")).unwrap(), b"external");
+        assert!(fs::symlink_metadata(&home).is_ok());
+    }
+}
+
+#[test]
+fn environment_legacy_protocol_and_unsupported_capabilities_never_allocate_or_fallback() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("legacy", "ok");
+    fixture.target("env-local", "environment");
+    fixture.target("invalid-env", "environment-unknown");
+    let before = fixture.inventory();
+    assert_environment_error(
+        &environment_command(&fixture, "ensure", "no-legacy-home", "alice", "legacy", &[]),
+        "unsupported_capability",
+    );
+    assert_environment_error(
+        &environment_command(
+            &fixture,
+            "ensure",
+            "no-pty-home",
+            "alice",
+            "env-local",
+            &["--interactive-exec-pty"],
+        ),
+        "unsupported_capability",
+    );
+    assert!(
+        !environment_command(
+            &fixture,
+            "ensure",
+            "invalid-home",
+            "alice",
+            "invalid-env",
+            &[]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(fixture.inventory(), before);
+    for id in ["no-legacy-home", "no-pty-home", "invalid-home"] {
+        assert!(!fixture.0.join("storage/environments").join(id).exists());
+    }
+    json(&environment_command(
+        &fixture,
+        "ensure",
+        "valid-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    for operation in ["start", "stop"] {
+        assert_environment_error(
+            &environment_command(&fixture, operation, "valid-home", "alice", "env-local", &[]),
+            "unsupported_capability",
+        );
+    }
+    let prompt = fixture.0.join("env-prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    for (target, pty) in [("legacy", false), ("env-local", true)] {
+        let mut command = fixture.cli();
+        command
+            .args(["run", "test", "--harness", "fake", "--prompt-file"])
+            .arg(&prompt)
+            .args([
+                "--placement",
+                target,
+                "--environment",
+                "valid-home",
+                "--environment-owner",
+                "alice",
+                "--copy-limit-bytes",
+                "10485760",
+                "--json",
+            ]);
+        if pty {
+            command.arg("--interactive-exec-pty");
+        }
+        assert_environment_error(&command.output().unwrap(), "unsupported_capability");
+        assert_eq!(fixture.inventory(), before);
+    }
+    let legacy = json(
+        &fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--prompt-file"])
+            .arg(&prompt)
+            .args([
+                "--placement",
+                "legacy",
+                "--copy-limit-bytes",
+                "10485760",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(legacy["state"], "SUCCEEDED");
+    assert!(legacy["environment_id"].is_null());
+    verified_manifest(&fixture, &legacy);
+    let log = fs::read_to_string(fixture.0.join("target-legacy.jsonl")).unwrap();
+    assert!(
+        log.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .all(|request| !request["method"]
+                .as_str()
+                .unwrap()
+                .starts_with("target.environment."))
+    );
+}
+
+#[test]
+fn environment_cancellation_and_expired_active_lease_retain_private_home() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("local", "environment");
+    let ensured = json(&environment_command(
+        &fixture,
+        "ensure",
+        "cancel-home",
+        "alice",
+        "local",
+        &[],
+    ));
+    let home = PathBuf::from(ensured["home"].as_str().unwrap());
+    let binary = fixture.script_fake(&format!(
+        "printf cancellation-private-marker > \"$HOME/private-marker\"\nexec {:?} \"$@\"",
+        env!("CARGO_BIN_EXE_fabric-fake-harness")
+    ));
+    let prompt = fixture.0.join("env-cancel.json");
+    fs::write(&prompt, r#"{"process_tree":{"ignore_child_term":true}}"#).unwrap();
+    let options = fabric_core::run::RunOptions {
+        environment: Some(fabric_domain::EnvironmentSelection {
+            environment_id: "cancel-home".parse().unwrap(),
+            owner: "alice".into(),
+            interactive_exec_pty: false,
+        }),
+        copy_limit_bytes: 10485760,
+        limits: fabric_runner::ExecutionLimits {
+            timeout: std::time::Duration::from_secs(30),
+            term_grace: std::time::Duration::from_millis(100),
+        },
+        ..fixture.options()
+    };
+    let harness = fabric_runner::FakeHarness::new(binary).unwrap();
+    let report = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            fabric_core::run::foreground(
+                &fixture.0.join("storage"),
+                "test",
+                &prompt,
+                &harness,
+                &options,
+            )
+        });
+        wait_for_tree(&fixture);
+        let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+        db.execute("UPDATE worker_leases SET expires_at=0", [])
+            .unwrap();
+        let denied = environment_command(
+            &fixture,
+            "destroy",
+            "cancel-home",
+            "alice",
+            "local",
+            &["--confirm", "cancel-home"],
+        );
+        options.cancellation.cancel();
+        let result = worker.join().unwrap().unwrap();
+        assert_environment_error(&denied, "storage");
+        result
+    });
+    assert_eq!(report.state, fabric_domain::RunState::Cancelled);
+    assert_eq!(report.error_kind.as_deref(), Some("cancelled"));
+    let report = serde_json::to_value(report).unwrap();
+    assert_eq!(
+        verified_manifest(&fixture, &report)["stop_reason"],
+        "cancelled"
+    );
+    assert_tree_stopped(&fixture, &report);
+    assert_eq!(
+        fs::read(home.join("private-marker")).unwrap(),
+        b"cancellation-private-marker"
+    );
+    let inspected = json(&environment_command(
+        &fixture,
+        "inspect",
+        "cancel-home",
+        "alice",
+        "local",
+        &[],
+    ));
+    assert_eq!(inspected["runtime"], "available");
+    assert_eq!(inspected["runs"][0], report["run_id"]);
+    let destroyed = json(&environment_command(
+        &fixture,
+        "destroy",
+        "cancel-home",
+        "alice",
+        "local",
+        &["--confirm", "cancel-home"],
+    ));
+    assert_eq!(destroyed["runtime"], "absent");
+}
+
+#[test]
+fn environment_ensure_never_adopts_a_preexisting_caller_named_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("env-local", "environment");
+    let container = fixture.0.join("storage/environments/unowned-home");
+    let tree = container.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    for directory in [
+        container.parent().unwrap(),
+        container.as_path(),
+        tree.as_path(),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(tree.join("sentinel"), "not-owned").unwrap();
+    assert_environment_error(
+        &environment_command(
+            &fixture,
+            "ensure",
+            "unowned-home",
+            "alice",
+            "env-local",
+            &[],
+        ),
+        "storage",
+    );
+    let report = json(&environment_command(
+        &fixture,
+        "inspect",
+        "unowned-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    assert_eq!(report["runtime"], "unknown");
+    assert!(report["home"].is_null());
+    assert_environment_error(
+        &environment_command(
+            &fixture,
+            "destroy",
+            "unowned-home",
+            "alice",
+            "env-local",
+            &["--confirm", "unowned-home"],
+        ),
+        "storage",
+    );
+    assert_eq!(fs::read(tree.join("sentinel")).unwrap(), b"not-owned");
+}
+
+#[test]
+fn environment_rejects_native_auth_context_without_reading_or_exporting_it() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("env-local", "environment");
+    let ensured = json(&environment_command(
+        &fixture,
+        "ensure",
+        "private-home",
+        "alice",
+        "env-local",
+        &[],
+    ));
+    let home = PathBuf::from(ensured["home"].as_str().unwrap());
+    fs::write(home.join("private-marker"), b"keep-private").unwrap();
+    let profile_file = fixture.0.join("profile.json");
+    let prompt = fixture.0.join("environment-prompt.json");
+    fs::write(&prompt, b"{}").unwrap();
+    for profile in [
+        serde_json::json!({
+            "harness_id":"fake", "harness_version":"fabric-fake-harness 1",
+            "native_config_refs":[{"kind":"native-home","path":fixture.0.join("must-not-be-read")}]
+        }),
+        serde_json::json!({
+            "harness_id":"fake", "harness_version":"fabric-fake-harness 1",
+            "connection_refs":[{"kind":"native-auth","name":"must-not-be-exported"}]
+        }),
+    ] {
+        fs::write(&profile_file, serde_json::to_vec(&profile).unwrap()).unwrap();
+        let output = fixture
+            .cli()
+            .args([
+                "run",
+                "test",
+                "--harness",
+                "fake",
+                "--placement",
+                "env-local",
+                "--environment",
+                "private-home",
+                "--environment-owner",
+                "alice",
+                "--json",
+            ])
+            .arg("--profile")
+            .arg(&profile_file)
+            .arg("--prompt-file")
+            .arg(&prompt)
+            .output()
+            .unwrap();
+        assert_environment_error(&output, "unsupported_capability");
+        assert_eq!(
+            fs::read(home.join("private-marker")).unwrap(),
+            b"keep-private"
+        );
+        let db = rusqlite::Connection::open(fixture.0.join("storage/fabric.db")).unwrap();
+        for table in ["runs", "workspaces", "run_launch_receipts"] {
+            let count: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+}
+
+#[test]
+fn environment_destroy_allows_recovered_needs_attention_with_verified_inactive_lease() {
+    let fixture = Fixture::new();
+    fixture.setup();
+    fixture.target("local", "environment-crash");
+    let ensured = json(&environment_command(
+        &fixture,
+        "ensure",
+        "interrupted-home",
+        "alice",
+        "local",
+        &[],
+    ));
+    let home = PathBuf::from(ensured["home"].as_str().unwrap());
+    fs::write(fixture.0.join("await-worker"), "").unwrap();
+    let binary = fixture.script_fake(&format!(
+        "printf private > \"$HOME/private-marker\"\ntouch {:?}\nexec /bin/sleep 30",
+        fixture.0.join("worker-ready")
+    ));
+    let prompt = fixture.0.join("interrupted-prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    let output = fixture
+        .cli()
+        .args(["run", "test", "--harness", "fake", "--fake-binary"])
+        .arg(binary)
+        .arg("--prompt-file")
+        .arg(prompt)
+        .args([
+            "--environment",
+            "interrupted-home",
+            "--environment-owner",
+            "alice",
+            "--timeout-seconds",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let runs = json(
+        &fixture
+            .cli()
+            .args(["runs", "list", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let run_id = runs[0]["run_id"].as_str().unwrap();
+    let before = json(
+        &fixture
+            .cli()
+            .args(["runs", "show", run_id, "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(before["run"]["state"], "NEEDS_ATTENTION");
+    assert_eq!(fs::read(home.join("private-marker")).unwrap(), b"private");
+    let recovered = json(
+        &fixture
+            .cli()
+            .args(["recover", run_id, "--apply", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(recovered["action"], "reclaimed");
+    let destroyed = json(&environment_command(
+        &fixture,
+        "destroy",
+        "interrupted-home",
+        "alice",
+        "local",
+        &["--confirm", "interrupted-home"],
+    ));
+    assert_eq!(destroyed["runtime"], "absent");
+    assert!(!home.exists());
+    let after = json(
+        &fixture
+            .cli()
+            .args(["runs", "show", run_id, "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(after["run"]["state"], "NEEDS_ATTENTION");
+    assert_eq!(after["run"]["capture"], before["run"]["capture"]);
+    assert_sealed_artifacts(&fixture, run_id);
 }

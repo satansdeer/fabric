@@ -1,4 +1,5 @@
 mod connect;
+mod environment;
 mod onboarding;
 mod up;
 
@@ -33,6 +34,8 @@ enum Commands {
     Up(up::UpArgs),
     /// Maintain an authenticated outbound connection to a claimed generic Connect automation.
     Connect(connect::Options),
+    /// Durable private home lifecycle, independent of disposable run workspaces.
+    Environments(environment::Options),
     #[command(hide = true)]
     ConnectAdmit {
         #[arg(long)]
@@ -254,6 +257,10 @@ fn plugin_input_error() -> FabricError {
 }
 
 #[derive(Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Parsed once; keep spawn arguments inline without an extra heap allocation."
+)]
 enum WorkersCommands {
     Spawn(SpawnArgs),
     Show {
@@ -284,7 +291,7 @@ enum WorkersCommands {
 
 #[derive(Args)]
 struct SpawnArgs {
-    #[arg(long, required_unless_present = "project", conflicts_with_all = ["project", "harness", "prompt", "task_id", "model", "prepared_state", "commit"])]
+    #[arg(long, required_unless_present = "project", conflicts_with_all = ["project", "harness", "prompt", "task_id", "model", "prepared_state", "commit", "environment_id", "environment_owner", "interactive_exec_pty"])]
     request: Option<PathBuf>,
     #[arg(long, required_unless_present = "request")]
     project: Option<String>,
@@ -306,6 +313,8 @@ struct SpawnArgs {
     fake_binary: Option<PathBuf>,
     #[arg(long)]
     idempotency_key: Option<String>,
+    #[command(flatten)]
+    environment: environment::SelectionArgs,
 }
 
 #[derive(Subcommand)]
@@ -362,6 +371,8 @@ struct WorkerArgs {
     required_capabilities: Vec<Capability>,
     #[arg(long, default_value = "local")]
     placement: String,
+    #[command(flatten)]
+    environment: environment::SelectionArgs,
     #[arg(long, default_value = "edit")]
     access: String,
     #[arg(long)]
@@ -548,6 +559,7 @@ fn main() -> ExitCode {
     let (json, result) = match cli.command {
         Commands::Up(args) => (args.json, up::up(cli.root, args)),
         Commands::Connect(options) => (true, connect::run(cli.root, options)),
+        Commands::Environments(options) => (options.json(), environment::run(cli.root, options)),
         Commands::ConnectAdmit {
             automation,
             fake_binary,
@@ -785,6 +797,7 @@ fn write_spawn(root: Option<PathBuf>, args: SpawnArgs) -> Result<(), FabricError
                 source_ref,
                 model: args.model,
                 limits: None,
+                environment: args.environment.selection(),
             }],
         }
     };
@@ -886,6 +899,7 @@ fn run_options(
         },
         cancellation,
         target_pin: None,
+        environment: args.environment.selection(),
         max_cost_usd: args.max_cost_usd,
         storage: args.storage.options(),
         harness_request: HarnessRequest {

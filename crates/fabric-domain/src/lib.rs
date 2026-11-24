@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 mod capture;
 mod connector;
+mod environment;
 mod harness;
 mod ids;
 mod policy;
@@ -18,6 +19,7 @@ pub use connector::{
     ConnectorCapabilities, ConnectorDelivery, ConnectorInput, ConnectorPolicy, IncomingEvent,
     NormalizedTrigger, connector_id,
 };
+pub use environment::*;
 pub use harness::{
     Capability, CapabilityReason, CapabilityStatus, CapabilitySupport, HarnessCapabilityManifest,
     HarnessId, HarnessPlan, HarnessRequest, HarnessVersion,

@@ -47,7 +47,7 @@ Provider-free regression command: `cargo test -p fabric-runner --test plugins` p
 
 ## Installed execution targets
 
-`target.plan` and operation-token acknowledgments are removed, not compatibility aliases. After initialize/health, `target.capabilities {}` returns exactly `{"placements":["PLUGIN_ID"],"operations":["prepare","start","inspect","cancel","collect","reclaim"],"optional":[]}`. Optional PTY, persistent environments and infrastructure-evidence claims are rejected. Before admission, `target.placement {"placement":"PLUGIN_ID","backends":["host.local"]}` selects `{"backend":"host.local"}` or refuses with `{"backend":"unsupported"}`. Any installed target ID may select the offered backend; this is not a literal-`local` allowlist.
+`target.plan` and operation-token acknowledgments are removed, not compatibility aliases. After initialize/health, legacy `target.capabilities {}` returns exactly `{"placements":["PLUGIN_ID"],"operations":["prepare","start","inspect","cancel","collect","reclaim"],"optional":[]}`. This remains supported without extra exchanges or fields. The sole optional extension is `["environment.v1"]`, negotiated below; other claims fail closed. Before admission, `target.placement {"placement":"PLUGIN_ID","backends":["host.local"]}` selects `{"backend":"host.local"}` or refuses with `{"backend":"unsupported"}`. Any installed target ID may select the offered backend; this is not a literal-`local` allowlist.
 
 Target initialization, health and capability exchanges retain the five-second
 per-request startup bound. After negotiation, lifecycle operations and shutdown
@@ -92,7 +92,34 @@ A separately installed fake remote refuses placement before allocating runs/work
 
 `local` resolves through the registry like any other target, or to the distributed sibling `fabric-local-target` when no local registry entry exists. A revoked/broken installed local entry is an error, not permission to use the bundled executable. Admission pins manifest, executable SHA-256, placement and selected registry into the durable accepted plan and immutable schema-14 `run_targets` row before preparation. Execution/recovery never silently repin after upgrades; missing/revoked/changed plugins refuse finalization/reclaim and retain unknown cleanup evidence. Existing pre-target workspace records retain their original evidence-based recovery rules.
 
-The local executable and its installable SDK reference package ship with release tooling. Replacing the installed driver does not rebuild Core. This is a trusted local host-primitive interface, not remote execution, a sandbox, secrets relocation, PTY or persistent-environment support.
+The local executable and its installable SDK reference package ship with release tooling. Replacing the installed driver does not rebuild Core. The Rust local driver negotiates the environment extension; existing TypeScript/reference legacy targets retain `optional:[]`. Neither is remote execution, a sandbox or a PTY implementation.
+
+### Optional environment extension v1
+
+Protocol v1's existing `optional` list is the explicit opt-in; no fields are added to its strict legacy capabilities or lifecycle envelopes. A new host accepts old targets unchanged. An old host rejects a new opt-in rather than guessing support. After placement, an opted-in target receives `target.environment.capabilities {"version":1}` and returns exactly:
+
+```json
+{"version":1,"persistent_home":true,"interactive_exec_pty":false,"infrastructure_diagnostics":false,"operations":["ensure","inspect","destroy","workspace"]}
+```
+
+Unknown fields, versions, reordered/different operation sets or claims beyond these actual Core primitives are rejected. Only `host.local` is implemented. Legacy targets return typed `unsupported_capability` for requested environments or PTY; the host never substitutes a different target or locally allocates on their behalf. PTY, infrastructure diagnostics and start/stop have no implementation; their flags remain false and start/stop requests return typed unsupported without asserting a running/stopped runtime.
+
+| Negotiated method | Exact operation envelope | Core-owned primitive |
+| --- | --- | --- |
+| `target.environment.ensure` | `{placement,environment_id,grant,actions,context}` | `environment.ensure` |
+| `target.environment.inspect` | same | `environment.inspect` |
+| `target.environment.destroy` | same; context includes `confirmed:true` | `environment.destroy` |
+| `target.environment.workspace` | `{placement,run_id,grant,actions,context}`; context adds `environment_id` to preparation inputs | `workspace.fork` |
+
+The action reply and `target.completed` exchange retain the exact grant/receipt shapes above. Context, target actions and acknowledgments do not authenticate an owner, allocate an arbitrary path, assert successful destruction or grant deletion authority. Core captures resource identities, verifies owner/UID/immutable target pin and native leases, then performs effects on validated local objects. A refused action never falls back. Receipt failure reports failure while preserving already committed Core effects and durable reconciliation evidence.
+
+Schema v18 stores immutable environment ID, owner label/effective UID, full target pin and negotiated capabilities; one-time Core-captured root/namespace/container/home/marker identities; desired/runtime/observation facts; monotonic destroy intent; and immutable run/environment bindings. An ID is scoped by its immutable owner, not an authentication token: another owner cannot reuse or adopt it. Runs still have independent run/workspace identities and actual fork/source receipts. Environment state is `available`, `absent` or `unknown`, not a terminal RunState or an assertion about a VM/Pod. Inspect reconciles filesystem facts; desired destroy alone never establishes absence.
+
+Private storage is `ROOT/environments/ID/tree`, with HOME and private XDG config/data/cache/state roots there, outside prepared sources, run forks, snapshots and artifact directories. Normal cancel/recovery/reclaim never traverses it. Default capture remains cwd/source-only: explicitly copying or printing a secret into a workspace/output can still capture it. No native credentials/config are implicitly copied or exported. Only a portable context without native config/connection references and external home/config command roots can bind this HOME; unsafe native contexts fail typed unsupported before launch.
+
+Explicit destroy requires exact `--confirm ID`, matching immutable owner/UID/target, saved descriptor identities and marker, and positive inactive native lease proof for every bound terminal run. Expired timestamps, strings and receipts are not ownership proof. Symlink/replaced/unowned resource or config roots and unknown/stale leases fail closed. A namespace shared lock protects runs/inspection; mutations take its nonblocking exclusive lock, so any active environment run currently blocks all environment mutations. Destroy intent is durable before anchored deletion; interrupted deletion can resume only against the same captured resources. Missing/tampered resources or creation interrupted before ownership capture remain `unknown` and cannot be automatically adopted/recreated. Destroyed IDs remain immutable tombstones.
+
+Trust ceiling: trusted installed code, local same-UID/root processes and external HOME dependencies are not sandboxed; descriptor checks do not remove the walk-to-spawn race. Filesystem permissions scope other UIDs, not malicious code running as the owner. Storage is ordinary local plaintext; use independently managed filesystem/storage encryption if required. Fabric implements neither encryption nor credential brokerage.
 
 
 ## TypeScript SDK and pinned package installation

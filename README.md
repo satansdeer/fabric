@@ -30,7 +30,30 @@ Hosted GitHub intake: [Connect deployment and supervised consumer](docs/CONNECT.
 
 External trusted-local plugins: [installation, protocol v1 and authority boundary](docs/PLUGIN_PROTOCOL.md).
 
-**Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v13 adds bounded local observations to v12's immutable capture context; older runs have no retrospective activity samples and lacking capture evidence remain retained.
+## Durable execution environments
+
+An environment is an explicit stable owner/UID/target-bound identity and private HOME, not a run, workspace or VM scheduler. The negotiated `environment.v1` local backend supports ensure/create, inspect/reconcile, explicit destroy and disposable run workspace creation. Legacy protocol-v1 `optional:[]` targets continue ordinary runs; requesting persistence/PTY from them fails `unsupported_capability`, without fallback. PTY, infrastructure diagnostics and environment start/stop are unsupported.
+
+```sh
+fabric environments ensure development --owner alice --target local --json
+fabric environments inspect development --owner alice --target local --json
+fabric run my-project --harness fake --prompt-file /absolute/task.json \
+  --environment development --environment-owner alice --placement local --json
+fabric environments destroy development --owner alice --target local \
+  --confirm development --json
+```
+
+`run` and inline `workers spawn` accept `--environment ID --environment-owner OWNER`; PTY requests use `--interactive-exec-pty` and currently fail typed unsupported. JSON worker tasks accept `"environment":{"environment_id":"development","owner":"alice","interactive_exec_pty":false}`. The accepted plan retains selection across manager restarts. Ensure the environment first using the exact target/owner; no auto-placement, adoption or repinning occurs.
+
+Each run has a distinct real run/workspace identity, immutable prepared-source pin and disposable writable fork/cwd. HOME and XDG config/data/cache/state live separately under `ROOT/environments/ID/tree`; a later run or recreated target sees the same private state. Normal reclaim, cancellation and recovery never remove it. Default artifacts/snapshots capture run source/output, not HOME; explicitly copying or printing secrets into a run can still capture them.
+
+Environment reports separate desired `available`/`destroyed` from observed runtime `available`/`absent`/`unknown`, observation time/reason, capabilities and dependent runs. No `RUNNING`/`DESTROYED` inference comes from a desired state or target receipt. Inspection verifies real owned resources; missing/replaced/symlink/unowned roots become unknown. Creation interrupted before ownership capture cannot adopt existing paths; destroyed IDs remain tombstones.
+
+Destroy requires exact ID confirmation, immutable owner/effective UID/full target pin, Core-captured descriptor identities for HOME and all five XDG directory roots, an ownership marker, and positive inactive native lease proof for every bound terminal run (including recovered `NEEDS_ATTENTION`). Expiry alone, stale/replaced leases and caller strings are insufficient. Interrupted owned deletion has durable intent and can resume; uncertainty retains resources. Current namespace locking serializes mutations and refuses them while **any** environment run is active.
+
+Only portable credential-free contexts without native config/auth references or external command home/config roots can use persistent HOME. Unsafe native contexts return typed unsupported; there is no implicit credential copy/export or change to native connectors/auth defaults. This is same-UID trusted-local storage with private permissions, **not** a sandbox, vault or encryption implementation. Owner names are labels; use independently managed filesystem encryption where required. See the [protocol/storage trust contract](docs/PLUGIN_PROTOCOL.md#optional-environment-extension-v1).
+
+**Upgrade:** finish active/queued work, then run the old binary's `fabric --root "$ROOT" manager stop --json` before switching binaries/schema. Stop refuses active work; a successful reply guarantees endpoint/ownership release. Do not kill active work or attempt a live in-place manager upgrade. Schema v18 adds durable execution environments and immutable run bindings; v17 added actual-fork source receipts. Existing older runs receive neither retrospective source/capture evidence nor automatic environment bindings.
 
 ```sh
 cargo build --locked -p fabric-cli
