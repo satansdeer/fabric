@@ -633,14 +633,16 @@ fn validate_connector_capabilities(
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)] // Timeout observation must run before session teardown.
 fn exchange_bounded(
-    (input, output): (&mut impl Write, &mut impl Read),
+    (input, output): (&mut impl Write, &mut BufReader<impl Read>),
     id: u64,
     method: &str,
     params: Value,
     deadline: Instant,
     cancel: &CancellationToken,
     frame_limit: usize,
+    on_timeout: impl FnOnce() -> Value,
 ) -> Result<Value, FabricError> {
     let mut request =
         serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
@@ -666,10 +668,26 @@ fn exchange_bounded(
             } else {
                 "response_read"
             };
+            let mut evidence = on_timeout();
+            evidence["request_id"] = json!(id);
+            evidence["method"] = json!(if method.len() <= 64
+                && method
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+            {
+                method
+            } else {
+                "UNKNOWN"
+            });
+            evidence["phase"] = json!(phase);
+            evidence["sent_bytes"] = json!(sent);
+            evidence["total_bytes"] = json!(request.len());
+            evidence["received_bytes"] = json!(frame.len());
+            evidence["buffered_bytes"] = json!(output.buffer().len());
             return Err(FabricError {
                 kind: ErrorKind::Output,
                 message: format!(
-                    "Plugin: timeout. RPC {method} (request {id}, phase {phase}, sent {sent}/{} bytes, received {} bytes).",
+                    "Plugin: timeout. RPC {method} (request {id}, phase {phase}, sent {sent}/{} bytes, received {} bytes). Timeout evidence: {evidence}",
                     request.len(),
                     frame.len()
                 ),
@@ -858,7 +876,7 @@ mod tests {
                 Err(error) => panic!("{error}"),
             }
         }
-        let mut output = input.try_clone().unwrap();
+        let mut output = BufReader::new(input.try_clone().unwrap());
         let start = Instant::now();
         let error = exchange_bounded(
             (&mut input, &mut output),
@@ -868,6 +886,7 @@ mod tests {
             start + Duration::from_millis(50),
             &CancellationToken::default(),
             MAX_FRAME,
+            || json!({}),
         )
         .unwrap_err();
         assert!(error.message.contains("timeout"));
@@ -890,8 +909,9 @@ mod tests {
             ("harness.normalize", MAX_FRAME, false),
         ] {
             let mut input = Vec::new();
-            let mut output =
-                std::io::Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+            let mut output = BufReader::new(std::io::Cursor::new(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
+            ));
             let result = exchange_bounded(
                 (&mut input, &mut output),
                 1,
@@ -900,6 +920,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(5),
                 &cancel,
                 limit,
+                || json!({}),
             );
             if accepted {
                 assert_eq!(result.unwrap(), json!({}));
@@ -912,7 +933,7 @@ mod tests {
             }
         }
         let mut input = Vec::new();
-        let mut output = std::io::Cursor::new(vec![b'x'; 2 * MAX_FRAME]);
+        let mut output = BufReader::new(std::io::Cursor::new(vec![b'x'; 2 * MAX_FRAME]));
         let error = exchange_bounded(
             (&mut input, &mut output),
             1,
@@ -921,6 +942,7 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
             &cancel,
             2 * MAX_FRAME,
+            || json!({}),
         )
         .unwrap_err();
         assert!(error.message.contains("frame_too_large"));

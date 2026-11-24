@@ -61,6 +61,62 @@ independent watchdog or a guarantee against longer scheduling pauses. Any
 overrun fails closed; owned processes are stopped and reaped, committed host
 evidence is retained, and no retry or local fallback occurs.
 
+On a shared transport deadline, the original `Plugin: timeout. RPC ...` error is
+preserved and followed by `Timeout evidence: {JSON}` (schema `version:1`). The
+snapshot is taken synchronously before the session returns the error, drops its
+transport or signals/reaps its owned plugin. It therefore covers startup,
+persistent target operations/receipts/shutdown, fresh recovery sessions and the
+other users of the same plugin transport, not just `target.completed`.
+
+The bounded metadata contains the actual retained direct-child PID, spawn-parent
+PID, observed process group (or an explicit unavailable/unknown state), and one
+non-reaping `waitid(WEXITED|WNOHANG|WNOWAIT)` observation: not exited, stopped with
+observed signal, observed exit code/signal, or UNKNOWN with a fixed reason.
+On macOS, `WEXITED` can return a stopped child; only terminal `CLD_*` codes count
+as exit. `not_exited` does not mean running. `try_wait` is explicitly UNKNOWN because calling it
+could reap the group leader and release the PID anchor needed for safe
+group-wide termination. Descendants are **not sampled** and are never presented
+as the transport child. An observed signal does not identify its sender or cause.
+
+Budget fields are microseconds: configured host timeout, current effective
+timeout, remaining budget at call entry, and monotonic call/session elapsed time.
+The deadline scope distinguishes per-request from legacy session deadlines.
+Protocol v1 does not negotiate a remote timeout (`negotiated_budget:
+not_in_protocol`); the post-negotiation host target cap remains one second.
+Request ID, bounded method label, phase, sent/total bytes, received frame bytes
+and the current `BufReader` **buffered byte count only** complete the snapshot.
+Received bytes exclude the frame terminator. A zero buffer count says nothing
+about unread kernel-pipe data; a nonzero count does not prove a complete reply.
+The observations are not an atomic process trace or remote latency measurement.
+
+No request/response bytes, parameters, prompt, terminal content, argv, environment,
+paths, tokens or remote error text are added. Only numeric OS errors and fixed
+failure reasons are recorded, without polling, process scans or new log streams.
+The existing error path exposes this evidence to callers and, for failed runs,
+retains it with the workspace retention reason. Capture limits, raw-pipe drain,
+group termination, direct-child reap, ownership and cleanup authority are
+unchanged. This is diagnostic coverage, **not an established fix** for issue #76.
+The historical missing-response cause remains NOT_ESTABLISHED; no retry, timeout
+increase, fallback or exact OMP-version admission restriction is introduced.
+
+Provider-free regression source uses the actual `fabric-local-target` child:
+a confirmed stopped child times out awaiting its pending completion receipt;
+a real buffered reference reply is counted without consumption/disclosure; and
+an observed exited child retains its group PID anchor until cleanup. A separately
+reaped child reports numeric `ECHILD` and no group lookup. Existing consumer
+timeout coverage also checks the snapshot's actual owned PID. Worker verification
+is NOT_RUN_BY_WORKER; manager prerequisite and narrow commands:
+
+```sh
+cargo build -p fabric-cli --bin fabric-local-target
+cargo test -p fabric-runner --lib plugin::session::tests::
+cargo test -p fabric-runner --lib plugin::tests::
+cargo test -p fabric-runner --test plugins target_timeout_identifies_rpc_and_exchange_phase_without_host_effects -- --exact
+cargo test -p fabric-runner --lib supervision::tests::
+cargo test -p fabric-runner --test plugins target_delayed_inspection_does_not_kill_a_healthy_worker -- --exact
+cargo test -p fabric-runner --test plugins cancellation_reaps_live_plugin -- --exact
+```
+
 Each `target.OP` receives `{placement,run_id,grant,actions,context}`. The opaque grant is scoped to that request and the offered actions; context contains bounded nonsecret inputs, not authority. The exact reply is `{grant,action}` selecting one offered action, or `{grant,action:{primitive:"unsupported"}}`. Unknown fields, stale grants, unoffered actions, paths, commands, PIDs and plugin-supplied outcomes fail closed. Core executes the selected primitive against captured validated objects inside this boundary, not after an acknowledgment. A separate target can, for example, select `copy` rather than `clone_or_copy` for preparation without rebuilding Core.
 
 Grant identifiers are 1–128 ASCII letters, digits, `_` or `-`. Drivers reject every
