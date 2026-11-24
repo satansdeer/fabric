@@ -3995,7 +3995,9 @@ fn storage_concurrent_workers_share_atomic_admission() {
         + options.max_log_bytes
         + options.max_artifact_bytes;
     options.storage.policy.max_managed_bytes =
-        fabric_core::workspace::storage::usage(&root).unwrap() + reservation + 512 * 1024;
+        fabric_core::workspace::storage::usage(&root, &options.storage).unwrap()
+            + reservation
+            + 512 * 1024;
     let barrier = std::sync::Barrier::new(2);
     let results = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..2)
@@ -4053,7 +4055,9 @@ fn storage_evicts_only_unreferenced_cache_and_same_key_rebuilds() {
         + options.max_log_bytes
         + options.max_artifact_bytes;
     options.storage.policy.max_managed_bytes =
-        fabric_core::workspace::storage::usage(&root).unwrap() + reservation - 1024 * 1024;
+        fabric_core::workspace::storage::usage(&root, &options.storage).unwrap()
+            + reservation
+            - 1024 * 1024;
     let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
     assert_eq!(report.state, fabric_domain::RunState::Succeeded);
     assert!(!Path::new(&old.prepared_path).exists());
@@ -4118,7 +4122,7 @@ fn storage_prepare_reuses_validated_ready_identity_without_fresh_admission() {
             ..Default::default()
         };
         options.policy.max_managed_bytes =
-            fabric_core::workspace::storage::usage(&root).unwrap() + 4096;
+            fabric_core::workspace::storage::usage(&root, &options).unwrap() + 4096;
         options.policy.max_workspace_bytes = options.policy.max_managed_bytes - 2;
         options.policy.max_log_bytes_per_run = 1;
         options.policy.max_artifact_bytes_per_run = 1;
