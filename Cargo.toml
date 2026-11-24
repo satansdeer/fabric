@@ -23,3 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fabric-domain = { path = "crates/fabric-domain" }
 fabric-core = { path = "crates/fabric-core" }
+
+# Integrity checks hash installed runtimes, including large Node executables.
+[profile.dev.package.sha2]
+opt-level = 3
