@@ -1236,6 +1236,7 @@ fn recovered_report(
     Ok(Some(RunReport {
         run_id: run.run_id.to_string(),
         workspace_id: run.workspace_id.to_string(),
+        environment_id: store.run_environment(&run.run_id).map_err(error)?,
         prepared_state_id: run.prepared_state_id.to_string(),
         base_commit_sha: run.base_commit_sha.clone(),
         source: store.task_source(&run.run_id).map_err(error)?,

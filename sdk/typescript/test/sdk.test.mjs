@@ -90,6 +90,24 @@ test('a third-party target can select concrete host plans without using the loca
   assert.deepEqual(proof.result, { placements: ['alternate'], operations: TARGET_OPERATIONS, optional: [] });
 });
 
+test('target conformance rejects unknown, mixed, duplicate and malformed optional capabilities', async t => {
+  const root = temporary(t);
+  for (const [i, optional] of [['future.v1'], ['environment.v1', 'future.v1'], ['environment.v1', 'environment.v1'], 'environment.v1'].entries()) {
+    const project = create('target', join(root, `invalid-optional-${i}`));
+    const { info } = directory(project);
+    rawPlugin(project, `import {createInterface} from 'node:readline';
+      for await (const line of createInterface({input:process.stdin})) {
+        const request=JSON.parse(line);
+        const result=request.method==='initialize'
+          ? ${JSON.stringify({protocol:1,id:info.id,version:info.version,kind:'target'})}
+          : request.method==='health' ? {ready:true}
+          : ${JSON.stringify({placements:[info.id],operations:TARGET_OPERATIONS,optional})};
+        process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\\n');
+      }`);
+    await assert.rejects(conformance(project), /unsupported_target_capabilities/);
+  }
+});
+
 test('target conformance requires concrete plans and receipts for every operation; fake remote refuses separately', async t => {
   const root = temporary(t);
   for (const failure of ['unsupported', 'receipt', 'remote']) {
@@ -407,7 +425,7 @@ test('reference local target package passes lifecycle conformance and installed 
   const root = temporary(t);
   const project = reference('local', join(root, 'local'), process.env.FABRIC_LOCAL_TARGET_BINARY);
   const proof = await conformance(project);
-  assert.deepEqual(proof.result, { placements: ['local'], operations: TARGET_OPERATIONS, optional: [] });
+  assert.deepEqual(proof.result, { placements: ['local'], operations: TARGET_OPERATIONS, optional: ['environment.v1'] });
   assert.equal(archive(pack(directory(project))).hash, directory(project).hash);
   if (!hostSkip) {
     const registry = join(root, 'registry');

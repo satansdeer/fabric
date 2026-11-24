@@ -241,7 +241,20 @@ pub(crate) fn execute_observed(
         .env("PATH", "/usr/bin:/bin")
         .env("LC_ALL", "C");
     // Keep private discovery roots alive through supervised termination and reap.
-    let _runtime_home = profile::private_environment(&mut command)?;
+    let _runtime_home = if [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+    ]
+    .into_iter()
+    .all(|name| spec.environment.iter().any(|(key, _)| key == name))
+    {
+        None
+    } else {
+        Some(profile::private_environment(&mut command)?)
+    };
     command
         .envs(spec.environment.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())

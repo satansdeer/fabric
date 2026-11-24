@@ -17,6 +17,8 @@ pub struct WorkerTask {
     pub model: Option<String>,
     #[serde(default)]
     pub limits: Option<WorkerLimits>,
+    #[serde(default)]
+    pub environment: Option<crate::EnvironmentSelection>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

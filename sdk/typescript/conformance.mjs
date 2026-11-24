@@ -127,7 +127,8 @@ export async function conformance(path, { timeout = 5000, connectorFixture } = {
       if (!exact(result, ['placements', 'operations', 'optional']) ||
           JSON.stringify(result.placements) !== JSON.stringify([info.id]) ||
           JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
-          !Array.isArray(result.optional) || result.optional.length) fail('unsupported_target_capabilities');
+          !Array.isArray(result.optional) ||
+          !(result.optional.length === 0 || result.optional.length === 1 && result.optional[0] === 'environment.v1')) fail('unsupported_target_capabilities');
       const placement = await call('target.placement', { placement: info.id, backends: ['host.local'] });
       if (!exact(placement, ['backend']) || placement.backend !== 'host.local') fail('unsupported_target_placement');
       // Transport fixtures only. Real execution/ownership evidence comes from Core, not this probe.

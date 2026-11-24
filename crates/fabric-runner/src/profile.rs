@@ -133,7 +133,7 @@ pub fn managed_evidence(
         ));
     }
     evidence(request, manifest, format!("{:x}", Sha256::digest(b"fabric-private-home-v1")), true, vec![CapabilityReason {
-        code: "private_runtime_home".into(), message: "Fresh private HOME/XDG; no native user config or credentials inherited. Project config belongs to the pinned base commit, not this fingerprint.".into(),
+        code: "private_runtime_home".into(), message: "Core-scoped private HOME/XDG (fresh unless explicitly bound to a durable environment); no native user config or credentials inherited. Project config belongs to the pinned base commit, not this fingerprint.".into(),
     }])
 }
 
