@@ -1,4 +1,4 @@
-//! Pinned OMP print-mode adapter with explicit trusted-local profile authorization.
+//! CLI-discovered OMP print-mode adapter with exact observed-version profile authorization.
 use std::path::PathBuf;
 
 use fabric_domain::{
@@ -8,7 +8,61 @@ use fabric_domain::{
 
 use crate::{AgentSpec, CommandSpec, HarnessAdapter, HarnessInfo, NativeEvent, execution_error};
 
-const SUPPORTED_VERSION: &str = "omp/19.1.0";
+#[cfg(test)]
+const SUPPORTED_VERSION: &str = "omp/19.1.1";
+const SUPPORTED_PROTOCOL: &str = "discovered OMP print-mode JSON CLI contract";
+
+fn check_version(version: &str) -> Result<(), FabricError> {
+    fabric_domain::HarnessVersion::validate(version)?;
+    let mut parts = version.strip_prefix("omp/").unwrap_or_default().split('.');
+    if !(0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) || parts.next().is_some()
+    {
+        return Err(FabricError {
+            kind: fabric_domain::ErrorKind::UnsupportedVersion,
+            message: "Expected an OMP version identity of the form omp/<major>.<minor>.<patch>."
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn check_help(help: &str) -> Result<(), FabricError> {
+    let option_line = |flag: &str| {
+        help.lines().find(|line| {
+            line.trim_start().starts_with('-')
+                && line
+                    .split_whitespace()
+                    .take_while(|token| token.starts_with('-'))
+                    .any(|token| token.trim_end_matches(',').split('=').next() == Some(flag))
+        })
+    };
+    for flag in ["-p", "--mode", "--no-session", "--no-title", "--max-cost"] {
+        if option_line(flag).is_none() {
+            return Err(FabricError {
+                kind: fabric_domain::ErrorKind::UnsupportedCapability,
+                message: format!(
+                    "OMP CLI is incompatible: required option {flag} is not advertised."
+                ),
+            });
+        }
+    }
+    if !option_line("--mode").is_some_and(|line| {
+        line.split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+        })
+        .any(|token| token == "json")
+    }) {
+        return Err(FabricError {
+            kind: fabric_domain::ErrorKind::UnsupportedCapability,
+            message: "OMP CLI must advertise print mode and JSON output.".into(),
+        });
+    }
+    Ok(())
+}
 
 #[path = "omp_profile.rs"]
 mod profile;
@@ -40,7 +94,11 @@ impl HarnessAdapter for OmpHarness {
             &self.binary,
             crate::profile::runtime_environment(&self.binary)?,
         )?;
-        crate::planning::check_version("omp", &version, SUPPORTED_VERSION)?;
+        check_version(&version)?;
+        check_help(&crate::probe_help(
+            &self.binary,
+            crate::profile::runtime_environment(&self.binary)?,
+        )?)?;
         Ok(HarnessInfo { version })
     }
 
@@ -49,12 +107,17 @@ impl HarnessAdapter for OmpHarness {
     }
 
     fn capabilities(&self, info: &HarnessInfo) -> Result<HarnessCapabilityManifest, FabricError> {
+        check_version(&info.version)?;
         let mut manifest = crate::planning::local_manifest(
             self.id(),
             info,
-            SUPPORTED_VERSION,
+            &info.version,
             CapabilitySupport::Native,
         )?;
+        manifest.supported_versions = SUPPORTED_PROTOCOL.into();
+        for status in &mut manifest.capabilities {
+            status.minimum_version = None;
+        }
         let usage = manifest
             .capabilities
             .iter_mut()
@@ -62,8 +125,7 @@ impl HarnessAdapter for OmpHarness {
             .expect("complete manifest");
         usage.support = CapabilitySupport::Native;
         usage.reason.code = "tested_message_end_usage".into();
-        usage.reason.message = "Pinned print-mode assistant message_end reports token usage when available; absent usage/pricing remains unknown.".into();
-        usage.minimum_version = Some(SUPPORTED_VERSION.into());
+        usage.reason.message = "Print-mode assistant message_end reports optional token usage; absent usage/pricing remains unknown. CLI discovery does not verify future wire semantics.".into();
         let profile = manifest
             .capabilities
             .iter_mut()
@@ -105,7 +167,15 @@ impl HarnessAdapter for OmpHarness {
     }
 
     fn command(&self, spec: &AgentSpec<'_>) -> Result<CommandSpec, FabricError> {
-        let plan = crate::profile::revalidate(self, spec, SUPPORTED_VERSION)?;
+        let version = &spec
+            .request
+            .profile
+            .as_ref()
+            .ok_or_else(|| {
+                crate::profile::invalid("OMP command requires an exact-version profile.")
+            })?
+            .harness_version;
+        let plan = crate::profile::revalidate(self, spec, version)?;
         let (profile, mut environment) = profile::resolve(&plan.request, &plan.manifest, true)?;
         if profile.digest != spec.profile.digest {
             return Err(crate::profile::invalid(
@@ -144,12 +214,58 @@ impl HarnessAdapter for OmpHarness {
     }
 
     fn normalize_event(&self, event: NativeEvent<'_>) -> Option<AgentEvent> {
-        // v19.1.0 print-mode.ts printableEvent and agent/src/types.ts:
+        // v19.1.0/v19.1.1 print-mode.ts printableEvent and agent/src/types.ts:
         // message_update drops snapshots; authoritative usage is on message_end.
         let NativeEvent::Json(value) = event else {
             return None;
         };
-        match value["type"].as_str()? {
+        let incompatible = || {
+            Some(AgentEvent::Failure {
+                code: "omp_incompatible_protocol".into(),
+                message: "OMP emitted a malformed required print-mode event.".into(),
+            })
+        };
+        let kind = value["type"].as_str()?;
+        let valid = match kind {
+            "message_update" => {
+                let update = &value["assistantMessageEvent"];
+                update["type"].is_string()
+                    && (update["type"] != "text_delta" || update["delta"].is_string())
+            }
+            "tool_execution_start" | "tool_execution_end" => value["toolName"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()),
+            "message_end" => {
+                let message = &value["message"];
+                message["role"].is_string()
+                    && message.get("usage").is_none_or(|usage| {
+                        usage.is_null()
+                            || usage.as_object().is_some_and(|usage| {
+                                ["input", "output", "cacheRead"].iter().all(|key| {
+                                    usage
+                                        .get(*key)
+                                        .is_none_or(|tokens| tokens.is_null() || tokens.is_u64())
+                                })
+                            })
+                    })
+            }
+            "agent_end" => {
+                value["isTerminal"].is_boolean()
+                    && value["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().all(|message| {
+                            message["role"].is_string()
+                                && message
+                                    .get("stopReason")
+                                    .is_none_or(serde_json::Value::is_string)
+                        })
+                    })
+            }
+            _ => true,
+        };
+        if !valid {
+            return incompatible();
+        }
+        match kind {
             "message_update" => {
                 let update = &value["assistantMessageEvent"];
                 match update["type"].as_str()? {
@@ -212,37 +328,100 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    const HELP: &str = "  -p, --print  Print and exit\n  --mode <mode>  Output mode: text, json, rpc\n  --no-session  Disable session\n  --no-title  Disable title\n  --max-cost <cost>  Request budget";
+
+    fn write_probe_binary(binary: &std::path::Path, version: &str, help: &str) {
+        fs::write(
+            binary,
+            format!("#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' '{help}'; else printf '{version}\\n'; fi\n"),
+        )
+        .unwrap();
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     #[test]
-    fn probe_rejects_unsupported_omp_version_with_typed_failure() {
+    fn probe_rejects_malformed_omp_versions_with_typed_failure() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("omp");
-        fs::write(&binary, "#!/bin/sh\nprintf 'omp/99.0.0\\n'\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let harness = OmpHarness { binary };
-        assert!(matches!(
-            harness.probe(),
-            Err(FabricError {
-                kind: fabric_domain::ErrorKind::UnsupportedVersion,
-                ..
-            })
-        ));
+        let harness = OmpHarness {
+            binary: binary.clone(),
+        };
+        for version in [
+            "other/19.1.1",
+            "omp/19.1",
+            "omp/19.x.1",
+            "omp/19.1.1.0",
+            "omp/19.1.1+build",
+            "omp/19.1.1-fixture+exact",
+        ] {
+            write_probe_binary(&binary, version, HELP);
+            assert!(matches!(
+                harness.probe(),
+                Err(FabricError {
+                    kind: fabric_domain::ErrorKind::UnsupportedVersion,
+                    ..
+                })
+            ));
+            assert_eq!(
+                harness
+                    .capabilities(&HarnessInfo {
+                        version: version.into(),
+                    })
+                    .unwrap_err()
+                    .kind,
+                fabric_domain::ErrorKind::UnsupportedVersion
+            );
+        }
+    }
+
+    #[test]
+    fn probe_rejects_missing_required_cli_options_without_a_model_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("omp");
+        let harness = OmpHarness {
+            binary: binary.clone(),
+        };
+        for (option, replacement) in [
+            ("--mode", "--model"),
+            ("--no-session", "--no-sessions"),
+            ("--no-title", "--no-titles"),
+            ("--max-cost", "--max-costly"),
+            ("-p, --print", "--printer"),
+            ("-p, --print", "--print"),
+            ("json", "json-lines"),
+        ] {
+            let help = format!(
+                "{}\nDescription mentions {option} but does not advertise it.",
+                HELP.replace(option, replacement)
+            );
+            write_probe_binary(&binary, "omp/19.1.99", &help);
+            assert_eq!(
+                harness.probe().err().unwrap().kind,
+                fabric_domain::ErrorKind::UnsupportedCapability,
+                "{option}"
+            );
+        }
     }
 
     #[test]
     fn exact_version_plan_preserves_native_cost_argv_and_rejects_unverified_features() {
+        for version in ["omp/19.1.0", "omp/19.1.1", "omp/19.1.99", "omp/20.0.0"] {
+            assert_exact_version_plan(version);
+        }
+    }
+
+    fn assert_exact_version_plan(version: &str) {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("omp");
-        fs::write(&binary, "#!/bin/sh\nprintf 'omp/19.1.0\\n'\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        write_probe_binary(&binary, version, HELP);
         let harness = OmpHarness { binary };
         let info = harness.probe().unwrap();
-        assert_eq!(info.version, "omp/19.1.0");
+        assert_eq!(info.version, version);
         let request = HarnessRequest {
             max_cost_usd: Some(0.25),
             profile: Some(fabric_domain::AgentProfile {
                 harness_id: harness.id(),
-                harness_version: SUPPORTED_VERSION.into(),
+                harness_version: version.into(),
                 native_config_refs: vec![fabric_domain::NativeConfigRef {
                     kind: "native-home".into(),
                     path: temp.path().to_owned(),
@@ -266,7 +445,8 @@ mod tests {
         .unwrap();
         let plan = harness.plan(&request, &info).unwrap();
         assert_eq!(plan.manifest.capabilities.len(), 13);
-        assert_eq!(plan.manifest.supported_versions, "omp/19.1.0");
+        assert_eq!(plan.manifest.exact_version, version);
+        assert_eq!(plan.manifest.supported_versions, SUPPORTED_PROTOCOL);
         assert!(plan.model_resolved.is_none());
         let prompt = temp.path().join("prompt");
         fs::write(&prompt, "literal --prompt").unwrap();
@@ -278,6 +458,24 @@ mod tests {
                 max_cost_usd: plan.request.max_cost_usd,
             })
             .unwrap();
+        let mut mismatched = request.clone();
+        mismatched.profile.as_mut().unwrap().harness_version = if version == "omp/19.1.0" {
+            "omp/19.1.1"
+        } else {
+            "omp/19.1.0"
+        }
+        .into();
+        assert!(harness.plan(&mismatched, &info).is_err());
+        assert!(
+            harness
+                .command(&AgentSpec {
+                    profile: &plan.profile,
+                    prompt_file: &prompt,
+                    request: &mismatched,
+                    max_cost_usd: plan.request.max_cost_usd,
+                })
+                .is_err()
+        );
         assert_eq!(
             command.args,
             [
@@ -321,17 +519,6 @@ mod tests {
             assert_eq!(
                 harness.plan(&request, &info).unwrap_err().kind,
                 fabric_domain::ErrorKind::InvalidArguments
-            );
-        }
-        for version in ["omp/19.1.1", "omp/19.1.0+build", "omp/19.1.0-fixture+exact"] {
-            assert_eq!(
-                harness
-                    .capabilities(&HarnessInfo {
-                        version: version.into(),
-                    })
-                    .unwrap_err()
-                    .kind,
-                fabric_domain::ErrorKind::UnsupportedVersion
             );
         }
         // The opt-in controller uses the same native plan/command path, not a wrapper.
@@ -485,6 +672,19 @@ mod tests {
                 text: "hello".into()
             })
         );
+        for value in [
+            serde_json::json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta"}}),
+            serde_json::json!({"type":"tool_execution_start"}),
+            serde_json::json!({"type":"message_end"}),
+            serde_json::json!({"type":"message_end","message":{"role":"assistant","usage":{"input":"9"}}}),
+            serde_json::json!({"type":"agent_end","messages":[]}),
+            serde_json::json!({"type":"agent_end","isTerminal":true,"messages":{}}),
+        ] {
+            assert!(matches!(
+                normalize(value),
+                Some(AgentEvent::Failure { code, .. }) if code == "omp_incompatible_protocol"
+            ));
+        }
         assert!(matches!(
             normalize(
                 serde_json::json!({"type":"tool_execution_end","toolName":"bash","isError":true})
@@ -602,7 +802,7 @@ mod tests {
             let profile = rejected.profile.as_mut().unwrap();
             match mutation {
                 0 => profile.harness_id = "fake-a".parse().unwrap(),
-                1 => profile.harness_version = "omp/19.1.1".into(),
+                1 => profile.harness_version = "omp/19.1.0".into(),
                 2 => profile.native_config_refs[0].kind = "unknown-native-ref".into(),
                 3 => profile.connection_refs[0].name = "unknown-connection".into(),
                 4 => profile.skills.push("required-skill".into()),

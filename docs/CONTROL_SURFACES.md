@@ -9,8 +9,12 @@ Execution is macOS-first trusted-local, selected through an installed target dri
 
 ## Native OMP setup
 
-Requires OMP **19.1.0**, a built Fabric CLI and its siblings
+Requires compatible native OMP, a built Fabric CLI and its siblings
 `fabric-fake-harness` and `fabric-local-target` for the deterministic example.
+Worker discovery checks the required print/JSON CLI surface rather than an OMP release allowlist;
+each authorization remains bound to the exact observed version. Print mode has no negotiated
+wire version, so discovery alone does not prove future event semantics. See the README compatibility contract.
+The actual-host smoke separately exercises native extension schemas/tools against the installed OMP.
 No npm install is required; OMP provides `ExtensionAPI`, `pi.zod`, and type-only imports.
 From the Fabric checkout, build when needed:
 

@@ -130,7 +130,8 @@ const errors: unknown[] = [];
 try {
 	await mkdir(repo);
 	const version = await exec(omp, ["--version"]);
-	assert.equal(version.code, 0); assert.equal(version.stdout.trim(), "omp/19.1.0", "smoke requires the pinned installed OMP 19.1.0");
+	assert.equal(version.code, 0);
+	assert.match(version.stdout.trim(), /^omp\/\d+\.\d+\.\d+$/, "smoke requires an OMP version identity; compatibility is exercised below, not inferred from a release pin");
 	for (const args of [["init", "--quiet"], ["config", "core.hooksPath", "/dev/null"]]) assert.equal((await exec("/usr/bin/git", args)).code, 0);
 	await writeFile(join(repo, "tracked"), "original\n");
 	assert.equal((await exec("/usr/bin/git", ["add", "."])).code, 0);

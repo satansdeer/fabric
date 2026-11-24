@@ -241,6 +241,12 @@ test -n "$XDG_DATA_HOME"
 test -n "$XDG_STATE_HOME"
 test -n "$XDG_CACHE_HOME"
 test -z "${UNSELECTED_SECRET-}${OMP_PROFILE-}${PI_PROFILE-}${PI_CONFIG_FILES-}${CLAUDE_CONFIG_DIR-}${HTTPS_PROXY-}"
+if [ "$1" = --help ]; then
+    test ! -e "$HOME/.omp"
+    test -z "${OPENAI_API_KEY-}"
+    printf '%s\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'
+    exit 0
+fi
 if [ "$1" = --version ]; then
     test ! -e "$HOME/.omp"
     test -z "${OPENAI_API_KEY-}"
@@ -253,7 +259,7 @@ if [ -n "${OPENAI_API_KEY-}" ]; then
     test "$OPENAI_API_KEY" = authorized-key-secret-sentinel
 fi
 printf 'native fixture changed source' > tracked
-printf '{"type":"message_end"}\n'
+printf '{"type":"message_end","message":{"role":"assistant"}}\n'
 "#).unwrap();
         fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
         serde_json::json!({
@@ -989,7 +995,7 @@ fn native_profile_authorization_is_required_before_batch_allocation() {
     let fixture = Fixture::new();
     fixture.setup();
     let binary = fixture.0.join("omp");
-    fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/19.1.0\\n'; exit 0; fi\nprintf '{\"type\":\"message_end\"}\\n'\n").unwrap();
+    fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/19.1.0\\n'; exit 0; fi\nif [ \"$1\" = --help ]; then printf '%s\\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'; exit 0; fi\nprintf '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\"}}\\n'\n").unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         fixture.0.join("native-prompt"),
@@ -2746,7 +2752,7 @@ fn omp_mock_receives_literal_prompt_parses_bounded_jsonl_and_records_observed_ve
     let fixture = Fixture::new();
     let (repo, base) = fixture.setup();
     let profile = fixture.0.join("env-profile.json");
-    fs::write(&profile, r#"{"harness_id":"omp","harness_version":"omp/19.1.0","connection_refs":[{"kind":"env","name":"GROQ_API_KEY"}]}"#).unwrap();
+    fs::write(&profile, r#"{"harness_id":"omp","harness_version":"omp/19.1.99","connection_refs":[{"kind":"env","name":"GROQ_API_KEY"}]}"#).unwrap();
     let bin = fixture.0.join("bin");
     fs::create_dir(&bin).unwrap();
     let executable = bin.join("omp");
@@ -2760,8 +2766,12 @@ test -z "${OPENAI_API_KEY+x}"
 test -z "${AWS_SECRET_ACCESS_KEY+x}"
 test -z "${BASH_ENV+x}"
 test -z "${PI_CODING_AGENT_DIR+x}"
+if [ "$#" = 1 ] && [ "$1" = --help ]; then
+    printf '%s\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'
+    exit 0
+fi
 if [ "$#" = 1 ] && [ "$1" = --version ]; then
-    printf 'omp/19.1.0\n'
+    printf 'omp/19.1.99\n'
     exit 0
 fi
 test "$GROQ_API_KEY" = explicitly-authorized-fixture-key
@@ -2814,7 +2824,7 @@ printf '\n{"type":"finished"}\n{"last":true}'
             .unwrap();
         let report = json(&out);
         assert_eq!(report["harness"], "omp");
-        assert_eq!(report["harness_version"], "omp/19.1.0");
+        assert_eq!(report["harness_version"], "omp/19.1.99");
         assert_eq!(report["base_commit_sha"], base["source_commit_sha"]);
         assert_eq!(report["state"], "SUCCEEDED");
         assert_eq!(report["events"]["parsed"], 3);
@@ -2884,7 +2894,7 @@ printf '\n{"type":"finished"}\n{"last":true}'
             .run(&report["run_id"].as_str().unwrap().parse().unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(run.harness_version, Some("omp/19.1.0".into()));
+        assert_eq!(run.harness_version, Some("omp/19.1.99".into()));
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(
             serde_json::to_value(run.capture.unwrap()).unwrap(),
@@ -2894,6 +2904,52 @@ printf '\n{"type":"finished"}\n{"last":true}'
             fs::read_to_string(repo.join("tracked")).unwrap(),
             "original"
         );
+    }
+}
+
+#[test]
+fn omp_incompatible_cli_and_required_events_fail_closed_without_a_model() {
+    use std::os::unix::fs::PermissionsExt;
+    for missing_option in [true, false] {
+        let fixture = Fixture::new();
+        fixture.setup();
+        let bin = fixture.0.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let binary = bin.join("omp");
+        let help = if missing_option {
+            "-p, --print\n--mode=json\n--no-session\n--max-cost=<value>"
+        } else {
+            "-p, --print\n--mode=json\n--no-session\n--no-title\n--max-cost=<value>"
+        };
+        let event = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta"}}"#;
+        fs::write(&binary, format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'omp/19.1.1\\n'; exit 0; fi\nif [ \"$1\" = --help ]; then printf '%s\\n' '{help}'; exit 0; fi\nprintf '%s\\n' '{event}'\n"
+        )).unwrap();
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = fixture.0.join("env-profile.json");
+        fs::write(&profile, r#"{"harness_id":"omp","harness_version":"omp/19.1.1","connection_refs":[{"kind":"env","name":"GROQ_API_KEY"}]}"#).unwrap();
+        let prompt = fixture.0.join("native.prompt");
+        fs::write(&prompt, "provider-free compatibility regression").unwrap();
+        let output = fixture
+            .cli()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("GROQ_API_KEY", "fixture-key")
+            .args(["run", "test", "--harness", "omp", "--prompt-file"])
+            .arg(prompt)
+            .arg("--profile")
+            .arg(profile)
+            .args(["--json", "--copy-limit-bytes", "10485760"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        if missing_option {
+            let diagnostic: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(diagnostic["error"]["kind"], "unsupported_capability");
+        } else {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["state"], "FAILED");
+            assert_eq!(report["exit_code"], 0);
+        }
     }
 }
 
@@ -2958,7 +3014,7 @@ fn omp_large_native_records_survive_capture_normalization_and_sealing() {
     fs::create_dir(&bin).unwrap();
     let executable = bin.join("omp");
     fs::write(&executable, format!(
-        "#!/bin/sh\nset -eu\nif [ \"$1\" = --version ]; then printf 'omp/19.1.0\\n'; exit 0; fi\nexec /bin/cat '{}'\n",
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = --version ]; then printf 'omp/19.1.0\\n'; exit 0; fi\nif [ \"$1\" = --help ]; then printf '%s\\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'; exit 0; fi\nexec /bin/cat '{}'\n",
         input.display()
     )).unwrap();
     fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3220,6 +3276,9 @@ fn run_many_caps_actual_external_workers_and_durably_associates_results() {
 set -eu
 lock='{}/lock'
 journal='{}'
+if [ "$1" = --help ]; then
+  printf '%s\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'; exit 0
+fi
 if [ "$1" = --version ]; then
   printf 'probe\n' >> "$journal.probes"; printf 'omp/19.1.0\n'; exit 0
 fi

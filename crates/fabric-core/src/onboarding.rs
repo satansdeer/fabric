@@ -724,7 +724,7 @@ mod tests {
             std::fs::write(native.join(auth), "opaque fixture authentication").unwrap();
             let binary = bin.join(name);
             std::fs::write(&binary, format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{version}'; exit 0; fi\n[ -z \"$OPENAI_API_KEY$CODEX_API_KEY$AWS_SECRET_ACCESS_KEY\" ] || exit 91\n[ ! -e \"$HOME/unselected-secret\" ] || exit 92\nselected=${{PI_CODING_AGENT_DIR:-$CODEX_HOME}}\n[ -n \"$selected\" ] || exit 93\n: > \"$selected/.worker-launched\"\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":\"fixture\"}}'\n"
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{version}'; exit 0; fi\nif [ \"$1\" = --help ]; then printf '%s\\n' '-p' '--mode=json' '--no-session' '--no-title' '--max-cost'; exit 0; fi\n[ -z \"$OPENAI_API_KEY$CODEX_API_KEY$AWS_SECRET_ACCESS_KEY\" ] || exit 91\n[ ! -e \"$HOME/unselected-secret\" ] || exit 92\nselected=${{PI_CODING_AGENT_DIR:-$CODEX_HOME}}\n[ -n \"$selected\" ] || exit 93\n: > \"$selected/.worker-launched\"\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":\"fixture\"}}'\n"
             )).unwrap();
             std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())

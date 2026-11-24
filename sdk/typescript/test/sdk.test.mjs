@@ -394,7 +394,7 @@ test('generated third-party target executes a Core host worker, seals verified a
   assert.ok(artifacts.find(artifact => artifact.kind === 'manifest'));
 });
 
-test('pinned OMP and Codex reference packages exercise the complete native contract without providers', { skip: !process.env.FABRIC_REFERENCE_PLUGIN_BINARY && 'Set FABRIC_REFERENCE_PLUGIN_BINARY' }, async t => {
+test('OMP and pinned Codex reference packages exercise the complete native contract without providers', { skip: !process.env.FABRIC_REFERENCE_PLUGIN_BINARY && 'Set FABRIC_REFERENCE_PLUGIN_BINARY' }, async t => {
   const root = temporary(t);
   const bin = join(root, 'bin');
   mkdirSync(bin, { mode: 0o700 });
@@ -409,7 +409,7 @@ test('pinned OMP and Codex reference packages exercise the complete native contr
       mkdirSync(registry, { mode: 0o700 });
       install(project, { registry, fabric: host, version: '0.1.0', sha256: directory(project).hash, trust: true });
       const version = id === 'omp' ? 'omp/19.1.0' : 'codex-cli 0.171.0';
-      writeFileSync(join(bin, id), '#!/bin/sh\n[ -z "${SECRET_CANARY+x}" ] || exit 17\n[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 18\n' + `printf '%s\\n' '${version}'\n`, { mode: 0o700 });
+      writeFileSync(join(bin, id), '#!/bin/sh\n[ -z "${SECRET_CANARY+x}" ] || exit 17\n[ "$#" -eq 1 ] || exit 18\nif [ "$1" = --help ]; then printf \'%s\\n\' \'-p\' \'--mode=json\' \'--no-session\' \'--no-title\' \'--max-cost\'; exit 0; fi\n[ "$1" = "--version" ] || exit 18\n' + `printf '%s\\n' '${version}'\n`, { mode: 0o700 });
       const checked = spawnSync(host, ['plugins', '--registry', registry, 'check', id], {
         env: { ...environment(root), PATH: `${bin}:${environment(root).PATH}`, SECRET_CANARY: 'must-not-reach-native-cli' },
         encoding: 'utf8', maxBuffer: 1024 * 1024,

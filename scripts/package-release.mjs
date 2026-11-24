@@ -69,7 +69,7 @@ try {
     const pkg = directory(path);
     for (const [file, bytes] of pkg.files) files[`plugins/${id}/${file}`] = sha256(bytes);
     if (id === 'local') targetPlugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash });
-    else plugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash, supported_cli: id === 'omp' ? 'omp/19.1.0' : 'codex-cli 0.171.0' });
+    else plugins.push({ id, version: pkg.info.version, protocol: 1, sha256: pkg.hash, supported_cli: id === 'omp' ? 'OMP print JSON CLI contract; observed version bound per run' : 'codex-cli 0.171.0' });
   }
   // SDK installer/scaffolder runtime, types and samples; no npm lifecycle hooks.
   for (const file of ['cli.mjs', 'package.mjs', 'protocol.mjs', 'conformance.mjs', 'index.mjs', 'index.d.mts', 'webhook.mjs']) copy(join(repo, 'sdk/typescript', file), `sdk/${file}`);

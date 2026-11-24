@@ -141,7 +141,7 @@ fn discovery_is_metadata_only_exact_and_uses_private_worker_home() {
             ),
         ] {
             let binary = binaries.join(name);
-            std::fs::write(&binary, format!("#!/bin/sh\n[ \"$1\" = --version ] || exit 93\n[ -z \"$OPENAI_API_KEY$CODEX_API_KEY$PI_CODING_AGENT_DIR$CODEX_HOME\" ] || exit 94\nprintf '%s\\n' '{version}'\n")).unwrap();
+            std::fs::write(&binary, format!("#!/bin/sh\n[ -z \"$OPENAI_API_KEY$CODEX_API_KEY$PI_CODING_AGENT_DIR$CODEX_HOME\" ] || exit 94\nif [ \"$1\" = --help ] && [ '{name}' = omp ]; then printf '%s\\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'; exit 0; fi\n[ \"$1\" = --version ] || exit 93\nprintf '%s\\n' '{version}'\n")).unwrap();
             std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
             let directory = if overrides {
                 temporary

@@ -88,7 +88,7 @@ jobs:
           ref: 437dd8e4b2ec579202fce2e81ca0900765b16472
           path: .ci/pstack
           persist-credentials: false
-      - name: Download and verify native OMP 19.1.0
+      - name: Download and verify native OMP 19.1.1
         timeout-minutes: 5
         shell: bash
         run: |
@@ -96,23 +96,23 @@ jobs:
           case "$(uname -m)" in
             arm64)
               platform=arm64
-              sha256=dca5643669ed5e553f707bd065499babd0fe3030696bbb24c9da09c798af5abb
+              sha256=d5a3324acd98375a01698a1b0c018be48caed2956c8aa9044ad137fe43bc0400
               ;;
             x86_64)
               platform=x64
-              sha256=edf51e3754f3f145298ae6dbfd9e6d5f5ec178e3386f043959ec71f7981c52af
+              sha256=6ffecb22a9fe01a98f90f91a2ef04a697850a23bf4dde83adad2fe80e51a8353
               ;;
             *) echo "Unsupported native OMP architecture: $(uname -m)" >&2; exit 1 ;;
           esac
           curl --fail --location --max-time 180 \
-            "https://github.com/can1357/oh-my-pi/releases/download/v19.1.0/omp-darwin-$platform" \
-            --output "$RUNNER_TEMP/omp-19.1.0"
-          printf '%s  %s\n' "$sha256" "$RUNNER_TEMP/omp-19.1.0" | shasum -a 256 --check
-          chmod 700 "$RUNNER_TEMP/omp-19.1.0"
+            "https://github.com/can1357/oh-my-pi/releases/download/v19.1.1/omp-darwin-$platform" \
+            --output "$RUNNER_TEMP/omp-19.1.1"
+          printf '%s  %s\n' "$sha256" "$RUNNER_TEMP/omp-19.1.1" | shasum -a 256 --check
+          chmod 700 "$RUNNER_TEMP/omp-19.1.1"
       - name: Native OMP and pstack discovery (fake workers, provider-free; no model turn)
         timeout-minutes: 5
         run: >-
           bun integrations/omp/host-smoke.ts
           "$GITHUB_WORKSPACE/target/debug/fabric"
-          "$RUNNER_TEMP/omp-19.1.0"
+          "$RUNNER_TEMP/omp-19.1.1"
           "$GITHUB_WORKSPACE/.ci/pstack/omp"
