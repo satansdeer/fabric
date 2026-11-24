@@ -4055,8 +4055,7 @@ fn storage_evicts_only_unreferenced_cache_and_same_key_rebuilds() {
         + options.max_log_bytes
         + options.max_artifact_bytes;
     options.storage.policy.max_managed_bytes =
-        fabric_core::workspace::storage::usage(&root, &options.storage).unwrap()
-            + reservation
+        fabric_core::workspace::storage::usage(&root, &options.storage).unwrap() + reservation
             - 1024 * 1024;
     let report = fabric_core::run::foreground(&root, "test", &prompt, &harness, &options).unwrap();
     assert_eq!(report.state, fabric_domain::RunState::Succeeded);
