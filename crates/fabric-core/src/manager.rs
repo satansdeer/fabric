@@ -669,7 +669,10 @@ impl Manager {
                 options.target_pin = accepted.target;
                 let registry = HarnessRegistry::default();
                 let adapter = crate::remote::resolve_harness(
-                    &self.root, &HarnessId::try_from(task.harness)?, &options, &registry,
+                    &self.root,
+                    &HarnessId::try_from(task.harness)?,
+                    &options,
+                    &registry,
                     &RegistryOptions {
                         fake_binary: batch.fake_binary.as_ref().map(PathBuf::from),
                     },

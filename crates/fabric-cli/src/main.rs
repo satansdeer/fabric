@@ -848,7 +848,10 @@ fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
     let options = run_options(&args.options, interrupt.token())?;
     let id = &args.harness;
     let harness = fabric_core::remote::resolve_harness(
-        &root, id, &options, &fabric_runner::HarnessRegistry::default(),
+        &root,
+        id,
+        &options,
+        &fabric_runner::HarnessRegistry::default(),
         &fabric_runner::RegistryOptions {
             fake_binary: args.options.fake_binary.clone(),
         },

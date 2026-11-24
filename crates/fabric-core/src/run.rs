@@ -153,13 +153,23 @@ pub fn foreground(
     let mut options = options.clone();
     let remote = crate::remote::is_remote(&options)?;
     let remote_adapter = if remote {
-        Some(crate::remote::resolve_harness(root, &harness.id(), &options,
-            &HarnessRegistry::default(), &RegistryOptions::default())?)
-    } else { None };
+        Some(crate::remote::resolve_harness(
+            root,
+            &harness.id(),
+            &options,
+            &HarnessRegistry::default(),
+            &RegistryOptions::default(),
+        )?)
+    } else {
+        None
+    };
     let harness = remote_adapter.as_deref().unwrap_or(harness);
     let info = harness.probe()?;
-    let plan = if remote { (harness.plan(&request, &info)?, None) }
-        else { crate::onboarding::plan(root, harness, request, &info)? };
+    let plan = if remote {
+        (harness.plan(&request, &info)?, None)
+    } else {
+        crate::onboarding::plan(root, harness, request, &info)?
+    };
     options.select_target(root, &plan.0)?;
     let (root, state, source) = select_prepared(root, project_name, &SourceRef::CurrentHead {})?;
     let mut report = foreground_prepared(
@@ -332,7 +342,12 @@ pub(crate) fn execute_prepared(
         model_requested: plan.request.model.clone(),
         model_resolved: plan.model_resolved.clone(),
         profile_digest: Some(plan.profile.digest.clone()),
-        backend_id: if target.is_remote() { "remote.v1" } else { "trusted-local" }.into(),
+        backend_id: if target.is_remote() {
+            "remote.v1"
+        } else {
+            "trusted-local"
+        }
+        .into(),
         event_cursor: 0,
         created_at,
         started_at: None,
@@ -364,8 +379,20 @@ pub(crate) fn execute_prepared(
         input.sync_all().map_err(error)?;
         drop(input);
         if target.is_remote() {
-            let capture = execute_remote(&root, &mut store, state, &run_id, &workspace_id,
-                workspace.path(), prompt, plan, options, &target, &pin, &mut attempt)?;
+            let capture = execute_remote(
+                &root,
+                &mut store,
+                state,
+                &run_id,
+                &workspace_id,
+                workspace.path(),
+                prompt,
+                plan,
+                options,
+                &target,
+                &pin,
+                &mut attempt,
+            )?;
             progress.artifacts_captured_at_ms = Some(fabric_runner::activity::timestamp_ms());
             progress.save(&store, &run_id, &activity)?;
             return Ok(capture);
@@ -689,124 +716,239 @@ pub(crate) fn execute_prepared(
 }
 
 fn execute_remote(
-    root: &Path, store: &mut fabric_store::Store, state: &PreparedState,
-    run_id: &RunId, workspace_id: &WorkspaceId, tree: &Path, prompt: &[u8],
-    plan: &HarnessPlan, options: &RunOptions, target: &fabric_runner::target::Target,
-    pin: &fabric_runner::target::TargetPin, attempt: &mut WorkerAttempt,
+    root: &Path,
+    store: &mut fabric_store::Store,
+    state: &PreparedState,
+    run_id: &RunId,
+    workspace_id: &WorkspaceId,
+    tree: &Path,
+    prompt: &[u8],
+    plan: &HarnessPlan,
+    options: &RunOptions,
+    target: &fabric_runner::target::Target,
+    pin: &fabric_runner::target::TargetPin,
+    attempt: &mut WorkerAttempt,
 ) -> Result<fabric_domain::CaptureMetadata, FabricError> {
-    let selection = options.environment.as_ref().ok_or_else(|| error("Remote environment required"))?;
+    let selection = options
+        .environment
+        .as_ref()
+        .ok_or_else(|| error("Remote environment required"))?;
     let binding = crate::remote::binding(root, selection)?;
     let fresh = runner_workspace(root, run_id)?;
-    if fresh.path() != tree { return Err(error("Transfer staging changed")); }
-    let source = store.source_evidence(&state.state_id).map_err(error)?
+    if fresh.path() != tree {
+        return Err(error("Transfer staging changed"));
+    }
+    let source = store
+        .source_evidence(&state.state_id)
+        .map_err(error)?
         .ok_or_else(|| error("Pinned source evidence absent"))?;
-    let transfer_limit = if options.copy_limit_bytes == 0 { crate::remote::TRANSFER_LIMIT }
-        else { options.copy_limit_bytes.min(crate::remote::TRANSFER_LIMIT) };
-    let uploaded = target.remote_call("environment.inspect", binding.clone())
+    let transfer_limit = if options.copy_limit_bytes == 0 {
+        crate::remote::TRANSFER_LIMIT
+    } else {
+        options.copy_limit_bytes.min(crate::remote::TRANSFER_LIMIT)
+    };
+    let uploaded = target
+        .remote_call("environment.inspect", binding.clone())
         .and_then(|reply| {
             if reply["available"] != true || reply["resource"] != binding["resource"] {
                 if reply["state"] == "target_failed" {
-                    store.record_remote_observation(run_id, &reply["evidence"]).map_err(error)?;
+                    store
+                        .record_remote_observation(run_id, &reply["evidence"])
+                        .map_err(error)?;
                 }
-                return Err(crate::remote::protocol_error("Remote environment unavailable"));
+                return Err(crate::remote::protocol_error(
+                    "Remote environment unavailable",
+                ));
             }
             crate::remote::upload(target, &binding, run_id.as_str(), tree, transfer_limit)
         });
-    let uploaded = match uploaded { Ok(value) => value, Err(failure) => {
-        if failure.kind == fabric_domain::ErrorKind::TargetProtocol { store.record_target_failure(run_id).map_err(error)?; }
-        return Err(failure);
-    }};
+    let uploaded = match uploaded {
+        Ok(value) => value,
+        Err(failure) => {
+            if failure.kind == fabric_domain::ErrorKind::TargetProtocol {
+                store.record_target_failure(run_id).map_err(error)?;
+            }
+            return Err(failure);
+        }
+    };
     let resource = uploaded["resource"].clone();
     let witness = &uploaded["witness"];
-    if witness["resource"] != resource || witness["actual_sha256"] != source.prepared_sha256
-        || resource["environment"] != binding || resource["run_id"] != run_id.as_str()
+    if witness["resource"] != resource
+        || witness["actual_sha256"] != source.prepared_sha256
+        || resource["environment"] != binding
+        || resource["run_id"] != run_id.as_str()
         || resource["instance"] != witness["instance"]
-        || !resource["resource_id"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control)) {
+        || !resource["resource_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control))
+    {
         store.record_target_failure(run_id).map_err(error)?;
-        return Err(crate::remote::protocol_error("Remote source content mismatch; refusing launch"));
+        return Err(crate::remote::protocol_error(
+            "Remote source content mismatch; refusing launch",
+        ));
     }
     let string = |key: &str, bound: usize| -> Result<String, FabricError> {
-        match witness[key].as_str().filter(|s| !s.is_empty() && s.len() <= bound && !s.chars().any(char::is_control)) {
+        match witness[key]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= bound && !s.chars().any(char::is_control))
+        {
             Some(value) => Ok(value.to_owned()),
             None => {
                 store.record_target_failure(run_id).map_err(error)?;
-                Err(crate::remote::protocol_error("Invalid remote source witness"))
+                Err(crate::remote::protocol_error(
+                    "Invalid remote source witness",
+                ))
             }
         }
     };
-    store.record_launch_receipt(&fabric_store::LaunchReceipt {
-        run_id:run_id.clone(), attempt_id:attempt.attempt_id.clone(),
-        workspace_id:workspace_id.clone(),
-        workspace_path:resource["resource_id"].as_str().ok_or_else(|| error("Resource absent"))?.into(),
-        workspace_device:None, workspace_inode:None,
-        remote:Some(fabric_store::RemoteLaunchWitness {
-            target_json:serde_json::to_string(pin).map_err(error)?,
-            environment_id:selection.environment_id.clone(), resource:resource.clone(),
-            os:string("os",32)?, arch:string("arch",32)?, hostname:string("hostname",255)?,
-            instance:string("instance",128)?,
-        }),
-        prepared_state_id:state.state_id.clone(), source_commit_sha:state.source_commit_sha.clone(),
-        preparation_key:state.preparation_key.clone(), recipe_digest:state.recipe_digest.clone(),
-        actual_sha256:source.prepared_sha256.clone(), source,
-    }).map_err(error)?;
+    store
+        .record_launch_receipt(&fabric_store::LaunchReceipt {
+            run_id: run_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            workspace_id: workspace_id.clone(),
+            workspace_path: resource["resource_id"]
+                .as_str()
+                .ok_or_else(|| error("Resource absent"))?
+                .into(),
+            workspace_device: None,
+            workspace_inode: None,
+            remote: Some(fabric_store::RemoteLaunchWitness {
+                target_json: serde_json::to_string(pin).map_err(error)?,
+                environment_id: selection.environment_id.clone(),
+                resource: resource.clone(),
+                os: string("os", 32)?,
+                arch: string("arch", 32)?,
+                hostname: string("hostname", 255)?,
+                instance: string("instance", 128)?,
+            }),
+            prepared_state_id: state.state_id.clone(),
+            source_commit_sha: state.source_commit_sha.clone(),
+            preparation_key: state.preparation_key.clone(),
+            recipe_digest: state.recipe_digest.clone(),
+            actual_sha256: source.prepared_sha256.clone(),
+            source,
+        })
+        .map_err(error)?;
     let outcome = (|| {
-        if options.cancellation.is_cancelled() { return Err(error("Cancelled before remote launch")); }
-        let started = target.remote_call("worker.start", serde_json::json!({
-            "resource":resource,"plan":plan,"actual_sha256":witness["actual_sha256"],
-            "prompt_sha256":format!("{:x}",Sha256::digest(prompt)),
-            "timeout_seconds":options.limits.timeout.as_secs(),
-            "term_grace_ms":options.limits.term_grace.as_millis() as u64,
-            "max_log_bytes":options.max_log_bytes.min(crate::remote::TRANSFER_LIMIT),
-            "storage_policy":options.storage.policy,
-            "scan_timeout_ms":options.storage.scan_timeout.as_millis() as u64
-        }))?;
-        if started["started"] != true { return Err(crate::remote::protocol_error("Remote worker not started")); }
+        if options.cancellation.is_cancelled() {
+            return Err(error("Cancelled before remote launch"));
+        }
+        let started = target.remote_call(
+            "worker.start",
+            serde_json::json!({
+                "resource":resource,"plan":plan,"actual_sha256":witness["actual_sha256"],
+                "prompt_sha256":format!("{:x}",Sha256::digest(prompt)),
+                "timeout_seconds":options.limits.timeout.as_secs(),
+                "term_grace_ms":options.limits.term_grace.as_millis() as u64,
+                "max_log_bytes":options.max_log_bytes.min(crate::remote::TRANSFER_LIMIT),
+                "storage_policy":options.storage.policy,
+                "scan_timeout_ms":options.storage.scan_timeout.as_millis() as u64
+            }),
+        )?;
+        if started["started"] != true {
+            return Err(crate::remote::protocol_error("Remote worker not started"));
+        }
         attempt.started_at = Some(now()?);
         store.record_worker_attempt(attempt).map_err(error)?;
-        store.start_remote_run(run_id, &plan.manifest.exact_version, attempt.started_at.unwrap()).map_err(error)?;
+        store
+            .start_remote_run(
+                run_id,
+                &plan.manifest.exact_version,
+                attempt.started_at.unwrap(),
+            )
+            .map_err(error)?;
         let mut cancelling = false;
         let result = loop {
             if options.cancellation.is_cancelled() && !cancelling {
-                target.remote_call("worker.cancel",serde_json::json!({"resource":resource}))?;
+                target.remote_call("worker.cancel", serde_json::json!({"resource":resource}))?;
                 cancelling = true;
             }
-            let reply = target.remote_call("worker.poll",serde_json::json!({"resource":resource}))?;
+            let reply =
+                target.remote_call("worker.poll", serde_json::json!({"resource":resource}))?;
             match reply["state"].as_str() {
                 Some("running") => std::thread::sleep(std::time::Duration::from_millis(50)),
                 Some("complete") => break reply["result"].clone(),
                 Some("target_failed") => {
                     if reply["evidence"]["instance"] != witness["instance"] {
-                        return Err(crate::remote::protocol_error("Remote diagnostic binding changed"));
+                        return Err(crate::remote::protocol_error(
+                            "Remote diagnostic binding changed",
+                        ));
                     }
-                    store.record_remote_observation(run_id,&reply["evidence"]).map_err(error)?;
+                    store
+                        .record_remote_observation(run_id, &reply["evidence"])
+                        .map_err(error)?;
                     return Err(crate::remote::protocol_error("Remote target terminated"));
                 }
                 _ => return Err(crate::remote::protocol_error("Invalid remote worker state")),
             }
         };
         let result = crate::remote::completion(result, &resource)?;
-        let durable_run = store.run(run_id).map_err(error)?.ok_or_else(||error("Run absent"))?;
-        let receipt = crate::remote::recovery_binding(store,&durable_run)?;
-        crate::remote::validate_completion(store,&durable_run,&result)?;
-        store.record_remote_completion(run_id,&serde_json::to_value(&result).map_err(error)?).map_err(error)?;
-        attempt.finished_at = Some(now()?); attempt.exit_code = result.exit_code; attempt.exit_signal = result.exit_signal;
+        let durable_run = store
+            .run(run_id)
+            .map_err(error)?
+            .ok_or_else(|| error("Run absent"))?;
+        let receipt = crate::remote::recovery_binding(store, &durable_run)?;
+        crate::remote::validate_completion(store, &durable_run, &result)?;
+        store
+            .record_remote_completion(run_id, &serde_json::to_value(&result).map_err(error)?)
+            .map_err(error)?;
+        attempt.finished_at = Some(now()?);
+        attempt.exit_code = result.exit_code;
+        attempt.exit_signal = result.exit_signal;
         attempt.event_cursor = result.capture.normalized_event_count;
         attempt.termination_reason = result.reason().map(str::to_owned);
         store.record_worker_attempt(attempt).map_err(error)?;
-        store.observe_run_exit(run_id,result.exit_code,result.exit_signal,result.reason(),attempt.finished_at.unwrap()).map_err(error)?;
+        store
+            .observe_run_exit(
+                run_id,
+                result.exit_code,
+                result.exit_signal,
+                result.reason(),
+                attempt.finished_at.unwrap(),
+            )
+            .map_err(error)?;
         let capture = result.capture;
-        let container = tree.parent().ok_or_else(||error("Container absent"))?;
-        let mut staging = crate::remote::download_staged(target,&resource,container,crate::remote::TRANSFER_LIMIT)?;
-        if staging.witness != *witness { return Err(crate::remote::protocol_error("Export source witness changed")); }
-        crate::remote::verify_output(&staging.path,&capture)?;
-        crate::remote::install_download(&mut staging,container,store,&durable_run,&receipt.actual_sha256,&capture)?;
-        store.record_capture(run_id,&capture).map_err(error)?;
-        let captured = crate::artifacts::capture(root,store,run_id,state,&capture,&plan.profile,options.max_artifact_bytes)?;
-        store.finish_run(run_id,&capture,&captured.0,&captured.1,now()?).map_err(error)?;
+        let container = tree.parent().ok_or_else(|| error("Container absent"))?;
+        let mut staging = crate::remote::download_staged(
+            target,
+            &resource,
+            container,
+            crate::remote::TRANSFER_LIMIT,
+        )?;
+        if staging.witness != *witness {
+            return Err(crate::remote::protocol_error(
+                "Export source witness changed",
+            ));
+        }
+        crate::remote::verify_output(&staging.path, &capture)?;
+        crate::remote::install_download(
+            &mut staging,
+            container,
+            store,
+            &durable_run,
+            &receipt.actual_sha256,
+            &capture,
+        )?;
+        store.record_capture(run_id, &capture).map_err(error)?;
+        let captured = crate::artifacts::capture(
+            root,
+            store,
+            run_id,
+            state,
+            &capture,
+            &plan.profile,
+            options.max_artifact_bytes,
+        )?;
+        store
+            .finish_run(run_id, &capture, &captured.0, &captured.1, now()?)
+            .map_err(error)?;
         target.finish().map_err(crate::remote::protocol_error)?;
         Ok(capture)
     })();
-    if outcome.as_ref().is_err_and(|failure|failure.kind == fabric_domain::ErrorKind::TargetProtocol) {
+    if outcome
+        .as_ref()
+        .is_err_and(|failure| failure.kind == fabric_domain::ErrorKind::TargetProtocol)
+    {
         store.record_target_failure(run_id).map_err(error)?;
     }
     outcome
@@ -1007,7 +1149,9 @@ pub(crate) fn spawn_execution(
                 &root,
                 state,
                 prompt,
-                adapters[&adapter_key(harness_id, &inputs[index].options)].0.as_ref(),
+                adapters[&adapter_key(harness_id, &inputs[index].options)]
+                    .0
+                    .as_ref(),
                 &inputs[index].options,
                 plan,
                 task.run_id.clone(),
@@ -1016,7 +1160,9 @@ pub(crate) fn spawn_execution(
                 &root,
                 state,
                 Path::new(&task.prompt_file),
-                adapters[&adapter_key(harness_id, &inputs[index].options)].0.as_ref(),
+                adapters[&adapter_key(harness_id, &inputs[index].options)]
+                    .0
+                    .as_ref(),
                 &inputs[index].options,
                 plan,
                 task.run_id.clone(),
@@ -1077,8 +1223,16 @@ pub(crate) type PlannedAdapters =
     HashMap<String, (Box<dyn HarnessAdapter>, fabric_runner::HarnessInfo)>;
 
 fn adapter_key(id: &HarnessId, options: &RunOptions) -> String {
-    format!("{}:{}:{}", id, options.harness_request.placement,
-        options.environment.as_ref().map(|e| e.environment_id.as_str()).unwrap_or(""))
+    format!(
+        "{}:{}:{}",
+        id,
+        options.harness_request.placement,
+        options
+            .environment
+            .as_ref()
+            .map(|e| e.environment_id.as_str())
+            .unwrap_or("")
+    )
 }
 
 pub(crate) fn plan_task(
@@ -1094,13 +1248,22 @@ pub(crate) fn plan_task(
     let (adapter, probe) = match adapters.entry(adapter_key(id, options)) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
-            let adapter = crate::remote::resolve_harness(root, id, options, harnesses.registry, harnesses.options)?;
+            let adapter = crate::remote::resolve_harness(
+                root,
+                id,
+                options,
+                harnesses.registry,
+                harnesses.options,
+            )?;
             let probe = adapter.probe()?;
             entry.insert((adapter, probe))
         }
     };
-    let plan = if remote { (adapter.plan(&request, probe)?, None) }
-        else { crate::onboarding::plan(root, adapter.as_ref(), request, probe)? };
+    let plan = if remote {
+        (adapter.plan(&request, probe)?, None)
+    } else {
+        crate::onboarding::plan(root, adapter.as_ref(), request, probe)?
+    };
     options.select_target(root, &plan.0)?;
     Ok(plan)
 }

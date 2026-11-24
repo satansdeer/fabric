@@ -179,15 +179,26 @@ fn execute_mutations(task: &Task) -> Result<(), Box<dyn std::error::Error>> {
         validate_path(Path::new(&probe.home_file))?;
         validate_path(Path::new(&probe.artifact))?;
         let home = std::env::var_os("HOME").ok_or("HOME unavailable")?;
-        let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(Path::new(&home).join(&probe.home_file))?;
-        if !file.metadata()?.is_file() { return Err("marker is not a regular file".into()); }
+        if !file.metadata()?.is_file() {
+            return Err("marker is not a regular file".into());
+        }
         let mut marker = Vec::new();
         (&mut file).take(4097).read_to_end(&mut marker)?;
-        if marker.len() > 4096 { return Err("marker exceeds fixture bound".into()); }
+        if marker.len() > 4096 {
+            return Err("marker exceeds fixture bound".into());
+        }
         let mut hostname = [0u8; 256];
-        if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 { return Err(io::Error::last_os_error().into()); }
-        let end = hostname.iter().position(|b| *b == 0).ok_or("hostname exceeds fixture bound")?;
+        if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let end = hostname
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or("hostname exceeds fixture bound")?;
         let observation = serde_json::json!({"marker":marker,"os":std::env::consts::OS,
             "hostname":std::str::from_utf8(&hostname[..end])?,
             "instance":std::env::var("FABRIC_EXECUTION_INSTANCE").ok()});

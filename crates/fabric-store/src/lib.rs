@@ -3,9 +3,9 @@
 use std::{fmt, fs::OpenOptions, path::Path, str::FromStr, time::Duration};
 
 use fabric_domain::{
-    ArtifactManifestId, BatchId, CaptureMetadata, EnvironmentId, FabricError, HarnessId, HarnessVersion,
-    PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState, SourceProvenance,
-    WorkspaceId, WorkspaceState,
+    ArtifactManifestId, BatchId, CaptureMetadata, EnvironmentId, FabricError, HarnessId,
+    HarnessVersion, PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState,
+    SourceProvenance, WorkspaceId, WorkspaceState,
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
@@ -1421,7 +1421,9 @@ impl Store {
                AND w.state='ACTIVE' AND w.retention_reason IS NULL)",
             params![id.as_str(), version, at],
         )?;
-        if changed != 1 { return Err(StoreError::Conflict); }
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
         Ok(())
     }
 
@@ -1586,52 +1588,100 @@ impl Store {
             .transpose()
     }
 
-    pub fn record_remote_observation(&self, id: &RunId, evidence: &serde_json::Value) -> Result<()> {
+    pub fn record_remote_observation(
+        &self,
+        id: &RunId,
+        evidence: &serde_json::Value,
+    ) -> Result<()> {
         let encoded = serde_json::to_string(evidence)
             .map_err(|_| StoreError::InvalidRecord("Invalid remote observation"))?;
-        if encoded.len() > 4096 { return Err(StoreError::InvalidRecord("Remote observation bounds")); }
-        self.connection.execute("INSERT INTO run_remote_observations(run_id,evidence_json) VALUES (?1,?2)",
-            params![id.as_str(),encoded])?;
+        if encoded.len() > 4096 {
+            return Err(StoreError::InvalidRecord("Remote observation bounds"));
+        }
+        self.connection.execute(
+            "INSERT INTO run_remote_observations(run_id,evidence_json) VALUES (?1,?2)",
+            params![id.as_str(), encoded],
+        )?;
         Ok(())
     }
 
     pub fn remote_observation(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
-        let version: i64 = self.connection.pragma_query_value(None,"user_version",|r|r.get(0))?;
-        if version < 19 { return Ok(None); }
-        let encoded: Option<String> = self.connection.query_row(
-            "SELECT evidence_json FROM run_remote_observations WHERE run_id=?1",
-            [id.as_str()],|r|r.get(0)).optional()?;
-        encoded.map(|s|serde_json::from_str(&s)
-            .map_err(|_|StoreError::InvalidRecord("Invalid remote observation"))).transpose()
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 19 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM run_remote_observations WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid remote observation"))
+            })
+            .transpose()
     }
 
     /// The entire original remote result, not just its normalized wait/reason.
     pub fn record_remote_completion(&self, id: &RunId, result: &serde_json::Value) -> Result<()> {
         if let Some(saved) = self.remote_completion(id)? {
-            return if saved == *result { Ok(()) } else { Err(StoreError::Conflict) };
+            return if saved == *result {
+                Ok(())
+            } else {
+                Err(StoreError::Conflict)
+            };
         }
-        let encoded = serde_json::to_string(result).map_err(|_|StoreError::InvalidRecord("Invalid remote completion"))?;
-        if encoded.len() > 65536 || self.launch_receipt(id)?.and_then(|r|r.remote).is_none() {
-            return Err(StoreError::InvalidRecord("Remote completion bounds or binding"));
+        let encoded = serde_json::to_string(result)
+            .map_err(|_| StoreError::InvalidRecord("Invalid remote completion"))?;
+        if encoded.len() > 65536 || self.launch_receipt(id)?.and_then(|r| r.remote).is_none() {
+            return Err(StoreError::InvalidRecord(
+                "Remote completion bounds or binding",
+            ));
         }
-        self.connection.execute("INSERT INTO run_remote_completions(run_id,result_json) VALUES (?1,?2)",
-            params![id.as_str(),encoded])?;
+        self.connection.execute(
+            "INSERT INTO run_remote_completions(run_id,result_json) VALUES (?1,?2)",
+            params![id.as_str(), encoded],
+        )?;
         Ok(())
     }
 
     pub fn remote_completion(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
-        let version: i64 = self.connection.pragma_query_value(None,"user_version",|r|r.get(0))?;
-        if version < 20 { return Ok(None); }
-        let encoded: Option<String> = self.connection.query_row(
-            "SELECT result_json FROM run_remote_completions WHERE run_id=?1",
-            [id.as_str()],|r|r.get(0)).optional()?;
-        encoded.map(|s|serde_json::from_str(&s)
-            .map_err(|_|StoreError::InvalidRecord("Invalid remote completion"))).transpose()
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 20 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT result_json FROM run_remote_completions WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid remote completion"))
+            })
+            .transpose()
     }
 
     /// Immutable verified local inode/digest provenance, committed before renames.
-    pub fn record_remote_installation(&self, id: &RunId, installation: &serde_json::Value) -> Result<()> {
-        let encoded = serde_json::to_string(installation).map_err(|_|StoreError::InvalidRecord("Invalid remote installation"))?;
+    pub fn record_remote_installation(
+        &self,
+        id: &RunId,
+        installation: &serde_json::Value,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(installation)
+            .map_err(|_| StoreError::InvalidRecord("Invalid remote installation"))?;
         if encoded.len() > 65536 || self.connection.execute(
             "UPDATE run_remote_completions SET installation_json=?2 WHERE run_id=?1 AND installation_json IS NULL",
             params![id.as_str(),encoded])? != 1 { return Err(StoreError::Conflict); }
@@ -1639,13 +1689,27 @@ impl Store {
     }
 
     pub fn remote_installation(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
-        let version: i64 = self.connection.pragma_query_value(None,"user_version",|r|r.get(0))?;
-        if version < 20 { return Ok(None); }
-        let encoded: Option<String> = self.connection.query_row(
-            "SELECT installation_json FROM run_remote_completions WHERE run_id=?1",
-            [id.as_str()],|r|r.get(0)).optional()?.flatten();
-        encoded.map(|s|serde_json::from_str(&s)
-            .map_err(|_|StoreError::InvalidRecord("Invalid remote installation"))).transpose()
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 20 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT installation_json FROM run_remote_completions WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        encoded
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid remote installation"))
+            })
+            .transpose()
     }
 
     /// The bounded output files have already been synced by the runner.
@@ -1665,20 +1729,43 @@ impl Store {
     /// Caller holds the root/run leases and has verified the pinned inactive remote
     /// result and downloaded bytes. Recovery never invents a terminal success.
     pub fn record_recovered_capture(
-        &mut self, expected: &Run, capture: &CaptureMetadata,
-        exit_code: Option<i32>, exit_signal: Option<i32>, reason: Option<&str>,
+        &mut self,
+        expected: &Run,
+        capture: &CaptureMetadata,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        reason: Option<&str>,
     ) -> Result<()> {
-        if expected.state != RunState::NeedsAttention || expected.capture.is_some()
+        if expected.state != RunState::NeedsAttention
+            || expected.capture.is_some()
             || expected.artifact_manifest_id.is_some()
             || exit_code.is_some() == exit_signal.is_some()
-            || expected.exit_code.is_some_and(|code| Some(code) != exit_code)
-            || expected.exit_signal.is_some_and(|signal| Some(signal) != exit_signal)
-            || !matches!(reason, None | Some("timeout" | "cancelled" | "workspace_limit" | "storage_pressure" | "storage_meter_failed" | "native_failure")) {
+            || expected
+                .exit_code
+                .is_some_and(|code| Some(code) != exit_code)
+            || expected
+                .exit_signal
+                .is_some_and(|signal| Some(signal) != exit_signal)
+            || !matches!(
+                reason,
+                None | Some(
+                    "timeout"
+                        | "cancelled"
+                        | "workspace_limit"
+                        | "storage_pressure"
+                        | "storage_meter_failed"
+                        | "native_failure"
+                )
+            )
+        {
             return Err(StoreError::InvalidRecord("Remote recovery result differs"));
         }
-        let encoded = serde_json::to_string(capture).map_err(|_|StoreError::InvalidRecord("Invalid capture"))?;
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if Self::query_run(&transaction,&expected.run_id)?.as_ref() != Some(expected) {
+        let encoded = serde_json::to_string(capture)
+            .map_err(|_| StoreError::InvalidRecord("Invalid capture"))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::query_run(&transaction, &expected.run_id)?.as_ref() != Some(expected) {
             return Err(StoreError::Conflict);
         }
         if transaction.execute(

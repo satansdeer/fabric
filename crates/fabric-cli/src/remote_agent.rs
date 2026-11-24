@@ -36,8 +36,12 @@ fn init() -> Result<(), fabric_domain::FabricError> {
 fn reap() -> Result<(), fabric_domain::FabricError> {
     loop {
         let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-        if pid > 0 { continue; }
-        if pid == 0 { return Ok(()); }
+        if pid > 0 {
+            continue;
+        }
+        if pid == 0 {
+            return Ok(());
+        }
         match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::EINTR) => continue,
             Some(libc::ECHILD) => return Ok(()),
@@ -53,25 +57,54 @@ fn init() -> Result<(), fabric_domain::FabricError> {
 fn main() {
     let result = (|| -> Result<(), fabric_domain::FabricError> {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
-        if args.len() == 1 && args[0] == "--init" { return init(); }
+        if args.len() == 1 && args[0] == "--init" {
+            return init();
+        }
         let initialize = args.len() == 3 && args[2] == "--initialize-home";
-        if args.len() != 2 && !initialize { return Err(fabric_runner::execution_error("Expected private HOME and work roots")); }
+        if args.len() != 2 && !initialize {
+            return Err(fabric_runner::execution_error(
+                "Expected private HOME and work roots",
+            ));
+        }
         let mut line = Vec::new();
         let mut stdin = std::io::stdin().lock();
         loop {
             let mut byte = [0];
-            if stdin.read(&mut byte).map_err(fabric_runner::execution_error)? != 1 || line.len() >= 16384 { return Err(fabric_runner::execution_error("Invalid remote binding")); }
-            if byte[0] == b'\n' { break; } line.push(byte[0]);
+            if stdin
+                .read(&mut byte)
+                .map_err(fabric_runner::execution_error)?
+                != 1
+                || line.len() >= 16384
+            {
+                return Err(fabric_runner::execution_error("Invalid remote binding"));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
         }
         drop(stdin);
-        let binding: serde_json::Value = serde_json::from_slice(&line).map_err(fabric_runner::execution_error)?;
-        let instance = std::env::var("FABRIC_TARGET_INSTANCE").map_err(fabric_runner::execution_error)?;
-        if initialize { fabric_core::remote_agent::initialize_persistent_home(std::path::Path::new(&args[0]),&binding)?; }
-        fabric_core::remote_agent::serve(PathBuf::from(&args[0]),PathBuf::from(&args[1]),binding,instance)
+        let binding: serde_json::Value =
+            serde_json::from_slice(&line).map_err(fabric_runner::execution_error)?;
+        let instance =
+            std::env::var("FABRIC_TARGET_INSTANCE").map_err(fabric_runner::execution_error)?;
+        if initialize {
+            fabric_core::remote_agent::initialize_persistent_home(
+                std::path::Path::new(&args[0]),
+                &binding,
+            )?;
+        }
+        fabric_core::remote_agent::serve(
+            PathBuf::from(&args[0]),
+            PathBuf::from(&args[1]),
+            binding,
+            instance,
+        )
     })();
     if result.is_err() {
         // Native errors and transport diagnostics can contain secrets. No raw stderr.
-        eprintln!("Remote agent failed closed"); std::process::exit(1);
+        eprintln!("Remote agent failed closed");
+        std::process::exit(1);
     }
 }
 
@@ -81,18 +114,34 @@ mod tests {
     fn reaps_multiple_batches_and_keeps_operating() {
         // Direct children exercise the drain loop, not actual PID1 adoption.
         for _ in 0..2 {
-            let mut children: Vec<_> = (0..3).map(|_| std::process::Command::new("/bin/true").spawn().unwrap()).collect();
+            let mut children: Vec<_> = (0..3)
+                .map(|_| std::process::Command::new("/bin/true").spawn().unwrap())
+                .collect();
             for child in &children {
-                assert!(unsafe { libc::waitid(libc::P_PID, child.id(), &mut std::mem::zeroed(), libc::WEXITED | libc::WNOWAIT) } == 0);
+                assert!(
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            child.id(),
+                            &mut std::mem::zeroed(),
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    } == 0
+                );
             }
             super::reap().unwrap();
             for child in &mut children {
-                assert_eq!(child.try_wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+                assert_eq!(
+                    child.try_wait().unwrap_err().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
             }
         }
     }
     #[test]
     fn refuses_non_pid1() {
-        if unsafe { libc::getpid() } != 1 { assert!(super::init().is_err()); }
+        if unsafe { libc::getpid() } != 1 {
+            assert!(super::init().is_err());
+        }
     }
 }

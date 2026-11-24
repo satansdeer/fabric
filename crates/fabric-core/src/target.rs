@@ -24,41 +24,60 @@ pub(crate) fn drive<T>(
             .map_err(|_| fabric_runner::execution_error("Invalid target binding."))?;
         let target = pin.open(&CancellationToken::default())?;
         if target.is_remote() {
-            let durable_run = store.run(run).map_err(fabric_runner::execution_error)?
-                .ok_or_else(||fabric_runner::execution_error("Remote Run unavailable"))?;
-            let bound = crate::remote::recovery_binding(store,&durable_run)?;
-            let receipt = bound.remote.as_ref()
-                .ok_or_else(||fabric_runner::execution_error("Remote ownership receipt unavailable"))?;
+            let durable_run = store
+                .run(run)
+                .map_err(fabric_runner::execution_error)?
+                .ok_or_else(|| fabric_runner::execution_error("Remote Run unavailable"))?;
+            let bound = crate::remote::recovery_binding(store, &durable_run)?;
+            let receipt = bound.remote.as_ref().ok_or_else(|| {
+                fabric_runner::execution_error("Remote ownership receipt unavailable")
+            })?;
             let input = serde_json::json!({"resource":receipt.resource});
             match action {
                 Action::Reclaim => {
                     let reply = target.remote_call("workspace.reclaim", input)?;
                     if reply != serde_json::json!({"reclaimed":true}) {
-                        return Err(fabric_runner::execution_error("Remote reclamation unproven"));
+                        return Err(fabric_runner::execution_error(
+                            "Remote reclamation unproven",
+                        ));
                     }
                 }
                 Action::Inspect | Action::Recover => {
                     let reply = target.remote_call("worker.poll", input)?;
                     if reply["state"] != "complete" {
-                        return Err(fabric_runner::execution_error("Remote process inactivity unproven"));
+                        return Err(fabric_runner::execution_error(
+                            "Remote process inactivity unproven",
+                        ));
                     }
-                    let completion = crate::remote::completion(reply["result"].clone(),&receipt.resource)?;
-                    crate::remote::validate_completion(store,&durable_run,&completion)?;
-                    if matches!(action,Action::Recover) && context["apply"] != false {
-                        store.record_remote_completion(run,&serde_json::to_value(&completion)
-                            .map_err(fabric_runner::execution_error)?).map_err(fabric_runner::execution_error)?;
+                    let completion =
+                        crate::remote::completion(reply["result"].clone(), &receipt.resource)?;
+                    crate::remote::validate_completion(store, &durable_run, &completion)?;
+                    if matches!(action, Action::Recover) && context["apply"] != false {
+                        store
+                            .record_remote_completion(
+                                run,
+                                &serde_json::to_value(&completion)
+                                    .map_err(fabric_runner::execution_error)?,
+                            )
+                            .map_err(fabric_runner::execution_error)?;
                     }
                 }
-                _ => return Err(fabric_runner::execution_error("Unsupported remote ownership operation")),
+                _ => {
+                    return Err(fabric_runner::execution_error(
+                        "Unsupported remote ownership operation",
+                    ));
+                }
             }
             // Remote acknowledgement is never evidence of a controller filesystem effect.
             let (value, _) = execute(store)?;
             let failure = target.finish().err();
-            if failure.is_some() && !matches!(action, Action::Inspect)
-                && context["apply"] != false {
-                store.record_target_failure(run).map_err(fabric_runner::execution_error)?;
+            if failure.is_some() && !matches!(action, Action::Inspect) && context["apply"] != false
+            {
+                store
+                    .record_target_failure(run)
+                    .map_err(fabric_runner::execution_error)?;
             }
-            return Ok(Committed {value, failure});
+            return Ok(Committed { value, failure });
         }
         let mut committed = target.drive(operation, run.as_str(), &[action], context, |_| {
             execute(store)

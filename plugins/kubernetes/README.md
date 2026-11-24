@@ -1,6 +1,6 @@
 # External Kubernetes target
 
-Issue #33 source implementation; **checks=NOT_RUN_BY_WORKER**. No Kubernetes, provider, native OAuth, build or test result is claimed here. The manager owns integration and execution of the checks below. No version bump or provider/model/effort/auth default changes.
+Issue #33 implementation; worker delivery **checks=NOT_RUN_BY_WORKER**. Manager-observed provider-free verification is recorded below. No native OAuth result, version bump, or provider/model/effort/auth default change is claimed.
 
 This explicitly installed target uses the public [`remote.v1` contract](../../docs/PLUGIN_PROTOCOL.md#generic-remote-target-backend-v1). Core and Runner contain no Kubernetes dispatch. `fabric-remote-agent` is a generic target-side executable: actual Linux process supervision, PTY allocation, HOME/workspace leases, source verification and capture happen inside the Pod. Controller directories are bounded transfer staging, **not** a mirror advertised as remote HOME. Acknowledging local grants cannot select this backend.
 
@@ -191,4 +191,15 @@ The script exercises real shell binary bytes/control/resize/exit/cancel/disconne
 
 Process success requires the original observed PID/start-time identity to disappear, not merely become `Z`; matching zombies fail while present. `/proc/PID/stat` parsing handles spaces/parentheses in comm, rejects malformed/unreadable evidence and treats only a changed start time as a replacement (never signaled/adopted). Ordinary descendants are observed before terminal cancel, disconnect and worker cancel. Two explicit ordinary orphan batches demonstrate actual adoption by PID1 and eventual disappearance, with finite waits and immediate terminal-error checks. These scenarios remain manager-only, not a unit fixture or universal containment proof.
 
-**Current source-only verification: NOT_RUN_BY_WORKER. Real Kubernetes E2E, real OOM, native OAuth and release/runtime compatibility are not established by this delivery.**
+**Worker source-only delivery: NOT_RUN_BY_WORKER. Its source handoff alone established no Kubernetes E2E, real OOM, native OAuth or release/runtime compatibility result; separate manager observations follow.**
+
+## Manager-observed private Kubernetes proof
+
+On 2026-11-24, the actual opt-in `e2e.py --allow-kubernetes` scenario passed in 47.62 seconds on the private Colima/VZ arm64, kubectl v1.35.10, k3s v1.35.10+k3s1, local-path fixture described above. It used a newly owned restricted namespace and installation, not existing environment resources.
+
+- `persistence`, `pty`, `cancel_reclaim`, and `scheduling`: **VERIFIED**. The scenario includes actual CLI → installed SDK package → external target → Linux agent execution, same-PVC Pod recreation, two ordinary orphan batches adopted/reaped by PID1, terminal resize/control-C/disconnect, cancellation and owned disposable-workspace reclamation.
+- Exact image source: `f818d0595f1a2299fc1ba66c26e0c8c0a2b2df51`; Linux arm64 image manifest: `sha256:ef505a0168e35091ebb2644dbb4ef5f50d392b4bfbcf4b88f9fff9b9daa83dde`. It was built and registered only in the private fixture's external containerd `k8s.io` namespace, not published as a supported registry image. Subsequent source formatting does not change this image's provenance.
+- After the scenario exited successfully, a separate namespaced installation-label query found zero owned Pods/PVCs. The owned namespace was retained; no unrelated resources or namespaces were deleted.
+- All six actual CLI/installed-target remote recovery regressions and four core transfer regressions passed. These include immutable returned-tree preservation after capture commit and before manifest association, with no worker rerun.
+- Real cgroup OOM remains **NOT_VERIFIED**; injectable terminated-status normalization is not real OOM evidence. Native OAuth remains **NOT_AUTHORIZED**. No paid model execution, multi-node/high-availability storage, hostile-code sandbox, or full consumer parity is claimed.
+

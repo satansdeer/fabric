@@ -286,7 +286,9 @@ fn remote_protocol_error(mut error: FabricError) -> FabricError {
     error.kind = ErrorKind::TargetProtocol;
     error
 }
-fn remote_failure(code: &'static str) -> FabricError { remote_protocol_error(failure(code)) }
+fn remote_failure(code: &'static str) -> FabricError {
+    remote_protocol_error(failure(code))
+}
 
 impl Target {
     /// Remote effects are owned by the explicitly negotiated target, never host grants.
@@ -300,24 +302,38 @@ impl Target {
         if !self.remote {
             return Err(remote_failure("remote_backend_not_negotiated"));
         }
-        let reply = self.call("target.remote.invoke", json!({"version":1,"operation":operation,"input":input}))
+        let reply = self
+            .call(
+                "target.remote.invoke",
+                json!({"version":1,"operation":operation,"input":input}),
+            )
             .map_err(remote_protocol_error)?;
-        let ticket = reply.get("ticket").and_then(Value::as_str)
+        let ticket = reply
+            .get("ticket")
+            .and_then(Value::as_str)
             .filter(|s| !s.is_empty() && s.len() <= 128)
             .ok_or_else(|| remote_failure("invalid_remote_ticket"))?;
         loop {
-            let reply = self.call("target.remote.poll", json!({"ticket":ticket})).map_err(remote_protocol_error)?;
+            let reply = self
+                .call("target.remote.poll", json!({"ticket":ticket}))
+                .map_err(remote_protocol_error)?;
             match reply.get("state").and_then(Value::as_str) {
                 Some("pending") if reply.as_object().is_some_and(|v| v.len() == 1) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Some("complete") if reply.as_object().is_some_and(|v| v.len() == 2) => {
-                    return reply.get("result").cloned().ok_or_else(|| remote_failure("invalid_remote_result"));
+                    return reply
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| remote_failure("invalid_remote_result"));
                 }
                 Some("failed") if reply["scope"] == "harness" => {
                     let kind = serde_json::from_value(reply["kind"].clone())
                         .map_err(|_| remote_failure("invalid_remote_error"))?;
-                    return Err(FabricError { kind, message:"Remote harness operation failed.".into() });
+                    return Err(FabricError {
+                        kind,
+                        message: "Remote harness operation failed.".into(),
+                    });
                 }
                 Some("failed") => return Err(remote_failure("remote_target_failed")),
                 _ => return Err(remote_failure("invalid_remote_result")),
@@ -343,7 +359,9 @@ impl Target {
     }
 
     pub fn open_exec(&self, request: &crate::pty::OpenExec) -> Result<(), FabricError> {
-        if self.remote { return Err(failure("host_pty_forbidden_for_remote_backend")); }
+        if self.remote {
+            return Err(failure("host_pty_forbidden_for_remote_backend"));
+        }
         self.require_environment(true)?;
         request.size.validate()?;
         request.limits.validate()?;
@@ -373,8 +391,8 @@ impl Target {
         } else {
             self.call("target.pty.exchange", params)?
         };
-        let reply: crate::pty::Reply = serde_json::from_value(value)
-        .map_err(|_| crate::pty::error())?;
+        let reply: crate::pty::Reply =
+            serde_json::from_value(value).map_err(|_| crate::pty::error())?;
         reply.validate(request.input.len())?;
         Ok(reply)
     }
@@ -385,8 +403,8 @@ impl Target {
         } else {
             self.call("target.pty.close", json!({"cancel":cancel}))?
         };
-        let reply: crate::pty::Reply = serde_json::from_value(value)
-            .map_err(|_| crate::pty::error())?;
+        let reply: crate::pty::Reply =
+            serde_json::from_value(value).map_err(|_| crate::pty::error())?;
         reply.validate(0)?;
         if reply.closed.is_none() || !reply.output.is_empty() {
             return Err(crate::pty::error());

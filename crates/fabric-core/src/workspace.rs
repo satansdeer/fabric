@@ -298,10 +298,15 @@ pub(super) fn validate_owned_workspace(
     run: &Run,
     workspace: &Workspace,
 ) -> Result<RunnerWorkspace, FabricError> {
-    validate_owned_workspace_tree(root,run,workspace,"tree")
+    validate_owned_workspace_tree(root, run, workspace, "tree")
 }
 
-fn validate_owned_workspace_tree(root: &Path, run: &Run, workspace: &Workspace, tree_name: &str) -> Result<RunnerWorkspace, FabricError> {
+fn validate_owned_workspace_tree(
+    root: &Path,
+    run: &Run,
+    workspace: &Workspace,
+    tree_name: &str,
+) -> Result<RunnerWorkspace, FabricError> {
     if workspace.run_id != run.run_id
         || workspace.workspace_id != run.workspace_id
         || workspace.state_id != run.prepared_state_id
@@ -353,10 +358,14 @@ fn validate_owned_workspace_tree(root: &Path, run: &Run, workspace: &Workspace, 
 }
 
 fn validate_directories(root: &Path, workspace: &Workspace) -> Result<(), FabricError> {
-    validate_directories_tree(root,workspace,"tree")
+    validate_directories_tree(root, workspace, "tree")
 }
 
-fn validate_directories_tree(root: &Path, workspace: &Workspace, tree_name: &str) -> Result<(), FabricError> {
+fn validate_directories_tree(
+    root: &Path,
+    workspace: &Workspace,
+    tree_name: &str,
+) -> Result<(), FabricError> {
     private_directory(root)?;
     let expected = fork_path(root, &workspace.workspace_id);
     if Path::new(&workspace.managed_path) != expected {
@@ -370,7 +379,10 @@ fn validate_directories_tree(root: &Path, workspace: &Workspace, tree_name: &str
             .parent()
             .ok_or_else(|| storage_error("Missing workspace container."))?,
     )?;
-    let expected = expected.parent().ok_or_else(||storage_error("Missing container"))?.join(tree_name);
+    let expected = expected
+        .parent()
+        .ok_or_else(|| storage_error("Missing container"))?
+        .join(tree_name);
     private_directory(&expected)?;
     if expected.canonicalize().map_err(storage_error)? != expected {
         return Err(storage_error("Workspace path contains a symlink surprise."));
@@ -608,17 +620,21 @@ fn recover_one(
         }
         item.reason = "unsafe_path_or_owner".into();
         recovery_workspace(root, store, &run, &workspace)?;
-        if run.capture.is_none() && store.launch_receipt(&run.run_id).map_err(storage_error)?
-            .is_some_and(|receipt|receipt.remote.is_some()) {
+        if run.capture.is_none()
+            && store
+                .launch_receipt(&run.run_id)
+                .map_err(storage_error)?
+                .is_some_and(|receipt| receipt.remote.is_some())
+        {
             item.reason = "remote_capture_unavailable".into();
-            recover_remote_output(root,store,&run,&workspace,apply)?;
+            recover_remote_output(root, store, &run, &workspace, apply)?;
             if !apply {
                 item.action = "would_recover".into();
                 item.reason = "captureable_inactive_workspace".into();
                 return Ok(());
             }
             drop(owner);
-            item = clean_one(root,store,id,true,&mut |_|Ok(()))?;
+            item = clean_one(root, store, id, true, &mut |_| Ok(()))?;
             return Ok(());
         }
         item.reason = "target_unavailable".into();
@@ -638,11 +654,20 @@ fn recover_one(
         )?
         .into_result()?;
         let owned = validate_owned_workspace(root, &run, &workspace)?;
-        if let Some(installation) = crate::remote::Installation::load(store,&run)? {
-            let receipt = crate::remote::recovery_binding(store,&run)?;
-            let capture = run.capture.as_ref().ok_or_else(||storage_error("Missing installed capture metadata"))?;
-            installation.validate(owned.path().parent().ok_or_else(||storage_error("Missing container"))?,
-                &receipt.actual_sha256,capture)?;
+        if let Some(installation) = crate::remote::Installation::load(store, &run)? {
+            let receipt = crate::remote::recovery_binding(store, &run)?;
+            let capture = run
+                .capture
+                .as_ref()
+                .ok_or_else(|| storage_error("Missing installed capture metadata"))?;
+            installation.validate(
+                owned
+                    .path()
+                    .parent()
+                    .ok_or_else(|| storage_error("Missing container"))?,
+                &receipt.actual_sha256,
+                capture,
+            )?;
         }
         item.reason = if run.capture.is_some() {
             "incomplete_or_invalid_capture"
@@ -689,92 +714,201 @@ fn recover_one(
     Ok(item)
 }
 
-fn recovery_workspace(root: &Path, store: &Store, run: &Run, workspace: &Workspace) -> Result<RunnerWorkspace, FabricError> {
+fn recovery_workspace(
+    root: &Path,
+    store: &Store,
+    run: &Run,
+    workspace: &Workspace,
+) -> Result<RunnerWorkspace, FabricError> {
     match fs::symlink_metadata(&workspace.managed_path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        _ => return validate_owned_workspace(root,run,workspace),
+        _ => return validate_owned_workspace(root, run, workspace),
     }
     // Only the exact committed install may authorize the tree-rename gap.
-    let owned = validate_owned_workspace_tree(root,run,workspace,"transfer-previous")?;
-    let receipt = crate::remote::recovery_binding(store,run)?;
-    let remote = receipt.remote.as_ref().ok_or_else(||storage_error("Missing remote receipt"))?;
-    let result = store.remote_completion(&run.run_id).map_err(storage_error)?
-        .ok_or_else(||storage_error("Missing installation completion"))?;
-    let completion = crate::remote::completion(result,&remote.resource)?;
-    crate::remote::validate_completion(store,run,&completion)?;
-    let installation = crate::remote::Installation::load(store,run)?
-        .ok_or_else(||storage_error("Unrecorded partial installation"))?;
-    installation.validate(owned.path().parent().ok_or_else(||storage_error("Missing container"))?,
-        &receipt.actual_sha256,&completion.capture)?;
+    let owned = validate_owned_workspace_tree(root, run, workspace, "transfer-previous")?;
+    let receipt = crate::remote::recovery_binding(store, run)?;
+    let remote = receipt
+        .remote
+        .as_ref()
+        .ok_or_else(|| storage_error("Missing remote receipt"))?;
+    let result = store
+        .remote_completion(&run.run_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("Missing installation completion"))?;
+    let completion = crate::remote::completion(result, &remote.resource)?;
+    crate::remote::validate_completion(store, run, &completion)?;
+    let installation = crate::remote::Installation::load(store, run)?
+        .ok_or_else(|| storage_error("Unrecorded partial installation"))?;
+    installation.validate(
+        owned
+            .path()
+            .parent()
+            .ok_or_else(|| storage_error("Missing container"))?,
+        &receipt.actual_sha256,
+        &completion.capture,
+    )?;
     Ok(owned)
 }
 
-fn recover_remote_output(root: &Path, store: &mut Store, run: &Run, workspace: &Workspace, apply: bool) -> Result<(), FabricError> {
+fn recover_remote_output(
+    root: &Path,
+    store: &mut Store,
+    run: &Run,
+    workspace: &Workspace,
+    apply: bool,
+) -> Result<(), FabricError> {
     use crate::remote;
-    let owned = recovery_workspace(root,store,run,workspace)?;
-    let receipt = remote::recovery_binding(store,run)?;
-    let remote = receipt.remote.as_ref().ok_or_else(||remote::error("missing remote receipt"))?;
-    let pin_json = store.run_target(&run.run_id).map_err(storage_error)?.ok_or_else(||remote::error("missing target"))?;
-    let installation = remote::Installation::load(store,run)?;
-    let container = owned.path().parent().ok_or_else(||remote::error("missing container"))?;
-    for path in [root.join("artifacts").join(format!("a-{}",run.run_id)),
-        root.join("artifact-staging").join(format!("a-{}",run.run_id)),
-        container.join("result.transfer.tar"),container.join("remote-return")] {
+    let owned = recovery_workspace(root, store, run, workspace)?;
+    let receipt = remote::recovery_binding(store, run)?;
+    let remote = receipt
+        .remote
+        .as_ref()
+        .ok_or_else(|| remote::error("missing remote receipt"))?;
+    let pin_json = store
+        .run_target(&run.run_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| remote::error("missing target"))?;
+    let installation = remote::Installation::load(store, run)?;
+    let container = owned
+        .path()
+        .parent()
+        .ok_or_else(|| remote::error("missing container"))?;
+    for path in [
+        root.join("artifacts").join(format!("a-{}", run.run_id)),
+        root.join("artifact-staging")
+            .join(format!("a-{}", run.run_id)),
+        container.join("result.transfer.tar"),
+        container.join("remote-return"),
+    ] {
         match fs::symlink_metadata(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             _ => return Err(remote::error("partial local capture; retain evidence")),
         }
     }
     if installation.is_none() {
-        for name in ["stdout.log","stderr.log","events.jsonl","transfer-previous"] {
+        for name in [
+            "stdout.log",
+            "stderr.log",
+            "events.jsonl",
+            "transfer-previous",
+        ] {
             match fs::symlink_metadata(container.join(name)) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                _ => return Err(remote::error("unrecorded partial local capture; retain evidence")),
+                _ => {
+                    return Err(remote::error(
+                        "unrecorded partial local capture; retain evidence",
+                    ));
+                }
             }
         }
-        if fabric_project::prepare::content_digest(owned.path(),std::time::Instant::now()+std::time::Duration::from_secs(1200))? != receipt.actual_sha256 {
+        if fabric_project::prepare::content_digest(
+            owned.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1200),
+        )? != receipt.actual_sha256
+        {
             return Err(remote::protocol_error("local source staging changed"));
         }
     }
-    let pin: fabric_runner::target::TargetPin = serde_json::from_str(&pin_json).map_err(remote::error)?;
+    let pin: fabric_runner::target::TargetPin =
+        serde_json::from_str(&pin_json).map_err(remote::error)?;
     let target = pin.open(&fabric_runner::CancellationToken::default())?;
-    if !target.is_remote() { return Err(remote::protocol_error("remote backend changed")); }
-    let reply = target.remote_call("worker.poll",serde_json::json!({"resource":remote.resource}))?;
-    if reply["state"] != "complete" { return Err(remote::error("remote inactivity unproven")); }
-    let result = remote::completion(reply["result"].clone(),&remote.resource)?;
-    remote::validate_completion(store,run,&result)?;
-    if let Some(saved) = &installation { saved.validate(container,&receipt.actual_sha256,&result.capture)?; }
+    if !target.is_remote() {
+        return Err(remote::protocol_error("remote backend changed"));
+    }
+    let reply = target.remote_call(
+        "worker.poll",
+        serde_json::json!({"resource":remote.resource}),
+    )?;
+    if reply["state"] != "complete" {
+        return Err(remote::error("remote inactivity unproven"));
+    }
+    let result = remote::completion(reply["result"].clone(), &remote.resource)?;
+    remote::validate_completion(store, run, &result)?;
+    if let Some(saved) = &installation {
+        saved.validate(container, &receipt.actual_sha256, &result.capture)?;
+    }
     let temporary = std::env::temp_dir();
-    let mut staging = remote::download_staged(&target,&remote.resource,if apply {container} else {&temporary},remote::TRANSFER_LIMIT)?;
+    let mut staging = remote::download_staged(
+        &target,
+        &remote.resource,
+        if apply { container } else { &temporary },
+        remote::TRANSFER_LIMIT,
+    )?;
     let witness = &staging.witness;
-    if witness["resource"] != remote.resource || witness["actual_sha256"] != receipt.actual_sha256
-        || witness["instance"] != remote.instance || witness["os"] != remote.os
-        || witness["arch"] != remote.arch || witness["hostname"] != remote.hostname {
+    if witness["resource"] != remote.resource
+        || witness["actual_sha256"] != receipt.actual_sha256
+        || witness["instance"] != remote.instance
+        || witness["os"] != remote.os
+        || witness["arch"] != remote.arch
+        || witness["hostname"] != remote.hostname
+    {
         return Err(remote::protocol_error("retained source witness changed"));
     }
-    remote::verify_output(&staging.path,&result.capture)?;
-    let mut prompt = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(container.join("prompt.input")).map_err(storage_error)?;
-    if !prompt.metadata().map_err(storage_error)?.is_file() { return Err(remote::error("prompt type")); }
+    remote::verify_output(&staging.path, &result.capture)?;
+    let mut prompt = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(container.join("prompt.input"))
+        .map_err(storage_error)?;
+    if !prompt.metadata().map_err(storage_error)?.is_file() {
+        return Err(remote::error("prompt type"));
+    }
     let mut copied = remote::private_file(&staging.path.join("prompt.input"))?;
-    if std::io::copy(&mut (&mut prompt).take(remote::TRANSFER_LIMIT+1),&mut copied).map_err(storage_error)? > remote::TRANSFER_LIMIT {
+    if std::io::copy(
+        &mut (&mut prompt).take(remote::TRANSFER_LIMIT + 1),
+        &mut copied,
+    )
+    .map_err(storage_error)?
+        > remote::TRANSFER_LIMIT
+    {
         return Err(remote::error("prompt bound"));
     }
     copied.sync_all().map_err(storage_error)?;
-    let staged_workspace = RunnerWorkspace {run_id:run.run_id.clone(),path:staging.path.join("tree")};
+    let staged_workspace = RunnerWorkspace {
+        run_id: run.run_id.clone(),
+        path: staging.path.join("tree"),
+    };
     let mut observed = run.clone();
     observed.capture = Some(result.capture.clone());
-    crate::artifacts::recover_capture(root,store,&observed,&staged_workspace,false)?;
+    crate::artifacts::recover_capture(root, store, &observed, &staged_workspace, false)?;
     // Shutdown must succeed before any durable recovery effect.
     target.finish()?;
-    if !apply { return Ok(()); }
-    recovery_workspace(root,store,run,workspace)?;
-    store.record_remote_completion(&run.run_id,&serde_json::to_value(&result).map_err(storage_error)?).map_err(storage_error)?;
-    remote::install_download(&mut staging,container,store,run,&receipt.actual_sha256,&result.capture)?;
-    store.record_recovered_capture(run,&result.capture,result.exit_code,result.exit_signal,result.reason()).map_err(storage_error)?;
-    let current = store.run(&run.run_id).map_err(storage_error)?.ok_or_else(||remote::error("run disappeared"))?;
-    let captured = crate::artifacts::recover_capture(root,store,&current,&owned,true)?
-        .ok_or_else(||remote::error("capture not established"))?;
-    store.recover_artifacts(&current,workspace,&captured.0,&captured.1).map_err(storage_error)
+    if !apply {
+        return Ok(());
+    }
+    recovery_workspace(root, store, run, workspace)?;
+    store
+        .record_remote_completion(
+            &run.run_id,
+            &serde_json::to_value(&result).map_err(storage_error)?,
+        )
+        .map_err(storage_error)?;
+    remote::install_download(
+        &mut staging,
+        container,
+        store,
+        run,
+        &receipt.actual_sha256,
+        &result.capture,
+    )?;
+    store
+        .record_recovered_capture(
+            run,
+            &result.capture,
+            result.exit_code,
+            result.exit_signal,
+            result.reason(),
+        )
+        .map_err(storage_error)?;
+    let current = store
+        .run(&run.run_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| remote::error("run disappeared"))?;
+    let captured = crate::artifacts::recover_capture(root, store, &current, &owned, true)?
+        .ok_or_else(|| remote::error("capture not established"))?;
+    store
+        .recover_artifacts(&current, workspace, &captured.0, &captured.1)
+        .map_err(storage_error)
 }
 
 pub(super) fn reclaim_run(root: &Path, id: &RunId) -> Result<GcItem, FabricError> {
