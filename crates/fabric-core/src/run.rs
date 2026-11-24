@@ -715,6 +715,7 @@ pub(crate) fn execute_prepared(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_remote(
     root: &Path,
     store: &mut fabric_store::Store,

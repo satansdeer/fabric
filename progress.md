@@ -481,3 +481,9 @@
 - Actual opt-in installed CLI/SDK/external-target/Linux-agent Kubernetes E2E passed in 47.62 seconds: persistent HOME through Pod recreation, PTY byte relay/resize/control-C/disconnect, ordinary PID1 adoption/reaping, worker cancellation and disposable workspace reclamation, ownership checks and real unschedulable CPU-request cleanup. Follow-up namespaced installation-label query found zero owned Pods/PVCs; namespace retained.
 - All six CLI remote recovery and four core transfer regressions passed; local CLI/reference-agent build passed. Native source worker ran no QA. Real OOM remains `NOT_VERIFIED` (injectable normalization only); OAuth remains `NOT_AUTHORIZED`; no paid execution or full consumer parity claim.
 - Opened manager PR #80. Initial CI stopped on formatting of new source; applied Rust 1.91 formatter output only to the 14 reported source files through anchored edits. The targeted formatting check passes; no behavioral change or hidden rerun of native workers.
+
+### Issue #33 manager acceptance: private Kubernetes client state
+
+- Real fixture QA exposed an unset-HOME `kubectl` discovery cache in the caller workspace. The external target now owns a mode-0700 temporary client HOME, passes it explicitly to `kubectl`, and removes it after owned agent/process closure. No credentials or ambient HOME are inherited.
+- Added one actual-subprocess regression for cache placement and cleanup; existing unit fixtures now close their owned target. All 15 Python checks passed without lifecycle warnings.
+- Repeated the actual installed Kubernetes CLI scenario after the fix: persistence, PTY, cancellation/reclaim, and scheduling all VERIFIED in 45.57 seconds; no `.kube` was recreated in the source workspace. Real OOM remains NOT_VERIFIED (injectable terminated-status normalization tested), OAuth NOT_AUTHORIZED, namespace retained.

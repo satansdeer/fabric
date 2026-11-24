@@ -203,3 +203,9 @@ On 2026-11-24, the actual opt-in `e2e.py --allow-kubernetes` scenario passed in 
 - All six actual CLI/installed-target remote recovery regressions and four core transfer regressions passed. These include immutable returned-tree preservation after capture commit and before manifest association, with no worker rerun.
 - Real cgroup OOM remains **NOT_VERIFIED**; injectable terminated-status normalization is not real OOM evidence. Native OAuth remains **NOT_AUTHORIZED**. No paid model execution, multi-node/high-availability storage, hostile-code sandbox, or full consumer parity is claimed.
 
+
+The manager repeated the installed Kubernetes scenario after isolating `kubectl`
+discovery state in a private temporary client HOME: all 15 Python boundary checks
+passed, then the real scenario passed in 45.57 seconds with the same explicit OOM
+and OAuth limits above. The client HOME is removed only after its owned agents
+and subprocesses stop; discovery caches do not enter the caller's workspace.

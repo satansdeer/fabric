@@ -200,6 +200,7 @@ class Target:
         self.agents, self.children = {}, set()
         self.children_lock = threading.Lock()
         self.stopping = threading.Event()
+        self.local_home = tempfile.TemporaryDirectory(prefix="fabric-k8s-client-")
 
     def command(self, args):
         return [self.c["kubectl"], "--kubeconfig", self.c["kubeconfig"], "--context", self.c["context"],
@@ -208,7 +209,8 @@ class Target:
     def spawn(self, args, **kwargs):
         require(not self.stopping.is_set())
         process = subprocess.Popen(self.command(args), stderr=subprocess.DEVNULL,
-                                   env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"}, **kwargs)
+                                   env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C",
+                                        "HOME": self.local_home.name}, **kwargs)
         with self.children_lock:
             self.children.add(process)
         return process
@@ -549,6 +551,7 @@ class Target:
             if child.poll() is None:
                 child.kill()
             child.wait()
+        self.local_home.cleanup()
 
 
 def serve(target):

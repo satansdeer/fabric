@@ -679,10 +679,7 @@ pub(crate) fn download_staged(
                     meta.is_dir()
                 } else {
                     meta.is_file()
-                } =>
-            {
-                ()
-            }
+                } => {}
             Ok(_) => return Err(protocol_error(format!("returned {name} type"))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(protocol_error(format!("missing {name}")));

@@ -18,6 +18,27 @@ e2e_spec.loader.exec_module(evidence)
 
 
 class Boundaries(unittest.TestCase):
+    def test_kubectl_cache_cannot_pollute_caller_workspace(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            work = root / "work"
+            work.mkdir()
+            client = root / "kubectl"
+            client.write_text('#!/bin/sh\nmkdir -p "$HOME/.kube"\nprintf discovery > "$HOME/.kube/cache"\n')
+            client.chmod(0o700)
+            target = plugin.Target(dict(kubectl=str(client), kubeconfig="/unused",
+                                        context="proof", namespace="proof"), "a" * 64)
+            home = Path(target.local_home.name)
+            try:
+                child = target.spawn(["get", "pods"], cwd=work)
+                self.assertEqual(child.wait(timeout=5), 0)
+                self.assertEqual(list(work.iterdir()), [])
+                self.assertEqual((home / ".kube/cache").read_text(), "discovery")
+                self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+            finally:
+                target.close()
+            self.assertFalse(home.exists())
+
     def test_original_identity_requires_disappearance_not_zombie(self):
         def proc(state=b"S", start=b"987"):
             return b"123 (comm with ) spaces (and)) " + b" ".join([state, b"1"] + [b"0"] * 17 + [start]) + b"\n"
@@ -37,6 +58,7 @@ class Boundaries(unittest.TestCase):
         settings = dict(namespace="bounded-test", installation="proof", uid=1000, gid=1000,
                         image="example.invalid/image@sha256:" + "1" * 64, cpu="100m", memory="128Mi", workspace_size="256Mi")
         target = plugin.Target(settings, "a" * 64)
+        self.addCleanup(target.close)
         binding = dict(owner="owner", environment_id="test", resource=None)
         name = target.names(binding)
         binding["resource"] = dict(backend="remote.v1", resource_id="k8s:ns:pvc", namespace_uid="ns",
@@ -93,7 +115,7 @@ class Boundaries(unittest.TestCase):
             lambda t,b,o: o["pod"]["spec"]["containers"][0]["securityContext"].update(privileged=True),
             lambda t,b,o: o["pod"]["spec"]["containers"][0].update(command=["/bin/sleep","infinity"]),
             lambda t,b,o: o["pod"]["spec"]["containers"][0].update(image="foreign@sha256:"+"0"*64),
-            lambda t,b,o: t.agents.update({b["resource"]["resource_id"]:object()}),
+            lambda t,b,o: t.agents.update({b["resource"]["resource_id"]:Mock()}),
             lambda t,b,o: o["pod"]["status"].update(phase="Running"),
         ])
         for mutate in mutations:
@@ -265,6 +287,7 @@ class Boundaries(unittest.TestCase):
         settings = dict(namespace="bounded-test", installation="proof", uid=1000, gid=1000,
                         image="example.invalid/image@sha256:" + "1" * 64, cpu="100m", memory="128Mi", workspace_size="256Mi")
         target = plugin.Target(settings, "a" * 64)
+        self.addCleanup(target.close)
         environment = dict(owner="owner", environment_id="test", resource=None)
         name = target.names(environment)
         pod = target.pod_spec(name, environment)
@@ -283,6 +306,7 @@ class Boundaries(unittest.TestCase):
         # Read-only API object injection, not Kubernetes execution or an E2E mock.
         settings = dict(namespace="bounded-test", installation="proof", storage_class="local-path", storage_size="256Mi")
         target = plugin.Target(settings, "a" * 64)
+        self.addCleanup(target.close)
         target.namespace = lambda: "namespace-uid"
         environment = dict(owner="owner", environment_id="test", resource=None)
         name = target.names(environment)
