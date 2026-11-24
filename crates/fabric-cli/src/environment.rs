@@ -9,7 +9,7 @@ pub struct SelectionArgs {
     pub environment_id: Option<EnvironmentId>,
     #[arg(long, requires = "environment_id")]
     pub environment_owner: Option<String>,
-    /// Unsupported until a target and Core both implement PTY execution.
+    /// Require a target that also negotiates the optional PTY capability.
     #[arg(long, requires = "environment_id")]
     pub interactive_exec_pty: bool,
 }

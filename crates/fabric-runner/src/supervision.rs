@@ -322,6 +322,11 @@ impl ProcessGroup {
     }
 
     pub(crate) fn stop_and_reap(&mut self, grace: Duration) -> Result<ExitStatus, FabricError> {
+        if self.reaped {
+            return Err(execution_error(
+                "Owned process was already reaped; refusing to signal a reused PID",
+            ));
+        }
         // Also clean up background descendants after a natural leader exit.
         let deadline = Instant::now() + grace;
         self.signal(libc::SIGTERM, deadline)

@@ -19,7 +19,8 @@ export interface TargetPlacement { placement: string; backends: ['host.local'] }
 export interface TargetCompleted { grant: string; evidence: { [key: string]: Json } }
 export type TargetOperation = 'prepare' | 'start' | 'inspect' | 'cancel' | 'collect' | 'reclaim';
 export const TARGET_OPERATIONS: readonly TargetOperation[];
-export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: string[] }
+/** Native client negotiation; generated serveTarget servers deliberately implement only optional:[]. */
+export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: [] | ['environment.v1'] | ['environment.v1', 'pty.v1'] }
 export interface TargetProposal<K extends TargetOperation = TargetOperation> { grant: string; action: TargetActionByOperation[K] | { primitive: 'unsupported' } }
 export const TARGET_ACTIONS: { readonly [K in TargetOperation]: readonly TargetActionByOperation[K][] };
 export function validTargetPlan(plan: unknown, job: TargetJob): boolean;
@@ -48,7 +49,7 @@ export interface HarnessDefinition extends Identity {
   run(context: HarnessContext): Result<void>;
 }
 export type TargetDefinition = Identity & {
-  capabilities(): Result<TargetCapabilities>;
+  capabilities(): Result<TargetCapabilities & { optional: [] }>;
   placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'unsupported' }>;
   completed(result: TargetCompleted): Result<{ received: string }>;
 } & { [K in TargetOperation]: (job: TargetJob<K>) => Result<TargetProposal<K>> };

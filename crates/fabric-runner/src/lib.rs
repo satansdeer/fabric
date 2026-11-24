@@ -11,6 +11,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod controller;
+pub mod pty;
 mod supervision;
 pub mod target;
 pub use supervision::{CancellationToken, ExecutionLimits, ForegroundInterrupt, StopReason};

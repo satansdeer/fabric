@@ -1,9 +1,11 @@
 //! Reference trusted-local driver. Core interprets these proposals with its own validated objects.
+use fabric_runner::pty::{Close, Exchange, LocalPty, OpenExec, POLL_MS};
 use fabric_runner::target::{Action, ForkMode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, Read, Write};
+use std::os::fd::AsRawFd;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,14 +46,62 @@ fn serve() -> Result<(), ()> {
     let mut id = 1u64;
     let mut pending = BTreeSet::new();
     let mut seen = BTreeSet::new();
+    let interrupt = fabric_runner::ForegroundInterrupt::install().map_err(|_| ())?;
+    let cancellation = interrupt.token();
+    let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(());
+    }
+    let output_flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+    if output_flags < 0
+        || unsafe {
+            libc::fcntl(
+                output.as_raw_fd(),
+                libc::F_SETFL,
+                output_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        return Err(());
+    }
+    let mut pty: Option<LocalPty> = None;
     loop {
         frame.clear();
-        input
-            .by_ref()
-            .take(65_537)
-            .read_until(b'\n', &mut frame)
-            .map_err(|_| ())?;
-        if frame.len() > 65_536 || frame.last() != Some(&b'\n') {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
+            if let Some(session) = pty.as_mut() {
+                session.tick().map_err(|_| ())?;
+            }
+            if frame.len() >= 65_536 {
+                return Err(());
+            }
+            match input
+                .by_ref()
+                .take((65_537 - frame.len()) as u64)
+                .read_until(b'\n', &mut frame)
+            {
+                Ok(0) => return Err(()),
+                Ok(_) if frame.last() == Some(&b'\n') => break,
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(()),
+            }
+            let mut fd = libc::pollfd {
+                fd: input.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut fd, 1, POLL_MS);
+            }
+        }
+        if frame.len() > 65_536 {
             return Err(());
         }
         let request: Request = serde_json::from_slice(&frame).map_err(|_| ())?;
@@ -70,7 +120,7 @@ fn serve() -> Result<(), ()> {
             }
             json!({"ready":true})
         } else if shutdown {
-            if request.params != json!({}) || !pending.is_empty() {
+            if request.params != json!({}) || !pending.is_empty() || pty.is_some() {
                 return Err(());
             }
             json!({"ready":true})
@@ -78,7 +128,7 @@ fn serve() -> Result<(), ()> {
             if request.params != json!({}) {
                 return Err(());
             }
-            json!({"placements":["local"],"operations":fabric_runner::target::OPERATIONS,"optional":["environment.v1"]})
+            json!({"placements":["local"],"operations":fabric_runner::target::OPERATIONS,"optional":["environment.v1","pty.v1"]})
         } else if request.method == "target.placement" {
             if request.params != json!({"placement":"local","backends":["host.local"]}) {
                 return Err(());
@@ -88,7 +138,37 @@ fn serve() -> Result<(), ()> {
             if request.params != json!({"version":1}) {
                 return Err(());
             }
-            serde_json::to_value(fabric_domain::EnvironmentCapabilities::local()).map_err(|_| ())?
+            let mut caps = fabric_domain::EnvironmentCapabilities::local();
+            caps.interactive_exec_pty = true;
+            serde_json::to_value(caps).map_err(|_| ())?
+        } else if request.method == "target.pty.openExec" {
+            if pty.is_some() {
+                return Err(());
+            }
+            let open: OpenExec = serde_json::from_value(request.params).map_err(|_| ())?;
+            if open.placement != "local" {
+                return Err(());
+            }
+            pty = Some(LocalPty::open(&open).map_err(|_| ())?);
+            json!({"opened":true})
+        } else if request.method == "target.pty.exchange" {
+            let exchange: Exchange = serde_json::from_value(request.params).map_err(|_| ())?;
+            serde_json::to_value(
+                pty.as_mut()
+                    .ok_or(())?
+                    .exchange(&exchange)
+                    .map_err(|_| ())?,
+            )
+            .map_err(|_| ())?
+        } else if request.method == "target.pty.close" {
+            let close: Close = serde_json::from_value(request.params).map_err(|_| ())?;
+            let reply = pty
+                .as_mut()
+                .ok_or(())?
+                .close(close.cancel)
+                .map_err(|_| ())?;
+            pty.take();
+            serde_json::to_value(reply).map_err(|_| ())?
         } else if request.method == "target.completed" {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -164,15 +244,42 @@ fn serve() -> Result<(), ()> {
             }
             json!({"grant":job.grant,"action":action})
         };
-        serde_json::to_writer(
-            &mut output,
-            &json!({"jsonrpc":"2.0","id":id,"result":result}),
-        )
-        .map_err(|_| ())?;
-        output
-            .write_all(b"\n")
-            .and_then(|()| output.flush())
+        let mut response = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result}))
             .map_err(|_| ())?;
+        response.push(b'\n');
+        if response.len() > 65_536 {
+            return Err(());
+        }
+        let mut written = 0;
+        while written < response.len() {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
+            if let Some(session) = pty.as_mut() {
+                session.tick().map_err(|_| ())?;
+            }
+            match output.write(&response[written..]) {
+                Ok(0) => return Err(()),
+                Ok(count) => written += count,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    let mut fd = libc::pollfd {
+                        fd: output.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut fd, 1, POLL_MS);
+                    }
+                    if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                        return Err(());
+                    }
+                }
+                Err(_) => return Err(()),
+            }
+        }
         if shutdown {
             return Ok(());
         }

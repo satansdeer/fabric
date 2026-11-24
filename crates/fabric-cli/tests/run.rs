@@ -6154,3 +6154,95 @@ fn environment_destroy_allows_recovered_needs_attention_with_verified_inactive_l
     assert_eq!(after["run"]["capture"], before["run"]["capture"]);
     assert_sealed_artifacts(&fixture, run_id);
 }
+
+#[test]
+fn owner_only_remote_pty_preserves_credentials_without_run_capture() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.setup();
+    // environment.v1-only peer remains valid, but must fail before PTY transport.
+    fixture.target("legacy-env", "environment");
+    let root = fixture.0.canonicalize().unwrap();
+    let script = root.join("pty-remote.py");
+    fs::write(&script, include_str!("pty_remote.py")).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new("/usr/bin/python3")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args([script.as_os_str(), std::ffi::OsStr::new("scenario")])
+        .arg(env!("CARGO_BIN_EXE_fabric"))
+        .arg(env!("CARGO_BIN_EXE_fabric-local-target"))
+        .arg(root.join("storage"))
+        .arg(root.join("plugin-registry"))
+        .arg(&script)
+        .output()
+        .unwrap();
+    success(&output);
+    let binary = fixture.script_fake(
+        r#"exec /usr/bin/python3 - <<'PY'
+import os
+with open(os.path.join(os.environ['XDG_CONFIG_HOME'], 'login-marker'), 'rb') as marker:
+    assert marker.read() == b'issue32-echo-disabled-only'
+assert os.environ['HOME'] == os.path.dirname(os.environ['XDG_CONFIG_HOME'])
+print('environment authentication marker available')
+PY"#,
+    );
+    let prompt = root.join("pty-run-prompt.json");
+    fs::write(&prompt, "{}").unwrap();
+    let report = json(
+        &fixture
+            .cli()
+            .args(["run", "test", "--harness", "fake", "--fake-binary"])
+            .arg(binary)
+            .arg("--prompt-file")
+            .arg(prompt)
+            .args([
+                "--placement",
+                "remote-fixture",
+                "--environment",
+                "remote-home",
+                "--environment-owner",
+                "alice",
+                "--copy-limit-bytes",
+                "10485760",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report["state"], "SUCCEEDED");
+    assert_eq!(report["environment_id"], "remote-home");
+    verified_manifest(&fixture, &report);
+    let restored = restored_workspace(&fixture, &report);
+    assert!(!restored.join(".config/login-marker").exists());
+    fn private_bytes_absent(path: &Path) {
+        let canary = b"issue32-echo-disabled-only";
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            if metadata.is_dir() {
+                if entry.file_name() != "environments" {
+                    private_bytes_absent(&entry.path());
+                }
+            } else if metadata.is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes.windows(canary.len()).any(|part| part == canary),
+                    "terminal credential entered default storage: {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    private_bytes_absent(&root.join("storage"));
+    // Explicit destruction after all remote sessions have reaped remains possible.
+    let destroyed = json(&environment_command(
+        &fixture,
+        "destroy",
+        "remote-home",
+        "alice",
+        "remote-fixture",
+        &["--confirm", "remote-home"],
+    ));
+    assert_eq!(destroyed["runtime"], "absent");
+}

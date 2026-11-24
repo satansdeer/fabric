@@ -126,6 +126,7 @@ function controller() {
 	clients.push(value); return value;
 }
 
+const errors: unknown[] = [];
 try {
 	await mkdir(repo);
 	const version = await exec(omp, ["--version"]);
@@ -277,21 +278,26 @@ export default function proof(pi:ExtensionAPI) {
 	await second.close();
 	passed = true;
 	console.log(`PASS: actual installed OMP ${version.stdout.trim()}, native schemas/tools, early four-worker handles, visible ordinary-context progress, controller close/reconnect, independent real failure, digests/reclaim and cancellation; no agent/provider turn${plugin ? "; actual /skill:swarm discovered" : ""}. Live model routing/authentication NOT_VERIFIED.`);
+} catch (error) {
+	errors.push(error);
 } finally {
-	const closeErrors: unknown[] = [];
 	for (const client of clients) {
-		try { await client.close(); } catch (error) { closeErrors.push(error); }
+		try { await client.close(); } catch (error) { errors.push(error); }
 	}
-	if (closeErrors.length) passed = false;
 	try {
 		if (await Bun.file(join(root, "fabric.db")).exists()) {
 			await writeFile(join(fixture, "release-all"), "");
-			for (const batch of batches) await cli(["cancel", batch, "--json"]);
+			for (const batch of batches) {
+				await cli(["cancel", batch, "--json"]);
+				assert.equal((await cli(["wait", batch, "--timeout-seconds", "60", "--json"])).terminal, true, "cleanup left workers running");
+			}
 			await cli(["manager", "stop", "--json"]);
 		}
+	} catch (error) {
+		errors.push(error);
 	} finally {
-		if (passed && process.env.FABRIC_SMOKE_KEEP !== "1") { await writable(fixture); await rm(fixture, { recursive: true, force: true }); }
+		if (passed && !errors.length && process.env.FABRIC_SMOKE_KEEP !== "1") { await writable(fixture); await rm(fixture, { recursive: true, force: true }); }
 		else console.error(`Actual-host smoke evidence retained: ${fixture}`);
 	}
-	if (closeErrors.length) throw new AggregateError(closeErrors, "Actual OMP controller shutdown failed");
 }
+if (errors.length) throw new AggregateError(errors, "Actual OMP host smoke or owned cleanup failed");

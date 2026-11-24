@@ -92,7 +92,7 @@ test('a third-party target can select concrete host plans without using the loca
 
 test('target conformance rejects unknown, mixed, duplicate and malformed optional capabilities', async t => {
   const root = temporary(t);
-  for (const [i, optional] of [['future.v1'], ['environment.v1', 'future.v1'], ['environment.v1', 'environment.v1'], 'environment.v1'].entries()) {
+  for (const [i, optional] of [['future.v1'], ['pty.v1'], ['pty.v1', 'environment.v1'], ['environment.v1', 'future.v1'], ['environment.v1', 'pty.v1', 'pty.v1'], ['environment.v1', 'environment.v1'], 'environment.v1'].entries()) {
     const project = create('target', join(root, `invalid-optional-${i}`));
     const { info } = directory(project);
     rawPlugin(project, `import {createInterface} from 'node:readline';
@@ -425,7 +425,7 @@ test('reference local target package passes lifecycle conformance and installed 
   const root = temporary(t);
   const project = reference('local', join(root, 'local'), process.env.FABRIC_LOCAL_TARGET_BINARY);
   const proof = await conformance(project);
-  assert.deepEqual(proof.result, { placements: ['local'], operations: TARGET_OPERATIONS, optional: ['environment.v1'] });
+  assert.deepEqual(proof.result, { placements: ['local'], operations: TARGET_OPERATIONS, optional: ['environment.v1', 'pty.v1'] });
   assert.equal(archive(pack(directory(project))).hash, directory(project).hash);
   if (!hostSkip) {
     const registry = join(root, 'registry');
@@ -437,6 +437,36 @@ test('reference local target package passes lifecycle conformance and installed 
     assert.equal(checked.error, undefined);
     assert.equal(checked.status, 0, checked.stderr + checked.stdout);
     assert.deepEqual(JSON.parse(checked.stdout), { compatible: true, healthy: true });
+  }
+});
+
+test('target conformance rejects malformed PTY close replies after a real shell', { skip: !process.env.FABRIC_LOCAL_TARGET_BINARY && 'Set FABRIC_LOCAL_TARGET_BINARY' }, async t => {
+  const root = temporary(t);
+  for (const [i, fault] of [
+    { closed: 'bogus' }, { closed: null }, { exit_code: 'invalid' },
+    { exit_code: 0.5 }, { exit_code: 2147483648 }, { exit_code: -2147483649 },
+  ].entries()) {
+    const project = reference('local', join(root, `bad-close-${i}`), process.env.FABRIC_LOCAL_TARGET_BINARY);
+    updatePackage(project, pkg => { pkg.type = 'module'; });
+    // Only corrupt close: negotiation, binary exchange and shell effects are real.
+    writeFileSync(join(project, 'plugin'), `#!${process.execPath}
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+const backend = spawn(${JSON.stringify(process.env.FABRIC_LOCAL_TARGET_BINARY)}, ['--fabric-plugin-stdio'], { stdio: ['pipe', 'pipe', 'inherit'] });
+const methods = new Map();
+createInterface({ input: process.stdin }).on('line', line => {
+  const request = JSON.parse(line); methods.set(request.id, request.method);
+  backend.stdin.write(line + '\\n');
+}).on('close', () => backend.stdin.end());
+createInterface({ input: backend.stdout }).on('line', line => {
+  const reply = JSON.parse(line);
+  if (methods.get(reply.id) === 'target.pty.close') Object.assign(reply.result, ${JSON.stringify(fault)});
+  methods.delete(reply.id); process.stdout.write(JSON.stringify(reply) + '\\n');
+});
+backend.on('exit', code => process.exit(code ?? 1));
+process.on('SIGTERM', () => backend.kill('SIGTERM'));
+`, { mode: 0o700 });
+    await assert.rejects(conformance(project), /invalid_pty_close/);
   }
 });
 

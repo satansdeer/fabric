@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, statSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { directory } from './package.mjs';
@@ -127,10 +127,61 @@ export async function conformance(path, { timeout = 5000, connectorFixture } = {
       if (!exact(result, ['placements', 'operations', 'optional']) ||
           JSON.stringify(result.placements) !== JSON.stringify([info.id]) ||
           JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
-          !Array.isArray(result.optional) ||
-          !(result.optional.length === 0 || result.optional.length === 1 && result.optional[0] === 'environment.v1')) fail('unsupported_target_capabilities');
+          ![ '[]', '["environment.v1"]', '["environment.v1","pty.v1"]' ].includes(JSON.stringify(result.optional))) fail('unsupported_target_capabilities');
       const placement = await call('target.placement', { placement: info.id, backends: ['host.local'] });
       if (!exact(placement, ['backend']) || placement.backend !== 'host.local') fail('unsupported_target_placement');
+      if (result.optional.length) {
+        const capabilities = await call('target.environment.capabilities', { version: 1 });
+        const expected = { version: 1, persistent_home: true,
+          interactive_exec_pty: result.optional.length === 2, infrastructure_diagnostics: false,
+          operations: ['ensure', 'inspect', 'destroy', 'workspace'] };
+        if (!isDeepStrictEqual(capabilities, expected)) fail('unsupported_environment_capabilities');
+      }
+      if (result.optional.length === 2) {
+        // This is an actual shell, not an echoed success envelope. Core owner
+        // authorization and remote authentication are exercised by CLI tests.
+        const namespace = join(home, 'environments'), environment = join(namespace, 'conformance');
+        const tree = join(environment, 'tree');
+        for (const path of [namespace, environment, tree, join(tree, '.config'), join(tree, '.cache'),
+          join(tree, '.local'), join(tree, '.local/share'), join(tree, '.local/state')]) mkdirSync(path, { mode: 0o700 });
+        const identity = path => { const s = statSync(path, { bigint: true }); return { device: String(s.dev), inode: String(s.ino) }; };
+        const opened = await call('target.pty.openExec', { version: 1, placement: info.id,
+          environment_id: 'conformance', owner: 'conformance', owner_uid: process.geteuid(),
+          home: tree, home_identity: identity(tree), namespace_identity: identity(namespace),
+          size: { rows: 24, columns: 80 }, limits: { idle_seconds: 5, max_seconds: 10 } });
+        if (!exact(opened, ['opened']) || opened.opened !== true) fail('invalid_pty_open');
+        let closed = false, bytes = Buffer.alloc(0);
+        let input = [...Buffer.from('ignored\x15printf "\\000\\303\\251\\033[31mPTY\\033[0m\\n"; printf %s pty-state > "$XDG_STATE_HOME/pty-proof"; stty size > "$XDG_STATE_HOME/pty-size"; exit\n')];
+        try {
+          while (!closed) {
+            const reply = await call('target.pty.exchange', { input, resize: { rows: 37, columns: 91 } });
+            if (!exact(reply, ['accepted', 'output', 'closed', 'exit_code']) ||
+              !Number.isInteger(reply.accepted) || reply.accepted < 0 || reply.accepted > input.length ||
+              !Array.isArray(reply.output) || reply.output.length > 4096 ||
+              !reply.output.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255) ||
+              ![null, 'exited', 'closed', 'cancelled', 'idle_timeout', 'max_duration'].includes(reply.closed) ||
+              reply.exit_code !== null && (!Number.isInteger(reply.exit_code) ||
+                reply.exit_code < -2147483648 || reply.exit_code > 2147483647) ||
+              reply.closed === null && reply.exit_code !== null) fail('invalid_pty_exchange');
+            input = input.slice(reply.accepted);
+            bytes = Buffer.concat([bytes, Buffer.from(reply.output)]);
+            if (bytes.length > 65_536) fail('pty_output_limit');
+            closed = reply.closed !== null;
+            if (closed && (reply.closed !== 'exited' || reply.exit_code !== 0)) fail('pty_exit');
+            if (!closed) await new Promise(resolve => setImmediate(resolve));
+          }
+          if (!bytes.includes(Buffer.from('\x00é\x1b[31mPTY\x1b[0m')) ||
+            readFileSync(join(tree, '.local/state/pty-proof'), 'utf8') !== 'pty-state' ||
+            readFileSync(join(tree, '.local/state/pty-size'), 'utf8').trim() !== '37 91') fail('pty_execution_failed');
+        } finally {
+          const close = await call('target.pty.close', { cancel: !closed });
+          if (!exact(close, ['accepted', 'output', 'closed', 'exit_code']) || close.accepted !== 0 ||
+            !Array.isArray(close.output) || close.output.length ||
+            !['exited', 'closed', 'cancelled', 'idle_timeout', 'max_duration'].includes(close.closed) ||
+            close.exit_code !== null && (!Number.isInteger(close.exit_code) ||
+              close.exit_code < -2147483648 || close.exit_code > 2147483647)) fail('invalid_pty_close');
+        }
+      }
       // Transport fixtures only. Real execution/ownership evidence comes from Core, not this probe.
       const evidence = {
         prepare: { size_bytes: 1, cloned_files: 0, copied_files: 1 },
