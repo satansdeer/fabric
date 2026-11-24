@@ -87,6 +87,7 @@ function host() {
  } };
  clients.push(value); return value;
 }
+const errors: unknown[] = [];
 try {
  await run("/usr/bin/git", ["init", "--quiet"]);
  await writeFile(join(repo, "tracked"), "original\n");
@@ -153,13 +154,23 @@ await run(binary, ["--root", root, "up", "--controller", "--source-only", "--jso
  finally { cancelDb.close(); }
  await second.close();
  console.log(JSON.stringify({ result: "PASS", fixture, evidence, source_sha: up.source_commit_sha, ready: up.prepared_state_id, batch, registered_tools: tools.map((t: Doc) => t.name), inference: "NOT_RUN", native_defaults: "untouched" }));
+} catch (error) {
+ errors.push(error);
 } finally {
  for (const client of clients) {
-  try { await client.close(); } catch (error) { console.error("Owned host cleanup:", error); }
+  try { await client.close(); } catch (error) { errors.push(error); }
  }
- if (await Bun.file(join(root, "fabric.db")).exists()) {
-  for (const batch of batches) await cli(["cancel", batch, "--json"]);
-  await cli(["manager", "stop", "--json"]);
+ try {
+  if (await Bun.file(join(root, "fabric.db")).exists()) {
+   for (const batch of batches) {
+    await cli(["cancel", batch, "--json"]);
+    assert.equal((await cli(["wait", batch, "--timeout-seconds", "60", "--json"])).terminal, true, "cleanup left workers running");
+   }
+   await cli(["manager", "stop", "--json"]);
+  }
+ } catch (error) {
+  errors.push(error);
  }
  console.error(`Owned fixture retained: ${fixture}`);
 }
+if (errors.length) throw new AggregateError(errors, "Owned OMP up smoke or cleanup failed");
