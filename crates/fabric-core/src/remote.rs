@@ -510,14 +510,11 @@ pub fn resolve_harness(
     registry: &fabric_runner::HarnessRegistry,
     registry_options: &fabric_runner::RegistryOptions,
 ) -> Result<Box<dyn HarnessAdapter>, FabricError> {
-    let pin = match &options.target_pin {
-        Some(pin) => pin.clone(),
-        None => TargetPin::select(&options.harness_request.placement)?,
-    };
-    let target = pin.open(&options.cancellation)?;
-    let remote = target.is_remote();
-    target.finish()?;
-    if remote {
+    if is_remote(options)? {
+        let pin = match &options.target_pin {
+            Some(pin) => pin.clone(),
+            None => TargetPin::select(&options.harness_request.placement)?,
+        };
         if registry_options.fake_binary.is_some() {
             return Err(error("controller binary cannot be imported"));
         }
@@ -536,6 +533,19 @@ pub fn resolve_harness(
 }
 
 pub(crate) fn is_remote(options: &crate::run::RunOptions) -> Result<bool, FabricError> {
+    // The unregistered built-in placement is host-local. Preserve harness admission
+    // before loading its executable; registered replacements still negotiate capabilities.
+    if options.target_pin.is_none()
+        && options.harness_request.placement == "local"
+        && fabric_runner::plugin::configured_registry()?.is_none_or(|registry| {
+            !registry
+                .plugins
+                .iter()
+                .any(|plugin| plugin.manifest.id.as_str() == "local")
+        })
+    {
+        return Ok(false);
+    }
     let pin = match &options.target_pin {
         Some(p) => p.clone(),
         None => TargetPin::select(&options.harness_request.placement)?,

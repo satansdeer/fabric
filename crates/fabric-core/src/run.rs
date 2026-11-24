@@ -152,6 +152,9 @@ pub fn foreground(
     let request = options.request()?;
     let mut options = options.clone();
     let remote = crate::remote::is_remote(&options)?;
+    if !remote && options.environment.is_some() {
+        crate::environment::validate_context(&request, true)?;
+    }
     let remote_adapter = if remote {
         Some(crate::remote::resolve_harness(
             root,
@@ -1246,6 +1249,9 @@ pub(crate) fn plan_task(
     options.validate()?;
     let request = options.request()?;
     let remote = crate::remote::is_remote(options)?;
+    if !remote && options.environment.is_some() {
+        crate::environment::validate_context(&request, true)?;
+    }
     let (adapter, probe) = match adapters.entry(adapter_key(id, options)) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {

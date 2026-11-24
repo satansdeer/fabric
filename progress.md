@@ -489,3 +489,9 @@
 - Repeated the actual installed Kubernetes CLI scenario after the fix: persistence, PTY, cancellation/reclaim, and scheduling all VERIFIED in 45.57 seconds; no `.kube` was recreated in the source workspace. Real OOM remains NOT_VERIFIED (injectable terminated-status normalization tested), OAuth NOT_AUTHORIZED, namespace retained.
 - Selected candidate v0.1.21 for the reviewed remote/Kubernetes implementation; workspace package versions only, no dependency updates. Final exact-head CI, manager merge, exact-main CI, public packaging and independent downloaded-byte acceptance remain required. The private Linux proof retains its separately recorded source and image digest; it is not relabelled as a v0.1.21 public image.
 - Added the existing 15 provider-free Kubernetes boundary checks to macOS CI; this step needs no cluster credentials or paid runtime. Real private-cluster E2E remains a separately recorded manager proof, not a claim about hosted CI.
+
+### Issue #33 manager CI regression fixes
+
+- Restored built-in local harness admission before loading the local target executable; registered replacements and pinned targets still negotiate actual remote capabilities. Local environment requests reject native references before adapter planning; remote HOME references remain target-owned.
+- Corrected the schema-11 compatibility fixture to remove the schema-19/20 remote tables when constructing its historical database; production migrations remain strict.
+- The three existing regression tests, Rust formatting and targeted strict Clippy all pass after these fixes. No native model worker or paid retry was started.

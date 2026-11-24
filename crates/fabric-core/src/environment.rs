@@ -459,9 +459,12 @@ impl HomeLease {
     }
 }
 
-pub(crate) fn validate_context(plan: &HarnessPlan) -> Result<(), FabricError> {
-    if !plan.profile.portable
-        || plan.request.profile.as_ref().is_some_and(|profile| {
+pub(crate) fn validate_context(
+    request: &fabric_domain::HarnessRequest,
+    portable: bool,
+) -> Result<(), FabricError> {
+    if !portable
+        || request.profile.as_ref().is_some_and(|profile| {
             !profile.native_config_refs.is_empty() || !profile.connection_refs.is_empty()
         })
     {
@@ -481,7 +484,7 @@ pub(crate) fn for_run(
 ) -> Result<HomeLease, FabricError> {
     target.require_environment(selection.interactive_exec_pty)?;
     if !target.is_remote() {
-        validate_context(plan)?;
+        validate_context(&plan.request, plan.profile.portable)?;
     }
     let (root, store) = workspace::open_store(root)?;
     let lease = workspace::environment_lock(&root, false)?;
