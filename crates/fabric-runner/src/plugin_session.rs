@@ -142,6 +142,18 @@ impl PluginSession {
             },
         )
     }
+    pub(crate) fn call_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, FabricError> {
+        let previous = (self.timeout, self.configured_timeout);
+        (self.timeout, self.configured_timeout) = (timeout, timeout);
+        let result = self.call(method, params);
+        (self.timeout, self.configured_timeout) = previous;
+        result
+    }
     pub(crate) fn set_cancellation(&mut self, cancellation: &CancellationToken) {
         self.cancel = cancellation.clone();
     }

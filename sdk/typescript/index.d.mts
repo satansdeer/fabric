@@ -147,7 +147,7 @@ export interface NativeHarnessDefinition extends Identity {
 }
 export type NativeHarness = Readonly<NativeHarnessDefinition & { kind: 'harness'; native: true }>;
 export function defineNativeHarness(options: NativeHarnessDefinition): NativeHarness;
-export function rejectNative(kind: 'unsupported_capability' | 'unsupported_version' | 'model_unsupported' | 'model_unverified' | 'unsupported_placement' | 'invalid_profile' | 'authorization_required' | 'invalid_arguments'): never;
+export function rejectNative(kind: 'unsupported_capability' | 'unsupported_version' | 'model_unsupported' | 'model_unverified' | 'unsupported_placement' | 'invalid_profile' | 'authorization_required' | 'invalid_arguments' | 'timeout'): never;
 export type NativeControlRequest = { jsonrpc: '2.0'; id: number } & (
   { method: 'initialize'; params: { protocol: 1 } } |
   { method: 'health' | 'shutdown'; params: Record<string, never> } |

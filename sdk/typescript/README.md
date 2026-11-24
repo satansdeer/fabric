@@ -186,6 +186,8 @@ export FABRIC_PLUGIN_REGISTRY="$REGISTRY"
 
 Repeat with `codex` and its separately reviewed package hash when needed. The plugins retain native CLI IDs. OMP checks its numeric version and required print/JSON options rather than a version allowlist; Codex remains pinned to `codex-cli 0.171.0`. Plans bind the exact observed CLI version, so an update requires a new binding. Install/configure the actual CLI separately before native discovery or consent; packaging and conformance use local doubles and do not authenticate or spend provider funds.
 
+Native probe and onboarding requests default to a composed 15.5s host deadline, covering serial version/help commands still individually limited to 5s plus teardown/control overhead. Other default operation budgets and explicit Rust host overrides are unchanged. Discovery command timeouts cross the native envelope as `failure: "timeout"` (`rejectNative('timeout')` for SDK authors), with a fixed Core message and no command output. See [the exact budget and lifecycle contract](../../docs/PLUGIN_PROTOCOL.md#native-discovery-budgets-issue-78); provider-free conformance's own explicitly bounded fixture session is separate.
+
 Set `FABRIC_PLUGIN_REGISTRY` in both controller and manager environments. Drain and stop an old manager before changing its binary or environment; follow the main README's upgrade procedure. Then use `fabric init --harness omp --check` and explicit `harness connect` as documented there. Missing, revoked or tampered installs fail closed without a built-in vendor fallback.
 
 Native adapter authors use `defineNativeHarness` and the [native control contract](../../docs/PLUGIN_PROTOCOL.md); ordinary `defineHarness` samples remain provider-free executable harnesses.

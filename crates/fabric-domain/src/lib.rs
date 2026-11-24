@@ -37,6 +37,7 @@ pub use worker::{ExecutionContext, SourceProvenance, SourceRef, WorkerLimits, Wo
 pub enum ErrorKind {
     InvalidArguments,
     Output,
+    Timeout,
     InvalidId,
     InvalidTransition,
     InvalidPolicy,

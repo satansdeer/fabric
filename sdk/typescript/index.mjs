@@ -60,7 +60,7 @@ async function serveNative(plugin) {
       if (!definition || !(definition[1] ? exact(params, definition[1]) : exact(params, ['event']) || exact(params, ['text']) && typeof params.text === 'string')) fail('invalid_params');
       try { result = { result: await plugin[definition[0]](params), failure: null }; }
       catch (e) {
-        const kinds = ['unsupported_capability', 'unsupported_version', 'model_unsupported', 'model_unverified', 'unsupported_placement', 'invalid_profile', 'authorization_required', 'invalid_arguments'];
+        const kinds = ['unsupported_capability', 'unsupported_version', 'model_unsupported', 'model_unverified', 'unsupported_placement', 'invalid_profile', 'authorization_required', 'invalid_arguments', 'timeout'];
         result = { result: null, failure: kinds.includes(e?.kind) ? e.kind : 'invalid_arguments' };
       }
     }

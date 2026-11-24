@@ -365,6 +365,9 @@ pub fn execution_error(error: impl std::fmt::Display) -> FabricError {
     }
 }
 
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const PROBE_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub fn probe_version(
     binary: &Path,
     environment: Vec<(OsString, OsString)>,
@@ -414,14 +417,20 @@ fn probe_output(
         Path::new("/"),
         capture,
         &ExecutionLimits {
-            timeout: std::time::Duration::from_secs(5),
-            ..ExecutionLimits::default()
+            timeout: PROBE_TIMEOUT,
+            term_grace: PROBE_TERM_GRACE,
         },
         &CancellationToken::default(),
         None,
         |_| Ok(()),
     )?;
     let metadata = result.capture.map_err(execution_error)?;
+    if result.stop_reason == Some(StopReason::Timeout) {
+        return Err(FabricError {
+            kind: ErrorKind::Timeout,
+            message: "Harness discovery command exceeded its 5s budget.".into(),
+        });
+    }
     if !result.status.success() || metadata.truncated || metadata.stdout_bytes_seen > max_bytes {
         return Err(execution_error(
             "Harness discovery probe failed or exceeded its output limit.",
