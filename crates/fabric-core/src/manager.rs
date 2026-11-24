@@ -209,11 +209,20 @@ pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
     };
     stream
         .set_read_timeout(Some(Duration::from_secs(wait + 20)))
-        .map_err(error)?;
+        .map_err(|failure| {
+            error(format!(
+                "Local manager response timeout setup failed: {failure}"
+            ))
+        })?;
     stream
         .set_write_timeout(Some(Duration::from_secs(15)))
-        .map_err(error)?;
+        .map_err(|failure| {
+            error(format!(
+                "Local manager request timeout setup failed: {failure}"
+            ))
+        })?;
     let mut stream = stream;
+    let response_started = Instant::now();
     // A failed reply is not automatically retried: acceptance may already be committed.
     write_frame(
         &mut stream,
@@ -222,8 +231,14 @@ pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
             root: endpoint.root,
             request,
         },
-    )?;
-    let response: Value = read_frame(&mut stream)?;
+    )
+    .map_err(|failure| error(format!("Local manager request write failed: {failure}")))?;
+    let response: Value = read_frame(&mut stream).map_err(|failure| {
+        error(format!(
+            "Local manager response read failed after {} ms: {failure}; acceptance may already be committed; do not retry automatically.",
+            response_started.elapsed().as_millis()
+        ))
+    })?;
     if let Some(failure) = response.get("error") {
         return Err(serde_json::from_value::<FabricError>(failure.clone())
             .map_err(|_| error("Invalid typed local manager error."))?);
@@ -252,7 +267,9 @@ fn start_detached(root: &Path) -> Result<(), FabricError> {
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(error)?;
+    let mut child = command
+        .spawn()
+        .map_err(|failure| error(format!("Local manager process spawn failed: {failure}")))?;
     // Reap if the client happens to remain alive; exiting the client does not kill the manager.
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -662,9 +679,17 @@ impl Manager {
                 let accepted: AcceptedPlan =
                     serde_json::from_str(&task.plan_json).map_err(error)?;
                 let plan = accepted.plan;
+                let mut options = crate::api::run_options(
+                    accepted.limits.as_ref().unwrap_or(&options),
+                    token.clone(),
+                )?;
+                options.target_pin = accepted.target;
                 let registry = HarnessRegistry::default();
-                let adapter = registry.resolve(
+                let (adapter, _) = crate::remote::resolve_harness(
+                    &self.root,
                     &HarnessId::try_from(task.harness)?,
+                    &mut options,
+                    &registry,
                     &RegistryOptions {
                         fake_binary: batch.fake_binary.as_ref().map(PathBuf::from),
                     },
@@ -674,11 +699,6 @@ impl Manager {
                         "Accepted harness version changed; task was not launched.",
                     ));
                 }
-                let mut options = crate::api::run_options(
-                    accepted.limits.as_ref().unwrap_or(&options),
-                    token.clone(),
-                )?;
-                options.target_pin = accepted.target;
                 crate::run::execute_prepared(
                     &self.root,
                     &state,

@@ -13,6 +13,7 @@ pub struct RunReport {
     pub worker_attempts: Vec<WorkerAttempt>,
     pub launch_receipt: Option<fabric_store::LaunchReceipt>,
     pub environment_id: Option<fabric_domain::EnvironmentId>,
+    pub target_observation: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +60,7 @@ pub fn show(root: &Path, id: &RunId) -> Result<RunReport, FabricError> {
         worker_attempts: store.worker_attempts(id).map_err(storage_error)?,
         launch_receipt: store.launch_receipt(id).map_err(storage_error)?,
         environment_id: store.run_environment(id).map_err(storage_error)?,
+        target_observation: store.remote_observation(id).map_err(storage_error)?,
     })
 }
 

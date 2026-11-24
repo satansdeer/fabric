@@ -12,9 +12,14 @@ export const defineHarness = (options) => define('harness', options);
 export const TARGET_OPERATIONS = Object.freeze(['prepare', 'start', 'inspect', 'cancel', 'collect', 'reclaim']);
 export function defineTarget(options) {
   identity({ ...options, kind: 'target' });
-  if (['capabilities', 'placement', 'completed', ...TARGET_OPERATIONS].some(method => typeof options[method] !== 'function')) fail('invalid_definition');
+  if (['capabilities', 'placement'].some(method => typeof options[method] !== 'function') ||
+      typeof options.remote !== 'function' && ['completed', ...TARGET_OPERATIONS].some(method => typeof options[method] !== 'function')) fail('invalid_definition');
   return Object.freeze({ ...options, kind: 'target' });
 }
+export const REMOTE_OPERATIONS = Object.freeze(['environment.ensure', 'environment.inspect', 'environment.destroy',
+  'harness.probe', 'harness.plan', 'pty.open', 'pty.exchange', 'pty.close', 'workspace.create',
+  'source.write', 'source.seal', 'worker.start', 'worker.poll', 'worker.cancel',
+  'workspace.export', 'workspace.read', 'workspace.reclaim']);
 export function defineConnector(options) {
   identity({ ...options, kind: 'connector' });
   if (['capabilities', 'verify', 'normalize'].some(name => typeof options[name] !== 'function') ||
@@ -76,6 +81,12 @@ export const TARGET_ACTIONS = Object.freeze({
   collect: [{ primitive: 'artifacts.capture' }, { primitive: 'artifacts.recover' }],
   reclaim: [{ primitive: 'workspace.reclaim' }],
 });
+export const TARGET_ENVIRONMENT_ACTIONS = Object.freeze({
+  ensure: [{ primitive: 'environment.ensure' }],
+  inspect: [{ primitive: 'environment.inspect' }],
+  destroy: [{ primitive: 'environment.destroy' }],
+  workspace: TARGET_ACTIONS.prepare,
+});
 export function validTargetPlan(plan, job) {
   return exact(plan, ['grant', 'action']) && plan.grant === job.grant &&
     (exact(plan.action, ['primitive']) && plan.action.primitive === 'unsupported' ||
@@ -84,9 +95,11 @@ export function validTargetPlan(plan, job) {
 }
 
 async function serveTarget(plugin) {
-  let id = 1;
+  let id = 1, optional = [], selected = false, ticket = null, outcome = null, sequence = 0;
   const pending = new Set();
   const seen = new Set();
+  const remote = () => optional.includes('remote.v1');
+  try {
   for await (const request of frames(process.stdin)) {
     if (!exact(request, ['jsonrpc', 'id', 'method', 'params']) || request.jsonrpc !== '2.0' || request.id !== id) fail('invalid_request');
     const { method, params } = request;
@@ -98,7 +111,8 @@ async function serveTarget(plugin) {
       if (method !== 'health' || !exact(params, [])) fail('invalid_request');
       result = { ready: true };
     } else if (method === 'shutdown') {
-      if (!exact(params, []) || pending.size) fail('invalid_params');
+      if (!exact(params, []) || pending.size || ticket !== null) fail('invalid_params');
+      await plugin.close?.();
       await write({ jsonrpc: '2.0', id, result: { ready: true } });
       process.stdin.destroy();
       return;
@@ -108,32 +122,70 @@ async function serveTarget(plugin) {
       if (!exact(result, ['placements', 'operations', 'optional']) ||
           JSON.stringify(result.placements) !== JSON.stringify([plugin.id]) ||
           JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
-          !Array.isArray(result.optional) || result.optional.length) fail('unsupported_target_capabilities');
+          !['[]', '["environment.v1"]', '["environment.v1","pty.v1"]', '["environment.v1","pty.v1","remote.v1"]'].includes(JSON.stringify(result.optional))) fail('unsupported_target_capabilities');
+      optional = result.optional;
+      if (remote() && typeof plugin.remote !== 'function') fail('invalid_definition');
     } else if (method === 'target.placement') {
       if (!exact(params, ['placement', 'backends']) || params.placement !== plugin.id ||
-          JSON.stringify(params.backends) !== '["host.local"]') fail('invalid_params');
+          JSON.stringify(params.backends) !== JSON.stringify([remote() ? 'remote.v1' : 'host.local'])) fail('invalid_params');
       result = await plugin.placement(params);
-      if (!exact(result, ['backend']) || !['host.local', 'unsupported'].includes(result.backend)) fail('invalid_target_placement');
+      if (!exact(result, ['backend']) || ![remote() ? 'remote.v1' : 'host.local', 'unsupported'].includes(result.backend)) fail('invalid_target_placement');
+      selected = result.backend !== 'unsupported';
+    } else if (method === 'target.environment.capabilities') {
+      if (!selected || !optional.length || !exact(params, ['version']) || params.version !== 1) fail('invalid_params');
+      result = { version: 1, persistent_home: true, interactive_exec_pty: optional.includes('pty.v1'),
+        infrastructure_diagnostics: remote(), operations: ['ensure', 'inspect', 'destroy', 'workspace'] };
+    } else if (method === 'target.remote.invoke') {
+      if (!selected || !remote() || ticket !== null || !exact(params, ['version', 'operation', 'input']) ||
+          params.version !== 1 || !REMOTE_OPERATIONS.includes(params.operation)) fail('invalid_params');
+      ticket = String(++sequence);
+      outcome = null;
+      Promise.resolve().then(() => plugin.remote(params.operation, params.input)).then(
+        value => { outcome = { state: 'complete', result: value }; },
+        failure => { outcome = { state: 'failed', scope: failure?.scope === 'harness' ? 'harness' : 'target',
+          kind: typeof failure?.kind === 'string' ? failure.kind : 'output' }; });
+      result = { ticket };
+    } else if (method === 'target.remote.poll') {
+      if (!remote() || ticket === null || !exact(params, ['ticket']) || params.ticket !== ticket) fail('invalid_params');
+      result = outcome ?? { state: 'pending' };
+      if (outcome !== null) { ticket = null; outcome = null; }
+    } else if (method.startsWith('target.pty.')) {
+      const operation = method.slice('target.pty.'.length);
+      if (remote() || !selected || !optional.includes('pty.v1') ||
+          !['openExec', 'exchange', 'close'].includes(operation) || typeof plugin.pty?.[operation] !== 'function') fail('invalid_params');
+      result = await plugin.pty[operation](params);
     } else if (method === 'target.completed') {
+      if (remote()) fail('host_grants_forbidden_for_remote_backend');
       if (!exact(params, ['grant', 'evidence']) || !pending.delete(params.grant) ||
           !params.evidence || Array.isArray(params.evidence) || typeof params.evidence !== 'object') fail('invalid_params');
       result = await plugin.completed(params);
       if (!exact(result, ['received']) || result.received !== params.grant) fail('invalid_target_receipt');
     } else {
-      const operation = method.startsWith('target.') && method.slice(7);
-      if (!TARGET_OPERATIONS.includes(operation) || !exact(params, ['placement', 'run_id', 'grant', 'actions', 'context']) ||
-          params.placement !== plugin.id || typeof params.run_id !== 'string' ||
-          !params.run_id.length || params.run_id.length > 128 || typeof params.grant !== 'string' ||
+      if (remote()) fail('host_grants_forbidden_for_remote_backend');
+      const environment = method.startsWith('target.environment.');
+      const operation = method.slice(environment ? 'target.environment.'.length : 7);
+      const actions = environment ? TARGET_ENVIRONMENT_ACTIONS : TARGET_ACTIONS;
+      const identityKey = environment && operation !== 'workspace' ? 'environment_id' : 'run_id';
+      const receiver = environment ? plugin.environment : plugin;
+      const callback = receiver?.[operation];
+      if (!Object.hasOwn(actions, operation) || typeof callback !== 'function' ||
+          environment && (!selected || !optional.includes('environment.v1')) ||
+          !exact(params, ['placement', identityKey, 'grant', 'actions', 'context']) ||
+          params.placement !== plugin.id || typeof params[identityKey] !== 'string' ||
+          !params[identityKey].length || params[identityKey].length > 128 || typeof params.grant !== 'string' ||
           !params.grant.length || params.grant.length > 128 || /[^A-Za-z0-9_-]/.test(params.grant) || seen.has(params.grant) || !Array.isArray(params.actions) ||
-          !params.actions.length || !params.actions.every(action => TARGET_ACTIONS[operation].some(
+          !params.actions.length || !params.actions.every(action => actions[operation].some(
             allowed => exact(action, Object.keys(allowed)) && Object.keys(allowed).every(key => allowed[key] === action[key]))) ||
           !params.context || Array.isArray(params.context) || typeof params.context !== 'object') fail('invalid_params');
       seen.add(params.grant);
-      result = await plugin[operation](params);
+      result = await callback.call(receiver, params);
       if (!validTargetPlan(result, params)) fail('invalid_target_proposal');
       if (result.action.primitive !== 'unsupported') pending.add(params.grant);
     }
     await write({ jsonrpc: '2.0', id: id++, result });
+  }
+  } finally {
+    await plugin.close?.();
   }
   fail('incomplete_exchange');
 }

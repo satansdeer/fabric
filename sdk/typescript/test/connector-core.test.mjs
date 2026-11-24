@@ -33,11 +33,11 @@ writeFileSync(webhookFabric,`#!/bin/sh\nexec ${shellQuote(fabric)} "$@" 2>>${she
 const server=webhookServer({fabric:webhookFabric,root:storage,registry,automation});await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const url=`http://127.0.0.1:${server.address().port}/webhook`;
 function event(nonce,body=JSON.stringify({event_id:'event-1',idempotency_key:'delivery-1',data:{title:'Untrusted issue title',model:'DO_NOT_SELECT',harness:'DO_NOT_RUN',command:'DO_NOT_EXECUTE'}})){const timestamp=Math.floor(Date.now()/1000),expires=timestamp+120;const auth='sha256='+createHmac('sha256',key).update(JSON.stringify([1,policy.source_id,policy.tenant_id,policy.scope,policy.route,timestamp,expires,nonce,body])).digest('hex');return {body,headers:{authorization:auth,'x-fabric-timestamp':String(timestamp),'x-fabric-expires':String(expires),'x-fabric-nonce':nonce}};}
-async function send(e){writeFileSync(connectorErrors,'');const r=await fetch(url,{method:'POST',...e});return {status:r.status,body:await r.json(),diagnostics:readFileSync(connectorErrors,'utf8')};}
+async function send(e){writeFileSync(connectorErrors,'');const started=performance.now();const r=await fetch(url,{method:'POST',...e});return {status:r.status,body:await r.json(),diagnostics:readFileSync(connectorErrors,'utf8'),elapsed_ms:performance.now()-started};}
 try{
  const before=call(['runs','list','--json']);
  const bad=event('bad-auth');bad.headers.authorization='sha256='+'0'.repeat(64);assert.equal((await send(bad)).status,403);assert.deepEqual(call(['runs','list','--json']),before);
- const first=event('first');const ack=await send(first);assert.equal(ack.status,202,ack.diagnostics);assert.equal(ack.body.acknowledged,true);assert.equal(ack.body.version,1);assert.equal(ack.body.accepted.accepted,true);
+ const first=event('first');const ack=await send(first);t.diagnostic(`Signed delivery admission: ${ack.elapsed_ms.toFixed(0)} ms`);assert.equal(ack.status,202,ack.diagnostics);assert.equal(ack.body.acknowledged,true);assert.equal(ack.body.version,1);assert.equal(ack.body.accepted.accepted,true);
  const id=ack.body.accepted.batch_id;assert.equal(typeof id,'string');
  const completed=call(['workers','wait',id,'--timeout-seconds','120','--json']);assert.equal(completed.terminal,true);
  const runs=call(['runs','list','--json']);assert.equal((await send(first)).status,403);assert.deepEqual(call(['runs','list','--json']),runs);

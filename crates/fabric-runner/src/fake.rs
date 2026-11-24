@@ -20,7 +20,16 @@ struct Task {
     exit_code: u8,
     #[serde(default)]
     process_tree: Option<ProcessTree>,
+    #[serde(default)]
+    environment_probe: Option<EnvironmentProbe>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentProbe {
+    home_file: String,
+    artifact: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessTree {
@@ -163,6 +172,37 @@ fn execute_mutations(task: &Task) -> Result<(), Box<dyn std::error::Error>> {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, &write.content)?;
+    }
+    if let Some(probe) = &task.environment_probe {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        validate_path(Path::new(&probe.home_file))?;
+        validate_path(Path::new(&probe.artifact))?;
+        let home = std::env::var_os("HOME").ok_or("HOME unavailable")?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(Path::new(&home).join(&probe.home_file))?;
+        if !file.metadata()?.is_file() {
+            return Err("marker is not a regular file".into());
+        }
+        let mut marker = Vec::new();
+        (&mut file).take(4097).read_to_end(&mut marker)?;
+        if marker.len() > 4096 {
+            return Err("marker exceeds fixture bound".into());
+        }
+        let mut hostname = [0u8; 256];
+        if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let end = hostname
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or("hostname exceeds fixture bound")?;
+        let observation = serde_json::json!({"marker":marker,"os":std::env::consts::OS,
+            "hostname":std::str::from_utf8(&hostname[..end])?,
+            "instance":std::env::var("FABRIC_EXECUTION_INSTANCE").ok()});
+        fs::write(&probe.artifact, serde_json::to_vec(&observation)?)?;
     }
     Ok(())
 }

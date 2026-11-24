@@ -555,6 +555,8 @@ fn capture_in_workspace(
     }
     // Reuse the owned, bounded process/drain path rather than buffering a binary patch.
     // Compare to the pinned launch HEAD, not a potentially worker-moved branch tip.
+    // Even with optional locks disabled, Git diff can refresh the index.
+    // Capture must preserve the returned tree's immutable installation digest.
     let mut command = CommandSpec {
         program: "/usr/bin/git".into(),
         args: [
@@ -564,6 +566,8 @@ fn capture_in_workspace(
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            "-c",
+            "diff.autoRefreshIndex=false",
             "-c",
             "protocol.allow=never",
             "diff",
@@ -614,7 +618,7 @@ fn capture_in_workspace(
         "capture_diagnostic",
         patch.stderr,
     ));
-    command.args.truncate(8);
+    command.args.truncate(10);
     command.args.extend(
         ["ls-files", "--others", "--exclude-standard", "-z", "--"]
             .into_iter()
@@ -628,7 +632,7 @@ fn capture_in_workspace(
         "untracked.stderr",
         &mut remaining,
     )?;
-    command.args.truncate(8);
+    command.args.truncate(10);
     command.args.extend(
         [
             "ls-files",
@@ -669,7 +673,7 @@ fn capture_in_workspace(
         "ignored_stderr",
         ignored.stderr,
     ));
-    command.args.truncate(8);
+    command.args.truncate(10);
     command.args.extend(
         ["ls-files", "--others", "--exclude-standard", "-z", "--"]
             .into_iter()

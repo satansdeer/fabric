@@ -53,6 +53,7 @@ pub enum ErrorKind {
     UnsupportedPlacement,
     InvalidProfile,
     AuthorizationRequired,
+    TargetProtocol,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

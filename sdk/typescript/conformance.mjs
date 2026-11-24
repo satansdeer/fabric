@@ -127,13 +127,15 @@ export async function conformance(path, { timeout = 5000, connectorFixture } = {
       if (!exact(result, ['placements', 'operations', 'optional']) ||
           JSON.stringify(result.placements) !== JSON.stringify([info.id]) ||
           JSON.stringify(result.operations) !== JSON.stringify(TARGET_OPERATIONS) ||
-          ![ '[]', '["environment.v1"]', '["environment.v1","pty.v1"]' ].includes(JSON.stringify(result.optional))) fail('unsupported_target_capabilities');
-      const placement = await call('target.placement', { placement: info.id, backends: ['host.local'] });
-      if (!exact(placement, ['backend']) || placement.backend !== 'host.local') fail('unsupported_target_placement');
+          ![ '[]', '["environment.v1"]', '["environment.v1","pty.v1"]', '["environment.v1","pty.v1","remote.v1"]' ].includes(JSON.stringify(result.optional))) fail('unsupported_target_capabilities');
+      const remote = result.optional.includes('remote.v1');
+      const backend = remote ? 'remote.v1' : 'host.local';
+      const placement = await call('target.placement', { placement: info.id, backends: [backend] });
+      if (!exact(placement, ['backend']) || placement.backend !== backend) fail('unsupported_target_placement');
       if (result.optional.length) {
         const capabilities = await call('target.environment.capabilities', { version: 1 });
         const expected = { version: 1, persistent_home: true,
-          interactive_exec_pty: result.optional.length === 2, infrastructure_diagnostics: false,
+          interactive_exec_pty: result.optional.includes('pty.v1'), infrastructure_diagnostics: remote,
           operations: ['ensure', 'inspect', 'destroy', 'workspace'] };
         if (!isDeepStrictEqual(capabilities, expected)) fail('unsupported_environment_capabilities');
       }
@@ -182,6 +184,18 @@ export async function conformance(path, { timeout = 5000, connectorFixture } = {
               close.exit_code < -2147483648 || close.exit_code > 2147483647)) fail('invalid_pty_close');
         }
       }
+      if (remote) {
+        // Invalid binding must fail without creating resources. No cluster fixture or
+        // credentials are synthesized by public protocol conformance.
+        const invoked = await call('target.remote.invoke', { version: 1, operation: 'environment.inspect', input: {} });
+        if (!exact(invoked, ['ticket']) || typeof invoked.ticket !== 'string') fail('invalid_remote_ticket');
+        let reply;
+        do {
+          await new Promise(resolve => setTimeout(resolve, 10));
+          reply = await call('target.remote.poll', invoked);
+        } while (isDeepStrictEqual(reply, { state: 'pending' }));
+        if (!isDeepStrictEqual(reply, { state: 'failed', scope: 'target', kind: 'output' })) fail('invalid_binding_not_rejected');
+      } else {
       // Transport fixtures only. Real execution/ownership evidence comes from Core, not this probe.
       const evidence = {
         prepare: { size_bytes: 1, cloned_files: 0, copied_files: 1 },
@@ -196,6 +210,7 @@ export async function conformance(path, { timeout = 5000, connectorFixture } = {
         if (!validTargetPlan(plan, job) || plan.action.primitive === 'unsupported') fail('unsupported_target_operation');
         const received = await call('target.completed', { grant: job.grant, evidence: evidence[op] });
         if (!exact(received, ['received']) || received.received !== job.grant) fail('invalid_target_receipt');
+      }
       }
     } else {
       result = resultFor(info.kind, await call(method, {}));

@@ -3,9 +3,9 @@
 use std::{fmt, fs::OpenOptions, path::Path, str::FromStr, time::Duration};
 
 use fabric_domain::{
-    ArtifactManifestId, BatchId, CaptureMetadata, FabricError, HarnessId, HarnessVersion,
-    PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState, SourceProvenance,
-    WorkspaceId, WorkspaceState,
+    ArtifactManifestId, BatchId, CaptureMetadata, EnvironmentId, FabricError, HarnessId,
+    HarnessVersion, PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState,
+    SourceProvenance, WorkspaceId, WorkspaceState,
 };
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
@@ -197,14 +197,31 @@ pub struct LaunchReceipt {
     pub attempt_id: String,
     pub workspace_id: WorkspaceId,
     pub workspace_path: String,
-    pub workspace_device: u64,
-    pub workspace_inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_inode: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteLaunchWitness>,
     pub prepared_state_id: PreparedStateId,
     pub source_commit_sha: String,
     pub preparation_key: String,
     pub recipe_digest: String,
     pub source: SourceEvidence,
     pub actual_sha256: String,
+}
+
+/// Observed remote source, never a controller inode, path, PID or deletion grant.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteLaunchWitness {
+    pub target_json: String,
+    pub environment_id: EnvironmentId,
+    pub resource: serde_json::Value,
+    pub os: String,
+    pub arch: String,
+    pub hostname: String,
+    pub instance: String,
 }
 
 impl Store {
@@ -265,7 +282,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=18 => {}
+            1..=20 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -578,6 +595,25 @@ impl Store {
             transaction.execute_batch(include_str!("environments.sql"))?;
             transaction.pragma_update(None, "user_version", 18)?;
         }
+        if version < 19 {
+            transaction.execute_batch(include_str!("remote_receipts.sql"))?;
+            transaction.pragma_update(None, "user_version", 19)?;
+        }
+        if version < 20 {
+            transaction.execute_batch(
+                "CREATE TABLE run_remote_completions (
+                   run_id TEXT PRIMARY KEY NOT NULL REFERENCES run_launch_receipts(run_id),
+                   result_json TEXT NOT NULL CHECK(json_valid(result_json)),
+                   installation_json TEXT CHECK(installation_json IS NULL OR json_valid(installation_json)));
+                 CREATE TRIGGER remote_completion_immutable BEFORE UPDATE ON run_remote_completions
+                 WHEN NEW.run_id != OLD.run_id OR NEW.result_json != OLD.result_json
+                   OR OLD.installation_json IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'remote completion is immutable'); END;
+                 CREATE TRIGGER remote_completion_no_delete BEFORE DELETE ON run_remote_completions
+                 BEGIN SELECT RAISE(ABORT, 'remote completion is immutable'); END;"
+            )?;
+            transaction.pragma_update(None, "user_version", 20)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -650,7 +686,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=18) {
+        if !matches!(version, 5..=20) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -1372,6 +1408,25 @@ impl Store {
         Ok(())
     }
 
+    /// No remote PID is controller signal authority. The immutable prestart
+    /// receipt and target/environment pins are required before RUNNING.
+    pub fn start_remote_run(&self, id: &RunId, version: &str, at: i64) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE runs SET state='RUNNING', harness_version=?2,
+             pid_metadata='remote.v1', started_at=?3, updated_at=?3
+             WHERE run_id=?1 AND state='PREPARING' AND ?3 >= updated_at
+             AND EXISTS (SELECT 1 FROM run_launch_receipts l WHERE l.run_id=?1
+               AND json_type(l.receipt_json,'$.remote')='object')
+             AND EXISTS (SELECT 1 FROM workspaces w WHERE w.run_id=?1
+               AND w.state='ACTIVE' AND w.retention_reason IS NULL)",
+            params![id.as_str(), version, at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
     /// Persist the observed wait result and supervision/native failure before finalization.
     pub fn observe_run_exit(
         &self,
@@ -1533,6 +1588,130 @@ impl Store {
             .transpose()
     }
 
+    pub fn record_remote_observation(
+        &self,
+        id: &RunId,
+        evidence: &serde_json::Value,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(evidence)
+            .map_err(|_| StoreError::InvalidRecord("Invalid remote observation"))?;
+        if encoded.len() > 4096 {
+            return Err(StoreError::InvalidRecord("Remote observation bounds"));
+        }
+        self.connection.execute(
+            "INSERT INTO run_remote_observations(run_id,evidence_json) VALUES (?1,?2)",
+            params![id.as_str(), encoded],
+        )?;
+        Ok(())
+    }
+
+    pub fn remote_observation(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 19 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM run_remote_observations WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid remote observation"))
+            })
+            .transpose()
+    }
+
+    /// The entire original remote result, not just its normalized wait/reason.
+    pub fn record_remote_completion(&self, id: &RunId, result: &serde_json::Value) -> Result<()> {
+        if let Some(saved) = self.remote_completion(id)? {
+            return if saved == *result {
+                Ok(())
+            } else {
+                Err(StoreError::Conflict)
+            };
+        }
+        let encoded = serde_json::to_string(result)
+            .map_err(|_| StoreError::InvalidRecord("Invalid remote completion"))?;
+        if encoded.len() > 65536 || self.launch_receipt(id)?.and_then(|r| r.remote).is_none() {
+            return Err(StoreError::InvalidRecord(
+                "Remote completion bounds or binding",
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO run_remote_completions(run_id,result_json) VALUES (?1,?2)",
+            params![id.as_str(), encoded],
+        )?;
+        Ok(())
+    }
+
+    pub fn remote_completion(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 20 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT result_json FROM run_remote_completions WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid remote completion"))
+            })
+            .transpose()
+    }
+
+    /// Immutable verified local inode/digest provenance, committed before renames.
+    pub fn record_remote_installation(
+        &self,
+        id: &RunId,
+        installation: &serde_json::Value,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(installation)
+            .map_err(|_| StoreError::InvalidRecord("Invalid remote installation"))?;
+        if encoded.len() > 65536 || self.connection.execute(
+            "UPDATE run_remote_completions SET installation_json=?2 WHERE run_id=?1 AND installation_json IS NULL",
+            params![id.as_str(),encoded])? != 1 { return Err(StoreError::Conflict); }
+        Ok(())
+    }
+
+    pub fn remote_installation(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 20 {
+            return Ok(None);
+        }
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT installation_json FROM run_remote_completions WHERE run_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        encoded
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|_| StoreError::InvalidRecord("Invalid remote installation"))
+            })
+            .transpose()
+    }
+
     /// The bounded output files have already been synced by the runner.
     pub fn record_capture(&self, id: &RunId, capture: &CaptureMetadata) -> Result<()> {
         let encoded = serde_json::to_string(capture)
@@ -1547,6 +1726,62 @@ impl Store {
         }
         Ok(())
     }
+    /// Caller holds the root/run leases and has verified the pinned inactive remote
+    /// result and downloaded bytes. Recovery never invents a terminal success.
+    pub fn record_recovered_capture(
+        &mut self,
+        expected: &Run,
+        capture: &CaptureMetadata,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if expected.state != RunState::NeedsAttention
+            || expected.capture.is_some()
+            || expected.artifact_manifest_id.is_some()
+            || exit_code.is_some() == exit_signal.is_some()
+            || expected
+                .exit_code
+                .is_some_and(|code| Some(code) != exit_code)
+            || expected
+                .exit_signal
+                .is_some_and(|signal| Some(signal) != exit_signal)
+            || !matches!(
+                reason,
+                None | Some(
+                    "timeout"
+                        | "cancelled"
+                        | "workspace_limit"
+                        | "storage_pressure"
+                        | "storage_meter_failed"
+                        | "native_failure"
+                )
+            )
+        {
+            return Err(StoreError::InvalidRecord("Remote recovery result differs"));
+        }
+        let encoded = serde_json::to_string(capture)
+            .map_err(|_| StoreError::InvalidRecord("Invalid capture"))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::query_run(&transaction, &expected.run_id)?.as_ref() != Some(expected) {
+            return Err(StoreError::Conflict);
+        }
+        if transaction.execute(
+            "UPDATE runs SET capture_metadata=?2, exit_code=?3, exit_signal=?4,
+             error_kind=CASE WHEN error_kind IS NOT NULL AND error_kind NOT IN ('harness_execution','artifact_capture') THEN error_kind
+               WHEN ?5 IS NOT NULL THEN ?5 WHEN ?3 IS NOT 0 THEN 'harness_exit' ELSE error_kind END
+             WHERE run_id=?1 AND state='NEEDS_ATTENTION' AND capture_metadata IS NULL
+             AND EXISTS (SELECT 1 FROM workspaces w WHERE w.run_id=?1 AND w.state='RECOVERY_REQUIRED')
+             AND NOT EXISTS (SELECT 1 FROM cleanup_intents c JOIN workspaces w USING(workspace_id) WHERE w.run_id=?1)
+             AND EXISTS (SELECT 1 FROM run_launch_receipts l WHERE l.run_id=?1 AND json_type(l.receipt_json,'$.remote')='object')",
+            params![expected.run_id.as_str(),encoded,exit_code,exit_signal,reason],
+        )? != 1 { return Err(StoreError::Conflict); }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Register verified promoted files and terminal completion in one transaction.
     /// Complete tracked and non-ignored untracked capture precedes cleanup eligibility.
     pub fn finish_run(
@@ -2199,7 +2434,9 @@ mod recovery_tests {
             .unwrap();
         // Reconstruct the actual v11 schema boundary, not legacy context evidence.
         store.connection.execute_batch(
-            "DROP TABLE run_environments;
+            "DROP TABLE run_remote_completions;
+             DROP TABLE run_remote_observations;
+             DROP TABLE run_environments;
              DROP TABLE environments;
              DROP TABLE run_launch_receipts;
              DROP TABLE prepared_source_evidence;

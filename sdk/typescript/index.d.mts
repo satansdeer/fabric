@@ -15,14 +15,31 @@ export type TargetActionByOperation = {
 };
 export type TargetAction = TargetActionByOperation[TargetOperation] | { primitive: 'unsupported' };
 export interface TargetJob<K extends TargetOperation = TargetOperation> { placement: string; run_id: string; grant: string; actions: TargetActionByOperation[K][]; context: { [key: string]: Json } }
-export interface TargetPlacement { placement: string; backends: ['host.local'] }
+export interface TargetPlacement { placement: string; backends: ['host.local'] | ['remote.v1'] }
 export interface TargetCompleted { grant: string; evidence: { [key: string]: Json } }
 export type TargetOperation = 'prepare' | 'start' | 'inspect' | 'cancel' | 'collect' | 'reclaim';
 export const TARGET_OPERATIONS: readonly TargetOperation[];
-/** Native client negotiation; generated serveTarget servers deliberately implement only optional:[]. */
-export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: [] | ['environment.v1'] | ['environment.v1', 'pty.v1'] }
+/** Remote ownership is negotiated explicitly; old host capability sets are unchanged. */
+export interface TargetCapabilities { placements: string[]; operations: readonly TargetOperation[]; optional: [] | ['environment.v1'] | ['environment.v1', 'pty.v1'] | ['environment.v1', 'pty.v1', 'remote.v1'] }
+export type RemoteOperation = 'environment.ensure' | 'environment.inspect' | 'environment.destroy' |
+  'harness.probe' | 'harness.plan' | 'pty.open' | 'pty.exchange' | 'pty.close' | 'workspace.create' |
+  'source.write' | 'source.seal' | 'worker.start' | 'worker.poll' | 'worker.cancel' |
+  'workspace.export' | 'workspace.read' | 'workspace.reclaim';
+export const REMOTE_OPERATIONS: readonly RemoteOperation[];
+/** Opaque target-bound evidence, never controller filesystem or PID authority. */
+export interface RemoteResource { backend: 'remote.v1'; resource_id: string; [key: string]: Json }
+export interface RemoteEnvironment { environment_id: string; owner: string; resource: RemoteResource | null }
+export interface RemoteInvoke { version: 1; operation: RemoteOperation; input: Json }
+export type RemotePoll = { state: 'pending' } | { state: 'complete'; result: Json } |
+  { state: 'failed'; scope: 'target' | 'harness'; kind: string };
 export interface TargetProposal<K extends TargetOperation = TargetOperation> { grant: string; action: TargetActionByOperation[K] | { primitive: 'unsupported' } }
 export const TARGET_ACTIONS: { readonly [K in TargetOperation]: readonly TargetActionByOperation[K][] };
+export type TargetEnvironmentOperation = 'ensure' | 'inspect' | 'destroy' | 'workspace';
+export interface TargetEnvironmentJob {
+  placement: string; environment_id?: string; run_id?: string; grant: string;
+  actions: { primitive: string; strategy?: string }[]; context: { [key: string]: Json };
+}
+export const TARGET_ENVIRONMENT_ACTIONS: Readonly<Record<TargetEnvironmentOperation, readonly { primitive: string; strategy?: string }[]>>;
 export function validTargetPlan(plan: unknown, job: TargetJob): boolean;
 /** Incoming fields are data only. Routing and secret references come from operator policy. */
 export interface IncomingEvent { body: string; timestamp: number; expires_at: number; nonce: string; authorization: string }
@@ -48,11 +65,20 @@ export interface HarnessDefinition extends Identity {
   plan(params: Record<string, never>): Result<Ready>;
   run(context: HarnessContext): Result<void>;
 }
-export type TargetDefinition = Identity & {
-  capabilities(): Result<TargetCapabilities & { optional: [] }>;
-  placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'unsupported' }>;
+type TargetBase = Identity & {
+  capabilities(): Result<TargetCapabilities>;
+  placement(request: TargetPlacement): Result<{ backend: 'host.local' | 'remote.v1' | 'unsupported' }>;
+  /** Must cancel/reap owned sessions on EOF and shutdown. Idempotent. */
+  close?(): Result<void>;
+};
+export type TargetDefinition = TargetBase & ({
   completed(result: TargetCompleted): Result<{ received: string }>;
-} & { [K in TargetOperation]: (job: TargetJob<K>) => Result<TargetProposal<K>> };
+  pty?: { openExec(input: Json): Result<Json>; exchange(input: Json): Result<Json>; close(input: Json): Result<Json> };
+  environment?: { [K in TargetEnvironmentOperation]: (job: TargetEnvironmentJob) => Result<{ grant: string; action: { primitive: string; strategy?: string } }> };
+} & { [K in TargetOperation]: (job: TargetJob<K>) => Result<TargetProposal<K>> } | {
+  /** Async jobs do not block the one-second control-channel response deadline. */
+  remote(operation: RemoteOperation, input: Json): Result<Json>;
+});
 export interface ConnectorDefinition extends Identity {
   capabilities(): Result<ConnectorCapabilities>;
   verify(input: ConnectorInput): Result<{ verified: boolean }>;
@@ -68,15 +94,20 @@ export function defineTarget(options: TargetDefinition): Target;
 export function defineConnector(options: ConnectorDefinition): Connector;
 export function serve(plugin: Harness | NativeHarness | Target | Connector): Promise<void>;
 export interface InitializeResult extends PluginIdentity { protocol: 1 }
-export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.capabilities' | 'connector.verify' | 'connector.normalize' | 'connector.subscribe' | 'connector.reply' | 'shutdown';
+export type ControlMethod = 'initialize' | 'health' | 'harness.plan' | 'target.capabilities' | 'target.placement' | 'target.completed' | 'target.environment.capabilities' | `target.environment.${TargetEnvironmentOperation}` | 'target.remote.invoke' | 'target.remote.poll' | `target.pty.${'openExec' | 'exchange' | 'close'}` | `target.${TargetOperation}` | 'connector.capabilities' | 'connector.verify' | 'connector.normalize' | 'connector.subscribe' | 'connector.reply' | 'shutdown';
 export type ControlRequest = { jsonrpc: '2.0'; id: number } & (
   { method: 'initialize'; params: { protocol: 1 } } |
   { [K in TargetOperation]: { method: `target.${K}`; params: TargetJob<K> } }[TargetOperation] |
+  { method: `target.environment.${TargetEnvironmentOperation}`; params: TargetEnvironmentJob } |
   { method: 'target.placement'; params: TargetPlacement } |
   { method: 'target.completed'; params: TargetCompleted } |
+  { method: 'target.environment.capabilities'; params: { version: 1 } } |
+  { method: 'target.remote.invoke'; params: RemoteInvoke } |
+  { method: 'target.remote.poll'; params: { ticket: string } } |
+  { method: `target.pty.${'openExec' | 'exchange' | 'close'}`; params: Json } |
   { method: 'connector.verify' | 'connector.normalize'; params: ConnectorInput } |
   { method: 'connector.subscribe' | 'connector.reply'; params: ConnectorOutbound } |
-  { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | `target.${TargetOperation}` | 'connector.verify' | 'connector.normalize' | 'connector.subscribe' | 'connector.reply'>; params: Record<string, never> }
+  { method: Exclude<ControlMethod, 'initialize' | 'target.placement' | 'target.completed' | 'target.environment.capabilities' | `target.environment.${TargetEnvironmentOperation}` | 'target.remote.invoke' | 'target.remote.poll' | `target.pty.${'openExec' | 'exchange' | 'close'}` | `target.${TargetOperation}` | 'connector.verify' | 'connector.normalize' | 'connector.subscribe' | 'connector.reply'>; params: Record<string, never> }
 );
 export type ControlResponse<T> = { jsonrpc: '2.0'; id: number } & ({ result: T; error?: never } | { error: { code: number; message: string }; result?: never });
 export interface PluginManifest extends PluginIdentity {
