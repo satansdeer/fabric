@@ -184,7 +184,7 @@ export FABRIC_PLUGIN_REGISTRY="$REGISTRY"
 "$FABRIC" plugins --registry "$REGISTRY" check omp
 ```
 
-Repeat with `codex` and its separately reviewed package hash when needed. The plugins retain native CLI IDs and pinned versions: `omp/19.1.0` and `codex-cli 0.171.0`. Install/configure the actual CLI separately before native discovery or consent; packaging and conformance use local doubles and do not authenticate or spend provider funds.
+Repeat with `codex` and its separately reviewed package hash when needed. The plugins retain native CLI IDs. OMP checks its numeric version and required print/JSON options rather than a version allowlist; Codex remains pinned to `codex-cli 0.171.0`. Plans bind the exact observed CLI version, so an update requires a new binding. Install/configure the actual CLI separately before native discovery or consent; packaging and conformance use local doubles and do not authenticate or spend provider funds.
 
 Set `FABRIC_PLUGIN_REGISTRY` in both controller and manager environments. Drain and stop an old manager before changing its binary or environment; follow the main README's upgrade procedure. Then use `fabric init --harness omp --check` and explicit `harness connect` as documented there. Missing, revoked or tampered installs fail closed without a built-in vendor fallback.
 

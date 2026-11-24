@@ -50,7 +50,7 @@ async function nativeConformance(info, entry, timeout) {
   const events = [];
   await processFixture(entry, () => [...(info.args ?? []), '--fabric-plugin-stdio'], async (child, home) => {
     const binary = join(home, info.native.executable);
-    writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' '${versions[info.id]}'\n`, { mode: 0o700 });
+    writeFileSync(binary, `#!/bin/sh\nif [ "$1" = --help ]; then printf '%s\\n' '-p' '--mode=json' '--no-session' '--no-title' '--max-cost'; exit 0; fi\nprintf '%s\\n' '${versions[info.id]}'\n`, { mode: 0o700 });
     const root = join(home, 'native');
     mkdirSync(root);
     // Fixture metadata only. No authentication store is read or copied.
