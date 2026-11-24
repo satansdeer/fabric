@@ -16,6 +16,10 @@ path = "src/fake.rs"
 name = "fabric-local-target"
 path = "src/local_target.rs"
 
+[[bin]]
+name = "fabric-remote-agent"
+path = "src/remote_agent.rs"
+
 [dependencies]
 clap.workspace = true
 serde.workspace = true

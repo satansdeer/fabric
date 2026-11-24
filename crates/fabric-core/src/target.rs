@@ -1,4 +1,4 @@
-//! Target operations execute here against Core-owned inputs, never plugin-provided paths or PIDs.
+//! Local primitives use Core-owned paths/PIDs; remote operations use pinned opaque resource bindings.
 use fabric_domain::{FabricError, RunId};
 use fabric_runner::{
     CancellationToken,
@@ -23,6 +23,32 @@ pub(crate) fn drive<T>(
         let pin: TargetPin = serde_json::from_str(&json)
             .map_err(|_| fabric_runner::execution_error("Invalid target binding."))?;
         let target = pin.open(&CancellationToken::default())?;
+        if target.is_remote() {
+            let receipt = store.launch_receipt(run).map_err(fabric_runner::execution_error)?
+                .and_then(|r|r.remote)
+                .ok_or_else(|| fabric_runner::execution_error("Remote ownership receipt unavailable"))?;
+            let input = serde_json::json!({"resource":receipt.resource});
+            match action {
+                Action::Reclaim => {
+                    let reply = target.remote_call("workspace.reclaim", input)?;
+                    if reply != serde_json::json!({"reclaimed":true}) {
+                        return Err(fabric_runner::execution_error("Remote reclamation unproven"));
+                    }
+                }
+                Action::Inspect | Action::Recover => {
+                    let reply = target.remote_call("worker.poll", input)?;
+                    if reply["state"] != "complete" {
+                        return Err(fabric_runner::execution_error("Remote process inactivity unproven"));
+                    }
+                }
+                _ => return Err(fabric_runner::execution_error("Unsupported remote ownership operation")),
+            }
+            // Remote acknowledgement is never evidence of a controller filesystem effect.
+            let (value, _) = execute(store)?;
+            let failure = target.finish().err();
+            if failure.is_some() { store.record_target_failure(run).map_err(fabric_runner::execution_error)?; }
+            return Ok(Committed {value, failure});
+        }
         let mut committed = target.drive(operation, run.as_str(), &[action], context, |_| {
             execute(store)
         })?;

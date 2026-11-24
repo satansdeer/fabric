@@ -15,6 +15,8 @@ pub mod inspect;
 pub mod logs;
 pub mod onboarding;
 pub mod run;
+pub mod remote;
+pub mod remote_agent;
 pub mod workspace;
 
 #[derive(Debug, Serialize)]

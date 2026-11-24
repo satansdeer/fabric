@@ -186,6 +186,10 @@ pub(crate) fn create_workspace_bound(
                 Ok((runner_workspace(&root, &run.run_id)?, evidence))
             };
             if let Some((_, target)) = target {
+                if target.is_remote() {
+                    // Controller-owned transfer staging, not a remote workspace or HOME.
+                    return prepare(backend).map(|(workspace, _)| workspace);
+                }
                 use fabric_runner::target::{Action, ForkMode};
                 use fabric_workspace::{ForkStrategy, LocalWorkspaceBackend};
                 let committed = target.drive(

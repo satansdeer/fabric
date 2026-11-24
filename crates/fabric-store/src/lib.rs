@@ -3,7 +3,7 @@
 use std::{fmt, fs::OpenOptions, path::Path, str::FromStr, time::Duration};
 
 use fabric_domain::{
-    ArtifactManifestId, BatchId, CaptureMetadata, FabricError, HarnessId, HarnessVersion,
+    ArtifactManifestId, BatchId, CaptureMetadata, EnvironmentId, FabricError, HarnessId, HarnessVersion,
     PreparedStateId, PreparedStateStatus, ProjectId, RunId, RunState, SourceProvenance,
     WorkspaceId, WorkspaceState,
 };
@@ -197,14 +197,31 @@ pub struct LaunchReceipt {
     pub attempt_id: String,
     pub workspace_id: WorkspaceId,
     pub workspace_path: String,
-    pub workspace_device: u64,
-    pub workspace_inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_inode: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteLaunchWitness>,
     pub prepared_state_id: PreparedStateId,
     pub source_commit_sha: String,
     pub preparation_key: String,
     pub recipe_digest: String,
     pub source: SourceEvidence,
     pub actual_sha256: String,
+}
+
+/// Observed remote source, never a controller inode, path, PID or deletion grant.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteLaunchWitness {
+    pub target_json: String,
+    pub environment_id: EnvironmentId,
+    pub resource: serde_json::Value,
+    pub os: String,
+    pub arch: String,
+    pub hostname: String,
+    pub instance: String,
 }
 
 impl Store {
@@ -265,7 +282,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=18 => {}
+            1..=19 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -578,6 +595,10 @@ impl Store {
             transaction.execute_batch(include_str!("environments.sql"))?;
             transaction.pragma_update(None, "user_version", 18)?;
         }
+        if version < 19 {
+            transaction.execute_batch(include_str!("remote_receipts.sql"))?;
+            transaction.pragma_update(None, "user_version", 19)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -650,7 +671,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=18) {
+        if !matches!(version, 5..=19) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -1372,6 +1393,23 @@ impl Store {
         Ok(())
     }
 
+    /// No remote PID is controller signal authority. The immutable prestart
+    /// receipt and target/environment pins are required before RUNNING.
+    pub fn start_remote_run(&self, id: &RunId, version: &str, at: i64) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE runs SET state='RUNNING', harness_version=?2,
+             pid_metadata='remote.v1', started_at=?3, updated_at=?3
+             WHERE run_id=?1 AND state='PREPARING' AND ?3 >= updated_at
+             AND EXISTS (SELECT 1 FROM run_launch_receipts l WHERE l.run_id=?1
+               AND json_type(l.receipt_json,'$.remote')='object')
+             AND EXISTS (SELECT 1 FROM workspaces w WHERE w.run_id=?1
+               AND w.state='ACTIVE' AND w.retention_reason IS NULL)",
+            params![id.as_str(), version, at],
+        )?;
+        if changed != 1 { return Err(StoreError::Conflict); }
+        Ok(())
+    }
+
     /// Persist the observed wait result and supervision/native failure before finalization.
     pub fn observe_run_exit(
         &self,
@@ -1531,6 +1569,25 @@ impl Store {
                     .map_err(|_| StoreError::InvalidRecord("Invalid launch receipt"))
             })
             .transpose()
+    }
+
+    pub fn record_remote_observation(&self, id: &RunId, evidence: &serde_json::Value) -> Result<()> {
+        let encoded = serde_json::to_string(evidence)
+            .map_err(|_| StoreError::InvalidRecord("Invalid remote observation"))?;
+        if encoded.len() > 4096 { return Err(StoreError::InvalidRecord("Remote observation bounds")); }
+        self.connection.execute("INSERT INTO run_remote_observations(run_id,evidence_json) VALUES (?1,?2)",
+            params![id.as_str(),encoded])?;
+        Ok(())
+    }
+
+    pub fn remote_observation(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
+        let version: i64 = self.connection.pragma_query_value(None,"user_version",|r|r.get(0))?;
+        if version < 19 { return Ok(None); }
+        let encoded: Option<String> = self.connection.query_row(
+            "SELECT evidence_json FROM run_remote_observations WHERE run_id=?1",
+            [id.as_str()],|r|r.get(0)).optional()?;
+        encoded.map(|s|serde_json::from_str(&s)
+            .map_err(|_|StoreError::InvalidRecord("Invalid remote observation"))).transpose()
     }
 
     /// The bounded output files have already been synced by the runner.

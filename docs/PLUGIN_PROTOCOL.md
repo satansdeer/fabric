@@ -1,6 +1,6 @@
 # Plugin protocol v1
 
-External plugins are explicitly installed trusted-local executables, not sandboxed code. Installing a plugin authorizes code execution as the operator. Do not install code you do not trust. Fabric does not discover or execute project manifests. No marketplace, dynamic library loading, credential inheritance, or remote execution is provided.
+External plugins are explicitly installed trusted-local executables, not sandboxed code. Installing a plugin authorizes code execution as the operator. Do not install code you do not trust. Fabric does not discover or execute project manifests. No marketplace, dynamic library loading or credential inheritance is provided. Remote execution requires explicit `remote.v1` negotiation and an installed target; it is never inferred from a target name.
 
 ## Operator lifecycle
 
@@ -41,13 +41,13 @@ Responses contain `jsonrpc`, matching numeric `id`, and exactly one of `result` 
 
 After nonbilling startup negotiation and existing capability/profile planning, Fabric launches the same installed executable/argv with `--fabric-plugin-run PROMPT_FILE` in the freshly validated owned workspace. This execution mode emits existing bounded JSON-lines harness events and uses the existing capture, timeout, cancellation, process-group, artifact and durable-worker lifecycle. Execution stdout/stderr are private captured artifacts, **not secret-free output**; do not write secrets there. They are not promoted into plugin error diagnostics or normalized failure messages. Cost limits, model overrides, resume, native-context import and unadvertised features are rejected rather than silently ignored.
 
-Legacy control results cannot specify argv, cwd, environment, paths, reclaim flags or arbitrary methods. The opt-in native extension below admits bounded argv and scoped environment proposals, never cwd or ownership/deletion authority. Target instructions use the restricted host primitives below; normalized connector events do not grant worker configuration or routing authority. Only Core performs workspace allocation, launch revalidation, ownership checks, artifact verification and reclamation. No plugin result grants deletion authority. Trusted executables can still make arbitrary system calls as the user: this protocol does not defend against a malicious installed executable directly accessing user files. Revoke and inspect retained evidence if trust is lost.
+Legacy control results cannot specify argv, cwd, environment, paths, reclaim flags or arbitrary methods. The opt-in native extension below admits bounded argv and scoped environment proposals, never cwd or ownership/deletion authority. Host-local target instructions use restricted Core-owned primitives; explicitly negotiated remote targets own their remote resources, never controller filesystem authority. Core retains routing, durable pins, source verification, budgets, receipt validation and artifact sealing. Normalized connector events do not grant worker configuration or routing authority. Trusted installed executables can make arbitrary system calls as the user: the protocol is not a sandbox. Revoke and inspect retained evidence if trust is lost.
 
 Provider-free regression command: `cargo test -p fabric-runner --test plugins` plus Core workspace lifecycle tests. Fixtures start external Python processes for all three kinds; no provider service is required.
 
 ## Installed execution targets
 
-`target.plan` and operation-token acknowledgments are removed, not compatibility aliases. After initialize/health, legacy `target.capabilities {}` returns exactly `{"placements":["PLUGIN_ID"],"operations":["prepare","start","inspect","cancel","collect","reclaim"],"optional":[]}`. This remains supported without extra exchanges or fields. Exact optional sets are `[]`, `["environment.v1"]` and `["environment.v1","pty.v1"]`; unknown, reordered, duplicate or incomplete sets fail closed. Before admission, `target.placement {"placement":"PLUGIN_ID","backends":["host.local"]}` selects `{"backend":"host.local"}` or refuses with `{"backend":"unsupported"}`. Any installed target ID may select the offered backend; this is not a literal-`local` allowlist.
+`target.plan` and operation-token acknowledgments are removed, not compatibility aliases. After initialize/health, `target.capabilities {}` returns exactly `{"placements":["PLUGIN_ID"],"operations":["prepare","start","inspect","cancel","collect","reclaim"],"optional":[]}` for legacy targets. Exact optional sets are `[]`, `["environment.v1"]`, `["environment.v1","pty.v1"]` and `["environment.v1","pty.v1","remote.v1"]`; unknown, reordered, duplicate or incomplete sets fail closed. Placement offers exactly `["host.local"]` for the first three sets or `["remote.v1"]` for the fourth. `target.placement` selects that exact backend or `unsupported`. Any installed ID may select the offered backend; there is no target-name allowlist or fallback.
 
 Target initialization, health and capability exchanges retain the five-second
 per-request startup bound. After negotiation, lifecycle operations and shutdown
@@ -144,11 +144,11 @@ drain/finalize capture, and persist actual exit and capture metadata. Durable
 it never erases committed evidence. Recovery may reclaim only from independently
 verified evidence and the existing ownership/lease/artifact policy, not a receipt.
 
-A separately installed fake remote refuses placement before allocating runs/workspaces; no local fallback occurs. Only the trusted-local host primitive backend is implemented. Actual remote execution requires a separately specified verifiable backend, not acceptance of remote status assertions.
+A separately installed fake remote refuses placement before allocating runs/workspaces; no local fallback occurs. A real remote target must explicitly implement the generic backend below. Acknowledging host-local instructions cannot establish remote execution.
 
 `local` resolves through the registry like any other target, or to the distributed sibling `fabric-local-target` when no local registry entry exists. A revoked/broken installed local entry is an error, not permission to use the bundled executable. Admission pins manifest, executable SHA-256, placement and selected registry into the durable accepted plan and immutable schema-14 `run_targets` row before preparation. Execution/recovery never silently repin after upgrades; missing/revoked/changed plugins refuse finalization/reclaim and retain unknown cleanup evidence. Existing pre-target workspace records retain their original evidence-based recovery rules.
 
-The local executable and its installable SDK reference package ship with release tooling. Replacing the installed driver does not rebuild Core. The Rust local driver negotiates `environment.v1` and `pty.v1`; existing generated TypeScript/reference legacy targets retain `optional:[]`. PTY allocation belongs to the target, not Core. This is not remote worker execution or a sandbox.
+The local executable and its installable SDK reference package ship with release tooling. Replacing the installed driver does not rebuild Core. The Rust local driver negotiates `environment.v1` and `pty.v1`; generated legacy targets retain `optional:[]`. Neither is a remote worker backend or a sandbox. The separately distributed `fabric-remote-agent` is generic target-side execution code; the external Kubernetes implementation and its installation are outside Core.
 
 ### Optional environment extension v1
 
@@ -158,7 +158,9 @@ Protocol v1's existing `optional` list is the explicit opt-in; no fields are add
 {"version":1,"persistent_home":true,"interactive_exec_pty":false,"infrastructure_diagnostics":false,"operations":["ensure","inspect","destroy","workspace"]}
 ```
 
-Unknown fields, versions, reordered/different operation sets or claims beyond implemented primitives are rejected. `interactive_exec_pty` must be false for `["environment.v1"]`, true only for `["environment.v1","pty.v1"]`. Only `host.local` run execution is implemented. Legacy targets return typed `unsupported_capability` for requested environments or PTY; the host never substitutes a different target or locally allocates on their behalf. Infrastructure diagnostics and start/stop remain unsupported without asserting a running/stopped runtime.
+Unknown fields, versions, reordered/different operation sets or claims beyond implemented primitives are rejected. `interactive_exec_pty` is false for `["environment.v1"]`, true for either PTY-bearing set. Infrastructure diagnostics are true only for the remote set. Legacy targets return typed `unsupported_capability` for requested environments or PTY; the host never substitutes another target or locally allocates on their behalf. Explicit start/stop remain unsupported; availability is an observed lifecycle fact, not an invented running/stopped runtime.
+
+The following grant methods apply **only to `host.local`**:
 
 | Negotiated method | Exact operation envelope | Core-owned primitive |
 | --- | --- | --- |
@@ -169,19 +171,21 @@ Unknown fields, versions, reordered/different operation sets or claims beyond im
 
 The action reply and `target.completed` exchange retain the exact grant/receipt shapes above. Context, target actions and acknowledgments do not authenticate an owner, allocate an arbitrary path, assert successful destruction or grant deletion authority. Core captures resource identities, verifies owner/UID/immutable target pin and native leases, then performs effects on validated local objects. A refused action never falls back. Receipt failure reports failure while preserving already committed Core effects and durable reconciliation evidence.
 
-Schema v18 stores immutable environment ID, owner label/effective UID, full target pin and negotiated capabilities; one-time Core-captured root/namespace/container/home/marker identities; desired/runtime/observation facts; monotonic destroy intent; and immutable run/environment bindings. An ID is scoped by its immutable owner, not an authentication token: another owner cannot reuse or adopt it. Runs still have independent run/workspace identities and actual fork/source receipts. Environment state is `available`, `absent` or `unknown`, not a terminal RunState or an assertion about a VM/Pod. Inspect reconciles filesystem facts; desired destroy alone never establishes absence.
+Schema v19 preserves immutable environment ID, owner label/effective UID, full target pin, capabilities, desired/runtime observations, monotonic destroy intent and immutable run/environment bindings. Host-local resources retain their captured filesystem identities. Remote resources are opaque backend-bound JSON, never controller paths or deletion grants. An ID is scoped by its immutable owner, not an authentication token. Runs have independent run/workspace identities and immutable prelaunch source receipts. State is `available`, `absent` or `unknown`; desired destruction alone never establishes absence.
 
-Private storage is `ROOT/environments/ID/tree`, with HOME and private XDG config/data/cache/state roots there, outside prepared sources, run forks, snapshots and artifact directories. Normal cancel/recovery/reclaim never traverses it. Default capture remains cwd/source-only: explicitly copying or printing a secret into a workspace/output can still capture it. No native credentials/config are implicitly copied or exported. Only a portable context without native config/connection references and external home/config command roots can bind this HOME; unsafe native contexts fail typed unsupported before launch.
+For `host.local`, private HOME/XDG storage is `ROOT/environments/ID/tree`, outside prepared sources, forks and artifacts. Only portable contexts without external native config/connection references can bind that local HOME; unsafe contexts fail before launch. For `remote.v1`, HOME/XDG and native context validation belong to the actual execution environment; controller credentials/config are never imported. Normal cancel/reclaim never deletes either HOME. Capture remains cwd/source-only: explicitly copying or printing a secret into a workspace/output can still capture it.
 
-Explicit destroy requires exact `--confirm ID`, matching immutable owner/UID/target, saved descriptor identities and marker, and positive inactive native lease proof for every bound terminal run. Expired timestamps, strings and receipts are not ownership proof. Symlink/replaced/unowned resource or config roots and unknown/stale leases fail closed. A namespace shared lock protects runs/inspection/shells; mutations take its nonblocking exclusive lock, so any active environment run or shell blocks all environment mutations. The target retains its own shared lease through PTY reap, independently of the Core/controller lease. Destroy intent is durable before anchored deletion; interrupted deletion can resume only against the same captured resources. Missing/tampered resources or creation interrupted before ownership capture remain `unknown` and cannot be automatically adopted/recreated. Destroyed IDs remain immutable tombstones.
+Explicit destroy requires exact `--confirm ID`, matching immutable owner/UID/target and positive inactivity of every bound run/shell. Host-local deletion additionally requires saved descriptor identities and marker; remote deletion additionally requires exact opaque resource binding and target-side exclusive ownership proof. Expired timestamps, strings and acknowledgments are not ownership proof. The controller namespace lease excludes active runs/shells; the target retains its own lease through process reap. Destroy intent is durable before effects; interrupted destruction may resume only against the same captured resources. Missing/tampered ownership remains unknown, never permission to adopt. Destroyed IDs remain immutable tombstones. Remote Pod recreation may preserve an independently verified durable HOME binding while producing a new execution instance.
 
 Trust ceiling: trusted installed code, local same-UID/root processes and external HOME dependencies are not sandboxed; descriptor checks do not remove the walk-to-spawn race. Filesystem permissions scope other UIDs, not malicious code running as the owner. Storage is ordinary local plaintext; use independently managed filesystem/storage encryption if required. Fabric implements neither encryption nor credential brokerage.
 
 ### Optional PTY extension v1
 
-`fabric shell ENV --owner OWNER --target TARGET` is a foreground attached-terminal surface, **not** a worker start, output capture, browser endpoint or credential broker. Before starting the target control process, Core checks the persisted immutable effective UID, explicit logical owner, exact full target pin, available lifecycle/no destroy intent, stored PTY capability, private namespace/container/HOME marker and all five XDG identities under the existing shared namespace lease. Fresh negotiation must agree before `openExec`. No caller-supplied destination, argv, credential, PID or plugin reply grants filesystem/destruction authority. Missing/unsupported capability is typed `unsupported_capability` before session transport opens; all content-channel failures have fixed content-free diagnostics and no fallback.
+`fabric shell ENV --owner OWNER --target TARGET` is an attached-terminal surface, **not** a worker start, output capture, browser endpoint or credential broker. Core checks immutable effective UID, logical owner, full target pin, available lifecycle/no destroy intent and PTY capability under its shared namespace lease. Host-local allocation also checks private HOME/XDG filesystem identities. Remote allocation uses only the saved opaque environment binding and target-side checks; it never opens a controller PTY. Missing capability is typed `unsupported_capability`; content-channel failures have fixed content-free diagnostics and no fallback.
 
 One control connection has at most one live PTY. Ordinary initialize/health/capabilities/placement and exact JSON-RPC-v1 envelopes remain mandatory. All three PTY methods use the existing one-second operation deadline and 65,536-byte UTF-8 JSON/LF frame bound. There is one request in flight and at most 4096 bytes in each direction per exchange; raw bytes are **JSON integer arrays 0–255**, not lossy UTF-8 strings or embedded newline framing. Unknown fields and invalid lengths/byte values are errors.
+
+The following direct methods apply **only to `host.local`**; remote PTY operations use the asynchronous backend below with identical byte/control/resize/closure semantics.
 
 | Method | Exact params | Exact result |
 | --- | --- | --- |
@@ -295,6 +299,47 @@ Normalization is streamed through a persistent bounded control process, not one 
 
 OMP/Codex implementations and their original provider-free fixtures live in `sdk/rust/reference-harnesses`. Build/package/install instructions are in the [SDK guide](../sdk/typescript/README.md#native-reference-harness-plugins). Controller and worker harness selections remain independent; installation never selects a harness automatically. Legacy harness readiness/run remains supported; targets use `target.execute` and connectors use `connector.ingest` as specified below. Provider-free fixtures do not establish provider authentication, model availability or model-backed execution.
 
+## Generic remote target backend v1
+
+The exact fourth optional set is a capability-based clean cutover, not a protocol-version or executable-version allowlist. Old `optional:[]`, environment-only and host-local PTY targets retain their original envelopes and ownership rules. Remote targets refuse **all** host grant/completed and host-path `openExec` methods. Core contains no Kubernetes, provider or harness-name dispatch.
+
+One control session has at most one operation in flight:
+
+* `target.remote.invoke {version:1,operation,input}` returns exactly `{ticket:STRING}` (nonempty, bounded).
+* `target.remote.poll {ticket}` returns exactly `{state:"pending"}`, `{state:"complete",result:VALUE}` or `{state:"failed",scope:"target"|"harness",kind:STRING}`.
+* Each wire exchange retains the one-second deadline and 65,536-byte frame bound. Pending is not retry/replay: it polls the **same** owned operation. There is no global healthy-run timeout, automatic retry or 600-second worker stop. Worker execution retains its explicitly admitted timeout and original process handles.
+* Typed failure messages are not forwarded. A structured target failure may instead complete with `{state:"target_failed",evidence:{instance,phase,reason,exit_code?,signal?}}`. Evidence is bound to the observed execution instance and stored separately from harness failure. Arbitrary stderr/text never establishes an infrastructure cause.
+
+`E` below is exactly `{environment_id,owner,resource}`; resource is initially null only for ensure. A saved resource is an opaque object containing `backend:"remote.v1"` and a nonempty bounded `resource_id`. `R` is a target-returned workspace resource containing its own opaque `resource_id`, `run_id`, actual `instance` and exact `environment:E`. Core persists and compares these bindings; it never treats them as paths, host UID/inode evidence or authority to remove host storage.
+
+| Operation | Input | Result / requirement |
+| --- | --- | --- |
+| `environment.ensure` | `E` | `{available:false,resource}` first durably binds persistent ownership before readiness; or `{available:true,resource}` |
+| `environment.inspect` | saved `E` | `{available:true,resource}` only after actual availability/ownership checks |
+| `environment.destroy` | saved `E` | `{absent:true}` only after owned-resource destruction; Core separately requires confirmation/inactivity |
+| `harness.probe` | `{environment:E,harness,input:{}}` | `{version}` from the actual remote installed harness |
+| `harness.plan` | `{environment:E,harness,input:{request,version}}` | existing `HarnessPlan`, validated in actual remote HOME; no controller auth/config import |
+| `pty.open` | `{environment:E,size,limits}` | `{opened:true}` after actual remote PTY allocation and shared HOME lease |
+| `pty.exchange` | `{input:[bytes],resize}` | existing validated PTY exchange result |
+| `pty.close` | `{cancel}` | existing validated closed result; owned group reaped, HOME retained |
+| `workspace.create` | `{environment:E,run_id,size,sha256,limit}` | fresh `R`; separate disposable storage, never persistent HOME |
+| `source.write` | `{resource:R,offset,bytes}` | `{offset}` exact next offset; 8192-byte chunks, no overwrite/replay |
+| `source.seal` | `{resource:R}` | `{resource:R,actual_sha256,os,arch,hostname,instance}` after bounded archive/hash verification and actual source observation |
+| `worker.start` | `{resource:R,plan,actual_sha256,prompt_sha256,timeout_seconds,term_grace_ms,max_log_bytes,storage_policy,scan_timeout_ms}` | `{started:true}` only after actual spawn; revalidate source, prompt, exact plan/version/native consent immediately before launch |
+| `worker.poll` | `{resource:R}` | `{state:"running"}` or `{state:"complete",result:{resource:R,exit_code,exit_signal,stop_reason,harness_failed,capture}}`; exactly one actual exit code/signal |
+| `worker.cancel` | `{resource:R}` | same worker state; cancel actual owned group, escalate/reap before completion |
+| `workspace.export` | `{resource:R,limit}` | `{size,sha256}` for actual inactive tree/log bytes |
+| `workspace.read` | `{resource:R,offset}` | `{bytes}` bounded 8192-byte chunks of that export |
+| `workspace.reclaim` | `{resource:R}` | `{reclaimed:true}` only after inactivity/exclusive disposable lease; never HOME |
+
+Transfer is bounded to 128 MiB, 100,000 unique entries, depth 64. Inputs reject absolute/traversal/duplicate paths, special/hard-linked entries and escaping links; extraction never traverses an archive-created link. Source hashes use the existing portable full-tree digest, not invented remote inode witnesses. The immutable prelaunch receipt binds source evidence, exact target pin, environment, resource and actual OS/architecture/hostname/instance. Remote receipts omit controller device/inode; schema constraints preserve all old local requirements. Controller workspace paths describe **transfer staging only**, never advertised as Pod HOME or remote execution paths.
+
+Returned tree/log bytes are downloaded to new private staging, size/SHA-256 verified, then passed through existing capture/Git validation/artifact sealing. Returned metadata alone cannot establish host filesystem effects or a sealed artifact. Transfer/ownership/pin mismatch fails closed and retains unknown evidence. Recovery requires the same target/resource/instance and positive remote completion; missing durable capture or unverifiable resources remain retained, not guessed successful or automatically deleted.
+
+The generic agent uses target-side private HOME/work roots, actual PTY/process groups, bounded capture/storage monitoring, shared HOME/workspace leases and exclusive destruction/reclaim. Transport EOF or heartbeat loss (10 seconds) cancels/reaps ordinary owned session/task groups; the target sends heartbeats every two seconds. Teardown does not sweep processes by name or invent PIDs. Deliberately detached same-UID processes, a malicious installed plugin/image, controller/cluster administrator, runtime replacement, abrupt node loss and compromised storage remain outside this trusted-local best-effort boundary. HOME storage encryption, network egress policy and native OAuth are owner responsibilities.
+
+External implementation, owner installation/configuration, least-privilege bootstrap, image contract, storage limits and explicitly opt-in real acceptance: [Kubernetes target](../plugins/kubernetes/README.md). Provider-free proposed checks: `node --test sdk/typescript/test/remote.test.mjs`, `python3 -m unittest discover -s plugins/kubernetes -p test_target.py`, `cargo test -p fabric-core remote::tests`, plus the existing Runner plugin/target and CLI environment/shell tests. These commands are manager-owned; issue #33 worker checks are `NOT_RUN_BY_WORKER`.
+
 ## Incoming connectors (contract version 1)
 
 Connectors are reviewed, externally installed `connector.ingest` plugins using the existing registry, SDK and supervised stdio host. No provider-specific routing exists in Core. Source format translation and authentication belong to the connector; approved automation selection and durable worker admission belong to Core. The former evidence-only connector operation/capability is removed, not aliased.
@@ -386,4 +431,5 @@ Use the existing SDK `create connector`, `test`, content hash, explicit trusted 
 `optional` may contain only `subscribe` and/or `reply`, and the SDK requires matching callbacks. Each advertised `connector.subscribe`/`connector.reply` accepts/returns `{version:1,data:JSON}` in its own negotiated session. Those effects are separate from incoming verification/routing. The generic sample advertises neither; Core does not automatically call outbound hooks, subscribe to a provider or claim reply delivery. No provider-specific operation is implemented by this reference.
 
 The [external GitHub issues integration](GITHUB_CONNECTOR.md) implements provider-side raw-byte verification, snapshot approval/normalization and scoped installation/response hooks through this contract. It forwards to the existing generic Connect route and validates exact local terminal evidence before replying; it adds no provider branches to Core or Connect. Its source-only delivery and opt-in live checks are distinct from verified release/deployment acceptance.
+
 

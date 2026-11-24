@@ -107,7 +107,7 @@ fn report(
         .environment_runs(&record.environment_id)
         .map_err(error)?;
     Ok(EnvironmentReport {
-        home: if record.runtime == EnvironmentRuntime::Available {
+        home: if record.runtime == EnvironmentRuntime::Available && !remote_record(&record) {
             Some(home(root, &record.environment_id))
         } else {
             None
@@ -179,6 +179,9 @@ pub fn ensure(
         Err(failure) => return Err(error(failure)),
     }
     let _lease = workspace::environment_lock(&root, true)?;
+    if target.is_remote() {
+        return remote_lifecycle(&root, &store, selection, &pin, target, "ensure");
+    }
     let result = target
         .drive(
             "environment.ensure",
@@ -295,6 +298,9 @@ pub fn inspect(
     let _lease = workspace::environment_lock(&root, false)?;
     let target = pin.open(&CancellationToken::default())?;
     target.require_environment(selection.interactive_exec_pty)?;
+    if target.is_remote() {
+        return remote_lifecycle(&root, &store, selection, &pin, target, "inspect");
+    }
     let result = target
         .drive(
             "environment.inspect",
@@ -335,6 +341,9 @@ pub fn destroy(
     let _runs = workspace::environment_inactive(&root, &store, &record.environment_id)?;
     let target = pin.open(&CancellationToken::default())?;
     target.require_environment(selection.interactive_exec_pty)?;
+    if target.is_remote() {
+        return remote_lifecycle(&root, &store, selection, &pin, target, "destroy");
+    }
     let saved = record
         .resource_json
         .as_deref()
@@ -405,6 +414,9 @@ pub(crate) struct HomeLease {
 }
 impl HomeLease {
     pub(crate) fn validate(&self) -> Result<(), FabricError> {
+        if remote_record(&self.record) {
+            return Ok(());
+        }
         workspace::environment_resource(
             &self.root,
             &self.record.environment_id,
@@ -416,6 +428,9 @@ impl HomeLease {
     }
     pub(crate) fn configure(&self, command: &mut CommandSpec) -> Result<(), FabricError> {
         self.validate()?;
+        if remote_record(&self.record) {
+            return Err(unsupported("Remote HOME cannot configure a host process"));
+        }
         if command.environment.iter().any(|(key, _)| {
             key == "HOME"
                 || key.to_string_lossy().starts_with("XDG_")
@@ -465,14 +480,20 @@ pub(crate) fn for_run(
     plan: &HarnessPlan,
 ) -> Result<HomeLease, FabricError> {
     target.require_environment(selection.interactive_exec_pty)?;
-    validate_context(plan)?;
+    if !target.is_remote() {
+        validate_context(plan)?;
+    }
     let (root, store) = workspace::open_store(root)?;
     let lease = workspace::environment_lock(&root, false)?;
     let record = owned(&store, selection, pin)?;
     if record.desired != EnvironmentDesired::Available || record.destroy_intent {
         return Err(error("Environment is not available for new runs"));
     }
-    observe(&root, &store, &record)?;
+    if target.is_remote() {
+        remote_observe(&store, &record, target)?;
+    } else {
+        observe(&root, &store, &record)?;
+    }
     let record = owned(&store, selection, pin)?;
     if record.runtime != EnvironmentRuntime::Available {
         return Err(error("Environment ownership is unknown"));
@@ -577,6 +598,17 @@ pub fn shell(
         record,
     };
     home_lease.validate()?;
+    let target = pin.open(cancellation)?;
+    target.require_environment(true)?;
+    if target.is_remote() {
+        remote_observe(&store, &home_lease.record, &target)?;
+        let opened = target.remote_call("pty.open", serde_json::json!({
+            "environment": remote_input(&home_lease.record)?,
+            "size": size, "limits": limits
+        }))?;
+        if opened != serde_json::json!({"opened":true}) { return Err(error("Invalid remote PTY receipt")); }
+        return Ok(ShellSession { target, home: home_lease, closed: false, finished: false });
+    }
     let home = home(&home_lease.root, &home_lease.record.environment_id);
     let namespace = home
         .parent()
@@ -598,8 +630,6 @@ pub fn shell(
         size,
         limits,
     };
-    let target = pin.open(cancellation)?;
-    target.require_environment(true)?;
     home_lease.validate()?;
     let mut session = ShellSession {
         target,
@@ -613,4 +643,83 @@ pub fn shell(
         .map_err(|_| fabric_runner::pty::error())?;
     session.closed = false;
     Ok(session)
+}
+
+fn remote_record(record: &EnvironmentRecord) -> bool {
+    record.resource_json.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .is_some_and(|v| v["backend"] == "remote.v1")
+}
+
+pub(crate) fn remote_input(record: &EnvironmentRecord) -> Result<serde_json::Value, FabricError> {
+    let resource: serde_json::Value = serde_json::from_str(
+        record.resource_json.as_deref().ok_or_else(|| error("Remote resource is not bound"))?
+    ).map_err(error)?;
+    if resource["backend"] != "remote.v1"
+        || resource["resource_id"].as_str().is_none_or(|s| s.is_empty() || s.len() > 4096)
+    {
+        return Err(error("Invalid remote ownership binding"));
+    }
+    Ok(serde_json::json!({"environment_id":record.environment_id,"owner":record.owner,"resource":resource}))
+}
+
+fn remote_observe(store: &Store, record: &EnvironmentRecord, target: &Target) -> Result<(), FabricError> {
+    let reply = target.remote_call("environment.inspect", remote_input(record)?)?;
+    let expected: serde_json::Value = serde_json::from_str(record.resource_json.as_deref().unwrap()).map_err(error)?;
+    if reply["resource"] != expected || reply["available"] != true {
+        store.observe_environment(&record.environment_id, EnvironmentRuntime::Unknown, "remote_binding_unavailable", now()?).map_err(error)?;
+        return Err(error("Remote resource binding changed or unavailable"));
+    }
+    store.observe_environment(&record.environment_id, EnvironmentRuntime::Available, "remote_owned_resource_verified", now()?).map_err(error)
+}
+
+fn remote_lifecycle(
+    root: &Path, store: &Store, selection: &EnvironmentSelection, pin: &TargetPin,
+    target: Target, operation: &str,
+) -> Result<EnvironmentReport, FabricError> {
+    if store.environment(&selection.environment_id).map_err(error)?.is_none() {
+        if operation != "ensure" {
+            return Err(error("Unknown remote environment"));
+        }
+        store.create_environment(&EnvironmentRecord {
+            environment_id: selection.environment_id.clone(), owner: selection.owner.clone(),
+            owner_uid: unsafe { libc::geteuid() }, target_json: serde_json::to_string(pin).map_err(error)?,
+            capabilities: target.environment_capabilities()?.clone(), resource_json: None,
+            desired: EnvironmentDesired::Available, runtime: EnvironmentRuntime::Unknown,
+            observed_at: now()?, observation: "remote_creation_pending".into(), destroy_intent: false,
+        }).map_err(error)?;
+    }
+    let pending = owned(store, selection, pin)?;
+    if pending.resource_json.is_none() {
+        if operation != "ensure" || pending.destroy_intent || pending.desired != EnvironmentDesired::Available {
+            return Err(error("Remote creation is incomplete"));
+        }
+        let reply = target.remote_call("environment.ensure", serde_json::json!({
+            "environment_id":selection.environment_id,"owner":selection.owner,"resource":null
+        }))?;
+        let resource = &reply["resource"];
+        if resource["backend"] != "remote.v1"
+            || resource["resource_id"].as_str().is_none_or(|s| s.is_empty() || s.len() > 4096)
+        {
+            return Err(error("Invalid remote resource ownership evidence"));
+        }
+        store.own_environment_resource(&selection.environment_id, &serde_json::to_string(resource).map_err(error)?, now()?).map_err(error)?;
+    }
+    let record = owned(store, selection, pin)?;
+    if operation == "destroy" {
+        let input = remote_input(&record)?;
+        let saved = record.resource_json.as_deref().unwrap();
+        store.intent_destroy_environment(&record.environment_id, saved, now()?).map_err(error)?;
+        let reply = target.remote_call("environment.destroy", input)?;
+        if reply["absent"] != true {
+            return Err(error("Remote destruction not observed"));
+        }
+        store.observe_environment(&record.environment_id, EnvironmentRuntime::Absent, "remote_owned_resource_absent", now()?).map_err(error)?;
+    } else {
+        if record.desired != EnvironmentDesired::Available || record.destroy_intent {
+            return Err(error("Destroyed environments are immutable tombstones"));
+        }
+        remote_observe(store, &record, &target)?;
+    }
+    target.finish()?;
+    report(root, store, owned(store, selection, pin)?, pin)
 }

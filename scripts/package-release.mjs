@@ -59,7 +59,7 @@ try {
     chmodSync(destination, executable ? 0o700 : 0o600);
     files[to] = sha256(readFileSync(destination));
   }
-  for (const binary of ['fabric', 'fabric-fake-harness', 'fabric-local-target']) copy(join(build, 'aarch64-apple-darwin/release', binary), `bin/${binary}`, true);
+  for (const binary of ['fabric', 'fabric-fake-harness', 'fabric-local-target', 'fabric-remote-agent']) copy(join(build, 'aarch64-apple-darwin/release', binary), `bin/${binary}`, true);
   const plugins = [];
   const targetPlugins = [];
   mkdirSync(join(stage, 'plugins'), { mode: 0o700 });

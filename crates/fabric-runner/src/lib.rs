@@ -215,6 +215,14 @@ pub fn execute(
     })
 }
 
+/// Execute with actual terminal evidence retained after post-spawn failures.
+pub fn execute_started(
+    request: ExecutionRequest<'_>,
+    started: impl FnOnce(u32) -> Result<(), FabricError>,
+) -> Result<Execution, FabricError> {
+    execute_observed(request, started, |_, _| Ok(()))
+}
+
 pub(crate) fn execute_observed(
     request: ExecutionRequest<'_>,
     started: impl FnOnce(u32) -> Result<(), FabricError>,

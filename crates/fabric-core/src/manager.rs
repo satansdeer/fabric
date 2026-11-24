@@ -662,9 +662,14 @@ impl Manager {
                 let accepted: AcceptedPlan =
                     serde_json::from_str(&task.plan_json).map_err(error)?;
                 let plan = accepted.plan;
+                let mut options = crate::api::run_options(
+                    accepted.limits.as_ref().unwrap_or(&options),
+                    token.clone(),
+                )?;
+                options.target_pin = accepted.target;
                 let registry = HarnessRegistry::default();
-                let adapter = registry.resolve(
-                    &HarnessId::try_from(task.harness)?,
+                let adapter = crate::remote::resolve_harness(
+                    &self.root, &HarnessId::try_from(task.harness)?, &options, &registry,
                     &RegistryOptions {
                         fake_binary: batch.fake_binary.as_ref().map(PathBuf::from),
                     },
@@ -674,11 +679,6 @@ impl Manager {
                         "Accepted harness version changed; task was not launched.",
                     ));
                 }
-                let mut options = crate::api::run_options(
-                    accepted.limits.as_ref().unwrap_or(&options),
-                    token.clone(),
-                )?;
-                options.target_pin = accepted.target;
                 crate::run::execute_prepared(
                     &self.root,
                     &state,

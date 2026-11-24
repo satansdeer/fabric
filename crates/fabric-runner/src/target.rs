@@ -1,4 +1,4 @@
-//! Installed target drivers propose operations; only the host executes authority-bearing primitives.
+//! Installed targets negotiate either Core-owned host primitives or target-owned remote resources.
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use fabric_domain::{ErrorKind, FabricError, HarnessId};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::CancellationToken;
@@ -172,7 +172,8 @@ impl TargetPin {
             || caps.operations != OPERATIONS
             || !(caps.optional.is_empty()
                 || caps.optional == ["environment.v1"]
-                || caps.optional == ["environment.v1", "pty.v1"])
+                || caps.optional == ["environment.v1", "pty.v1"]
+                || caps.optional == ["environment.v1", "pty.v1", "remote.v1"])
         {
             return Err(failure("unsupported_target_capabilities"));
         }
@@ -181,18 +182,19 @@ impl TargetPin {
         struct Placement {
             backend: String,
         }
+        let remote = caps.optional == ["environment.v1", "pty.v1", "remote.v1"];
         let placement: Placement = serde_json::from_value(session.call(
             "target.placement",
-            json!({"placement":self.placement,"backends":["host.local"]}),
+            json!({"placement":self.placement,"backends":if remote {vec!["remote.v1"]} else {vec!["host.local"]}}),
         )?)
         .map_err(|_| failure("invalid_target_placement"))?;
-        if placement.backend != "host.local" {
+        if placement.backend != if remote { "remote.v1" } else { "host.local" } {
             return Err(FabricError {
                 kind: ErrorKind::UnsupportedPlacement,
                 message: "Target refused available placement; no execution fallback.".into(),
             });
         }
-        let pty = caps.optional == ["environment.v1", "pty.v1"];
+        let pty = remote || caps.optional == ["environment.v1", "pty.v1"];
         let environment = if !caps.optional.is_empty() {
             let capabilities: fabric_domain::EnvironmentCapabilities = serde_json::from_value(
                 session.call("target.environment.capabilities", json!({"version":1}))?,
@@ -200,6 +202,7 @@ impl TargetPin {
             .map_err(|_| failure("invalid_environment_capabilities"))?;
             let mut expected = fabric_domain::EnvironmentCapabilities::local();
             expected.interactive_exec_pty = pty;
+            expected.infrastructure_diagnostics = remote;
             if capabilities != expected {
                 return Err(unsupported_environment(
                     "unsupported environment capability negotiation",
@@ -215,6 +218,7 @@ impl TargetPin {
             session: Mutex::new(Some(session)),
             next_grant: AtomicU64::new(1),
             environment,
+            remote,
         })
     }
 }
@@ -260,6 +264,7 @@ pub struct Target {
     session: Mutex<Option<PluginSession>>,
     next_grant: AtomicU64,
     environment: Option<fabric_domain::EnvironmentCapabilities>,
+    remote: bool,
 }
 /// A host effect committed even if its target receipt failed. Callers must account
 /// for `value` before surfacing `failure`; an error here is never a successful receipt.
@@ -278,6 +283,40 @@ impl<T> Committed<T> {
 }
 
 impl Target {
+    /// Remote effects are owned by the explicitly negotiated target, never host grants.
+    pub fn is_remote(&self) -> bool {
+        self.remote
+    }
+
+    /// One invocation, polled without retrying it. Every wire request retains the
+    /// existing target deadline; healthy remote work has no implicit wall-clock stop.
+    pub fn remote_call(&self, operation: &str, input: Value) -> Result<Value, FabricError> {
+        if !self.remote {
+            return Err(failure("remote_backend_not_negotiated"));
+        }
+        let reply = self.call("target.remote.invoke", json!({"version":1,"operation":operation,"input":input}))?;
+        let ticket = reply.get("ticket").and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .ok_or_else(|| failure("invalid_remote_ticket"))?;
+        loop {
+            let reply = self.call("target.remote.poll", json!({"ticket":ticket}))?;
+            match reply.get("state").and_then(Value::as_str) {
+                Some("pending") if reply.as_object().is_some_and(|v| v.len() == 1) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Some("complete") if reply.as_object().is_some_and(|v| v.len() == 2) => {
+                    return reply.get("result").cloned().ok_or_else(|| failure("invalid_remote_result"));
+                }
+                Some("failed") if reply["scope"] == "harness" => {
+                    let kind = serde_json::from_value(reply["kind"].clone())
+                        .map_err(|_| failure("invalid_remote_error"))?;
+                    return Err(FabricError { kind, message:"Remote harness operation failed.".into() });
+                }
+                Some("failed") => return Err(failure("remote_target_failed")),
+                _ => return Err(failure("invalid_remote_result")),
+            }
+        }
+    }
     pub fn environment_capabilities(
         &self,
     ) -> Result<&fabric_domain::EnvironmentCapabilities, FabricError> {
@@ -297,6 +336,7 @@ impl Target {
     }
 
     pub fn open_exec(&self, request: &crate::pty::OpenExec) -> Result<(), FabricError> {
+        if self.remote { return Err(failure("host_pty_forbidden_for_remote_backend")); }
         self.require_environment(true)?;
         request.size.validate()?;
         request.limits.validate()?;
@@ -320,19 +360,26 @@ impl Target {
     ) -> Result<crate::pty::Reply, FabricError> {
         self.require_environment(true)?;
         request.validate()?;
-        let reply: crate::pty::Reply = serde_json::from_value(self.call(
-            "target.pty.exchange",
-            serde_json::to_value(request).map_err(|_| crate::pty::error())?,
-        )?)
+        let params = serde_json::to_value(request).map_err(|_| crate::pty::error())?;
+        let value = if self.remote {
+            self.remote_call("pty.exchange", params)?
+        } else {
+            self.call("target.pty.exchange", params)?
+        };
+        let reply: crate::pty::Reply = serde_json::from_value(value)
         .map_err(|_| crate::pty::error())?;
         reply.validate(request.input.len())?;
         Ok(reply)
     }
 
     pub fn close_exec(&self, cancel: bool) -> Result<crate::pty::Reply, FabricError> {
-        let reply: crate::pty::Reply =
-            serde_json::from_value(self.call("target.pty.close", json!({"cancel":cancel}))?)
-                .map_err(|_| crate::pty::error())?;
+        let value = if self.remote {
+            self.remote_call("pty.close", json!({"cancel":cancel}))?
+        } else {
+            self.call("target.pty.close", json!({"cancel":cancel}))?
+        };
+        let reply: crate::pty::Reply = serde_json::from_value(value)
+            .map_err(|_| crate::pty::error())?;
         reply.validate(0)?;
         if reply.closed.is_none() || !reply.output.is_empty() {
             return Err(crate::pty::error());
@@ -350,6 +397,9 @@ impl Target {
         context: serde_json::Value,
         execute: impl FnOnce(Action) -> Result<(T, serde_json::Value), FabricError>,
     ) -> Result<Committed<T>, FabricError> {
+        if self.remote {
+            return Err(failure("host_grants_forbidden_for_remote_backend"));
+        }
         let environment_operation = operation.strip_prefix("environment.");
         if let Some(operation) = environment_operation {
             let caps = self.environment_capabilities()?;
