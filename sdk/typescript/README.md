@@ -75,6 +75,8 @@ For a conventional npm dependency, import from `@fabric/plugin-sdk`. Do not run 
 
 All kinds negotiate protocol/id/version/kind and complete health/shutdown. Harness execution runs in a second actual process. The kit bounds frames to 65,536 bytes including LF, and its harness fixture capture to 1,024 events / 1 MiB. Invalid/malformed/oversized/truncated frames, remote errors and timeouts fail with fixed secret-free diagnostics and terminate the process group. Connector fixtures exercise authentication and normalization, not worker scheduling. Third-party callback correctness, provider-backed behavior and Core artifact/lifecycle acceptance remain outside fixture proof.
 
+Target conformance accepts the negotiated `environment.v1` extension advertised by the native local reference package; its six-operation fixture is not environment lifecycle proof. Core's environment integration checks provide that proof. Generated TypeScript targets and `serve(defineTarget(...))` still support only `optional: []`; advertising an unimplemented environment adapter remains rejected. Unknown, mixed or duplicate optional target capabilities fail closed.
+
 SDK metadata must be exactly `sdk: "0.1.0", protocol: 1`; mismatch diagnostics explain what to regenerate/update **before plugin code runs**. Runtime identity/protocol mismatches fail negotiation before Core admits execution. Update package pins only after reviewing the new content.
 
 ### Incoming connector fixtures and webhook
