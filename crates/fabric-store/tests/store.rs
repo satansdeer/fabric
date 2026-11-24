@@ -128,7 +128,9 @@ fn change(workspace: WorkspaceState) -> RunWorkspaceTransition {
 fn remove_task_source_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS run_environments;
+            "DROP TABLE IF EXISTS run_remote_completions;
+         DROP TABLE IF EXISTS run_remote_observations;
+         DROP TABLE IF EXISTS run_environments;
          DROP TABLE IF EXISTS environments;
          DROP TABLE IF EXISTS run_launch_receipts;
          DROP TABLE IF EXISTS prepared_source_evidence;
@@ -1318,9 +1320,17 @@ fn read_only_inspection_neither_creates_migrates_nor_writes_v5_v6_or_v7() {
     let escaped_path = root.path().join("inspection ?#%.sqlite3");
     std::fs::rename(&path, &escaped_path).unwrap();
     let path = escaped_path;
-    for version in [18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
+    for version in [20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
         let db = Connection::open(&path).unwrap();
         db.pragma_update(None, "user_version", version).unwrap();
+        if version == 19 {
+            db.execute_batch("DROP TABLE run_remote_completions;")
+                .unwrap();
+        }
+        if version == 18 {
+            db.execute_batch("DROP TABLE run_remote_observations;")
+                .unwrap();
+        }
         if version == 17 {
             db.execute_batch("DROP TABLE run_environments; DROP TABLE environments;")
                 .unwrap();
