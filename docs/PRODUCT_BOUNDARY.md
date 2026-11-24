@@ -16,6 +16,7 @@ Fabric is a macOS-first, single-user, trusted-local coding-agent worker layer. I
 - Interactive shells have bounded byte queues, idle/max duration, resize and explicit close/cancel. They do not create supervised run output/artifacts, Connect inbox content or GitHub comments. Terminal state is restored on normal/error exits while the terminal exists, not after SIGKILL/host loss. Reconnect is a new shell. Trusted commands/plugins and explicitly user-owned recordings are not universally redacted.
 - The provider-free PTY relay fixture mutually authenticates fresh TCP connections with a private fixture HMAC key, then relays to a separate native target. It uses loopback and shared owner-private filesystem resources; data is not encrypted. This proves a target transport/session contract, not remote run isolation, production ingress, cloud placement or provider login.
 - Storage admission is best effort and measures logical bytes; APFS physical/exclusive usage and host disk exhaustion are not guaranteed. Adapter request budgets are not hard billing caps.
+- Plugin timeout metadata observes only the session's actual owned direct child before teardown: bounded PID/group/wait/budget/RPC counters and buffered byte count, never payload, argv or environment. Non-reaping exit observation preserves the process-group PID anchor; it is not descendant supervision, a scheduler trace, killer attribution or proof that a missing response's cause is known. Existing trusted-local, capture, lifecycle and authorization limits remain unchanged.
 
 ## Corrective milestone status
 

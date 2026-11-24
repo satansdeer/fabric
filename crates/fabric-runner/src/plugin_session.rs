@@ -9,6 +9,7 @@ pub(crate) struct PluginSession {
     _home: tempfile::TempDir,
     next_id: u64,
     timeout: Duration,
+    configured_timeout: Duration,
     cancel: CancellationToken,
     start: Instant,
     frame_limit: usize,
@@ -72,6 +73,7 @@ impl PluginSession {
             _home: home,
             next_id: 1,
             timeout,
+            configured_timeout: timeout,
             cancel: cancel.clone(),
             start,
             frame_limit: if manifest.native.is_some() {
@@ -103,11 +105,17 @@ impl PluginSession {
         self.next_id = id
             .checked_add(1)
             .ok_or_else(|| failure("request_id_exhausted"))?;
+        let call_started = Instant::now();
         let deadline = if self.persistent {
-            Instant::now() + self.timeout
+            call_started + self.timeout
         } else {
             self.start + self.timeout
         };
+        let group = &mut self.group;
+        let configured = self.configured_timeout;
+        let effective = self.timeout;
+        let session_started = self.start;
+        let persistent = self.persistent;
         exchange_bounded(
             (
                 self.input.as_mut().ok_or_else(|| failure("closed_input"))?,
@@ -119,6 +127,19 @@ impl PluginSession {
             deadline,
             &self.cancel,
             self.frame_limit,
+            || {
+                json!({
+                    "version":1,
+                    "child":group.timeout_snapshot(),
+                    "configured_budget_us":configured.as_micros() as u64,
+                    "effective_budget_us":effective.as_micros() as u64,
+                    "remaining_budget_at_call_us":deadline.saturating_duration_since(call_started).as_micros() as u64,
+                    "negotiated_budget":"not_in_protocol",
+                    "deadline_scope":if persistent { "per_request" } else { "session" },
+                    "call_elapsed_us":call_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    "session_elapsed_us":session_started.elapsed().as_micros().min(u64::MAX as u128) as u64
+                })
+            },
         )
     }
     pub(crate) fn set_cancellation(&mut self, cancellation: &CancellationToken) {
@@ -153,3 +174,7 @@ impl PluginSession {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "plugin_session_tests.rs"]
+mod tests;

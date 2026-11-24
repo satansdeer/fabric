@@ -241,7 +241,7 @@ impl ProcessGroup {
         Ok(())
     }
 
-    pub(crate) fn exited(&mut self) -> io::Result<bool> {
+    fn exit_info(&mut self) -> io::Result<libc::siginfo_t> {
         // WNOWAIT observes exit without releasing the PID/group identity anchor.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
@@ -255,25 +255,93 @@ impl ProcessGroup {
         if result == -1 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
+                return Err(error);
             }
             // Another reaper removed our ownership anchor. Never signal a possibly reused PID.
             if error.raw_os_error() == Some(libc::ECHILD) {
                 self.reaped = true;
             }
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "waitid(P_PID, {}, WEXITED|WNOHANG|WNOWAIT): {error}",
-                    self.child.id()
-                ),
-            ));
+            return Err(error);
         }
+        Ok(info)
+    }
+
+    pub(crate) fn exited(&mut self) -> io::Result<bool> {
+        let info = match self.exit_info() {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(false),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "waitid(P_PID, {}, WEXITED|WNOHANG|WNOWAIT): {error}",
+                        self.child.id()
+                    ),
+                ));
+            }
+        };
         #[cfg(target_os = "macos")]
         let pid = info.si_pid;
         #[cfg(not(target_os = "macos"))]
         let pid = unsafe { info.si_pid() };
-        Ok(pid != 0)
+        Ok(pid != 0
+            && matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ))
+    }
+
+    /// One non-reaping observation; never release the group leader's PID anchor.
+    pub(crate) fn timeout_snapshot(&mut self) -> serde_json::Value {
+        let pid = self.child.id();
+        let exit = match self.exit_info() {
+            Ok(info) => {
+                #[cfg(target_os = "macos")]
+                let (observed_pid, status) = (info.si_pid, info.si_status);
+                #[cfg(not(target_os = "macos"))]
+                let (observed_pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+                if observed_pid == 0 {
+                    serde_json::json!({"state":"not_exited"})
+                } else {
+                    match info.si_code {
+                        libc::CLD_EXITED => serde_json::json!({"state":"exited","code":status}),
+                        libc::CLD_KILLED | libc::CLD_DUMPED => {
+                            serde_json::json!({"state":"signaled","signal":status})
+                        }
+                        libc::CLD_STOPPED | libc::CLD_TRAPPED => {
+                            serde_json::json!({"state":"stopped","signal":status})
+                        }
+                        _ => {
+                            serde_json::json!({"state":"UNKNOWN","reason":"unexpected_waitid_code","code":info.si_code})
+                        }
+                    }
+                }
+            }
+            Err(error) => serde_json::json!({
+                "state":"UNKNOWN","reason":"waitid_failed","errno":error.raw_os_error()
+            }),
+        };
+        let pgid = if self.reaped {
+            -1
+        } else {
+            unsafe { libc::getpgid(pid as i32) }
+        };
+        let pgid_errno = if pgid == -1 && !self.reaped {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        serde_json::json!({
+            "pid":pid,
+            "relationship":"owned_direct_child",
+            "spawn_parent_pid":std::process::id(),
+            "pgid":(pgid != -1).then_some(pgid),
+            "pgid_state":if self.reaped { "UNKNOWN_anchor_lost" } else if pgid == -1 { "unavailable" } else { "observed" },
+            "pgid_errno":pgid_errno,
+            "descendants":"not_sampled",
+            "try_wait":{"state":"UNKNOWN","reason":"not_called_preserve_group_pid_anchor"},
+            "waitid_wnowait":exit
+        })
     }
 
     pub fn supervise(

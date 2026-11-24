@@ -221,6 +221,18 @@ fn target_timeout_identifies_rpc_and_exchange_phase_without_host_effects() {
         "{error}"
     );
     assert!(error.message.contains("received 0 bytes"), "{error}");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(error.message.split_once(" Timeout evidence: ").unwrap().1).unwrap();
+    let pid: u32 = std::fs::read_to_string(dir.path().join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(snapshot["child"]["pid"], pid);
+    assert_eq!(snapshot["child"]["relationship"], "owned_direct_child");
+    assert_eq!(snapshot["request_id"], 5);
+    assert_eq!(snapshot["received_bytes"], 0);
+    assert_eq!(snapshot["buffered_bytes"], 0);
     assert!(start.elapsed() < Duration::from_secs(3));
     drop(target);
     reaped(dir.path());
