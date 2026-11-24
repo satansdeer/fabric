@@ -92,8 +92,7 @@ Recovery refuses unknown evidence but can reclaim independently verified effects
 under the existing policy; a failed target receipt is never cleanup proof.
 The bundled `fabric-local-target` is used only when no registry local entry exists;
 a revoked or broken installed entry never triggers a bundled/local fallback.
-Unsupported PTY, persistent-environment and infrastructure-evidence capabilities
-fail explicitly. See [the target contract](PLUGIN_PROTOCOL.md#installed-execution-targets).
+Unsupported PTY, persistent-environment and infrastructure-evidence capabilities fail explicitly. `fabric shell ENV --owner OWNER --target TARGET` is a separate attached-terminal control, gated by immutable UID/owner/target, lifecycle, private HOME/XDG identities and negotiated `pty.v1` before opening the target session transport. It creates no worker/run, artifact, Connect inbox or API/browser token. Reconnection starts fresh; existing worker supervision/output capture remains unchanged. See [the target/PTY contract](PLUGIN_PROTOCOL.md#optional-pty-extension-v1).
 
 The legacy tool `fabric` accepts `{ "request": <v1 JSON object> }`;
 `/fabric <literal JSON request>` parses the same document without rewriting it

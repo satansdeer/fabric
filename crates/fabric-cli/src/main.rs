@@ -1,6 +1,7 @@
 mod connect;
 mod environment;
 mod onboarding;
+mod shell;
 mod up;
 
 use std::io::{self, Read, Write};
@@ -36,6 +37,8 @@ enum Commands {
     Connect(connect::Options),
     /// Durable private home lifecycle, independent of disposable run workspaces.
     Environments(environment::Options),
+    /// Open an owner-only terminal in an existing environment; never capture its content.
+    Shell(shell::Options),
     #[command(hide = true)]
     ConnectAdmit {
         #[arg(long)]
@@ -560,6 +563,7 @@ fn main() -> ExitCode {
         Commands::Up(args) => (args.json, up::up(cli.root, args)),
         Commands::Connect(options) => (true, connect::run(cli.root, options)),
         Commands::Environments(options) => (options.json(), environment::run(cli.root, options)),
+        Commands::Shell(options) => (false, shell::run(cli.root, options)),
         Commands::ConnectAdmit {
             automation,
             fake_binary,

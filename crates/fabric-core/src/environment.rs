@@ -9,7 +9,7 @@ use fabric_runner::{CancellationToken, CommandSpec};
 use fabric_store::{EnvironmentRecord, Store};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -484,4 +484,133 @@ pub(crate) fn for_run(
     };
     lease.validate()?;
     Ok(lease)
+}
+
+/// Live terminal ownership, deliberately distinct from run/workspace capture.
+/// Field order keeps the target and its owned processes ahead of the HOME lease.
+pub struct ShellSession {
+    target: Target,
+    home: HomeLease,
+    closed: bool,
+    finished: bool,
+}
+
+impl ShellSession {
+    pub fn exchange(
+        &mut self,
+        request: &fabric_runner::pty::Exchange,
+    ) -> Result<fabric_runner::pty::Reply, FabricError> {
+        if self.closed {
+            return Err(fabric_runner::pty::error());
+        }
+        self.home.validate()?;
+        // Plugin errors may contain arbitrary remote strings. Never propagate
+        // them into diagnostics for this content-bearing channel.
+        let reply = self
+            .target
+            .exchange_exec(request)
+            .map_err(|_| fabric_runner::pty::error())?;
+        self.closed = reply.closed.is_some();
+        Ok(reply)
+    }
+
+    pub fn close(&mut self, cancel: bool) -> Result<(), FabricError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let result = self
+            .target
+            .close_exec(cancel)
+            .map_err(|_| fabric_runner::pty::error());
+        self.closed = true;
+        let finished = self
+            .target
+            .finish()
+            .map_err(|_| fabric_runner::pty::error());
+        result?;
+        finished
+    }
+}
+
+impl Drop for ShellSession {
+    fn drop(&mut self) {
+        // Also closes a normally exited stream after its final output is drained.
+        if !self.finished {
+            let _ = self.close(true);
+        }
+    }
+}
+
+pub fn shell(
+    root: &Path,
+    selection: &EnvironmentSelection,
+    placement: &str,
+    size: fabric_runner::pty::Size,
+    limits: fabric_runner::pty::Limits,
+    cancellation: &CancellationToken,
+) -> Result<ShellSession, FabricError> {
+    size.validate()?;
+    limits.validate()?;
+    let (root, store) = workspace::open_store(root)?;
+    let pin = TargetPin::select(placement)?;
+    let lease = workspace::environment_lock(&root, false)?;
+    let record = owned(&store, selection, &pin)?;
+    // Deny foreign identities, changed target pins, lifecycle and unsupported
+    // persisted capabilities before even starting the target control process.
+    if !record.capabilities.interactive_exec_pty {
+        return Err(unsupported(
+            "Target does not support environment PTY sessions",
+        ));
+    }
+    if record.desired != EnvironmentDesired::Available
+        || record.destroy_intent
+        || record.runtime != EnvironmentRuntime::Available
+    {
+        return Err(error(
+            "Environment is not available for interactive sessions",
+        ));
+    }
+    let home_lease = HomeLease {
+        _lease: lease,
+        root,
+        record,
+    };
+    home_lease.validate()?;
+    let home = home(&home_lease.root, &home_lease.record.environment_id);
+    let namespace = home
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(fabric_runner::pty::error)?;
+    let request = fabric_runner::pty::OpenExec {
+        version: 1,
+        placement: placement.into(),
+        environment_id: selection.environment_id.clone(),
+        owner: selection.owner.clone(),
+        owner_uid: home_lease.record.owner_uid,
+        home_identity: fabric_runner::pty::Identity::of(
+            &fs::symlink_metadata(&home).map_err(error)?,
+        ),
+        namespace_identity: fabric_runner::pty::Identity::of(
+            &fs::symlink_metadata(namespace).map_err(error)?,
+        ),
+        home,
+        size,
+        limits,
+    };
+    let target = pin.open(cancellation)?;
+    target.require_environment(true)?;
+    home_lease.validate()?;
+    let mut session = ShellSession {
+        target,
+        home: home_lease,
+        closed: false,
+        finished: false,
+    };
+    session
+        .target
+        .open_exec(&request)
+        .map_err(|_| fabric_runner::pty::error())?;
+    session.closed = false;
+    Ok(session)
 }

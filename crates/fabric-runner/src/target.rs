@@ -170,7 +170,9 @@ impl TargetPin {
                 .map_err(|_| failure("invalid_target_capabilities"))?;
         if caps.placements != [self.placement.as_str()]
             || caps.operations != OPERATIONS
-            || !(caps.optional.is_empty() || caps.optional == ["environment.v1"])
+            || !(caps.optional.is_empty()
+                || caps.optional == ["environment.v1"]
+                || caps.optional == ["environment.v1", "pty.v1"])
         {
             return Err(failure("unsupported_target_capabilities"));
         }
@@ -190,13 +192,15 @@ impl TargetPin {
                 message: "Target refused available placement; no execution fallback.".into(),
             });
         }
-        let environment = if caps.optional == ["environment.v1"] {
+        let pty = caps.optional == ["environment.v1", "pty.v1"];
+        let environment = if !caps.optional.is_empty() {
             let capabilities: fabric_domain::EnvironmentCapabilities = serde_json::from_value(
                 session.call("target.environment.capabilities", json!({"version":1}))?,
             )
             .map_err(|_| failure("invalid_environment_capabilities"))?;
-            // Only Core's local primitives exist. A target cannot invent host support.
-            if capabilities != fabric_domain::EnvironmentCapabilities::local() {
+            let mut expected = fabric_domain::EnvironmentCapabilities::local();
+            expected.interactive_exec_pty = pty;
+            if capabilities != expected {
                 return Err(unsupported_environment(
                     "unsupported environment capability negotiation",
                 ));
@@ -290,6 +294,50 @@ impl Target {
             ));
         }
         Ok(())
+    }
+
+    pub fn open_exec(&self, request: &crate::pty::OpenExec) -> Result<(), FabricError> {
+        self.require_environment(true)?;
+        request.size.validate()?;
+        request.limits.validate()?;
+        if request.version != 1 || request.placement != self.pin.placement {
+            return Err(crate::pty::error());
+        }
+        let reply: crate::pty::Opened = serde_json::from_value(self.call(
+            "target.pty.openExec",
+            serde_json::to_value(request).map_err(|_| crate::pty::error())?,
+        )?)
+        .map_err(|_| crate::pty::error())?;
+        if !reply.opened {
+            return Err(crate::pty::error());
+        }
+        Ok(())
+    }
+
+    pub fn exchange_exec(
+        &self,
+        request: &crate::pty::Exchange,
+    ) -> Result<crate::pty::Reply, FabricError> {
+        self.require_environment(true)?;
+        request.validate()?;
+        let reply: crate::pty::Reply = serde_json::from_value(self.call(
+            "target.pty.exchange",
+            serde_json::to_value(request).map_err(|_| crate::pty::error())?,
+        )?)
+        .map_err(|_| crate::pty::error())?;
+        reply.validate(request.input.len())?;
+        Ok(reply)
+    }
+
+    pub fn close_exec(&self, cancel: bool) -> Result<crate::pty::Reply, FabricError> {
+        let reply: crate::pty::Reply =
+            serde_json::from_value(self.call("target.pty.close", json!({"cancel":cancel}))?)
+                .map_err(|_| crate::pty::error())?;
+        reply.validate(0)?;
+        if reply.closed.is_none() || !reply.output.is_empty() {
+            return Err(crate::pty::error());
+        }
+        Ok(reply)
     }
 
     /// A grant exists for this call only. No plugin paths, PIDs, argv, outcome or
