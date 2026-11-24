@@ -51,6 +51,10 @@ for value in "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_H
   [ -n "$value" ] && [ -d "$value" ] && [ "$value" != /hostile-xdg ] || exit 72
 done
 [ -z "$OPENAI_API_KEY$OMP_PROFILE$PI_PROFILE$PI_CONFIG_FILES$CLAUDE_CONFIG_DIR$HTTPS_PROXY" ] || exit 73
+if [ "$1" = --help ]; then
+  printf '%s\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'
+  exit 0
+fi
 printf 'omp/19.1.0\n'
 "#).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -155,7 +159,7 @@ fn only_selected_approved_credential_env_reaches_the_worker() {
         let mut request = HarnessRequest {
             profile: Some(AgentProfile {
                 harness_id: adapter.id(),
-                harness_version: "omp/19.1.0".into(),
+                harness_version: info.version.clone(),
                 native_config_refs: Vec::new(),
                 model_policy: Default::default(),
                 skills: Vec::new(),
@@ -219,9 +223,14 @@ fn only_selected_approved_credential_env_reaches_the_worker() {
         r#"#!/bin/sh
 [ -z "$ANTHROPIC_API_KEY$OMP_PROFILE$PI_PROFILE$PI_CONFIG_FILES$HTTPS_PROXY" ] || exit 71
 [ -n "$HOME" ] && [ -d "$HOME" ] && [ ! -e "$HOME/ambient-marker" ] || exit 72
+if [ "$1" = --help ]; then
+  [ -z "$OPENAI_API_KEY" ] || exit 73
+  printf '%s\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'
+  exit 0
+fi
 if [ "$1" = --version ]; then
   [ -z "$OPENAI_API_KEY" ] || exit 73
-  printf 'omp/19.1.0\n'
+  printf 'omp/19.1.1\n'
 else
   [ "$OPENAI_API_KEY" = raw-key-sentinel ] || exit 74
 fi

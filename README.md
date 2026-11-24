@@ -136,7 +136,7 @@ From an existing Git checkout, use the **native bundle's** binary:
 # Unattended explicit trust/execute/auth/preparation consent: --yes --json.
 ```
 
-`up` explains source/HEAD/dirty state, selected native paths and exposure, then obtains consent before executing discovery plugins/harness probes and again before auth-enabled execution/preparation. It registers the bundle's hash-verified native packages in a private registry, discovers configured OMP 19.1.0 or Codex 0.171.0, connects through existing revocable native consent, registers/reuses the project and reuses exact READY identities. Existing valid grants are retained. It prepares committed HEAD only, never uncommitted changes. Repo `fabric.recipe.toml`/`.fabric/recipe.toml` takes precedence over detected `cargo build --locked`/`npm ci`; otherwise explicitly choose `--source-only` or `--recipe`. Preparation tools must already be installed; no harness, runtime or global dependency installation occurs. Installed Core/plugins/controller launch require no npm/Node; a repo's explicitly approved npm preparation still requires npm.
+`up` explains source/HEAD/dirty state, selected native paths and exposure, then obtains consent before executing discovery plugins/harness probes and again before auth-enabled execution/preparation. It registers the bundle's hash-verified native packages in a private registry, discovers configured compatible native OMP or Codex 0.171.0, connects through existing revocable native consent, registers/reuses the project and reuses exact READY identities. Existing valid grants are retained. It prepares committed HEAD only, never uncommitted changes. Repo `fabric.recipe.toml`/`.fabric/recipe.toml` takes precedence over detected `cargo build --locked`/`npm ci`; otherwise explicitly choose `--source-only` or `--recipe`. Preparation tools must already be installed; no harness, runtime or global dependency installation occurs. Installed Core/plugins/controller launch require no npm/Node; a repo's explicitly approved npm preparation still requires npm.
 
 Follow the printed `controller` command. `/fabric help` and `/fabric tools` are provider-free local controls; `/fabric spawn <typed JSON>` and status/results/wait/cancel execute the actual registered typed handlers. `/swarm <task>` explicitly starts a native model turn and routes local work through those tools, not a replacement scheduler. Empty `/swarm` is local help. Real controller inference is separately opt-in, not established by host registration.
 
@@ -475,11 +475,13 @@ The existing runner owns each child's private macOS process group. Timeout, canc
 
 Library callers pass `fabric_core::run::RunOptions` to `foreground`/`run_many`, setting `limits: fabric_runner::ExecutionLimits { timeout, term_grace }` and a cloneable `fabric_runner::CancellationToken`. Calling `cancel()` on that live token is idempotent and contains no PID. API deadlines may use subsecond `Duration` values; timeout must be positive/representable and TERM grace at most 30 seconds. `ForegroundInterrupt` is an opt-in scoped SIGINT handler used by the CLI, not automatically installed by library execution.
 
-For OMP only, `--max-cost-usd USD` (API `RunOptions::max_cost_usd`) passes its supported `--max-cost=USD` request-budget flag. Values must be finite and positive. OMP stops admitting new model requests once its reported spend reaches this budget; in-flight calls can overshoot, so it is **best effort, not an exact billing cap**. Unsupported installed OMP versions can reject the flag as an ordinary observed harness failure. Fabric enforces its own wall timeout; it does not depend on OMP `--max-time`, promise exact provider accounting, or make unapproved paid calls.
+For OMP only, `--max-cost-usd USD` (API `RunOptions::max_cost_usd`) passes its supported `--max-cost=USD` request-budget flag. Values must be finite and positive. OMP stops admitting new model requests once its reported spend reaches this budget; in-flight calls can overshoot, so it is **best effort, not an exact billing cap**. Discovery rejects OMP installations that do not advertise this required flag; runtime failures remain observed harness failures. Fabric enforces its own wall timeout; it does not depend on OMP `--max-time`, promise exact provider accounting, or make unapproved paid calls.
 
 ### Installed OMP adapter (live execution requires spending approval)
 
-The adapter pins `omp/19.1.0`; Codex pins `codex-cli 0.171.0`. Version-only doctors do not authenticate or prove model availability. Both adapters currently reject Fabric model overrides; explicitly choose and authorize the native configured model before a live invocation, with no guessed model or fallback.
+The OMP adapter discovers a numeric `omp/<major>.<minor>.<patch>` identity and the required print/JSON CLI options through bounded, isolated `--version`/`--help` probes, rather than a release-version allowlist. The required options are `-p`/`--print`, `--mode` advertising `json`, `--no-session`, `--no-title` and `--max-cost`. The exact observed version still binds each authorized profile and execution plan. Deterministic adapter coverage includes 19.1.0, 19.1.1 and compatible future-version fixtures; this does not claim future releases have been independently verified. Codex remains pinned to `codex-cli 0.171.0`. Discovery does not authenticate or prove model availability. Both adapters currently reject Fabric model overrides; explicitly choose and authorize the native configured model before a live invocation, with no guessed model or fallback.
+
+OMP print mode exposes no negotiated wire-protocol version. Flag discovery proves the advertised CLI surface, not all future event semantics: malformed required fields in known events fail the run, unknown additive event types remain compatible, and absent optional usage stays unknown. Existing capture limits still apply; an otherwise successful process that omits terminal event evidence is not newly rejected at EOF.
 
 OMP runs `omp -p --mode json --no-session --no-title -- PROMPT` in a freshly validated private fork. The prompt is one literal argv value, not a shell command; native OMP message semantics still apply. Workers/probes clear inherited environment and use private HOME/XDG. Only consented native context or an explicit advanced profile authorizes selected native configuration/credential references; arbitrary ambient keys are not forwarded. Trusted configuration may execute commands and is not a security sandbox.
 
@@ -578,7 +580,7 @@ fabric harnesses doctor fake --json
 fabric harnesses doctor omp --json
 ```
 
-Doctors are bounded, version-only probes, not provider/authentication or model checks. Supported pins are `fabric-fake-harness 1`, `fabric-fake-a 1`, `fabric-fake-b 1`, `omp/19.1.0` and `codex-cli 0.171.0`; other versions fail `unsupported_version`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating any batch or worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Only fake-a currently supports model override. Missing usage/cost remains unknown; resume is unsupported.
+Doctors use bounded discovery probes, not provider/authentication or model checks. Fake adapters remain pinned to `fabric-fake-harness 1`, `fabric-fake-a 1` and `fabric-fake-b 1`; Codex remains pinned to `codex-cli 0.171.0`. OMP admission checks its numeric version identity and required CLI surface instead of a release allowlist; malformed identities fail `unsupported_version`, missing required options fail `unsupported_capability`. Worker requests accept `--model`, repeatable `--require-capability`, `--placement`, `--access`, `--hard-read-only` and `--resume`, but reject capabilities not implemented by that adapter before allocating any batch or worker. Trusted-local placement currently enforces edit only; remote/BYOC, inspect/read-only and publish are not implemented. Only fake-a currently supports model override. Missing usage/cost remains unknown; resume is unsupported.
 
 
 `run-many` accepts task-local harnesses and complete request overrides; `--harness` supplies an optional default. Prompt paths resolve against the task manifest's directory. For example, `tasks.json`:
@@ -598,7 +600,7 @@ Both distinct fixture protocols use the same pool, attempt records, isolated for
 
 ### Explicit profiles
 
-Workers and version probes clear the inherited environment and use private HOME/XDG directories. Connected native harnesses use their explicitly consented configuration without a manual profile. Advanced v1 callers may still select `--profile PATH` (or a task request's `profile`), bound to `omp` / `omp/19.1.0`, with explicit nonsecret connection references. For an already configured environment credential in a foreground invocation:
+Workers and discovery probes clear the inherited environment and use private HOME/XDG directories. Connected native harnesses use their explicitly consented configuration without a manual profile. Advanced v1 callers may still select `--profile PATH` (or a task request's `profile`), bound to `omp` and its exact observed version, with explicit nonsecret connection references. The version in this example must match the installed binary. For an already configured environment credential in a foreground invocation:
 
 ```json
 {
@@ -640,7 +642,7 @@ profiles, durable evidence and reclaim. Accepted failed batches return one compl
 JSON response with a nonzero exit code; preflight failures return a typed error.
 SIGINT/SIGTERM cancel owned foreground workers.
 
-The OMP 19.1.0 extension exposes `fabric_spawn`, `fabric_status`,
+The native OMP extension exposes `fabric_spawn`, `fabric_status`,
 `fabric_results`, `fabric_cancel` and bounded `fabric_wait`. Spawn returns early
 durable IDs; controller disconnect stops observation, not admitted workers.
 The legacy foreground `fabric` tool and `/fabric` command remain for debugging.

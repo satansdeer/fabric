@@ -715,6 +715,10 @@ printf '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1,"ca
                     r#"#!/bin/sh
 set -eu
 if [ "$#" = 1 ] && [ "$1" = --version ]; then printf '{version}\n'; exit 0; fi
+if [ "$#" = 1 ] && [ "$1" = --help ] && [ "{harness}" = omp ]; then
+  printf '%s\n' '-p, --print' '--mode=json' '--no-session' '--no-title' '--max-cost=<value>'
+  exit 0
+fi
 test -z "${{UNSELECTED_SECRET-}}${{OPENAI_API_KEY-}}${{CODEX_API_KEY-}}${{HTTPS_PROXY-}}"
 test -n "$HOME"
 test -n "$XDG_CONFIG_HOME"

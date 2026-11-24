@@ -377,13 +377,32 @@ fn probe_version_args(
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
 ) -> Result<String, FabricError> {
-    // Version probes use the same concurrent bounded draining path as runs.
+    Ok(probe_output(binary, args, environment, 4096)?
+        .trim_end_matches(['\r', '\n'])
+        .to_owned())
+}
+
+/// Model-free CLI surface discovery, using the same isolation and process bounds as version probes.
+pub fn probe_help(
+    binary: &Path,
+    environment: Vec<(OsString, OsString)>,
+) -> Result<String, FabricError> {
+    probe_output(binary, vec!["--help".into()], environment, 65536)
+}
+
+fn probe_output(
+    binary: &Path,
+    args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+    max_bytes: u64,
+) -> Result<String, FabricError> {
+    // Discovery probes use the same concurrent bounded draining path as runs.
     let mut output = tempfile::tempfile().map_err(execution_error)?;
     let capture = Capture::new(
         output.try_clone().map_err(execution_error)?,
         tempfile::tempfile().map_err(execution_error)?,
         None,
-        4096 + capture::TRUNCATION_MARKER.len() as u64,
+        max_bytes + capture::TRUNCATION_MARKER.len() as u64,
     )
     .map_err(execution_error)?;
     let result = execute(
@@ -403,18 +422,18 @@ fn probe_version_args(
         |_| Ok(()),
     )?;
     let metadata = result.capture.map_err(execution_error)?;
-    if !result.status.success() || metadata.truncated || metadata.stdout_bytes_seen > 4096 {
+    if !result.status.success() || metadata.truncated || metadata.stdout_bytes_seen > max_bytes {
         return Err(execution_error(
-            "Harness version probe failed or exceeded 4 KiB.",
+            "Harness discovery probe failed or exceeded its output limit.",
         ));
     }
     output.seek(SeekFrom::Start(0)).map_err(execution_error)?;
     let mut version = String::new();
     output
-        .take(4097)
+        .take(max_bytes + 1)
         .read_to_string(&mut version)
         .map_err(execution_error)?;
-    Ok(version.trim_end_matches(['\r', '\n']).to_owned())
+    Ok(version)
 }
 
 /// Discover without executing anything; relative PATH entries resolve before cwd changes.

@@ -190,7 +190,7 @@ pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
         .ok_or_else(|| invalid("Git source needs a UTF-8 project name."))?;
     if args.controller && args.harness.as_ref().is_some_and(|id| id.as_str() != "omp") {
         return Err(invalid(
-            "--controller requires the native OMP adapter (omp/19.1.0).",
+            "--controller requires a compatible native OMP adapter.",
         ));
     }
     let binary = std::env::current_exe()
@@ -276,7 +276,7 @@ pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
             Err(error) => errors.push(format!("{id}: {}", error.message)),
         }
     }
-    let mut context = selected.ok_or_else(|| invalid(format!("No supported installed native harness/config found. Install OMP 19.1.0 or Codex 0.171.0 and configure authentication locally, then retry --harness <id>. {}", errors.join("; "))))?;
+    let mut context = selected.ok_or_else(|| invalid(format!("No compatible installed native harness/config found. Install OMP with the required native print-mode protocol or Codex 0.171.0 and configure authentication locally, then retry --harness <id>. {}", errors.join("; "))))?;
     exposure(&context);
     if !context.credential_available {
         return Err(invalid(
