@@ -225,9 +225,7 @@ impl HarnessAdapter for OmpHarness {
                 message: "OMP emitted a malformed required print-mode event.".into(),
             })
         };
-        let Some(kind) = value["type"].as_str() else {
-            return None;
-        };
+        let kind = value["type"].as_str()?;
         let valid = match kind {
             "message_update" => {
                 let update = &value["assistantMessageEvent"];
