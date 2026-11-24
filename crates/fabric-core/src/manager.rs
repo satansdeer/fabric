@@ -209,11 +209,20 @@ pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
     };
     stream
         .set_read_timeout(Some(Duration::from_secs(wait + 20)))
-        .map_err(error)?;
+        .map_err(|failure| {
+            error(format!(
+                "Local manager response timeout setup failed: {failure}"
+            ))
+        })?;
     stream
         .set_write_timeout(Some(Duration::from_secs(15)))
-        .map_err(error)?;
+        .map_err(|failure| {
+            error(format!(
+                "Local manager request timeout setup failed: {failure}"
+            ))
+        })?;
     let mut stream = stream;
+    let response_started = Instant::now();
     // A failed reply is not automatically retried: acceptance may already be committed.
     write_frame(
         &mut stream,
@@ -222,8 +231,14 @@ pub fn request(root: &Path, request: Request) -> Result<Value, FabricError> {
             root: endpoint.root,
             request,
         },
-    )?;
-    let response: Value = read_frame(&mut stream)?;
+    )
+    .map_err(|failure| error(format!("Local manager request write failed: {failure}")))?;
+    let response: Value = read_frame(&mut stream).map_err(|failure| {
+        error(format!(
+            "Local manager response read failed after {} ms: {failure}; acceptance may already be committed; do not retry automatically.",
+            response_started.elapsed().as_millis()
+        ))
+    })?;
     if let Some(failure) = response.get("error") {
         return Err(serde_json::from_value::<FabricError>(failure.clone())
             .map_err(|_| error("Invalid typed local manager error."))?);
@@ -252,7 +267,9 @@ fn start_detached(root: &Path) -> Result<(), FabricError> {
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(error)?;
+    let mut child = command
+        .spawn()
+        .map_err(|failure| error(format!("Local manager process spawn failed: {failure}")))?;
     // Reap if the client happens to remain alive; exiting the client does not kill the manager.
     std::thread::spawn(move || {
         let _ = child.wait();
