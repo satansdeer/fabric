@@ -4841,9 +4841,9 @@ fn registered_profile_digest_verification_is_strict_and_legacy_absence_is_compat
                 .unwrap();
         }
         if case == "legacy" {
-            // Historical runs predate the immutable prelaunch capture context.
+            // Historical runs predate immutable capture contexts and source receipts.
             db.execute_batch(
-                "DROP TABLE connector_deliveries; DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
+                "DROP TABLE run_launch_receipts; DROP TABLE prepared_source_evidence; DROP TABLE connector_deliveries; DROP TABLE run_targets; DROP TABLE run_observations; DROP TABLE run_capture_contexts; PRAGMA user_version=11;",
             )
             .unwrap();
         }
