@@ -1228,6 +1228,169 @@ fn directory_names(directory: &File) -> Result<Vec<std::ffi::CString>, FabricErr
     Ok(names)
 }
 
+/// Environment storage uses the same descriptor-anchored ownership and deletion
+/// interpreter as disposable workspaces, but never enters normal run reclamation.
+pub(crate) struct EnvironmentResource {
+    cleanup: OpenCleanup,
+    name: std::ffi::CString,
+    home_roots: Option<[Identity; 5]>,
+}
+
+impl EnvironmentResource {
+    pub(crate) fn authority(&self) -> Result<String, FabricError> {
+        serde_json::to_string(&(&self.cleanup.authority, self.home_identities()?))
+            .map_err(storage_error)
+    }
+
+    pub(crate) fn absent(&self) -> bool {
+        self.cleanup.container.is_none()
+    }
+
+    pub(crate) fn validate_home(&self) -> Result<(), FabricError> {
+        let observed = self.home_identities()?;
+        if self
+            .home_roots
+            .as_ref()
+            .is_some_and(|saved| saved != &observed)
+        {
+            return Err(storage_error(
+                "Environment config root was replaced; ownership denied",
+            ));
+        }
+        Ok(())
+    }
+
+    fn home_identities(&self) -> Result<[Identity; 5], FabricError> {
+        use crate::artifacts::{open_at, stat};
+        let tree = self
+            .cleanup
+            .tree
+            .as_ref()
+            .ok_or_else(|| storage_error("Environment home is absent"))?;
+        let device = stat(tree)?.st_dev;
+        let validate = |directory: &File| {
+            let metadata = stat(directory)?;
+            cleanup_directory(&metadata)?;
+            if metadata.st_dev != device {
+                return Err(storage_error(
+                    "Environment config root crosses a device boundary",
+                ));
+            }
+            Ok(Identity::of(&metadata))
+        };
+        let config = validate(&open_at(tree, c".config", libc::O_DIRECTORY)?)?;
+        let cache = validate(&open_at(tree, c".cache", libc::O_DIRECTORY)?)?;
+        let local = open_at(tree, c".local", libc::O_DIRECTORY)?;
+        let local_identity = validate(&local)?;
+        let share = validate(&open_at(&local, c"share", libc::O_DIRECTORY)?)?;
+        let state = validate(&open_at(&local, c"state", libc::O_DIRECTORY)?)?;
+        Ok([config, cache, local_identity, share, state])
+    }
+
+    pub(crate) fn destroy(self) -> Result<(), FabricError> {
+        self.cleanup.delete_named(&self.name, &mut |_| Ok(()))
+    }
+}
+
+pub(crate) fn environment_resource(
+    root: &Path,
+    id: &fabric_domain::EnvironmentId,
+    marker: &str,
+    saved: Option<&str>,
+    destroying: bool,
+) -> Result<EnvironmentResource, FabricError> {
+    let saved: Option<(CleanupAuthority, [Identity; 5])> = saved
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(storage_error)?;
+    let (authority, home_roots) = saved.unzip();
+    let name = std::ffi::CString::new(id.as_str()).map_err(storage_error)?;
+    let cleanup = open_owned_cleanup(
+        root,
+        c"environments",
+        &name,
+        marker,
+        if destroying { authority.as_ref() } else { None },
+    )?;
+    if authority
+        .as_ref()
+        .is_some_and(|saved| saved != &cleanup.authority)
+    {
+        return Err(storage_error(
+            "Environment resource was replaced; ownership denied",
+        ));
+    }
+    Ok(EnvironmentResource {
+        cleanup,
+        name,
+        home_roots,
+    })
+}
+
+pub(crate) fn environment_lock(root: &Path, exclusive: bool) -> Result<CleanupLease, FabricError> {
+    use std::os::fd::AsRawFd;
+    let path = root.join("environments");
+    private_directory(&path)?;
+    let before = fs::symlink_metadata(&path).map_err(storage_error)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(&path)
+        .map_err(storage_error)?;
+    let after = file.metadata().map_err(storage_error)?;
+    if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+        return Err(storage_error(
+            "Environment namespace changed while acquiring lease",
+        ));
+    }
+    // ponytail: one namespace lock, shared by runs/inspection; lifecycle mutations
+    // serialize and fail closed while any environment run holds a shared lease.
+    if unsafe {
+        libc::flock(
+            file.as_raw_fd(),
+            (if exclusive {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_SH
+            }) | libc::LOCK_NB,
+        )
+    } != 0
+    {
+        return Err(storage_error(
+            "environment_lease_busy: environment is in active use",
+        ));
+    }
+    Ok(CleanupLease(file))
+}
+
+pub(crate) fn environment_inactive(
+    root: &Path,
+    store: &Store,
+    id: &fabric_domain::EnvironmentId,
+) -> Result<Vec<CleanupLease>, FabricError> {
+    let mut guards = Vec::new();
+    for id in store.environment_runs(id).map_err(storage_error)? {
+        let run = store
+            .run(&id)
+            .map_err(storage_error)?
+            .ok_or_else(|| storage_error("Missing environment Run ownership"))?;
+        if !run.state.is_terminal() {
+            return Err(storage_error(
+                "environment_active_or_unknown: reconcile/cancel its runs first",
+            ));
+        }
+        match leases::status(root, store, id.as_str())? {
+            leases::Status::Inactive(guard) => guards.push(guard),
+            _ => {
+                return Err(storage_error(
+                    "environment_lease_unknown_or_active: expiry is not ownership proof",
+                ));
+            }
+        }
+    }
+    Ok(guards)
+}
+
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
@@ -1784,167 +1947,4 @@ mod cleanup_tests {
             assert!(store.prepared_state(&old.state_id).unwrap().is_none());
         }
     }
-}
-
-/// Environment storage uses the same descriptor-anchored ownership and deletion
-/// interpreter as disposable workspaces, but never enters normal run reclamation.
-pub(crate) struct EnvironmentResource {
-    cleanup: OpenCleanup,
-    name: std::ffi::CString,
-    home_roots: Option<[Identity; 5]>,
-}
-
-impl EnvironmentResource {
-    pub(crate) fn authority(&self) -> Result<String, FabricError> {
-        serde_json::to_string(&(&self.cleanup.authority, self.home_identities()?))
-            .map_err(storage_error)
-    }
-
-    pub(crate) fn absent(&self) -> bool {
-        self.cleanup.container.is_none()
-    }
-
-    pub(crate) fn validate_home(&self) -> Result<(), FabricError> {
-        let observed = self.home_identities()?;
-        if self
-            .home_roots
-            .as_ref()
-            .is_some_and(|saved| saved != &observed)
-        {
-            return Err(storage_error(
-                "Environment config root was replaced; ownership denied",
-            ));
-        }
-        Ok(())
-    }
-
-    fn home_identities(&self) -> Result<[Identity; 5], FabricError> {
-        use crate::artifacts::{open_at, stat};
-        let tree = self
-            .cleanup
-            .tree
-            .as_ref()
-            .ok_or_else(|| storage_error("Environment home is absent"))?;
-        let device = stat(tree)?.st_dev;
-        let validate = |directory: &File| {
-            let metadata = stat(directory)?;
-            cleanup_directory(&metadata)?;
-            if metadata.st_dev != device {
-                return Err(storage_error(
-                    "Environment config root crosses a device boundary",
-                ));
-            }
-            Ok(Identity::of(&metadata))
-        };
-        let config = validate(&open_at(tree, c".config", libc::O_DIRECTORY)?)?;
-        let cache = validate(&open_at(tree, c".cache", libc::O_DIRECTORY)?)?;
-        let local = open_at(tree, c".local", libc::O_DIRECTORY)?;
-        let local_identity = validate(&local)?;
-        let share = validate(&open_at(&local, c"share", libc::O_DIRECTORY)?)?;
-        let state = validate(&open_at(&local, c"state", libc::O_DIRECTORY)?)?;
-        Ok([config, cache, local_identity, share, state])
-    }
-
-    pub(crate) fn destroy(self) -> Result<(), FabricError> {
-        self.cleanup.delete_named(&self.name, &mut |_| Ok(()))
-    }
-}
-
-pub(crate) fn environment_resource(
-    root: &Path,
-    id: &fabric_domain::EnvironmentId,
-    marker: &str,
-    saved: Option<&str>,
-    destroying: bool,
-) -> Result<EnvironmentResource, FabricError> {
-    let saved: Option<(CleanupAuthority, [Identity; 5])> = saved
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(storage_error)?;
-    let (authority, home_roots) = saved.unzip();
-    let name = std::ffi::CString::new(id.as_str()).map_err(storage_error)?;
-    let cleanup = open_owned_cleanup(
-        root,
-        c"environments",
-        &name,
-        marker,
-        if destroying { authority.as_ref() } else { None },
-    )?;
-    if authority
-        .as_ref()
-        .is_some_and(|saved| saved != &cleanup.authority)
-    {
-        return Err(storage_error(
-            "Environment resource was replaced; ownership denied",
-        ));
-    }
-    Ok(EnvironmentResource {
-        cleanup,
-        name,
-        home_roots,
-    })
-}
-
-pub(crate) fn environment_lock(root: &Path, exclusive: bool) -> Result<CleanupLease, FabricError> {
-    use std::os::fd::AsRawFd;
-    let path = root.join("environments");
-    private_directory(&path)?;
-    let before = fs::symlink_metadata(&path).map_err(storage_error)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-        .open(&path)
-        .map_err(storage_error)?;
-    let after = file.metadata().map_err(storage_error)?;
-    if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
-        return Err(storage_error(
-            "Environment namespace changed while acquiring lease",
-        ));
-    }
-    // ponytail: one namespace lock, shared by runs/inspection; lifecycle mutations
-    // serialize and fail closed while any environment run holds a shared lease.
-    if unsafe {
-        libc::flock(
-            file.as_raw_fd(),
-            (if exclusive {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_SH
-            }) | libc::LOCK_NB,
-        )
-    } != 0
-    {
-        return Err(storage_error(
-            "environment_lease_busy: environment is in active use",
-        ));
-    }
-    Ok(CleanupLease(file))
-}
-
-pub(crate) fn environment_inactive(
-    root: &Path,
-    store: &Store,
-    id: &fabric_domain::EnvironmentId,
-) -> Result<Vec<CleanupLease>, FabricError> {
-    let mut guards = Vec::new();
-    for id in store.environment_runs(id).map_err(storage_error)? {
-        let run = store
-            .run(&id)
-            .map_err(storage_error)?
-            .ok_or_else(|| storage_error("Missing environment Run ownership"))?;
-        if !run.state.is_terminal() {
-            return Err(storage_error(
-                "environment_active_or_unknown: reconcile/cancel its runs first",
-            ));
-        }
-        match leases::status(root, store, id.as_str())? {
-            leases::Status::Inactive(guard) => guards.push(guard),
-            _ => {
-                return Err(storage_error(
-                    "environment_lease_unknown_or_active: expiry is not ownership proof",
-                ));
-            }
-        }
-    }
-    Ok(guards)
 }
