@@ -96,8 +96,8 @@ The existing error path exposes this evidence to callers and, for failed runs,
 retains it with the workspace retention reason. Capture limits, raw-pipe drain,
 group termination, direct-child reap, ownership and cleanup authority are
 unchanged. This is diagnostic coverage, **not an established fix** for issue #76.
-The historical missing-response cause remains NOT_ESTABLISHED; no retry, timeout
-increase, fallback or exact OMP-version admission restriction is introduced.
+The historical missing-response cause remains NOT_ESTABLISHED; issue #76 introduced
+no retry, timeout increase, fallback or exact OMP-version admission restriction.
 
 Provider-free regression source uses the actual `fabric-local-target` child:
 a confirmed stopped child times out awaiting its pending completion receipt;
@@ -233,6 +233,57 @@ After initialize/health, native operations return `{result: VALUE, failure: null
 | `harness.plan` | `{request, version, context}` | `{plan, supports_cost_limit}` |
 | `harness.command` | `{request, profile, prompt_file, context}` | `{program, args, environment}` |
 | `harness.normalize` | `{event: JSON}` or `{text: STRING}` | `{event: typed_event_or_null}` |
+
+### Native discovery budgets (issue #78)
+
+The default Rust host gives only `harness.probe` and `harness.native_context` a
+15.5-second per-request deadline: two serial discovery commands at 5 seconds
+each, each with 250 ms owned TERM/KILL/reap grace, plus the existing 5-second
+control allowance. OMP's version and help validation both remain mandatory;
+compatibility is capability-based, not an exact-version allowlist. Codex's
+single-command discovery fits the same finite envelope. Other native requests,
+initialize, health and shutdown retain their 5-second defaults; target startup,
+target operation caps and legacy session deadlines are unchanged.
+
+`PluginHost { timeout: None }` (the default) selects these operation budgets.
+`PluginHost { timeout: Some(duration) }` explicitly overrides them without
+composition or inflation, including when duration is 5 seconds; accepted values
+remain positive and at most 60 seconds. The request budget is restored before
+shutdown. Transport timeout evidence reports the selected request budget in both
+configured/effective fields (15,500,000 us for default discovery), not a claimed
+remote negotiation. Explicit cancellation and existing absolute worker deadlines
+still interrupt the exchange; no operation gets a refreshed run budget.
+
+These are monotonic transport/command deadlines, not hard wall-clock completion
+guarantees: scheduling, bounded capture finalization and owned teardown can add
+time. With defaults, a successful discovery invocation has separate allowances
+for initialize (5s), health (5s), discovery (15.5s), shutdown (5s) and process exit
+(5s); it does not share a single 15.5s total invocation deadline. Failure paths
+retain owned process-group teardown. A genuinely hung reference discovery
+command still reaches its own 5-second deadline and is terminated/reaped by the
+runner before the native reply. That reply preserves `failure: "timeout"` as
+domain `Timeout`, with a fixed host message, rather than `invalid_native_reply`.
+It carries no command output or speculative cause; transport timeouts retain
+their existing `Output` kind and pre-teardown RPC evidence.
+
+One provider-free regression uses the real reference-plugin executable and an
+isolated CLI double: serial 3-second version/help commands exceed the former
+outer 5-second budget, including onboarding discovery; a TERM-ignoring hung help
+command must return typed timeout with neither the command nor plugin PID alive.
+It does not reproduce or explain the paid historical failure. Worker checks:
+`NOT_RUN_BY_WORKER`. Proposed narrow manager QA, once after source review:
+
+```sh
+cargo test --offline --locked -p fabric-reference-harnesses --test probe_budget reference_probe_composes_command_budgets_and_reaps_timeout -- --exact
+cargo build --offline --locked -p fabric-cli --bin fabric-local-target
+cargo test --offline --locked -p fabric-runner --test plugins protocol_failures_are_bounded_reaped_and_secret_free -- --exact
+cargo test --offline --locked -p fabric-runner --test plugins native_capture_respects_the_execution_deadline_and_preserves_cancellation -- --exact
+cargo test --offline --locked -p fabric-runner --lib plugin::session::tests::
+```
+
+The existing plugin regressions above cover explicit target overrides and
+normalizer absolute deadlines/cancellation; session tests retain timeout evidence.
+No model/provider invocation, retry or native-default change is part of this fix.
 
 `context` carries the discovered CLI path, bounded runtime PATH, explicitly requested native root paths for discovery, and selected credential **availability booleans only**. No environment secret values are sent to control children. Command credential proposals use the literal `fabric-credential-available`; only Core resolves selected profile connections into the final worker environment. Native HOME/directory proposals must remain within selected profile roots; unsolicited environment keys, loader/XDG overrides, duplicate keys, another executable and invalid argv are rejected. Exactly one `{prompt:true}` argument is replaced with Core's literal UTF-8 prompt, avoiding large prompt control frames and shell interpretation.
 

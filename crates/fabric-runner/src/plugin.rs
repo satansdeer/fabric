@@ -503,25 +503,25 @@ struct RpcError {
     message: String,
 }
 
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Every call owns and reaps its process group, including protocol failure paths.
+#[derive(Default)]
 pub struct PluginHost {
-    pub timeout: Duration,
-}
-impl Default for PluginHost {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(5),
-        }
-    }
+    /// None selects operation-specific defaults; Some is an explicit hard override (0 < t <= 60s).
+    pub timeout: Option<Duration>,
 }
 impl PluginHost {
+    fn control_timeout(&self) -> Duration {
+        self.timeout.unwrap_or(CONTROL_TIMEOUT)
+    }
     pub fn target(
         &self,
         manifest: &PluginManifest,
         cancel: &CancellationToken,
     ) -> Result<crate::target::Target, FabricError> {
         crate::target::TargetPin::from_manifest(manifest.clone(), manifest.id.as_str())?
-            .open_with_timeout(cancel, self.timeout)
+            .open_with_timeout(cancel, self.control_timeout())
     }
     pub(crate) fn invoke<T: serde::de::DeserializeOwned>(
         &self,
@@ -530,8 +530,18 @@ impl PluginHost {
         params: Value,
         cancel: &CancellationToken,
     ) -> Result<T, FabricError> {
-        let mut session = PluginSession::open(manifest, self.timeout, cancel)?;
-        let result = serde_json::from_value(session.call(method, params)?)
+        let control_timeout = self.control_timeout();
+        let mut session = PluginSession::open(manifest, control_timeout, cancel)?;
+        let timeout = if self.timeout.is_none()
+            && manifest.native.is_some()
+            && matches!(method, "harness.probe" | "harness.native_context")
+        {
+            // Discovery may run version and help serially, each with owned teardown.
+            2 * (crate::PROBE_TIMEOUT + crate::PROBE_TERM_GRACE) + CONTROL_TIMEOUT
+        } else {
+            control_timeout
+        };
+        let result = serde_json::from_value(session.call_with_timeout(method, params, timeout)?)
             .map_err(|_| failure("invalid_result"))?;
         session.finish()?;
         Ok(result)
@@ -594,7 +604,7 @@ impl PluginHost {
         if manifest.kind != PluginKind::Connector || input.version != 1 {
             return Err(failure("wrong_connector_contract"));
         }
-        let mut session = PluginSession::open(manifest, self.timeout, cancel)?;
+        let mut session = PluginSession::open(manifest, self.control_timeout(), cancel)?;
         let capabilities =
             serde_json::from_value(session.call("connector.capabilities", json!({}))?)
                 .map_err(|_| failure("invalid_result"))?;

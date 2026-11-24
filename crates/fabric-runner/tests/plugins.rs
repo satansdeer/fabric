@@ -312,7 +312,7 @@ fn protocol_failures_are_bounded_reaped_and_secret_free() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let host = PluginHost {
-            timeout: Duration::from_secs(2),
+            timeout: Some(Duration::from_secs(2)),
         };
         let start = std::time::Instant::now();
         let error = host

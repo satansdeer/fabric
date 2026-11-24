@@ -510,7 +510,7 @@ let count = 0;
 const unavailable = () => { throw new Error('SECRET_CANARY'); };
 await serve(defineNativeHarness({
   id: 'native-sdk', version: '1.0.0',
-  probe: ({ context }) => { if (context.credentials?.SELECTED === true) return { version: 'fixture/1.0.0' }; rejectNative('authorization_required'); },
+  probe: ({ context }) => { if (context.credentials?.TIMEOUT === true) rejectNative('timeout'); if (context.credentials?.SELECTED === true) return { version: 'fixture/1.0.0' }; rejectNative('authorization_required'); },
   nativeContext: unavailable, capabilities: unavailable, plan: unavailable, command: unavailable,
   normalize: () => ({ event: { type: 'output', stream: 'stdout', text: String(++count) } }),
 }));`);
@@ -519,6 +519,7 @@ await serve(defineNativeHarness({
     ['harness.probe', { context: { binary: null, environment: {}, credentials: { SELECTED: true } } }],
     ['harness.probe', { context: { binary: null, environment: {}, credentials: {} } }],
     ['harness.plan', { request: {}, version: 'fixture/1.0.0', context: {} }],
+    ['harness.probe', { context: { binary: null, environment: {}, credentials: { TIMEOUT: true } } }],
     ['harness.normalize', { text: 'one' }], ['harness.normalize', { text: 'two' }], ['shutdown', {}],
   ];
   const result = spawnSync(process.execPath, [join(project, 'plugin.ts'), '--fabric-plugin-stdio'], {
@@ -530,8 +531,9 @@ await serve(defineNativeHarness({
   assert.deepEqual(replies[2].result, { result: { version: 'fixture/1.0.0' }, failure: null });
   assert.deepEqual(replies[3].result, { result: null, failure: 'authorization_required' });
   assert.deepEqual(replies[4].result, { result: null, failure: 'invalid_arguments' });
-  assert.equal(replies[5].result.result.event.text, '1');
-  assert.equal(replies[6].result.result.event.text, '2');
+  assert.deepEqual(replies[5].result, { result: null, failure: 'timeout' });
+  assert.equal(replies[6].result.result.event.text, '1');
+  assert.equal(replies[7].result.result.event.text, '2');
   assert.ok(!result.stdout.includes('SECRET_CANARY'));
   assert.ok(!result.stderr.includes('SECRET_CANARY'));
 });

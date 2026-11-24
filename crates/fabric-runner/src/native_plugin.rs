@@ -189,10 +189,11 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
 pub(crate) fn resolve_reply<T>(reply: NativeReply<T>) -> Result<T, FabricError> {
     match (reply.result, reply.failure) {
         (Some(result), None) => Ok(result),
-        (None, Some(kind)) if matches!(kind, ErrorKind::UnsupportedCapability | ErrorKind::UnsupportedVersion | ErrorKind::ModelUnsupported | ErrorKind::ModelUnverified | ErrorKind::UnsupportedPlacement | ErrorKind::InvalidProfile | ErrorKind::AuthorizationRequired | ErrorKind::InvalidArguments) => Err(FabricError { kind, message: match kind {
+        (None, Some(kind)) if matches!(kind, ErrorKind::UnsupportedCapability | ErrorKind::UnsupportedVersion | ErrorKind::ModelUnsupported | ErrorKind::ModelUnverified | ErrorKind::UnsupportedPlacement | ErrorKind::InvalidProfile | ErrorKind::AuthorizationRequired | ErrorKind::InvalidArguments | ErrorKind::Timeout) => Err(FabricError { kind, message: match kind {
             ErrorKind::ModelUnverified => "MODEL_UNVERIFIED: external harness model override is unverified.".into(),
             ErrorKind::AuthorizationRequired => "External harness requires an explicitly authorized profile and available credential connections.".into(),
             ErrorKind::InvalidProfile => "External harness rejected the selected profile.".into(),
+            ErrorKind::Timeout => "External harness discovery command exceeded its deadline.".into(),
             _ => format!("External harness rejected request ({kind:?})."),
         } }),
         _ => Err(failure("invalid_native_reply")),
