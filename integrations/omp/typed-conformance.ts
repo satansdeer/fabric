@@ -225,11 +225,9 @@ done
 	assert.equal(remote.isError, true);
 	assert.equal(object(remote.details.error).kind, "unsupported_placement");
 	assert.deepEqual(inventory(), beforeRemote, "remote request silently allocated local work");
-	const started = Date.now();
 	const spawned = await first.invoke("fabric_spawn", { project: "demo", tasks, max_concurrency: 4, idempotency_key: "omp-four-workers" });
 	assert.equal(spawned.isError, false);
 	assert.equal(spawned.details.accepted, true);
-	assert.ok(Date.now() - started < 5000, "spawn waited for workers instead of returning durable handles");
 	const batch = text(spawned.details.batch_id);
 	batches.push(batch);
 	assert.deepEqual(records(spawned.details.tasks).map(task => task.task_id), ids);
@@ -238,6 +236,7 @@ done
 	const status = await first.invoke("fabric_status", { batch_id: batch });
 	assert.equal(status.details.terminal, false);
 	assert.equal(array(status.details.tasks).length, 4);
+	assert.ok(records(status.details.tasks).every(task => task.terminal === false), "spawn returned only after a gated worker completed");
 	assert.ok(array(status.details.events).length > 0, "status omitted durable progress");
 	const waitStarted = Date.now();
 	const waiting = await first.invoke("fabric_wait", { batch_id: batch, timeout_seconds: 1 });
