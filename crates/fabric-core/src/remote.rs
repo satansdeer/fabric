@@ -503,13 +503,14 @@ impl HarnessAdapter for RemoteHarness {
 
 /// Resolves an adapter in its actual execution environment, without probing local
 /// native config/auth or applying controller onboarding defaults to a remote HOME.
+/// Returns the negotiated remote flag with the adapter and retains the selected target pin.
 pub fn resolve_harness(
     root: &Path,
     id: &HarnessId,
-    options: &crate::run::RunOptions,
+    options: &mut crate::run::RunOptions,
     registry: &fabric_runner::HarnessRegistry,
     registry_options: &fabric_runner::RegistryOptions,
-) -> Result<Box<dyn HarnessAdapter>, FabricError> {
+) -> Result<(Box<dyn HarnessAdapter>, bool), FabricError> {
     if is_remote(options)? {
         let pin = match &options.target_pin {
             Some(pin) => pin.clone(),
@@ -522,17 +523,20 @@ pub fn resolve_harness(
             .environment
             .as_ref()
             .ok_or_else(|| error("remote execution requires explicit environment"))?;
-        Ok(Box::new(RemoteHarness {
-            id: id.clone(),
-            pin,
-            environment: binding(root, selection)?,
-        }))
+        Ok((
+            Box::new(RemoteHarness {
+                id: id.clone(),
+                pin,
+                environment: binding(root, selection)?,
+            }),
+            true,
+        ))
     } else {
-        registry.resolve(id, registry_options)
+        Ok((registry.resolve(id, registry_options)?, false))
     }
 }
 
-pub(crate) fn is_remote(options: &crate::run::RunOptions) -> Result<bool, FabricError> {
+pub(crate) fn is_remote(options: &mut crate::run::RunOptions) -> Result<bool, FabricError> {
     // The unregistered built-in placement is host-local. Preserve harness admission
     // before loading its executable; registered replacements still negotiate capabilities.
     if options.target_pin.is_none()
@@ -546,11 +550,15 @@ pub(crate) fn is_remote(options: &crate::run::RunOptions) -> Result<bool, Fabric
     {
         return Ok(false);
     }
-    let pin = match &options.target_pin {
-        Some(p) => p.clone(),
-        None => TargetPin::select(&options.harness_request.placement)?,
-    };
-    let target = pin.open(&options.cancellation)?;
+    // Retain the selected pin; every subsequent open still verifies its integrity and revocation.
+    if options.target_pin.is_none() {
+        options.target_pin = Some(TargetPin::select(&options.harness_request.placement)?);
+    }
+    let target = options
+        .target_pin
+        .as_ref()
+        .expect("selected target")
+        .open(&options.cancellation)?;
     let remote = target.is_remote();
     target.finish()?;
     Ok(remote)

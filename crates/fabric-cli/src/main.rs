@@ -845,12 +845,12 @@ fn write_api(
 fn write_run(root: Option<PathBuf>, args: RunArgs) -> Result<(), FabricError> {
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let interrupt = fabric_runner::ForegroundInterrupt::install()?;
-    let options = run_options(&args.options, interrupt.token())?;
+    let mut options = run_options(&args.options, interrupt.token())?;
     let id = &args.harness;
-    let harness = fabric_core::remote::resolve_harness(
+    let (harness, _) = fabric_core::remote::resolve_harness(
         &root,
         id,
-        &options,
+        &mut options,
         &fabric_runner::HarnessRegistry::default(),
         &fabric_runner::RegistryOptions {
             fake_binary: args.options.fake_binary.clone(),

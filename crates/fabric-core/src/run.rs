@@ -151,18 +151,21 @@ pub fn foreground(
     options.validate()?;
     let request = options.request()?;
     let mut options = options.clone();
-    let remote = crate::remote::is_remote(&options)?;
+    let remote = crate::remote::is_remote(&mut options)?;
     if !remote && options.environment.is_some() {
         crate::environment::validate_context(&request, true)?;
     }
     let remote_adapter = if remote {
-        Some(crate::remote::resolve_harness(
-            root,
-            &harness.id(),
-            &options,
-            &HarnessRegistry::default(),
-            &RegistryOptions::default(),
-        )?)
+        Some(
+            crate::remote::resolve_harness(
+                root,
+                &harness.id(),
+                &mut options,
+                &HarnessRegistry::default(),
+                &RegistryOptions::default(),
+            )?
+            .0,
+        )
     } else {
         None
     };
@@ -1224,7 +1227,7 @@ pub(crate) struct PreparedBatch {
 }
 
 pub(crate) type PlannedAdapters =
-    HashMap<String, (Box<dyn HarnessAdapter>, fabric_runner::HarnessInfo)>;
+    HashMap<String, (Box<dyn HarnessAdapter>, fabric_runner::HarnessInfo, bool)>;
 
 fn adapter_key(id: &HarnessId, options: &RunOptions) -> String {
     format!(
@@ -1248,25 +1251,29 @@ pub(crate) fn plan_task(
 ) -> Result<(HarnessPlan, Option<String>), FabricError> {
     options.validate()?;
     let request = options.request()?;
-    let remote = crate::remote::is_remote(options)?;
-    if !remote && options.environment.is_some() {
-        crate::environment::validate_context(&request, true)?;
-    }
-    let (adapter, probe) = match adapters.entry(adapter_key(id, options)) {
-        Entry::Occupied(entry) => entry.into_mut(),
+    let (adapter, probe, remote) = match adapters.entry(adapter_key(id, options)) {
+        Entry::Occupied(entry) => {
+            if !entry.get().2 && options.environment.is_some() {
+                crate::environment::validate_context(&request, true)?;
+            }
+            entry.into_mut()
+        }
         Entry::Vacant(entry) => {
-            let adapter = crate::remote::resolve_harness(
+            let (adapter, remote) = crate::remote::resolve_harness(
                 root,
                 id,
                 options,
                 harnesses.registry,
                 harnesses.options,
             )?;
+            if !remote && options.environment.is_some() {
+                crate::environment::validate_context(&request, true)?;
+            }
             let probe = adapter.probe()?;
-            entry.insert((adapter, probe))
+            entry.insert((adapter, probe, remote))
         }
     };
-    let plan = if remote {
+    let plan = if *remote {
         (adapter.plan(&request, probe)?, None)
     } else {
         crate::onboarding::plan(root, adapter.as_ref(), request, probe)?
