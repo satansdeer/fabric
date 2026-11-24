@@ -215,15 +215,16 @@ export default function proof(pi:ExtensionAPI) {
 		prompt: JSON.stringify({ required_files: [".deps/ready"], writes: [{ path: "tracked", content: `worker-${id} ; $(touch INJECTED) 'quoted'\n` }], ...(id === "three" ? { exit_code: 9 } : {}) }) }));
 	const remote = await first.invoke("fabric_spawn", { project: "demo", tasks, placement: "remote" });
 	assert.equal(remote.isError, true); assert.equal(object(object(remote.details).error).kind, "unsupported_placement");
-	const start = Date.now();
 	const spawn = await first.invoke("fabric_spawn", { project: "demo", tasks, max_concurrency: 4, idempotency_key: "actual-host-four" });
 	assert.equal(spawn.isError, false); const accepted = object(spawn.details);
 	const batch = text(accepted.batch_id); batches.push(batch);
-	assert.equal(accepted.accepted, true); assert.ok(Date.now() - start < 5000, "actual host spawn blocked on worker completion");
+	assert.equal(accepted.accepted, true);
 	assert.equal(new Set(records(accepted.tasks).map(task => text(task.run_id))).size, 4);
 	for (const id of ids) await eventually(() => Bun.file(join(fixture, `started.${id}`)).exists(), `worker ${id} never started`);
 	const waiting = object((await first.invoke("fabric_wait", { batch_id: batch, timeout_seconds: 1 })).details);
 	assert.equal(waiting.terminal, false);
+	assert.equal(records(waiting.tasks).length, 4);
+	assert.ok(records(waiting.tasks).every(task => task.terminal === false), "spawn returned only after a gated worker completed");
 	await writeFile(join(fixture, "release.one"), ""); await writeFile(join(fixture, "release.three"), "");
 	let progress: Document | undefined;
 	await eventually(async () => {
