@@ -282,7 +282,7 @@ impl Store {
         let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0 => transaction.execute_batch(include_str!("schema.sql"))?,
-            1..=19 => {}
+            1..=20 => {}
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
         if version < 2 {
@@ -599,6 +599,21 @@ impl Store {
             transaction.execute_batch(include_str!("remote_receipts.sql"))?;
             transaction.pragma_update(None, "user_version", 19)?;
         }
+        if version < 20 {
+            transaction.execute_batch(
+                "CREATE TABLE run_remote_completions (
+                   run_id TEXT PRIMARY KEY NOT NULL REFERENCES run_launch_receipts(run_id),
+                   result_json TEXT NOT NULL CHECK(json_valid(result_json)),
+                   installation_json TEXT CHECK(installation_json IS NULL OR json_valid(installation_json)));
+                 CREATE TRIGGER remote_completion_immutable BEFORE UPDATE ON run_remote_completions
+                 WHEN NEW.run_id != OLD.run_id OR NEW.result_json != OLD.result_json
+                   OR OLD.installation_json IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'remote completion is immutable'); END;
+                 CREATE TRIGGER remote_completion_no_delete BEFORE DELETE ON run_remote_completions
+                 BEGIN SELECT RAISE(ABORT, 'remote completion is immutable'); END;"
+            )?;
+            transaction.pragma_update(None, "user_version", 20)?;
+        }
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -671,7 +686,7 @@ impl Store {
         for sidecar in &sidecars {
             validate(sidecar, false)?;
         }
-        if !matches!(version, 5..=19) {
+        if !matches!(version, 5..=20) {
             return Err(StoreError::UnsupportedSchema(version));
         }
         Ok(Self { connection })
@@ -1588,6 +1603,49 @@ impl Store {
             [id.as_str()],|r|r.get(0)).optional()?;
         encoded.map(|s|serde_json::from_str(&s)
             .map_err(|_|StoreError::InvalidRecord("Invalid remote observation"))).transpose()
+    }
+
+    /// The entire original remote result, not just its normalized wait/reason.
+    pub fn record_remote_completion(&self, id: &RunId, result: &serde_json::Value) -> Result<()> {
+        if let Some(saved) = self.remote_completion(id)? {
+            return if saved == *result { Ok(()) } else { Err(StoreError::Conflict) };
+        }
+        let encoded = serde_json::to_string(result).map_err(|_|StoreError::InvalidRecord("Invalid remote completion"))?;
+        if encoded.len() > 65536 || self.launch_receipt(id)?.and_then(|r|r.remote).is_none() {
+            return Err(StoreError::InvalidRecord("Remote completion bounds or binding"));
+        }
+        self.connection.execute("INSERT INTO run_remote_completions(run_id,result_json) VALUES (?1,?2)",
+            params![id.as_str(),encoded])?;
+        Ok(())
+    }
+
+    pub fn remote_completion(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
+        let version: i64 = self.connection.pragma_query_value(None,"user_version",|r|r.get(0))?;
+        if version < 20 { return Ok(None); }
+        let encoded: Option<String> = self.connection.query_row(
+            "SELECT result_json FROM run_remote_completions WHERE run_id=?1",
+            [id.as_str()],|r|r.get(0)).optional()?;
+        encoded.map(|s|serde_json::from_str(&s)
+            .map_err(|_|StoreError::InvalidRecord("Invalid remote completion"))).transpose()
+    }
+
+    /// Immutable verified local inode/digest provenance, committed before renames.
+    pub fn record_remote_installation(&self, id: &RunId, installation: &serde_json::Value) -> Result<()> {
+        let encoded = serde_json::to_string(installation).map_err(|_|StoreError::InvalidRecord("Invalid remote installation"))?;
+        if encoded.len() > 65536 || self.connection.execute(
+            "UPDATE run_remote_completions SET installation_json=?2 WHERE run_id=?1 AND installation_json IS NULL",
+            params![id.as_str(),encoded])? != 1 { return Err(StoreError::Conflict); }
+        Ok(())
+    }
+
+    pub fn remote_installation(&self, id: &RunId) -> Result<Option<serde_json::Value>> {
+        let version: i64 = self.connection.pragma_query_value(None,"user_version",|r|r.get(0))?;
+        if version < 20 { return Ok(None); }
+        let encoded: Option<String> = self.connection.query_row(
+            "SELECT installation_json FROM run_remote_completions WHERE run_id=?1",
+            [id.as_str()],|r|r.get(0)).optional()?.flatten();
+        encoded.map(|s|serde_json::from_str(&s)
+            .map_err(|_|StoreError::InvalidRecord("Invalid remote installation"))).transpose()
     }
 
     /// The bounded output files have already been synced by the runner.

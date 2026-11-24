@@ -24,9 +24,11 @@ pub(crate) fn drive<T>(
             .map_err(|_| fabric_runner::execution_error("Invalid target binding."))?;
         let target = pin.open(&CancellationToken::default())?;
         if target.is_remote() {
-            let receipt = store.launch_receipt(run).map_err(fabric_runner::execution_error)?
-                .and_then(|r|r.remote)
-                .ok_or_else(|| fabric_runner::execution_error("Remote ownership receipt unavailable"))?;
+            let durable_run = store.run(run).map_err(fabric_runner::execution_error)?
+                .ok_or_else(||fabric_runner::execution_error("Remote Run unavailable"))?;
+            let bound = crate::remote::recovery_binding(store,&durable_run)?;
+            let receipt = bound.remote.as_ref()
+                .ok_or_else(||fabric_runner::execution_error("Remote ownership receipt unavailable"))?;
             let input = serde_json::json!({"resource":receipt.resource});
             match action {
                 Action::Reclaim => {
@@ -40,7 +42,12 @@ pub(crate) fn drive<T>(
                     if reply["state"] != "complete" {
                         return Err(fabric_runner::execution_error("Remote process inactivity unproven"));
                     }
-                    crate::remote::completion(reply["result"].clone(),&receipt.resource)?;
+                    let completion = crate::remote::completion(reply["result"].clone(),&receipt.resource)?;
+                    crate::remote::validate_completion(store,&durable_run,&completion)?;
+                    if matches!(action,Action::Recover) && context["apply"] != false {
+                        store.record_remote_completion(run,&serde_json::to_value(&completion)
+                            .map_err(fabric_runner::execution_error)?).map_err(fabric_runner::execution_error)?;
+                    }
                 }
                 _ => return Err(fabric_runner::execution_error("Unsupported remote ownership operation")),
             }

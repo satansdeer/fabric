@@ -785,6 +785,10 @@ fn execute_remote(
             }
         };
         let result = crate::remote::completion(result, &resource)?;
+        let durable_run = store.run(run_id).map_err(error)?.ok_or_else(||error("Run absent"))?;
+        let receipt = crate::remote::recovery_binding(store,&durable_run)?;
+        crate::remote::validate_completion(store,&durable_run,&result)?;
+        store.record_remote_completion(run_id,&serde_json::to_value(&result).map_err(error)?).map_err(error)?;
         attempt.finished_at = Some(now()?); attempt.exit_code = result.exit_code; attempt.exit_signal = result.exit_signal;
         attempt.event_cursor = result.capture.normalized_event_count;
         attempt.termination_reason = result.reason().map(str::to_owned);
@@ -792,10 +796,10 @@ fn execute_remote(
         store.observe_run_exit(run_id,result.exit_code,result.exit_signal,result.reason(),attempt.finished_at.unwrap()).map_err(error)?;
         let capture = result.capture;
         let container = tree.parent().ok_or_else(||error("Container absent"))?;
-        let staging = crate::remote::download_staged(target,&resource,container,crate::remote::TRANSFER_LIMIT)?;
+        let mut staging = crate::remote::download_staged(target,&resource,container,crate::remote::TRANSFER_LIMIT)?;
         if staging.witness != *witness { return Err(crate::remote::protocol_error("Export source witness changed")); }
         crate::remote::verify_output(&staging.path,&capture)?;
-        crate::remote::install_download(&staging,container)?;
+        crate::remote::install_download(&mut staging,container,store,&durable_run,&receipt.actual_sha256,&capture)?;
         store.record_capture(run_id,&capture).map_err(error)?;
         let captured = crate::artifacts::capture(root,store,run_id,state,&capture,&plan.profile,options.max_artifact_bytes)?;
         store.finish_run(run_id,&capture,&captured.0,&captured.1,now()?).map_err(error)?;

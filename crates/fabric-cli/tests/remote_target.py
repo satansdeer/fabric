@@ -5,12 +5,15 @@ Test-only export faults model the completed-result/controller crash window. No
 Kubernetes objects, provider, production fault flag, or replacement worker.
 """
 import json
+import hashlib
+import io
 import os
 from pathlib import Path
 import subprocess
 import select
 import time
 import sys
+import tarfile
 
 config = json.loads(Path(sys.argv[1]).read_text())
 root = Path(config["root"])
@@ -20,6 +23,7 @@ sequence = 0
 pending = None
 instance = "original-instance"
 resource = {"backend": "remote.v1", "resource_id": "fixture-storage-original"}
+malformed_export = None
 
 
 def call(operation, value):
@@ -51,6 +55,11 @@ def call(operation, value):
 
 
 def invoke(operation, value):
+    global malformed_export
+    if operation == "workspace.read" and malformed_export is not None:
+        offset = value["offset"]
+        assert 0 <= offset < len(malformed_export)
+        return {"bytes": list(malformed_export[offset:offset + 8192])}
     if operation in ("environment.ensure", "environment.inspect"):
         if value["resource"] is None:
             assert operation == "environment.ensure"
@@ -79,6 +88,20 @@ def invoke(operation, value):
             result["size"] = 134217729
         elif mode == "binding":
             result["witness"]["instance"] = "foreign-instance"
+        elif mode in ("malformed_tar", "missing_tree", "missing_log", "log_type"):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as archive:
+                for name in ("tree", "stdout.log", "stderr.log", "events.jsonl"):
+                    if (mode == "missing_tree" and name == "tree") or (mode == "missing_log" and name == "stderr.log"):
+                        continue
+                    entry = tarfile.TarInfo(name)
+                    entry.mode = 0o700 if name == "tree" else 0o600
+                    if name == "tree" or (mode == "log_type" and name == "stdout.log"):
+                        entry.type = tarfile.DIRTYPE
+                    archive.addfile(entry, io.BytesIO())
+            malformed_export = b"not a tar archive" if mode == "malformed_tar" else buffer.getvalue()
+            result["size"] = len(malformed_export)
+            result["sha256"] = hashlib.sha256(malformed_export).hexdigest()
         else:
             raise AssertionError(mode)
     if operation == "workspace.reclaim":
@@ -97,17 +120,19 @@ try:
         elif method in ("health", "shutdown"):
             result = {"ready": True}
         elif method == "target.capabilities":
-            result = dict(placements=["remote-proof"], operations=["prepare", "start", "inspect", "cancel", "collect", "reclaim"], optional=["environment.v1", "remote.v1"])
+            result = dict(placements=["remote-proof"], operations=["prepare", "start", "inspect", "cancel", "collect", "reclaim"], optional=["environment.v1", "pty.v1", "remote.v1"])
         elif method == "target.placement":
             assert params == {"placement": "remote-proof", "backends": ["remote.v1"]}
             result = {"backend": "remote.v1"}
         elif method == "target.environment.capabilities":
-            result = dict(version=1, persistent_home=True, interactive_exec_pty=False, infrastructure_diagnostics=True, operations=["ensure", "inspect", "destroy", "workspace"])
+            result = dict(version=1, persistent_home=True, interactive_exec_pty=True, infrastructure_diagnostics=True, operations=["ensure", "inspect", "destroy", "workspace"])
         elif method == "target.remote.invoke":
             assert pending is None and params["version"] == 1
             try:
                 pending = dict(state="complete", result=invoke(params["operation"], params["input"]))
-            except Exception:
+            except Exception as error:
+                with (root / "errors.jsonl").open("a") as log:
+                    log.write(json.dumps({"operation": params["operation"], "error": repr(error)}) + "\n")
                 pending = dict(state="failed", scope="target", kind="output")
             result = {"ticket": "single-flight"}
         elif method == "target.remote.poll":
