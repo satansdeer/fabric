@@ -84,6 +84,16 @@ try {
   copy(join(repo, 'docs/GITHUB_CONNECTOR.md'), 'docs/GITHUB_CONNECTOR.md', false,
     text => text.replaceAll('sdk/typescript/', 'sdk/'));
   copy(join(repo, 'docs/CONTROL_SURFACES.md'), 'docs/CONTROL_SURFACES.md');
+  // Authoring sources only: reuse the single release SDK, bind native paths offline later.
+  const acpKit = {
+    id: 'fabric-acp', version: '0.1.0', protocol: 1, path: 'plugins/acp', sdk_path: 'sdk',
+    purpose: 'offline-profile-authoring-only', installable: false,
+    fixture: { path: 'plugins/acp/fixtures/turn-agent.mjs', purpose: 'deterministic fake ACP peer; no native provider support' },
+  };
+  for (const file of ['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'README.md', 'fixtures/turn-agent.mjs']) {
+    copy(join(repo, 'plugins/acp', file), `${acpKit.path}/${file}`, false,
+      text => text.replaceAll('../../sdk/typescript', '../../sdk').replaceAll('sdk/typescript/', 'sdk/'));
+  }
   // The smoke's SDK imports are dynamic and resolve inside the extracted bundle.
   const manifest = {
     version, tag, source_sha: source, build_kind: buildKind, platform: 'macos-arm64',
@@ -91,6 +101,7 @@ try {
     source_url: `https://github.com/satansdeer/fabric/tree/${source}`,
     build: { rustc: run('rustc', ['--version']), cargo: run('cargo', ['--version']), cargo_lock_sha256: sha256(readFileSync(join(repo, 'Cargo.lock'))) },
     plugins,
+    acp_profile_kit: acpKit,
     omp: { version: 'omp/19.1.0', url: 'https://github.com/can1357/oh-my-pi/releases/download/v19.1.0/omp-darwin-arm64', sha256: 'dca5643669ed5e553f707bd065499babd0fe3030696bbb24c9da09c798af5abb', bundled: false },
     omp_extension: { path: 'integrations/omp/fabric.ts', sha256: files['integrations/omp/fabric.ts'], source_url: `https://github.com/satansdeer/fabric/blob/${source}/integrations/omp/fabric.ts` },
     fixture: { path: 'bin/fabric-fake-harness', sha256: files['bin/fabric-fake-harness'], purpose: 'provider-free fake-a/fake-b only; not a native model worker' },
@@ -103,7 +114,7 @@ try {
   const hash = sha256(readFileSync(join(output, manifest.archive)));
   writeFileSync(join(output, `${manifest.archive}.sha256`), `${hash}  ${manifest.archive}\n`, { mode: 0o600, flag: 'wx' });
   const notes = `macOS arm64 native bootstrap ${tag}\n\nSource: ${manifest.source_url}\nBuild kind: ${buildKind}\nArchive: ${manifest.archive}\nSHA256: ${hash}\n\nOfficial plugin content pins (protocol 1):\n${plugins.map(p => `- ${p.id} ${p.version}: ${p.sha256}; supports ${p.supported_cli}`).join('\n')}\n${targetPlugins.map(p => `- target ${p.id} ${p.version}: ${p.sha256}`).join('\n')}\n\nOMP extension: ${manifest.omp_extension.source_url}\nExtension SHA256: ${manifest.omp_extension.sha256}\nProvider-free fixture: ${manifest.fixture.path} (${manifest.fixture.sha256})\nTrusted-local target bundled as executable and installable package. OMP/Codex CLIs are separately installed, not bundled.\n\nNative bootstrap binaries are macOS arm64 only. Generic remote execution, persistent environments and PTY use external target plugins. Kubernetes reference source and setup: ${manifest.source_url}/plugins/kubernetes/README.md . Linux agent images, Kubernetes credentials and Kubernetes target packages are not bundled. Private Kubernetes proof does not establish public image availability, real cgroup OOM, native OAuth or multi-node/high-availability behavior. No Apple signing/notarization, Intel/Linux bootstrap, provider-backed or full swarm-parity claim. Publication is not downloaded-install proof; link the later smoke evidence in #33 and #38 before release dogfooding.\n`;
-  writeFileSync(join(output, 'release-notes.md'), notes + '\nResult contract: results/workers results retain canonical relative_path, size_bytes and sha256 and add local_read_path only after full sealed-artifact verification. Read local_read_path directly from any parent cwd on the manager host. Invalid registered artifacts fail retrieval; runs artifacts stays metadata-only. See docs/CONTROL_SURFACES.md. This is not native model-backed parity evidence.\n', { mode: 0o600, flag: 'wx' });
+  writeFileSync(join(output, 'release-notes.md'), notes + `\nACP profile-authoring kit: ${acpKit.id} ${acpKit.version}, protocol ${acpKit.protocol}, ${acpKit.path}/package.mjs; reuses ${acpKit.sdk_path}/. All kit/SDK payload hashes are in release.json files. Not an installable native profile: no native harness, HOME, credentials, account/provider/model or settings are bundled. Only explicit owner-run offline packaging binds executable/runtime/settings pins and native HOME. The labelled fake peer proves extracted package/install/initialize/isolated host edit/artifact/reclaim only; native Cline initialize-only evidence is not native session/model/controller/worker support. Cursor second-native-profile proof and remaining #95 gates stay OPEN; stage one is not complete.\n\nResult contract: results/workers results retain canonical relative_path, size_bytes and sha256 and add local_read_path only after full sealed-artifact verification. Read local_read_path directly from any parent cwd on the manager host. Invalid registered artifacts fail retrieval; runs artifacts stays metadata-only. See docs/CONTROL_SURFACES.md. This is not native model-backed parity evidence.\n`, { mode: 0o600, flag: 'wx' });
   console.log(JSON.stringify({ archive: join(output, manifest.archive), sha256: hash, source_sha: source, build_kind: buildKind, plugins }, null, 2));
 } finally {
   rmSync(build, { recursive: true, force: true });

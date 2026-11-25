@@ -106,7 +106,8 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   assert.equal(initialized.cleanup, 'reaped');
   assert.equal(initialized.launch.config_sha256, sha256(readFileSync(join(bridgeDir, 'launch.json'))));
   assert.doesNotMatch(inspection.stdout, /SECRET_|UNTRUSTED_/);
-  assert.deepEqual(lines(log).map(record => record.method), ['initialize']);
+  assert.deepEqual(lines(log).filter(record => Object.hasOwn(record, 'method')).map(record => record.method), ['initialize']);
+  for (const record of lines(log)) if (record.stopped) reaped(record.stopped);
   fabric(['project', 'prepare', 'fixture', '--recipe', recipe, '--json']);
   const runArgs = ['run', 'fixture', '--harness', 'acp', '--placement', 'local', '--profile', profile,
     '--prompt-file', promptFile, '--copy-limit-bytes', '67108864', '--timeout-seconds', '30', '--json'];

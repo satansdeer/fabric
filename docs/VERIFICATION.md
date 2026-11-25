@@ -1070,3 +1070,71 @@ host. The host now selects `/fabric` without forbidding unrelated registered
 commands. `bun integrations/omp/conformance.ts /absolute/bundle/bin/fabric`
 passed against the packaged native CLI and reference plugins, including actual
 mixed batches, artifact/reclaim checks and transport failure handling; no inference.
+
+## Issue #104 — v0.1.22 local extracted ACP kit proof
+
+Unreviewed working-source candidate on base
+`33abcb452354b20e46061ca4a1cdefdba101c2c2`; not a published/tagged release,
+exact-head CI result or separately downloaded public acceptance.
+
+Commands executed on macOS arm64 (Node 22.23.2, Rust 1.91.0):
+
+```sh
+export PATH="/Users/maksimivanov/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin"
+export CARGO_HOME=/Users/maksimivanov/.cargo
+export RUSTUP_HOME=/Users/maksimivanov/.rustup
+export RUSTUP_TOOLCHAIN=1.91.0
+export CARGO_NET_OFFLINE=true
+NODE=/Users/maksimivanov/.local/share/fabric/reviews/fabric-issue8-released-cycle-c1crbsot/fabric-ci-node22-_tocmjya/node-v22.23.2-darwin-arm64/bin/node
+CHECK=/private/tmp/fabric-issue104-check.uiCk9N
+"$NODE" scripts/package-release.mjs --local 33abcb452354b20e46061ca4a1cdefdba101c2c2 "$CHECK/release"
+NAME=fabric-v0.1.22-local.33abcb452354-macos-arm64
+cp "$NODE" "$CHECK/node22"
+chmod 700 "$CHECK/node22"
+HASH=$(cut -d ' ' -f 1 "$CHECK/release/$NAME.tar.gz.sha256")
+"$CHECK/node22" "$CHECK/release/$NAME/scripts/smoke-release.mjs" --local \
+  "$CHECK/release/$NAME.tar.gz" "$HASH" \
+  33abcb452354b20e46061ca4a1cdefdba101c2c2 "$CHECK/install-short-node" \
+  > "$CHECK/proof-short-node.json"
+```
+
+- Offline candidate build passed. Archive SHA256:
+  `da19747cc01bdd962ea087e27825a09c5b7636db0cee0c48d90d507f73b4feaf`.
+- Shipped smoke, invoked outside the checkout, passed with
+  `proof: LOCAL_PACKAGE_ONLY`. Official OMP/Codex/local installation, SDK
+  conformance, provider-free OMP 19.1.0 discovery and ordinary fake worker
+  (`SUCCEEDED`, `reclaimed`) remained valid.
+- Required ACP kit/SDK file pins and relocation passed. The owned labelled fake
+  profile packaged offline and installed into its private registry. Inspection
+  returned `acp_initialized`, protocol 1, `reaped`, with auth/model `unverified`
+  and peer identity `untrusted`; its log contained only `initialize`.
+- Actual isolated host run `r-1795619235099256000-43523-0` returned `SUCCEEDED`,
+  no native failure and `reclaimed`. Assertions checked the intended README
+  patch and exact output, every captured artifact size/SHA256, unchanged
+  original source, private HOME/minimal environment, reaped fake child and
+  absent owned workspace. ACP proof used extracted files, no provider/network
+  calls or inherited credentials. The ordinary smoke separately downloaded
+  its existing public OMP pin.
+- Earlier attempts: inherited Cargo-home selection could not resolve
+  `serde_json` offline; explicitly selecting the existing cache fixed it.
+  The first built-archive smoke reached ACP packaging but rejected the long
+  canonical review-local Node path. Direct packager diagnosis returned
+  `acp_unsafe_runtime` (127-byte shebang bound). Copying the identical Node
+  executable into the owned short temporary path let the same archive pass;
+  no runtime guard was relaxed.
+
+Retained local evidence: the archive/inventory/notes under `$CHECK/release`,
+extracted installation under `$CHECK/install-short-node` and
+`$CHECK/proof-short-node.json`. Temporary profiles, registries, source fixture,
+children and workspaces were reclaimed by the smoke.
+
+No native model/session/controller/worker support was tested. Recorded Cline
+3.0.75 initialize-only evidence remains distinct. Cursor second-native-profile
+proof and remaining #95 gates stay OPEN; stage one is not complete. Manager
+review, CI, publication and independent downloaded acceptance remain outstanding.
+
+CI run `45642466664` exposed a mixed-log assertion race in the existing installed
+ACP integration check: a legitimate fixture `{ stopped: pid }` teardown record
+was projected to an extra `undefined` RPC method. The check now uses the same
+method-presence filter as initialize inspection tests and verifies every recorded
+stopped PID is reaped. No transport, timeout, cancellation or cleanup guard changed.

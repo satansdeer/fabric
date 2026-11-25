@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-cli"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "clap",
  "fabric-core",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-core"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "fabric-domain",
  "fabric-project",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-domain"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "serde",
  "serde_json",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-project"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "fabric-domain",
  "fabric-store",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-reference-harnesses"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "fabric-domain",
  "fabric-runner",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-runner"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "fabric-domain",
  "libc",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-store"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "fabric-domain",
  "libc",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-workspace"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "fabric-domain",
  "fabric-project",

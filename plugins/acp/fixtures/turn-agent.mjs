@@ -1,4 +1,4 @@
-// Provider-free ACP peer. Used only by integration.test.mjs; never an agent shim.
+// Deterministic fake ACP peer for integration and extracted-release smoke only; never a native agent.
 import { createInterface } from 'node:readline';
 import { appendFileSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
