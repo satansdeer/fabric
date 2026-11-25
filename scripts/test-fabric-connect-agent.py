@@ -167,10 +167,13 @@ os.execv({str(f.fabric.with_name("fabric-fake-harness"))!r}, [{str(f.fabric.with
         # Admit through the real CLI/Core, discard only its output once after durable commit.
         lost = f.path / "admission-reply-lost"
         wrapper = f.path / "cli-with-response-loss"
-        fixtures.executable(wrapper, f'''import pathlib, subprocess, sys
+        fixtures.executable(wrapper, f'''import os, pathlib, subprocess, sys, time
+parent = os.getppid()
 result = subprocess.run([{str(f.fabric)!r}] + sys.argv[1:], stdout=subprocess.PIPE)
 if "connect-admit" in sys.argv and result.returncode == 0 and not pathlib.Path({str(lost)!r}).exists():
     pathlib.Path({str(lost)!r}).touch()
+    # Hold the lost reply until the owned agent crashes; startup speed must not permit retry.
+    while os.getppid() == parent: time.sleep(0.05)
 else: sys.stdout.buffer.write(result.stdout)
 sys.exit(result.returncode)
 ''')
@@ -264,7 +267,7 @@ sys.exit(result.returncode)
             "run_id": completed["run_id"], "artifact_manifest_id": completed["artifact_manifest_id"], "native_provider_calls": 0}))
     finally:
         gate.touch()
-        stop(agent)
+        stop(agent, crash=True)
         stop(server.process)
 
 
