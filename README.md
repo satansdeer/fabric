@@ -124,6 +124,94 @@ The bundled extension/fake fixture supports later consumer checks; `host-smoke.t
 
 See [publication and evidence](docs/VERIFICATION.md#issue-38-native-release-bootstrap).
 
+### Daily upstream OMP canary (provider-free)
+
+[The separate canary workflow](.github/workflows/omp-canary.yml) runs daily at
+07:23 UTC and via `workflow_dispatch` on main, using macOS arm64. It does not
+change [pinned supported-version CI](.github/workflows/macos.yml). The moving
+input is GitHub's latest stable `can1357/oh-my-pi` release, resolved afresh with
+the authenticated GitHub API; draft, prerelease and nonnumeric tags fail closed.
+
+Fabric is **not** resolved from `releases/latest`. The small reviewed
+`fabricPin` in `scripts/omp-canary.mjs` records the independently manager-accepted
+public release:
+
+- Tag: `v0.1.21`
+- Source: `8d12ad30e9d8ae5ecc5d3541527c8dbc6037ad32`
+- Archive SHA256: `b80336b976c2e688af6ef6fd3e24fd92be9af94a41b2af02a307f8157860429b`
+- Executable SHA256: `4b4ac89513540a083eae235439c887b946b0f374ab525592541effa7beb7d1bb`
+
+Each downloaded asset requires an authenticated upstream `sha256:` API digest;
+absent/unverifiable digests fail explicitly, with no unverified fallback. Fabric
+additionally requires the accepted archive/executable pins, matching public
+checksum/inventory, exact source tag commit, per-file hashes and plugin content
+hashes. The release smoke's hard-pinned OMP 19.1.0 is deliberately not downloaded
+or used here.
+
+For local reproduction on macOS arm64 with Node 22.23.2, Bun 1.3.5 and an
+explicit GitHub API token (never copied into native children):
+
+```sh
+: "${GH_TOKEN:?authenticated read access to public GitHub release metadata/assets}"
+export GH_TOKEN
+export CANARY_BUN="$(command -v bun)"
+EVIDENCE="$(mktemp -d)/evidence"
+node scripts/omp-canary.mjs run "$EVIDENCE"
+# Deterministic regression check; no network, credentials or GitHub mutations:
+node scripts/test-omp-canary.mjs
+```
+
+Only new scratch HOME/config/data/native-agent/install directories are used.
+The native agent starts with an empty SQLite `agent.db`, no credential rows,
+provider/model settings, dummy API keys, user config copies or external plugins.
+This satisfies only the existing metadata check, not authentication or model
+admission. The shared source `integrations/omp/up-smoke.ts` consumes the accepted
+public Fabric binary/extension/plugins and moving OMP binary. It checks native
+`up`, actual idle `get_state`, original registered typed tools through local
+slash commands, source-only setup, fake workers, reconnect, cancellation and
+artifact integrity. It starts a disposable local manager for fake workers, not
+paid canary workers. No model prompt, inference, provider request, provider/model
+override, user executable/config replacement, upgrade or retry is authorized.
+If native admission requires capabilities absent from this empty context, the
+canary fails; it never forces a model/provider to make the probe pass. Native
+binaries remain trusted local code, not an OS/network sandbox. PASS proves this
+provider-free contract only, **not full model or external-plugin compatibility**.
+
+The `omp-canary-evidence` artifact retains exact release IDs/tags/resolved source
+SHAs, authenticated expected and observed download digests, Fabric inventory,
+probe source revision and isolated command/host logs, including failed runs.
+`result.json` distinguishes infrastructure (API/download/setup), digest/inventory
+and native probe stages. Only sanitized credential-free fixture logs are uploaded,
+not the scratch agent database, HOME, auth/config, or user logs. The failure-only
+report job alone has `issues: write`; it creates/updates an actionable issue with
+the failed stage, identities and evidence run URL. It deduplicates across open
+and closed issues by Fabric pin + upstream release ID + category/stage, reopens
+the same issue and replaces its latest evidence rather than growing it daily.
+Before identity resolution, a bounded `unresolved` key groups that stage's outage;
+setup/interrupted/missing-artifact failures have a separate infrastructure key.
+Issue API failures remain visible as a failed reporting job; no automatic retries.
+
+**Promotion is manual:** independently download a candidate public Fabric
+release, verify authenticated upstream digests, source/inventory and archive
+bytes, then perform independent native acceptance against those downloaded bytes.
+Only after manager acceptance, update all four `fabricPin` identities together
+in a reviewed change with acceptance evidence. A new release or green canary
+never promotes Fabric automatically. Do not substitute a local build, use
+`releases/latest` for Fabric, or bypass missing digests/provider-free admission.
+
+The deterministic regression check also runs with
+`bun scripts/test-omp-canary.mjs` (verified provider-free). It covers missing,
+invalid and mismatched digests, stable-only release admission and paginated
+failure-issue deduplication, including closed issues and unresolved identities.
+This check is not downloaded-asset/native workflow acceptance.
+
+Independent public-byte acceptance of Fabric v0.1.21 with OMP 19.1.1 verified
+the authenticated downloads and release inventories, then **failed** at
+`native-up-typed-tools`: an empty OMP profile exits with “No default model
+selected” before replying to `get_state`. This is a reported compatibility
+boundary, not a green native-probe result. The canary deliberately supplies
+neither credentials nor a model override to conceal it.
+
 ### One-command local setup and opt-in OMP controller
 
 From an existing Git checkout, use the **native bundle's** binary:
