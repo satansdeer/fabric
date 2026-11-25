@@ -12,6 +12,7 @@ process.on('SIGTERM', () => { record({ stopped: process.pid }); process.exit(0);
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
   record({ method: request.method });
+  if (!Object.hasOwn(request, 'method')) { record({ response: request }); continue; }
   if (request.method === 'initialize') {
     if (initialized || request.params.protocolVersion !== 1 || Object.keys(request.params.clientCapabilities).length) process.exit(21);
     initialized = true;
@@ -30,19 +31,51 @@ for await (const line of createInterface({ input: process.stdin })) {
       cwd: process.cwd(), home: process.env.HOME, environment: Object.keys(process.env).sort(), prompt });
     const update = (update, sessionId = 'connection-local') => send({ method: 'session/update', params: { sessionId, update } });
     const text = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: prompt } };
-    if (mode === 'cancel') continue;
+    const extension = (method = 'cursor/task', data = 'PRIVATE_EXTENSION_CANARY') => send({
+      method, params: { sessionId: 'untrusted-other-session', data, marker: mode },
+    });
+    if (['extensions', 'cancel', 'concurrent'].includes(mode)) extension();
+    if (['count-limit', 'count-flood', 'byte-flood'].includes(mode)) {
+      for (let i = 0; i < (mode === 'count-limit' ? 32 : 33); i++) {
+        extension('vendor/progress', mode === 'byte-flood' ? '😀'.repeat(2000) : 'bounded');
+      }
+    }
+    if (mode === 'large-extension') extension(`vendor/${'x'.repeat(3000)}`, '😀'.repeat(2000));
+    if (mode === 'cancel') { record({ extensionsSent: mode }); continue; }
     if (mode === 'slow') await delay(2100); // Longer than the fixture's setup RPC deadline.
-    if (mode === 'concurrent') while (!existsSync(`${log}.release`)) await delay(20);
+    if (mode === 'concurrent') {
+      record({ extensionsSent: mode });
+      while (!existsSync(`${log}.release`)) await delay(20);
+    }
     if (mode === 'failure') { send({ id: request.id, error: { code: -32000, message: 'SECRET_PEER_ERROR_CANARY', data: { credential: 'SECRET_PEER_DATA_CANARY' } } }); continue; }
     if (mode === 'disconnect') { process.exit(24); }
-    if (mode === 'request') { send({ id: 'peer-request', method: 'session/request_permission', params: { sessionId: 'connection-local', permissions: [] } }); continue; }
+    if (['request', 'vendor-request', 'extension-request'].includes(mode)) {
+      send({ id: mode === 'extension-request' ? 0 : 'peer-request',
+        method: mode === 'request' ? 'session/request_permission' : mode === 'vendor-request' ? 'cursor/ask_question' : 'cursor/task',
+        params: { sessionId: 'connection-local', secret: 'SECRET_REQUEST_CANARY' } });
+      continue;
+    }
+    if (mode === 'late') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n' +
+        JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'connection-local', update: text } }) + '\n');
+      continue;
+    }
     if (mode === 'malformed') update({ ...text, unexpected: 'SECRET_UPDATE_CANARY' });
     else if (mode === 'mismatch') update(text, 'other-connection');
     else if (mode === 'tool') update({ sessionUpdate: 'tool_call', toolCallId: 'unsafe', title: 'SECRET_TOOL_CANARY' });
     else if (mode === 'image') update({ sessionUpdate: 'agent_message_chunk', content: { type: 'image', data: 'SECRET_IMAGE_CANARY', mimeType: 'image/png' } });
+    else if (['core-session', 'core-fs', 'core-terminal', 'core-method', 'core-rpc'].includes(mode)) {
+      send({ method: { 'core-session': 'session/future', 'core-fs': 'fs/changed',
+        'core-terminal': 'terminal/created', 'core-method': 'authenticate',
+        'core-rpc': 'rpc.private/event' }[mode], params: {} });
+    }
     else if (mode !== 'stop') {
       writeFileSync('README.md', mode === 'concurrent' ? `ACP fixture worker\n${prompt}\n` : 'ACP fixture worker');
       update(text);
+      if (mode === 'extensions') {
+        extension('cursor/update_todos');
+        extension('cursor/generate_image');
+      }
     }
     send({ id: request.id, result: { stopReason: mode === 'stop' ? 'invented-success' : 'end_turn' } });
   } else if (request.method === 'session/cancel') {

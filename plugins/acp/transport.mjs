@@ -237,9 +237,11 @@ class AcpConnection {
       }
       if (this.#callbacks >= this.#maxCallbacks) { this.#fail('acp_callback_overflow'); return; }
       this.#callbacks++;
+      // Snapshot wire-order state before deferred callbacks or promise continuations run.
+      const requestPendingAtReceipt = this.#pending.size > 0;
       // Do not await user code in the reader: replies, abort and close must progress.
       Promise.resolve().then(() => {
-        if (!this.#failure) return this.#callback(value, this.#controller.signal);
+        if (!this.#failure) return this.#callback(value, this.#controller.signal, requestPendingAtReceipt);
       }).catch(() => this.#fail('acp_callback_failed')).finally(() => { this.#callbacks--; });
       return;
     }
