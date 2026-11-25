@@ -79,6 +79,7 @@ class AcpConnection {
   #maxCallbacks;
   #callbacks = 0;
   #callback;
+  #failOnPeerRequest;
   #controller = new AbortController();
   #requestTimeout;
   #initializeTimeout;
@@ -94,6 +95,8 @@ class AcpConnection {
         !literal(cwd) || !isAbsolute(cwd) || !object(env) ||
         !Object.entries(env).every(([key, value]) => key.length && !/[=\0]/.test(key) && literal(value)) ||
         typeof onNotification !== 'function' || !validSignal(signal)) throw error('acp_invalid_options');
+    if (options.failOnPeerRequest !== undefined && !boolean(options.failOnPeerRequest)) throw error('acp_invalid_options');
+    this.#failOnPeerRequest = options.failOnPeerRequest ?? false;
     this.#maxRecord = bound(options.maxRecordBytes, 1_048_576, 256, 16_777_216);
     this.#maxPending = bound(options.maxPendingRequests, 64, 1, 1024);
     this.#maxCallbacks = bound(options.maxNotificationCallbacks, 64, 1, 1024);
@@ -174,15 +177,15 @@ class AcpConnection {
   async #call(method, params, timeoutMs, signal) {
     if (this.#failure) throw this.#failure;
     this.#validateCall(method, params);
-    timeoutMs = bound(timeoutMs, this.#requestTimeout, 1, 300_000);
-    if (!validSignal(signal)) throw error('acp_invalid_options');
+    if (!validSignal(signal) || (timeoutMs === null && !signal)) throw error('acp_invalid_options');
+    if (timeoutMs !== null) timeoutMs = bound(timeoutMs, this.#requestTimeout, 1, 300_000);
     if (signal?.aborted) { this.#fail('acp_aborted'); throw this.#failure; }
     if (this.#pending.size >= this.#maxPending) throw error('acp_pending_limit');
     if (!Number.isSafeInteger(this.#nextId)) { this.#fail('acp_id_exhausted'); throw this.#failure; }
     const id = this.#nextId++;
     return new Promise((resolve, reject) => {
       const abort = () => this.#fail('acp_aborted');
-      const timer = setTimeout(() => this.#fail('acp_deadline'), timeoutMs);
+      const timer = timeoutMs === null ? undefined : setTimeout(() => this.#fail('acp_deadline'), timeoutMs);
       const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
       this.#pending.set(id, { resolve, reject, cleanup });
       signal?.addEventListener('abort', abort, { once: true });
@@ -229,6 +232,7 @@ class AcpConnection {
           (own(value, 'id') && !idValid(value.id))) { this.#fail('acp_invalid_envelope'); return; }
       if (own(value, 'id')) {
         this.#send({ jsonrpc: '2.0', id: value.id, error: { code: -32601, message: 'Method not found' } });
+        if (this.#failOnPeerRequest) this.#fail('acp_unsupported_request');
         return;
       }
       if (this.#callbacks >= this.#maxCallbacks) { this.#fail('acp_callback_overflow'); return; }

@@ -1,9 +1,10 @@
-# ACP v1 local transport foundation
+# ACP v1 transport and external native text bridge
 
-Stage one of issue #95, implemented by #97. **Not a supported Fabric worker or
-installable Fabric plugin.** No runtime dependencies; Node >=22.18, ESM. This
-module provides reusable local stdio transport and nonbilling initialization,
-not another scheduler or agent loop.
+Issue #99 adds an offline-packaged SDK plugin to the #97/#98 transport foundation.
+No runtime dependencies; Node >=22.18, ESM. One connection and one text turn,
+not another scheduler. **Provider-free integration is not native provider support
+or completion of #95.** Cursor `agent acp` and `cline --acp` initialization and
+the remaining stage-one acceptance gates require separate consent and evidence.
 
 ## API
 
@@ -60,6 +61,8 @@ this module's protocol exchange, not a guarantee about arbitrary child behavior.
   increasing safe integers; agent request IDs occupy the opposite direction.
   This is a raw RPC API, **not** permission to invoke authentication/session/prompt
   methods; higher layers must supply that policy. Nothing invokes them implicitly.
+  Explicit `timeoutMs: null` disables only that RPC's timer and requires an
+  `AbortSignal` owner; framing, pending limits, disconnect and cancellation remain active.
 - `notify(method, params = {})` sends a notification after initialization, with
   no fabricated response. A caller may explicitly send `session/cancel`; the
   module does not infer ACP sessions or prompt-turn cancellation semantics.
@@ -72,6 +75,9 @@ this module's protocol exchange, not a guarantee about arbitrary child behavior.
   There is no request handler/permission auto-approval. In particular
   `cursor/ask_question`, `cursor/create_plan`, `session/request_permission`, file
   and terminal requests cannot block on or receive fake human answers.
+  Optional `failOnPeerRequest: true` also terminates with
+  `acp_unsupported_request`; default `false` preserves transport-only behavior.
+  The bridge enables it, so denying a blocking request cannot become success.
 - `cancel()`, `close()`, request/initialization abort, or launch-signal abort
   terminate the connection. Await these methods or `closed` to wait for child
   reaping. `closed` always resolves `{ code }`, retaining the first terminal reason;
@@ -79,7 +85,7 @@ this module's protocol exchange, not a guarantee about arbitrary child behavior.
 
 ## Exact resource and failure bounds
 
-All numeric options are integer bounds, never infinite/disabled deadlines:
+Numeric timeout options stay bounded; only a signal-owned per-request override can omit its timer:
 
 | Option | Default | Allowed range |
 | --- | ---: | ---: |
@@ -90,7 +96,7 @@ All numeric options are integer bounds, never infinite/disabled deadlines:
 | `initializeTimeoutMs` | 10,000 | 1–300,000 |
 | `terminationGraceMs` | 250 | 0–5,000 |
 
-Per-request `timeoutMs` has the same allowed range as `requestTimeoutMs`.
+Numeric per-request `timeoutMs` has the same allowed range as `requestTimeoutMs`.
 Deadlines cover RPC write/response, not arbitrary caller work. There is no idle
 or whole-worker timer; timers exist only for active RPCs and owned termination.
 Event-loop scheduling and teardown can extend wall-clock completion.
@@ -126,8 +132,8 @@ codes are `acp_invalid_options`, `acp_spawn_failed`, `acp_not_ready`,
 `acp_invalid_initialize`, `acp_unsupported_protocol`, `acp_malformed_frame`,
 `acp_truncated_frame`, `acp_frame_too_large`, `acp_invalid_envelope`,
 `acp_invalid_response_id`, `acp_callback_failed`, `acp_callback_overflow`,
-`acp_write_overflow`, `acp_deadline`, `acp_aborted`, `acp_closed`, and
-`acp_disconnected`. There is no stderr/payload logging or raw capture API.
+`acp_write_overflow`, `acp_deadline`, `acp_aborted`, `acp_closed`,
+`acp_unsupported_request`, and `acp_disconnected`. There is no stderr/payload logging or raw capture API.
 Stderr is drained and discarded. No retries, version fallback, replay or reconnect.
 
 Terminal cleanup destroys owned pipes, sends SIGTERM to the launched child,
@@ -135,62 +141,157 @@ escalates to SIGKILL after the grace period if still alive, and waits for Node's
 child `close` event. No killing by name, process discovery or detached process
 group. **Trusted-local, same-user execution, not a sandbox.** This standalone
 module owns/reaps the direct child only; it cannot contain a malicious agent or
-promise cleanup of escaped descendants. A later Fabric integration must retain
-Core's process-group ownership and leave the bridge and agent in that group.
+promise cleanup of escaped descendants. The Fabric bridge retains
+Core's process-group ownership and leaves the bridge and agent in that group.
 
-## Next native SDK integration slice: actual host boundary
+## Installable native SDK bridge
 
-Source evidence in this prepared tree:
+`package.mjs` builds a deterministic directory/tarball using the existing SDK
+packager; no downloads, lifecycle scripts, compilation or provider probes.
+`fabric-acp-bridge` is the discoverable executable, with an absolute,
+package-bound Node shebang (not `/usr/bin/env`, a shell, or a PATH-selected Node).
+The native SDK control endpoint and turn entrypoint are the same executable.
+Core must discover that installed file; `command.program` is exactly
+`context.binary`. Its turn arguments are `--turn` and one `{prompt:true}`;
+Core substitutes literal text, never shell syntax. A lookalike elsewhere on PATH
+is rejected before launching the ACP child.
 
-- [`sdk/typescript/index.mjs:30–75`](../../sdk/typescript/index.mjs):
-  `defineNativeHarness` requires probe/nativeContext/capabilities/plan/command/
-  normalize callbacks; `serveNative` is the Fabric control protocol, **not ACP**.
-- [`sdk/typescript/index.d.mts:122–188`](../../sdk/typescript/index.d.mts):
-  native metadata selects the executable; `NativeCommand` takes literal args
-  and `{ prompt: true }`, with selected credential references rather than values.
-- [`crates/fabric-runner/src/native_plugin.rs:114–174,384–493`](../../crates/fabric-runner/src/native_plugin.rs):
-  Core discovers `manifest.native.executable`; `command.program` must equal that
-  discovered path. Exactly one `{ prompt: true }` is required; Core substitutes
-  literal prompt text. Returning Node/a bridge instead of a discovered ACP agent,
-  or omitting the prompt argument, is rejected. Environment proposals are also
-  restricted to selected credentials/roots/controller state.
-- [`crates/fabric-runner/src/lib.rs:245–272`](../../crates/fabric-runner/src/lib.rs):
-  Core clears environment, supplies private roots as needed, launches with null
-  stdin and piped output in its owned process group. A direct stdio ACP agent
-  cannot receive initialization or session traffic on that null stdin.
+### Explicit offline setup
 
-Compatible approach for review: package an actual discoverable, content-pinned
-**native ACP bridge executable** as the selected harness executable (not an alias
-claiming an existing agent binary). Its future native metadata must discover the
-bridge itself; `harness.command` returns exactly `context.binary` with exactly one
-prompt marker. The bridge accepts that literal prompt argument, owns the ACP
-child's pipes using this module, and emits bounded native records for the existing
-normalizer. Core continues owning the bridge/child process group; neither detaches.
-Its runtime and underlying agent launch configuration need explicit reviewed
-packaging/profile/consent rather than environment or executable substitution.
-This meets the current executable/prompt/stdin contract without changing Core;
-no such executable, manifest, selection alias or session implementation is added
-here.
+Review an absolute executable and literal arguments yourself. Hashes must come
+from independently approved files, not agent metadata. Example nonsecret
+`launch-input.json` for a native binary:
 
-That next slice still needs native SDK packaging, exact-version probing,
-capability/profile evidence, consent/auth readiness policy, `session/new` and
-`session/prompt` event normalization, permission routing, cancellation, usage/cost
-semantics and artifact/session lifecycle integration. Stage one implements none
-of those higher-level worker requirements and does not advertise ACP support.
-
-## Provider-free check
-
-```sh
-node --test plugins/acp/*.test.mjs
+```json
+{
+  "executable": {"path": "/approved/absolute/agent", "sha256": "<64 lowercase hex>"},
+  "args": ["acp"],
+  "nativeHome": "/approved/absolute/native-home",
+  "cwd": "fabric-workspace",
+  "pins": [],
+  "requestTimeoutMs": 60000
+}
 ```
 
-Real fixture children run in fresh temporary working directories with explicit
-minimal environments. Coverage includes fragmented/multibyte/coalesced frames,
-out-of-order replies, independent connections, negotiation validation, unsupported
-requests, bounded no-LF records, strict IDs/envelopes, EOF/disconnection, pending
-RPC and callback cancellation, deadlines, sanitized failures and owned reaping
-(including a TERM-ignoring child). No provider, model prompt, native-agent
-acceptance, installation or authentication is exercised.
+All paths must already exist, be absolute and canonical. Executable/runtime
+files are SHA-256 checked during packaging, probe/context/plan/command and again
+before the child launches. Explicit additional `pins` bind script/resource files.
+Shebang ACP entrypoints are rejected: select an approved absolute runtime and
+literal absolute script argument instead, pinning that script. When that runtime
+is the bridge's Node, its first argument must be a pinned script (no loader flags).
+This is not transitive dependency attestation or a sandbox: review the executable,
+arguments and its dependencies. Same-user filesystem replacement races are not
+atomically excluded.
+
+`cwd` has exactly one supported policy: `fabric-workspace`. The bridge passes
+Core's canonical working directory literally both to spawn and `session/new`;
+it cannot select a different user/project directory. The explicit spawn environment
+contains only `HOME` (the configured native home) and `LC_ALL=C`; macOS may add
+`__CF_USER_TEXT_ENCODING` inside the child runtime even with an empty environment.
+No inherited PATH, credentials, `NODE_OPTIONS`, loader environment or arbitrary
+environment field is accepted.
+Native config/credential contents stay in native stores; neither packaging nor
+the bridge reads/copies them. Never put credentials in arguments or configuration.
+Native stores/configuration remain mutable and are not fingerprinted as model
+or authentication evidence.
+
+Use an explicitly approved absolute Node >=22.18 executable for these commands.
+`REGISTRY` must be a private canonical directory outside Git;
+`FABRIC` is the absolute installed Fabric binary. Registration is explicit:
+
+```sh
+/absolute/node plugins/acp/package.mjs launch-input.json /absolute/new-package /absolute/acp.tgz
+# Retain/review the printed package sha256 and new-package/launch.json.
+/absolute/node sdk/typescript/cli.mjs install /absolute/acp.tgz \
+  --registry "$REGISTRY" --fabric "$FABRIC" --version 0.1.0 --sha256 "$HASH" --trust
+export FABRIC_PLUGIN_REGISTRY="$REGISTRY"
+export FABRIC_ACP_HOME=/approved/absolute/native-home
+export PATH="$REGISTRY/packages/$HASH:/usr/bin:/bin"
+"$FABRIC" harnesses doctor acp --json
+```
+
+Changing executable, argv, native home, pins, setup timeout or runtime requires a
+new reviewed package/hash and explicit SDK upgrade; no launch field comes from
+peer metadata. Probe/version describe **this bridge**, not a native agent version.
+`agentInfo`, auth methods, modes/models and capability metadata are untrusted,
+never consent or readiness. No authenticate, install, login or model-selection RPC.
+
+### Native context / current host limit
+
+The selected `FABRIC_ACP_HOME` must exactly match the packaged native home.
+Inspection returns a native-default profile and `credential_available:false`:
+generic ACP cannot prove authentication or model readiness without a separate
+typed policy. `fabric harness connect acp` consequently **fails closed** in the
+current host (`crates/fabric-core/src/onboarding.rs` requires credential
+availability). The plugin does not forge readiness to make that route green.
+
+The existing explicit-profile API is usable for an operator-reviewed invocation:
+
+```sh
+# Run inside the registered, prepared, committed source checkout.
+"$FABRIC" --root "$STORAGE" init --harness acp --check --json > /private/inspection.json
+jq '.native_context.profile' /private/inspection.json > /private/acp-profile.json
+# Review native-home exposure and the installed package/launch configuration.
+"$FABRIC" --root "$STORAGE" run PROJECT --harness acp --placement local \
+  --profile /private/acp-profile.json --prompt-file /private/prompt.txt --json
+```
+
+This explicit profile is execution consent, **not** verified authentication.
+No automatic onboarding, model resolution, credential-readiness success or
+provider support is claimed. Native-default only: model overrides/exact policies,
+resume/followup, cost limits, imported skills/plugins/MCP, inspect/publish access,
+and nonlocal placement are rejected. Core owns workspace/patch/cancellation.
+Only headless text turns and structured text/failure normalization are native
+capabilities. All other optional capabilities remain unsupported.
+
+### Turn and normalization contract
+
+The bridge performs `initialize` → `session/new` (empty `mcpServers`) →
+`session/prompt` (one text block). IDs are connection-local; no session persistence,
+restart, replay or second turn. Only matching `session/update` notifications
+during the prompt, containing `agent_message_chunk` text, are supported.
+Each text chunk is at most 32,768 UTF-8 bytes; output buffering is at most 1 MiB.
+Control characters except tab/newline are removed before capture. Unknown updates,
+reasoning, tools, modalities and peer requests fail, rather than dropping data or
+auto-approving. Opaque `_meta` is never acted on.
+
+Only a validated `end_turn` permits exit zero; cancelled/refused/limited turns and
+malformed/unknown stops fail. No done, usage, cost, model identity, native
+capability or provider-success record is invented. Normalization accepts only
+bridge text, fixed-code failure, and validated stop records. Core creates its own
+process lifecycle events. Native stdout/text is sensitive content, not universal
+secret-redacted output; peer stderr and remote error messages/data are discarded.
+
+Initialization has a 10-second deadline; `session/new` uses the package-bound
+1–300,000 ms setup timeout (default 60 seconds). **The prompt turn has no RPC
+wall-clock timeout**: its AbortSignal owner, disconnect and Core cancellation
+control termination. Core's separately configured worker ceiling still applies;
+it is not a routine restart policy. Signals while a prompt is pending attempt
+`session/cancel`, then terminate/reap the owned child, escalating after 250 ms.
+Notification delivery is best-effort; bounded teardown is not. Nothing detaches
+or creates a new process group. No restart/retry loop.
+
+## Provider-free regression
+
+```sh
+FABRIC_ACP_TEST_HOST=/absolute/built/fabric /absolute/node --test plugins/acp/*.test.mjs
+```
+
+The host integration test requires a real built Fabric; it never silently skips.
+Without `FABRIC_ACP_TEST_HOST`, it uses this checkout's `target/debug/fabric`.
+No SDK native-reference conformance helper is used.
+
+The check packages/installs into an isolated registry, uses real fixture children
+through Core probe/context/capabilities/plan/command/normalization and local target
+primitives, verifies text/patch/artifact hashes, malformed and mismatched events,
+tools/modalities/requests, remote failure, invalid stops, disconnect,
+longer-than-setup-deadline turns and pending-turn cancellation. It checks process-group
+inheritance/reaping and rejects changed launch pins without executing replacements.
+It clones the local existing commit into a temporary fixture repo; no commit,
+remote, provider, credential store or supervisor storage is touched. Owned
+temporary trees/children are cleaned up. Transport-only checks additionally
+cover deadlines and remain independent:
+`/absolute/node --test plugins/acp/transport.test.mjs`.
 
 Protocol references: [initialization](https://agentclientprotocol.com/protocol/v1/initialization.md),
 [stdio](https://agentclientprotocol.com/protocol/v1/transports.md),
