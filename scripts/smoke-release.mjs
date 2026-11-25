@@ -32,8 +32,8 @@ const env = {
   GIT_AUTHOR_NAME: 'Release smoke', GIT_AUTHOR_EMAIL: 'smoke@example.invalid',
   GIT_COMMITTER_NAME: 'Release smoke', GIT_COMMITTER_EMAIL: 'smoke@example.invalid',
 };
-function run(command, argv, cwd = fixture) {
-  const result = spawnSync(command, argv, { cwd, env, encoding: 'utf8', timeout: 180_000, maxBuffer: 8 * 1024 * 1024 });
+function run(command, argv, cwd = fixture, environment = env) {
+  const result = spawnSync(command, argv, { cwd, env: environment, encoding: 'utf8', timeout: 180_000, maxBuffer: 8 * 1024 * 1024 });
   assert.ifError(result.error);
   assert.equal(result.status, 0, `${command} ${argv.join(' ')}\n${result.stderr}`);
   return result.stdout.trim();
@@ -91,6 +91,22 @@ try {
     assert.equal(pkg.hash, plugin.sha256);
     assert.equal(pkg.info.version, plugin.version);
   }
+  // Required on every candidate: absence is a failure, never a skipped ACP proof.
+  const kit = manifest.acp_profile_kit;
+  assert.equal(kit.id, 'fabric-acp');
+  assert.equal(kit.version, '0.1.0');
+  assert.equal(kit.protocol, 1);
+  assert.equal(kit.path, 'plugins/acp');
+  assert.equal(kit.sdk_path, 'sdk');
+  assert.equal(kit.purpose, 'offline-profile-authoring-only');
+  assert.equal(kit.installable, false);
+  assert.equal(kit.fixture.path, 'plugins/acp/fixtures/turn-agent.mjs');
+  for (const file of [
+    ...['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'README.md', 'fixtures/turn-agent.mjs'].map(file => `${kit.path}/${file}`),
+    ...['cli.mjs', 'package.mjs', 'protocol.mjs', 'index.mjs', 'webhook.mjs'].map(file => `${kit.sdk_path}/${file}`),
+  ]) assert.match(manifest.files[file], /^[a-f0-9]{64}$/, `required pinned ACP kit/SDK payload: ${file}`);
+  assert.equal(existsSync(join(installed, kit.path, 'launch.json')), false, 'kit must not bind a native profile');
+  assert.equal(existsSync(join(installed, kit.path, 'package.json')), false, 'kit is not an installable plugin');
   const binary = join(installed, 'bin/fabric');
   assert.equal(run(binary, ['--version']), manifest.cli_version);
   assert.equal(JSON.parse(run(binary, ['doctor', '--json'])).platform.supported, true);
@@ -118,7 +134,8 @@ try {
   mkdirSync(repo, { mode: 0o700 });
   for (const argv of [['init', '--quiet'], ['config', 'core.hooksPath', '/dev/null']]) run('/usr/bin/git', argv, repo);
   writeFileSync(join(repo, 'tracked'), 'release fixture\n');
-  run('/usr/bin/git', ['add', 'tracked'], repo);
+  writeFileSync(join(repo, 'README.md'), 'release source fixture\n');
+  run('/usr/bin/git', ['add', 'tracked', 'README.md'], repo);
   run('/usr/bin/git', ['-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'fixture'], repo);
   const projectSource = run('/usr/bin/git', ['rev-parse', 'HEAD'], repo);
   const cli = argv => JSON.parse(run(binary, ['--root', join(fixture, 'fabric'), 'project', ...argv, '--json'], repo));
@@ -134,7 +151,92 @@ try {
   const worker = JSON.parse(run(binary, ['--root', join(fixture, 'fabric'), 'run', 'release-smoke', '--harness', 'fake', '--fake-binary', join(installed, manifest.fixture.path), '--prompt-file', prompt, '--copy-limit-bytes', '10485760', '--json'], repo));
   assert.equal(worker.state, 'SUCCEEDED');
   assert.equal(worker.cleanup.action, 'reclaimed');
-  console.log(JSON.stringify({ proof: fromArchive ? (local ? 'LOCAL_PACKAGE_ONLY' : 'RELEASE_CANDIDATE_LOCAL_PACKAGE') : 'DOWNLOADED_RELEASE', source_sha: source, archive: manifest.archive, sha256: expectedHash, installed, cli_version: manifest.cli_version, executable_sha256: manifest.files['bin/fabric'], plugins: manifest.plugins, target_plugins: manifest.target_plugins, local_target_worker: { run_id: worker.run_id, state: worker.state, cleanup: worker.cleanup.action }, omp_extension: manifest.omp_extension, fixture: manifest.fixture, native_discovery: native, project_source_sha: projectSource, prepared_state: prepared.state_id, runtime_path: env.PATH, cargo: 'absent', rustc: 'absent', providers: 'not invoked', manager: 'not started', codex_discovery: 'not tested', host_swarm: 'not tested' }, null, 2));
+  // Offline extracted-kit proof. The only ACP executable is Node running the
+  // shipped, explicitly fake peer copied into this owned temporary profile.
+  run('/bin/sh', ['-c', '! command -v cargo && ! command -v rustc && ! command -v bun && ! command -v npm']);
+  const acp = join(fixture, 'acp');
+  const acpHome = join(acp, 'native-home'), acpRegistry = join(acp, 'registry');
+  mkdirSync(acp, { mode: 0o700 });
+  mkdirSync(acpHome, { mode: 0o700 });
+  mkdirSync(acpRegistry, { mode: 0o700 });
+  const peer = join(acp, 'deterministic-fake-acp-peer.mjs'), log = join(acp, 'peer.jsonl');
+  writeFileSync(peer, readFileSync(join(installed, kit.fixture.path)), { mode: 0o600, flag: 'wx' });
+  const node = realpathSync(process.execPath);
+  const launchInput = join(acp, 'launch-input.json'), archivePath = join(acp, 'profile.tgz');
+  writeFileSync(launchInput, JSON.stringify({
+    executable: { path: node, sha256: hash(readFileSync(node)) }, args: [peer, log],
+    nativeHome: acpHome, cwd: 'fabric-workspace', pins: [{ path: peer, sha256: hash(readFileSync(peer)) }],
+    requestTimeoutMs: 5000,
+  }), { mode: 0o600, flag: 'wx' });
+  const packaged = JSON.parse(run(node, [join(installed, kit.path, 'package.mjs'), launchInput, join(acp, 'package'), archivePath]));
+  assert.equal(directory(packaged.package).hash, packaged.sha256);
+  const sdk = join(installed, kit.sdk_path, 'cli.mjs');
+  const registered = JSON.parse(run(node, [sdk, 'install', archivePath, '--registry', acpRegistry,
+    '--fabric', binary, '--version', kit.version, '--sha256', packaged.sha256, '--trust']));
+  assert.equal(registered.sha256, packaged.sha256);
+  const bridgeDir = join(acpRegistry, 'packages', packaged.sha256);
+  const bridge = join(bridgeDir, 'fabric-acp-bridge');
+  // The local target is the existing official package, not another SDK/runtime.
+  const localTarget = manifest.target_plugins.find(plugin => plugin.id === 'local');
+  run(node, [sdk, 'install', join(installed, 'plugins/local'), '--registry', acpRegistry, '--fabric', binary,
+    '--version', localTarget.version, '--sha256', localTarget.sha256, '--trust']);
+  const acpEnv = { ...env, PATH: `${bridgeDir}:/usr/bin:/bin`, FABRIC_PLUGIN_REGISTRY: acpRegistry, FABRIC_ACP_HOME: acpHome };
+  const host = argv => JSON.parse(run(binary, ['--root', join(acp, 'storage'), ...argv, '--json'], repo, acpEnv));
+  const context = host(['init', '--harness', 'acp', '--check']).native_context;
+  assert.equal(context.credential_available, false);
+  assert.deepEqual(context.credential_paths, []);
+  assert.deepEqual(context.profile.model_policy, { kind: 'native-default' });
+  assert.equal(existsSync(log), false, 'offline packaging/install/context must not launch the peer');
+  const inspection = JSON.parse(run(bridge, ['--inspect', '--cwd', repo], acp, { HOME: acpHome, LC_ALL: 'C' }));
+  assert.equal(inspection.stage, 'negotiated');
+  assert.equal(inspection.code, 'acp_initialized');
+  assert.equal(inspection.protocolVersion, 1);
+  assert.equal(inspection.cleanup, 'reaped');
+  assert.equal(inspection.auth, 'unverified');
+  assert.equal(inspection.model, 'unverified');
+  assert.equal(inspection.peer_identity, 'untrusted');
+  assert.equal(inspection.launch.config_sha256, hash(readFileSync(join(bridgeDir, 'launch.json'))));
+  const records = () => readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(records().filter(record => record.method).map(record => record.method), ['initialize']);
+  const profile = join(acp, 'profile.json'), acpPrompt = join(acp, 'prompt.txt');
+  const text = 'deterministic fake ACP release proof';
+  writeFileSync(profile, JSON.stringify(context.profile), { mode: 0o600, flag: 'wx' });
+  writeFileSync(acpPrompt, text, { mode: 0o600, flag: 'wx' });
+  host(['project', 'add', '--name', 'acp-release-smoke', '--path', repo]);
+  host(['project', 'prepare', 'acp-release-smoke', '--recipe', recipe]);
+  const turn = host(['run', 'acp-release-smoke', '--harness', 'acp', '--placement', 'local',
+    '--profile', profile, '--prompt-file', acpPrompt, '--copy-limit-bytes', '10485760', '--timeout-seconds', '30']);
+  assert.equal(turn.state, 'SUCCEEDED');
+  assert.equal(turn.capture.native_failure, null);
+  assert.equal(turn.cleanup.action, 'reclaimed');
+  assert.equal(existsSync(turn.workspace_path), false);
+  assert.equal(readFileSync(join(repo, 'README.md'), 'utf8'), 'release source fixture\n', 'source checkout must remain unchanged');
+  const { artifacts } = host(['runs', 'artifacts', turn.run_id]);
+  const contents = new Map();
+  for (const artifact of artifacts) {
+    const bytes = readFileSync(join(acp, 'storage', artifact.relative_path));
+    assert.equal(bytes.length, artifact.size_bytes);
+    assert.equal(hash(bytes), artifact.sha256);
+    contents.set(artifact.kind, bytes.toString('utf8'));
+  }
+  assert.match(contents.get('tracked_patch'), /-release source fixture\n\+ACP fixture worker\n/);
+  assert.match(contents.get('tracked_patch'), /^diff --git a\/README\.md b\/README\.md\n/);
+  const events = contents.get('events').trim().split('\n').map(line => JSON.parse(line)).filter(record => record.event).map(record => record.event);
+  assert.deepEqual(events.filter(event => event.type === 'output'), [{ type: 'output', stream: 'stdout', text }]);
+  assert.equal(events.some(event => ['failure', 'tool', 'usage'].includes(event.type)), false);
+  assert.deepEqual(records().filter(record => record.method).map(record => record.method),
+    ['initialize', 'initialize', 'session/new', 'session/prompt']);
+  const child = records().find(record => record.pid);
+  assert.equal(child.cwd, turn.workspace_path);
+  assert.equal(child.home, acpHome);
+  assert.equal(child.prompt, text);
+  assert.deepEqual(child.environment.filter(key => key !== '__CF_USER_TEXT_ENCODING'), ['HOME', 'LC_ALL']);
+  for (const pid of new Set(records().flatMap(record => [record.pid, record.stopped].filter(Boolean)))) {
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'owned fake ACP child must be reaped');
+  }
+  const acpProof = { kind: 'DETERMINISTIC_FAKE_ACP_ONLY', kit, package_sha256: packaged.sha256,
+    inspection, run_id: turn.run_id, state: turn.state, cleanup: turn.cleanup.action, artifacts };
+  console.log(JSON.stringify({ proof: fromArchive ? (local ? 'LOCAL_PACKAGE_ONLY' : 'RELEASE_CANDIDATE_LOCAL_PACKAGE') : 'DOWNLOADED_RELEASE', source_sha: source, archive: manifest.archive, sha256: expectedHash, installed, cli_version: manifest.cli_version, executable_sha256: manifest.files['bin/fabric'], plugins: manifest.plugins, target_plugins: manifest.target_plugins, acp_profile_kit: acpProof, local_target_worker: { run_id: worker.run_id, state: worker.state, cleanup: worker.cleanup.action }, omp_extension: manifest.omp_extension, fixture: manifest.fixture, native_discovery: native, project_source_sha: projectSource, prepared_state: prepared.state_id, runtime_path: env.PATH, cargo: 'absent', rustc: 'absent', providers: 'not invoked', manager: 'not started', codex_discovery: 'not tested', host_swarm: 'not tested' }, null, 2));
 } finally {
   removePrivate(fixture);
   rmSync(fixture, { recursive: true, force: true });

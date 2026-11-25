@@ -6,6 +6,47 @@ ESM. One connection and one text turn, not another scheduler.
 **Provider-free integration is not native provider support or completion of #95.**
 Native initialization and live-turn gates require separate approval and evidence.
 
+## Release profile-authoring kit (v0.1.22 candidate)
+
+The macOS archive ships these genuine authoring sources at `plugins/acp/`,
+including this README, the packager, bridge, inspector, config and transport.
+It reuses the archive's single `sdk/`; it does not ship a preconfigured
+installable ACP profile or a second SDK. `release.json.acp_profile_kit` identifies
+the kit/version/protocol and its authoring-only meaning; `release.json.files`
+pins every kit, SDK and labelled fake-peer payload.
+
+From the extracted archive root, use `plugins/acp/package.mjs` as below and
+`sdk/cli.mjs` for installation.
+Use only an owner-reviewed absolute Node and explicit local launch input.
+Packaging is offline and never executes the selected native program. No native
+executable, HOME path, credentials, settings, account/provider/model or supported
+status is prebound; the owner explicitly binds executable/runtime/settings
+hashes and native HOME while packaging their own profile.
+
+The shipped `fixtures/turn-agent.mjs` is a **deterministic fake ACP peer**, not
+Cline, Cursor or native provider support. The extracted release smoke copies it
+into an owned temporary profile, packages/installs via shipped files, checks
+initialize-only inspection, then proves an isolated real-host text/edit turn,
+sealed artifact hashes, unchanged source and owned child/workspace cleanup.
+No checkout imports, compilation, Bun, npm hooks, native install/update/login,
+inherited credentials or network/model calls participate in that ACP proof.
+Missing kit files, broken SDK relocation or invalid success/artifact evidence
+fail the smoke rather than skipping coverage. Runnable candidate regression:
+
+```sh
+/absolute/node /absolute/extracted/scripts/smoke-release.mjs --archive \
+  /absolute/fabric-v0.1.22-macos-arm64.tar.gz "$HASH" "$SOURCE_SHA" /absolute/new-install
+```
+
+This command also retains the ordinary OMP/Codex/local release smoke and its
+public OMP version download; only the ACP portion is offline. For a locally
+packaged, unreviewed candidate use `--local` instead of `--archive`.
+v0.1.22 publication/downloaded acceptance remains manager-owned. Recorded native
+Cline 3.0.75 initialization is not native session/model/controller/worker proof.
+Cursor second-native-profile proof and remaining #95 gates stay **OPEN**;
+neither kit shipment nor fake/initialize-only success completes stage one.
+
+
 ## API
 
 ```js
