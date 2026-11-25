@@ -103,6 +103,10 @@ await run(binary, ["--root", root, "up", "--controller", "--source-only", "--jso
  assert.deepEqual(await readFile(join(root, ".native-context-omp.json")), grant);
  assert.ok(up.next_command.includes("controller")); assert.equal(up.project, "demo");
  const first = host();
+ const state = await first.request("get_state");
+ await writeFile(join(evidence, "get-state.json"), JSON.stringify(state));
+ assert.equal(state.isStreaming, false, "native host must be idle; no model turn is allowed");
+ assert.equal(state.isCompacting, false, "native host must not be compacting");
  const commands = (await first.request("get_available_commands")).commands;
  assert.ok(commands.some((c: Doc) => c.name === "fabric")); assert.ok(commands.some((c: Doc) => c.name === "swarm"));
  if (process.argv[4]) assert.ok(commands.some((c: Doc) => c.name === "skill:swarm"), "pinned external skill was not discovered");
