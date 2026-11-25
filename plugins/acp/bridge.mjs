@@ -16,7 +16,7 @@ const codes = new Set([
   'acp_callback_failed', 'acp_callback_overflow', 'acp_write_overflow', 'acp_deadline', 'acp_aborted',
   'acp_closed', 'acp_disconnected', 'acp_remote_error', 'acp_initialize_failed', 'acp_unsupported_request',
   'acp_invalid_session', 'acp_invalid_update', 'acp_unsupported_update', 'acp_invalid_stop',
-  'acp_turn_cancelled', 'acp_turn_incomplete', 'acp_output_overflow', 'acp_extension_overflow', 'acp_bridge_failed',
+  'acp_turn_cancelled', 'acp_turn_incomplete', 'acp_output_overflow', 'acp_extension_overflow', 'acp_tool_overflow', 'acp_bridge_failed',
 ]);
 const clean = text => text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 const all = ['headless.run', 'events.structured', 'model.override', 'session.resume', 'session.followup',
@@ -29,6 +29,71 @@ const extension = method => !method.startsWith('rpc.') &&
   /^[A-Za-z_][A-Za-z0-9_.-]*\/[A-Za-z_][A-Za-z0-9_./-]*$/.test(method) &&
   !['session', 'fs', 'terminal'].includes(method.split('/', 1)[0]);
 const extensionLimits = { prefixBytes: 2048, recordBytes: 4096, turnBytes: 32_768, turnCount: 32 };
+const toolLimit = 256;
+const toolStatuses = ['pending', 'in_progress', 'completed', 'failed'];
+const toolKinds = ['read', 'edit', 'delete', 'move', 'search', 'execute', 'think', 'fetch', 'switch_mode', 'other'];
+const text = value => typeof value === 'string';
+const optional = (value, key, check) => value[key] == null || check(value[key]);
+const dataFields = (value, names) => fields(value, [...names, '_meta']) && optional(value, '_meta', object);
+const terminal = status => status === 'completed' || status === 'failed';
+const uint32 = value => Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff;
+
+function contentBlock(value) {
+  if (!object(value) || !optional(value, 'annotations', annotations =>
+    dataFields(annotations, ['audience', 'lastModified', 'priority']) &&
+    optional(annotations, 'audience', roles => Array.isArray(roles) && roles.every(role => ['user', 'assistant'].includes(role))) &&
+    optional(annotations, 'lastModified', text) && optional(annotations, 'priority', priority => typeof priority === 'number'))) return false;
+  const common = ['type', 'annotations'];
+  switch (value.type) {
+    case 'text':
+      return dataFields(value, [...common, 'text']) && text(value.text);
+    case 'image':
+    case 'audio':
+      return dataFields(value, [...common, 'data', 'mimeType', ...(value.type === 'image' ? ['uri'] : [])]) &&
+        text(value.data) && text(value.mimeType) && optional(value, 'uri', text);
+    case 'resource_link':
+      return dataFields(value, [...common, 'uri', 'name', 'mimeType', 'title', 'description', 'size']) &&
+        text(value.uri) && text(value.name) && ['mimeType', 'title', 'description'].every(key => optional(value, key, text)) &&
+        optional(value, 'size', size => Number.isSafeInteger(size) && size >= 0);
+    case 'resource': {
+      const resource = value.resource;
+      return dataFields(value, [...common, 'resource']) && object(resource) && text(resource.uri) &&
+        optional(resource, 'mimeType', text) &&
+        ((dataFields(resource, ['uri', 'mimeType', 'text']) && text(resource.text)) ||
+         (dataFields(resource, ['uri', 'mimeType', 'blob']) && text(resource.blob)));
+    }
+    default: return false;
+  }
+}
+
+function toolContent(value) {
+  if (!object(value)) return false;
+  switch (value.type) {
+    case 'content': return dataFields(value, ['type', 'content']) && contentBlock(value.content);
+    case 'diff': return dataFields(value, ['type', 'path', 'oldText', 'newText']) &&
+      text(value.path) && optional(value, 'oldText', text) && text(value.newText);
+    case 'terminal': return dataFields(value, ['type', 'terminalId']) && text(value.terminalId);
+    default: return false; // No subagents capability is advertised.
+  }
+}
+
+function validTool(update) {
+  const initial = update.sessionUpdate === 'tool_call';
+  if (!dataFields(update, ['sessionUpdate', 'toolCallId', 'title', 'name', 'kind', 'status',
+    'content', 'locations', 'rawInput', 'rawOutput']) || !text(update.toolCallId)) return false;
+  if (initial && (!text(update.title) ||
+      (Object.hasOwn(update, 'kind') && !toolKinds.includes(update.kind)) ||
+      (Object.hasOwn(update, 'status') && !toolStatuses.includes(update.status)) ||
+      (Object.hasOwn(update, 'content') && !Array.isArray(update.content)) ||
+      (Object.hasOwn(update, 'locations') && !Array.isArray(update.locations)))) return false;
+  // rawInput/rawOutput are arbitrary JSON, including null; no payload is retained.
+  return optional(update, 'title', text) && optional(update, 'name', text) &&
+    optional(update, 'kind', kind => toolKinds.includes(kind)) &&
+    optional(update, 'status', status => toolStatuses.includes(status)) &&
+    optional(update, 'content', content => Array.isArray(content) && content.every(toolContent)) &&
+    optional(update, 'locations', locations => Array.isArray(locations) && locations.every(location =>
+      dataFields(location, ['path', 'line']) && text(location.path) && optional(location, 'line', uint32)));
+}
 
 function plugin(config, configBytes) {
   const profile = {
@@ -87,6 +152,13 @@ function plugin(config, configBytes) {
       if (fields(event, ['type', 'text']) && event.type === 'acp.text' && typeof event.text === 'string' && Buffer.byteLength(event.text) <= 32_768) {
         return { event: { type: 'output', stream: 'stdout', text: clean(event.text) } };
       }
+      if (fields(event, ['type', 'call', 'status', 'phase']) && event.type === 'acp.tool' &&
+          Number.isInteger(event.call) && event.call >= 1 && event.call <= toolLimit &&
+          [...toolStatuses, 'unknown'].includes(event.status) &&
+          (event.phase === 'update' || (event.phase === 'end' && terminal(event.status)) ||
+           (event.phase === 'start' && ['pending', 'in_progress'].includes(event.status)))) {
+        return { event: { type: 'tool', name: `acp.tool.${event.call}.${event.status}`, phase: event.phase } };
+      }
       if (fields(event, ['type', 'code']) && event.type === 'acp.failure' && codes.has(event.code)) {
         return { event: { type: 'failure', code: event.code, message: event.code === 'acp_unsupported_request'
           ? 'Unsupported blocking ACP peer request; no input or approval supplied.' : event.code } };
@@ -100,6 +172,7 @@ function plugin(config, configBytes) {
 async function turn(config, prompt) {
   let connection, sessionId, pending = false, firstFailure;
   let phase = 'initialize', extensionCount = 0, extensionBytes = 0;
+  const tools = new Map();
   const controller = new AbortController();
   function emit(event) {
     const line = JSON.stringify(event) + '\n';
@@ -119,6 +192,22 @@ async function turn(config, prompt) {
     extensionCount++;
     extensionBytes += size;
     process.stderr.write(line);
+  }
+  function reportTool(update) {
+    if (!validTool(update)) fail('acp_invalid_update');
+    // Fixed-size keys retain correlation, not peer IDs or metadata. Per turn only.
+    const key = sha256(JSON.stringify(update.toolCallId));
+    let tool = tools.get(key);
+    if (!tool) {
+      if (tools.size >= toolLimit) fail('acp_tool_overflow');
+      tool = { call: tools.size + 1, status: 'unknown' };
+      tools.set(key, tool);
+    }
+    const initial = update.sessionUpdate === 'tool_call';
+    tool.status = update.status ?? (initial ? 'pending' : tool.status);
+    // A delta does not imply a missing start; end_turn does not imply tool completion.
+    const phase = (initial || update.status != null) && terminal(tool.status) ? 'end' : initial ? 'start' : 'update';
+    emit({ type: 'acp.tool', call: tool.call, status: tool.status, phase });
   }
   function stop(code) {
     firstFailure ??= code;
@@ -149,10 +238,15 @@ async function turn(config, prompt) {
             return;
           }
           const params = message.params;
-          if (!pending || !requestPendingAtReceipt || !fields(params, ['sessionId', 'update', '_meta']) ||
+          if (!pending || !requestPendingAtReceipt || !dataFields(params, ['sessionId', 'update']) ||
               params.sessionId !== sessionId) fail('acp_invalid_update');
           const update = params.update;
-          if (!object(update) || update.sessionUpdate !== 'agent_message_chunk') fail('acp_unsupported_update');
+          if (!object(update)) fail('acp_invalid_update');
+          if (['tool_call', 'tool_call_update'].includes(update.sessionUpdate)) {
+            reportTool(update);
+            return;
+          }
+          if (update.sessionUpdate !== 'agent_message_chunk') fail('acp_unsupported_update');
           if (!fields(update, ['sessionUpdate', 'content', '_meta']) ||
               !fields(update.content, ['type', 'text', '_meta']) || update.content.type !== 'text' ||
               typeof update.content.text !== 'string' || Buffer.byteLength(update.content.text) > 32_768) fail('acp_invalid_update');
