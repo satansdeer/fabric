@@ -1132,3 +1132,9 @@ No native model/session/controller/worker support was tested. Recorded Cline
 3.0.75 initialize-only evidence remains distinct. Cursor second-native-profile
 proof and remaining #95 gates stay OPEN; stage one is not complete. Manager
 review, CI, publication and independent downloaded acceptance remain outstanding.
+
+CI run `45642466664` exposed a mixed-log assertion race in the existing installed
+ACP integration check: a legitimate fixture `{ stopped: pid }` teardown record
+was projected to an extra `undefined` RPC method. The check now uses the same
+method-presence filter as initialize inspection tests and verifies every recorded
+stopped PID is reaped. No transport, timeout, cancellation or cleanup guard changed.
