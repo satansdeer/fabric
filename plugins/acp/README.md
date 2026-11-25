@@ -1,4 +1,4 @@
-# ACP v1 transport and external native text bridge
+# ACP v1 transport and external native bridge
 
 The offline-packaged SDK plugin reuses the ACP v1 transport, with an explicit
 initialize-only inspection command (#101). No runtime dependencies; Node >=22.18,
@@ -362,19 +362,47 @@ No automatic onboarding, model resolution, credential-readiness success or
 provider support is claimed. Native-default only: model overrides/exact policies,
 resume/followup, cost limits, imported skills/plugins/MCP, inspect/publish access,
 and nonlocal placement are rejected. Core owns workspace/patch/cancellation.
-Only headless text turns and structured text/failure normalization are native
-capabilities. All other optional capabilities remain unsupported.
+Only headless text turns and structured text/tool/failure normalization are native
+capabilities. Tool notifications add no execution or approval capability.
+All other optional capabilities remain unsupported.
 
 ### Turn and normalization contract
 
 The bridge performs `initialize` → `session/new` (empty `mcpServers`) →
 `session/prompt` (one text block). IDs are connection-local; no session persistence,
 restart, replay or second turn. Core `session/update` notifications must match the
-exact session during the pending prompt and contain `agent_message_chunk` text.
-Each text chunk is at most 32,768 UTF-8 bytes; output buffering is at most 1 MiB.
-Control characters except tab/newline are removed before capture. Malformed,
-mismatched or out-of-phase core updates, unknown core methods, reasoning, tools
-and modalities still fail closed. Opaque `_meta` is never acted on.
+exact session during the pending prompt, including the wire-receipt phase check.
+Supported variants are `agent_message_chunk` text, `tool_call` and
+`tool_call_update`. Each text chunk is at most 32,768 UTF-8 bytes; output buffering
+is at most 1 MiB. Control characters except tab/newline are removed from text.
+Malformed, mismatched or out-of-phase core updates, unknown core methods,
+reasoning and non-text agent messages still fail closed.
+
+**Tool lifecycle subset (stable v1):** initial calls require string `toolCallId`
+and `title`; omitted kind/status default to `other`/`pending`. Updates require
+only the ID; omitted/null optional fields leave previous evidence unchanged.
+Raw input/output accept any JSON value, not only objects. Standard content blocks
+(text, image, audio, resource link, embedded resource), diffs, locations and
+terminal references are shape-validated and discarded. Subagent session content
+is rejected: no `subagents` capability is advertised. Peer titles, names, IDs,
+commands, arguments, output, paths, content and `_meta` are never used as native
+names or diagnostics, retained as raw tool evidence, executed, opened or applied.
+Filesystem, terminal and permission requests remain unsupported even after a
+tool notification; the bridge advertises empty client capabilities.
+
+At most 256 distinct tool IDs are correlated per turn using fixed-size hashes;
+the next distinct ID fails with `acp_tool_overflow`. No lifecycle history or raw
+metadata is kept. Native tool names are bridge-assigned
+`acp.tool.<ordinal>.<status>`, where status is a validated v1 enum or `unknown`
+for an update without a preceding announcement/status. The ordinal is stable
+within a turn; the suffix carries status because the existing native event has
+no status field. An initial pending/in-progress announcement emits `start`;
+observed completed/failed statuses emit `end`; other deltas emit `update`.
+An initial terminal status emits only `end`. A failed tool does not fail the
+whole turn. Missing announcements are not synthesized, statuses need not be
+monotonic, and `end_turn` does not invent completion for unfinished tools.
+All events describe untrusted peer reports, not execution authority or proof
+that an action ran. Correlation is discarded with the turn.
 
 Unknown **notifications** may cross the shared extension boundary only with an
 ASCII namespaced method (`[A-Za-z_][A-Za-z0-9_.-]*/[A-Za-z_][A-Za-z0-9_./-]*`)
@@ -412,9 +440,9 @@ with its existing explicit truncation marker.
 Only a validated `end_turn` permits exit zero; cancelled/refused/limited turns and
 malformed/unknown stops fail. No done, usage, cost, model identity, native
 capability or provider-success record is invented. Normalization accepts only
-bridge text, fixed-code failure, and validated stop records. Extension evidence
-has no normalized event and adds no usage/tool/support claim. Core creates its
-own process lifecycle events. Native stdout/text and retained extension evidence
+bridge text, bounded tool labels, fixed-code failure, and validated stop records.
+Extension evidence has no normalized event and adds no usage/tool/support claim.
+Core creates its own process lifecycle events. Native stdout/text and retained extension evidence
 are sensitive content, not universal secret-redacted output; peer stderr and
 remote error messages/data are discarded. Initialize-only `--inspect` continues
 to discard all notification bodies; auth/model remain unverified and peer
@@ -442,15 +470,20 @@ No SDK native-reference conformance helper is used.
 The check packages/installs into an isolated registry, uses real fixture children
 through Core probe/context/capabilities/plan/command/normalization and local target
 primitives, verifies text/patch/artifact hashes, malformed and mismatched events,
-tools/modalities/requests, remote failure, invalid stops and disconnect. Extension
+tool lifecycles/deltas/defaults, malformed tool shapes, unsupported modalities and
+requests, remote failure, invalid stops and disconnect. Tool checks include
+arbitrary JSON input/output, non-monotonic and orphan updates, terminal initial
+reports, private sentinel non-disclosure, inert content/diffs/paths/terminals,
+correlation overflow and initialize/session-new/post-response phase rejection. Extension
 checks cover interleaved exact-session text/patch success, private bounded
 evidence, truncation/hash integrity, count/byte floods and blocking vendor
 requests (including the same method as an accepted notification with ID `0`).
 Two independently active installed-plugin turns have distinct literal prompts,
 children, evidence and owned workspaces: SIGINT cancels one with a pending prompt
-after extension delivery while the other remains alive, then the survivor
-produces only its own evidence/text/patch. Both workspaces are reclaimed and both
-children reaped without replay; a fixture release file makes overlap deterministic.
+after extension/tool delivery while the other remains alive, then the survivor
+produces only its own evidence/text/patch and terminal tool event. Cancelled tools
+receive no fabricated end. Both workspaces are reclaimed and both children reaped
+without replay; a fixture release file makes overlap deterministic.
 It also checks longer-than-setup-deadline turns, process-group inheritance and
 changed pins without executing replacements.
 It clones the local existing commit into a temporary fixture repo; no commit,
@@ -466,4 +499,5 @@ Transport-only checks remain independent:
 Protocol references: [initialization](https://agentclientprotocol.com/protocol/v1/initialization.md),
 [stdio](https://agentclientprotocol.com/protocol/v1/transports.md),
 [schema](https://agentclientprotocol.com/protocol/v1/schema.md),
+[tool calls](https://agentclientprotocol.com/protocol/v1/tool-calls.md),
 [security](https://agentclientprotocol.com/protocol/v1/security.md).

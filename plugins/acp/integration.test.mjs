@@ -25,7 +25,7 @@ function reaped(pid) {
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `owned child ${pid} still alive`);
 }
 
-test('installed ACP package through the real Fabric host (no providers)', { timeout: 300_000 }, async t => {
+test('installed ACP package through the real Fabric host (no providers)', { timeout: 360_000 }, async t => {
   assert.ok(existsSync(host), 'Real Fabric host required; set FABRIC_ACP_TEST_HOST to an absolute built host. Never skipped.');
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'fabric-acp-')));
   const registry = join(root, 'registry'), home = join(root, 'native-home'), repo = join(root, 'repo');
@@ -127,8 +127,12 @@ test('installed ACP package through the real Fabric host (no providers)', { time
       contents.set(artifact.kind, bytes.toString('utf8'));
     }
     const events = contents.get('events').trim().split('\n').map(line => JSON.parse(line)).filter(record => record.event).map(record => record.event);
-    assert.equal(events.some(event => event.type === 'usage' || event.type === 'tool'), false);
-    assert.doesNotMatch(contents.get('stdout') + contents.get('stderr') + contents.get('events'), /SECRET_|UNTRUSTED_/);
+    assert.equal(events.some(event => event.type === 'usage'), false);
+    for (const event of events.filter(event => event.type === 'tool')) {
+      assert.match(event.name, /^acp\.tool\.[1-9][0-9]{0,2}\.(pending|in_progress|completed|failed|unknown)$/);
+      assert.ok(['start', 'update', 'end'].includes(event.phase));
+    }
+    assert.doesNotMatch(result.stdout + result.stderr + contents.get('stdout') + contents.get('stderr') + contents.get('events'), /SECRET_|UNTRUSTED_/);
     const extensions = contents.get('stderr').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
     assert.ok(extensions.length <= 32);
     assert.ok(Buffer.byteLength(contents.get('stderr')) <= 32_768);
@@ -182,13 +186,91 @@ test('installed ACP package through the real Fabric host (no providers)', { time
       assert.equal(proof.extensions[0].truncated, true);
     } else assert.equal(proof.extensions.length, 32);
   }
-  const failures = { malformed: 'acp_invalid_update', mismatch: 'acp_invalid_update', tool: 'acp_unsupported_update',
+  const toolEvent = (call, status, phase) => ({ type: 'tool', name: `acp.tool.${call}.${status}`, phase });
+  writeFileSync(promptFile, 'fixture:tool');
+  const toolProof = evidence(fabric(runArgs), null);
+  assert.deepEqual(toolProof.events.filter(event => ['tool', 'output'].includes(event.type)), [
+    toolEvent(1, 'pending', 'start'), toolEvent(1, 'pending', 'update'), toolEvent(1, 'pending', 'update'),
+    toolEvent(1, 'in_progress', 'update'), { type: 'output', stream: 'stdout', text: 'fixture:tool' },
+    toolEvent(1, 'completed', 'end'), toolEvent(1, 'completed', 'update'), toolEvent(1, 'in_progress', 'update'),
+    toolEvent(1, 'failed', 'end'), toolEvent(2, 'unknown', 'update'), toolEvent(2, 'completed', 'end'),
+    toolEvent(3, 'failed', 'end'), toolEvent(4, 'completed', 'end'), toolEvent(5, 'in_progress', 'start'),
+  ]);
+  assert.equal(toolProof.contents.get('tracked_patch'), '');
+  assert.equal(toolProof.contents.get('stderr'), '');
+  assert.equal(existsSync(`${log}.MUST_NOT_EXIST`), false);
+  const toolPeer = lines(log).find(record => record.mode === 'tool');
+  assert.equal(existsSync(join(toolPeer.cwd, 'MUST_NOT_EXIST')), false);
+  writeFileSync(promptFile, 'fixture:tool-limit');
+  const limit = evidence(fabric(runArgs), null);
+  assert.deepEqual(limit.events.filter(event => event.type === 'tool'),
+    Array.from({ length: 256 }, (_, index) => toolEvent(index + 1, 'pending', 'start')));
+  const initial = { sessionUpdate: 'tool_call', toolCallId: 'SECRET_ID_CANARY', title: 'SECRET_TITLE_CANARY' };
+  const delta = { sessionUpdate: 'tool_call_update', toolCallId: initial.toolCallId };
+  const malformedTools = {
+    'missing-id': { sessionUpdate: 'tool_call', title: '' },
+    'numeric-id': { ...initial, toolCallId: 1 },
+    'missing-title': { sessionUpdate: 'tool_call', toolCallId: '' },
+    'null-title': { ...initial, title: null },
+    'null-status': { ...initial, status: null },
+    'null-kind': { ...initial, kind: null },
+    'null-content': { ...initial, content: null },
+    'null-locations': { ...initial, locations: null },
+    'bad-name': { ...delta, name: {} },
+    'bad-title': { ...delta, title: 1 },
+    'bad-status': { ...delta, status: 'SECRET_STATUS_CANARY' },
+    'bad-kind': { ...delta, kind: 'SECRET_KIND_CANARY' },
+    'bad-meta': { ...delta, _meta: [] },
+    'extra-field': { ...delta, unexpected: true },
+    'missing-delta-id': { sessionUpdate: 'tool_call_update' },
+    'bad-content': { ...delta, content: {} },
+    'bad-text': { ...delta, content: [{ type: 'content', content: { type: 'text', text: 3 } }] },
+    'bad-annotation': { ...delta, content: [{ type: 'content', content: { type: 'text', text: '', annotations: [] } }] },
+    'bad-diff': { ...delta, content: [{ type: 'diff', path: '/SECRET_PATH_CANARY' }] },
+    'bad-terminal': { ...delta, content: [{ type: 'terminal', terminalId: 1 }] },
+    'bad-image': { ...delta, content: [{ type: 'content', content: { type: 'image', data: '' } }] },
+    'bad-resource': { ...delta, content: [{ type: 'content', content: { type: 'resource', resource: { uri: '', text: 1 } } }] },
+    'bad-link': { ...delta, content: [{ type: 'content', content: { type: 'resource_link', uri: '' } }] },
+    'unsupported-session': { ...delta, content: [{ type: 'session', sessionId: 'SECRET_SESSION_CANARY' }] },
+    'bad-locations': { ...delta, locations: {} },
+    'bad-path': { ...delta, locations: [{ path: 1 }] },
+    'bad-line': { ...delta, locations: [{ path: '', line: -1 }] },
+    'large-line': { ...delta, locations: [{ path: '', line: 4294967296 }] },
+    'fractional-line': { ...delta, locations: [{ path: '', line: 1.5 }] },
+  };
+  const validationCwd = join(storage, 'tool-validation');
+  mkdirSync(validationCwd);
+  for (const [name, update] of Object.entries(malformedTools)) {
+    const mode = `tool-invalid-${name}`;
+    const result = spawnSync(join(bridgeDir, 'fabric-acp-bridge'), ['--turn', `fixture:${mode}\n${JSON.stringify(update)}`],
+      { cwd: validationCwd, env: { HOME: root, LC_ALL: 'C' }, encoding: 'utf8', timeout: 15_000 });
+    assert.ifError(result.error);
+    assert.equal(result.status, 1, mode);
+    assert.deepEqual(JSON.parse(result.stdout), { type: 'acp.failure', code: 'acp_invalid_update' }, mode);
+    assert.equal(result.stderr, '', mode);
+    reaped(lines(log).find(record => record.mode === mode).pid);
+  }
+  for (const mode of ['tool-early-initialize', 'tool-early-session']) {
+    const early = join(root, mode);
+    prepare({ ...config, args: [agent, log, mode] }, early);
+    const result = spawnSync(join(early, 'fabric-acp-bridge'), ['--turn', 'unused'],
+      { cwd: repo, env: { HOME: root, LC_ALL: 'C' }, encoding: 'utf8', timeout: 15_000 });
+    assert.ifError(result.error);
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(JSON.parse(result.stdout), { type: 'acp.failure', code: 'acp_invalid_update' });
+    assert.equal(result.stderr, '');
+    reaped(lines(log).find(record => record.early === mode).earlyPid);
+  }
+  const failures = { malformed: 'acp_invalid_update', mismatch: 'acp_invalid_update',
     image: 'acp_invalid_update', request: 'acp_unsupported_request', failure: 'acp_remote_error',
     stop: 'acp_invalid_stop', disconnect: 'acp_disconnected', late: 'acp_invalid_update',
     'vendor-request': 'acp_unsupported_request', 'extension-request': 'acp_unsupported_request',
     'core-session': 'acp_unsupported_update', 'core-fs': 'acp_unsupported_update',
     'core-terminal': 'acp_unsupported_update', 'core-method': 'acp_unsupported_update',
     'core-rpc': 'acp_unsupported_update',
+    'tool-mismatch': 'acp_invalid_update', 'tool-late': 'acp_invalid_update', 'tool-overflow': 'acp_tool_overflow',
+    'tool-request': 'acp_unsupported_request', 'tool-fs-request': 'acp_unsupported_request',
+    'tool-terminal-request': 'acp_unsupported_request',
     'count-flood': 'acp_extension_overflow', 'byte-flood': 'acp_extension_overflow' };
   for (const [mode, code] of Object.entries(failures)) {
     writeFileSync(promptFile, `fixture:${mode}`);
@@ -202,6 +284,7 @@ test('installed ACP package through the real Fabric host (no providers)', { time
       });
     }
     if (mode === 'count-flood') assert.equal(proof.extensions.length, 32);
+    else if (mode === 'tool-overflow') assert.equal(proof.events.filter(event => event.type === 'tool').length, 256);
     else if (mode === 'byte-flood') {
       assert.ok(proof.extensions.length > 0 && proof.extensions.length < 32);
       const next = { ...proof.extensions.at(-1), sequence: proof.extensions.length + 1 };
@@ -239,6 +322,18 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   assert.equal(cancelPeer.prompt, cancelledPrompt); assert.equal(survivorPeer.prompt, survivorPrompt);
   assert.ok(existsSync(cancelPeer.cwd) && existsSync(survivorPeer.cwd));
   process.kill(cancelPeer.pid, 0); process.kill(survivorPeer.pid, 0);
+  // Peer writes are not proof of host delivery. Cancel only after both captures
+  // contain the ordered tool deltas, not after an arbitrary delay.
+  function delivered(peer) {
+    const records = readFileSync(join(dirname(peer.cwd), 'events.jsonl'), 'utf8').split('\n').slice(0, -1).map(line => JSON.parse(line));
+    return records.filter(record => record.event?.type === 'tool').length === 2 &&
+      readFileSync(join(dirname(peer.cwd), 'stderr.log'), 'utf8').endsWith('\n');
+  }
+  while (![cancelPeer, survivorPeer].every(delivered)) {
+    assert.ok(Date.now() < until && cancelling.child.exitCode === null && surviving.child.exitCode === null,
+      'Both active turns must capture tool notifications before cancellation');
+    await delay(20);
+  }
   cancelling.child.kill('SIGINT');
   assert.notEqual(await cancelling.closed, 0);
   const cancelled = JSON.parse(cancelling.stdout);
@@ -248,6 +343,8 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   assert.equal(existsSync(cancelPeer.cwd), false);
   reaped(cancelPeer.pid);
   const cancelledProof = evidence(cancelling, undefined, 'CANCELLED');
+  assert.deepEqual(cancelledProof.events.filter(event => event.type === 'tool'),
+    [toolEvent(1, 'pending', 'start'), toolEvent(1, 'in_progress', 'update')]);
   assert.equal(cancelledProof.extensions.length, 1);
   assert.equal(JSON.parse(Buffer.from(cancelledProof.extensions[0].json_base64, 'base64')).params.marker, 'cancel');
   assert.equal(surviving.child.exitCode, null, 'cancelling one host run stopped the other');
@@ -256,6 +353,8 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   writeFileSync(`${log}.release`, 'release the independently owned surviving turn');
   assert.equal(await surviving.closed, 0, surviving.stdout + surviving.stderr);
   const survivor = evidence(surviving, null);
+  assert.deepEqual(survivor.events.filter(event => event.type === 'tool'),
+    [toolEvent(1, 'pending', 'start'), toolEvent(1, 'in_progress', 'update'), toolEvent(1, 'completed', 'end')]);
   assert.notEqual(survivor.report.run_id, cancelled.run_id);
   assert.equal(survivor.report.workspace_path, survivorPeer.cwd);
   assert.deepEqual(survivor.events.filter(event => event.type === 'output'),
