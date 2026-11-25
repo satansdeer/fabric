@@ -6,6 +6,7 @@ import { defineNativeHarness, serve, rejectNative } from './sdk/index.mjs';
 import { readBounded } from './sdk/protocol.mjs';
 import { launchAcp } from './transport.mjs';
 import { VERSION, validate, sha256, fail, fields, object } from './config.mjs';
+import { main as inspect } from './inspect.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const codes = new Set([
@@ -165,6 +166,7 @@ async function turn(config, prompt) {
 
 export async function main() {
   try {
+    if (process.argv[2] === '--inspect') { await inspect(process.argv.slice(3)); return; }
     const bytes = readBounded(join(here, 'launch.json'), 32_768);
     const config = JSON.parse(bytes);
     if (process.argv.length === 3 && process.argv[2] === '--fabric-plugin-stdio') await serve(plugin(config, bytes));

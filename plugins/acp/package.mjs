@@ -20,14 +20,14 @@ export function prepare(config, destination) {
   const root = resolve(destination);
   if (realpathSync(dirname(root)) !== dirname(root)) fail('acp_unsafe_path');
   const bytes = JSON.stringify(launch) + '\n';
-  const files = ['fabric-acp-bridge', 'bridge.mjs', 'config.mjs', 'transport.mjs', 'launch.json', 'sdk'];
+  const files = ['fabric-acp-bridge', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'launch.json', 'sdk'];
   mkdirSync(root, { mode: 0o700 }); // Never overwrite an existing package.
   try {
     mkdirSync(join(root, 'sdk'), { mode: 0o700 });
     for (const name of ['index.mjs', 'protocol.mjs', 'webhook.mjs']) {
       writeFileSync(join(root, 'sdk', name), readBounded(join(here, '../../sdk/typescript', name), 1_048_576), { mode: 0o600, flag: 'wx' });
     }
-    for (const name of ['bridge.mjs', 'config.mjs', 'transport.mjs', 'README.md']) {
+    for (const name of ['bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'README.md']) {
       writeFileSync(join(root, name), readBounded(join(here, name), 1_048_576), { mode: 0o600, flag: 'wx' });
     }
     writeFileSync(join(root, 'launch.json'), bytes, { mode: 0o600, flag: 'wx' });

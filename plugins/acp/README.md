@@ -1,10 +1,10 @@
 # ACP v1 transport and external native text bridge
 
-Issue #99 adds an offline-packaged SDK plugin to the #97/#98 transport foundation.
-No runtime dependencies; Node >=22.18, ESM. One connection and one text turn,
-not another scheduler. **Provider-free integration is not native provider support
-or completion of #95.** Cursor `agent acp` and `cline --acp` initialization and
-the remaining stage-one acceptance gates require separate consent and evidence.
+The offline-packaged SDK plugin reuses the ACP v1 transport, with an explicit
+initialize-only inspection command (#101). No runtime dependencies; Node >=22.18,
+ESM. One connection and one text turn, not another scheduler.
+**Provider-free integration is not native provider support or completion of #95.**
+Native initialization and live-turn gates require separate approval and evidence.
 
 ## API
 
@@ -216,6 +216,83 @@ peer metadata. Probe/version describe **this bridge**, not a native agent versio
 `agentInfo`, auth methods, modes/models and capability metadata are untrusted,
 never consent or readiness. No authenticate, install, login or model-selection RPC.
 
+### Opt-in initialize-only inspection
+
+After reviewing the installed package/hash and `launch.json`, explicitly select
+an **existing, canonical, absolute directory owned by the current user**. Use a
+dedicated disposable workspace; native executables can have startup side effects.
+The command accepts exactly `--inspect --cwd DIRECTORY`, no config override or extra flags:
+
+```sh
+/usr/bin/env -i "$REGISTRY/packages/$HASH/fabric-acp-bridge" \
+  --inspect --cwd /approved/absolute/owned-inspection-workspace
+```
+
+The packaged shebang binds the approved absolute Node used for packaging.
+The command reuses `config.mjs` validation and `transport.mjs`, reads only the
+bounded installed launch configuration and pinned files, and verifies runtime,
+executable and resource hashes before launching. It does not read native HOME
+contents. The child receives only the bound `HOME` and `LC_ALL=C`, literal argv
+and the explicit cwd. No PATH resolution, shell, loader environment, auth store,
+discovery, installation, update, login, retry or detached process.
+Probe/doctor/context/plan never invoke this command or launch the ACP peer.
+
+For an approved script-based native installation, select its actual absolute
+runtime, **not a shell wrapper**. For example, use
+`"executable":{"path":"/approved/native/node","sha256":"<approved runtime hash>"}`,
+`"args":["/approved/native/index.js","acp"]` and
+`"pins":[{"path":"/approved/native/index.js","sha256":"<approved script hash>"}]`
+in the launch input above. Use the installed program's reviewed literal ACP
+arguments (Cline's documented flag is `--acp`), and pin additional reviewed
+resources via `pins`. Package with the separately approved bridge Node.
+The bridge runtime is pinned automatically; do not use `env` shebangs, `-e`,
+loader flags, PATH aliases or unreviewed wrapper-derived arguments.
+Hashes identify approved local bytes, not a vendor version or transitive dependencies.
+
+Only `initialize` is sent: no `authenticate`, `session/new`, `model/list`,
+`session/prompt` or session cancellation RPC. The handshake is capped at the
+smaller of the packaged setup timeout and 10 seconds; records are limited to
+65,536 bytes, one pending request and 16 notification callbacks. Notifications
+are discarded without retaining/displaying payloads. Unsupported peer requests
+fail with `acp_unsupported_request` rather than waiting for human answers.
+SIGINT/SIGTERM abort negotiation or cleanup. All launched paths close and await
+direct-child reaping, escalating SIGTERM to SIGKILL after 250 ms. No success is
+emitted before owned teardown completes; exit zero from the peer is not success.
+
+One bounded JSON line reports `stage` (`negotiated` or `failed`), a fixed `code`,
+`failed_stage` on failure, `protocolVersion` only after validated negotiation,
+and `launch` evidence (bridge identity, config/executable/runtime/resource
+SHA-256 values, never paths). `cleanup` is `not_started` or `reaped`.
+`auth`/`model` remain `unverified`; `peer_identity` remains `untrusted`.
+Exit status is 0 only for negotiation plus owned cleanup; failures exit 1.
+No argv, native-home/config paths, credentials, raw stderr, remote error data,
+auth methods, capabilities or `agentInfo` are emitted.
+
+This is **initialize-only evidence**, not authentication, model readiness,
+installed vendor-version proof or a live Fabric worker turn. The direct-child
+ownership/same-user replacement limits above still apply: this command is not
+a sandbox and cannot reclaim malicious escaped descendants.
+
+### Remaining native gates
+
+Primary native entrypoint contracts: [Cursor `agent acp`](https://cursor.com/docs/cli/acp)
+and [Cline `cline --acp`](https://docs.cline.bot/usage/acp).
+Cline does not auto-approve tools by default; do not enable auto-approval.
+These sources describe invocation, not proof of an installed executable or version.
+
+Installation, version, negotiation and live-turn evidence are tracked separately
+in #89/#93/#95. This inspector never authorizes installation, updates or login.
+For Cline 3.0.75, startup auto-update runs before ACP initialization. Before its
+first launch, create `.cline/data/settings/global-settings.json` under the
+approved private native HOME with
+`{"autoUpdateEnabled":false,"telemetryOptOut":true}` and include that file in
+the launch pins. Use the pinned native executable directly with `--acp`, not
+the npm wrapper. This is version-specific startup preparation, not a generic
+ACP requirement or an authentication guarantee. See the
+[pinned Cline source](https://github.com/cline/cline/tree/06f0ec711ea417430d552b98e7911fdac6f495a1).
+Separately authorized auth/model/live-turn acceptance remains a gate.
+Fixture or initialize-only success cannot turn the support matrix green or close #95.
+
 ### Native context / current host limit
 
 The selected `FABRIC_ACP_HOME` must exactly match the packaged native home.
@@ -284,13 +361,21 @@ No SDK native-reference conformance helper is used.
 The check packages/installs into an isolated registry, uses real fixture children
 through Core probe/context/capabilities/plan/command/normalization and local target
 primitives, verifies text/patch/artifact hashes, malformed and mismatched events,
-tools/modalities/requests, remote failure, invalid stops, disconnect,
-longer-than-setup-deadline turns and pending-turn cancellation. It checks process-group
-inheritance/reaping and rejects changed launch pins without executing replacements.
+tools/modalities/requests, remote failure, invalid stops and disconnect. It proves
+two independently active installed-plugin turns with distinct literal prompts,
+children and owned workspaces: SIGINT cancels one while the other remains alive,
+then the survivor produces only its own text/patch. Both workspaces are reclaimed
+and both children reaped; a fixture release file makes overlap deterministic.
+It also checks longer-than-setup-deadline turns, process-group inheritance and
+changed pins without executing replacements.
 It clones the local existing commit into a temporary fixture repo; no commit,
-remote, provider, credential store or supervisor storage is touched. Owned
-temporary trees/children are cleaned up. Transport-only checks additionally
-cover deadlines and remain independent:
+remote, provider, credential store or supervisor storage is touched.
+Owned temporary trees/children are cleaned up. The packaged initialize-only
+checks cover post-initialize RPC exclusion, secret/metadata non-disclosure,
+invalid/changed launch input, deadlines, malformed/oversized frames, notification
+overflow, blocking peer requests, exit zero, signals during initialize/teardown
+and TERM-ignoring child reaping. No absent native agent is silently skipped.
+Transport-only checks remain independent:
 `/absolute/node --test plugins/acp/transport.test.mjs`.
 
 Protocol references: [initialization](https://agentclientprotocol.com/protocol/v1/initialization.md),

@@ -31,8 +31,10 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   const registry = join(root, 'registry'), home = join(root, 'native-home'), repo = join(root, 'repo');
   const log = join(root, 'children.jsonl'), storage = join(root, 'storage');
   const children = new Set();
-  t.after(() => {
-    for (const child of children) child.kill('SIGTERM');
+  t.after(async () => {
+    await Promise.all([...children].map(child => new Promise(resolve => {
+      child.once('close', resolve); child.kill('SIGTERM');
+    })));
     for (const record of lines(log)) if (record.pid) {
       const command = spawnSync('/bin/ps', ['-o', 'command=', '-p', String(record.pid)], { encoding: 'utf8' }).stdout;
       if (command.includes(log)) {
@@ -92,6 +94,19 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   fabric(['project', 'add', '--name', 'fixture', '--path', repo]);
   const recipe = join(root, 'recipe.toml'), promptFile = join(root, 'prompt.txt');
   writeFileSync(recipe, "version=1\n[[steps]]\nargv=['/usr/bin/true']\n");
+  assert.deepEqual(lines(log), [], 'normal plugin inspection must not launch an ACP peer');
+  const inspection = spawnSync(join(bridgeDir, 'fabric-acp-bridge'), ['--inspect', '--cwd', repo],
+    { cwd: root, env: { HOME: root, LC_ALL: 'C' }, encoding: 'utf8', timeout: 15_000 });
+  assert.ifError(inspection.error);
+  assert.equal(inspection.status, 0, inspection.stdout + inspection.stderr);
+  assert.equal(inspection.stderr, '');
+  const initialized = JSON.parse(inspection.stdout);
+  assert.equal(initialized.stage, 'negotiated');
+  assert.equal(initialized.protocolVersion, 1);
+  assert.equal(initialized.cleanup, 'reaped');
+  assert.equal(initialized.launch.config_sha256, sha256(readFileSync(join(bridgeDir, 'launch.json'))));
+  assert.doesNotMatch(inspection.stdout, /SECRET_|UNTRUSTED_/);
+  assert.deepEqual(lines(log).map(record => record.method), ['initialize']);
   fabric(['project', 'prepare', 'fixture', '--recipe', recipe, '--json']);
   const runArgs = ['run', 'fixture', '--harness', 'acp', '--placement', 'local', '--profile', profile,
     '--prompt-file', promptFile, '--copy-limit-bytes', '67108864', '--timeout-seconds', '30', '--json'];
@@ -135,25 +150,62 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     const proof = evidence(fabric(runArgs, { success: false }), code);
     assert.deepEqual(proof.events.filter(event => event.type === 'failure'), [{ type: 'failure', code, message: code }]);
   }
-  writeFileSync(promptFile, 'fixture:cancel');
-  const child = spawn(host, args(runArgs), { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
-  children.add(child);
-  let stdout = '', stderr = '';
-  child.stdout.on('data', bytes => { stdout += bytes; });
-  child.stderr.on('data', bytes => { stderr += bytes; });
-  const closed = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', status => resolve(status)); });
+  const cancelledPrompt = `fixture:cancel\ncancel-only $(touch ${root}/MUST_NOT_EXIST); \"λ\"`;
+  const survivorPrompt = `fixture:concurrent\nsurvivor-only $(touch ${root}/MUST_NOT_EXIST); \"😀\"`;
+  function start(prompt, name) {
+    const path = join(root, `${name}.txt`);
+    writeFileSync(path, prompt);
+    const values = runArgs.map(value => value === promptFile ? path : value);
+    const child = spawn(host, args(values), { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    children.add(child);
+    const run = { child, stdout: '', stderr: '' };
+    child.stdout.on('data', bytes => { run.stdout += bytes; });
+    child.stderr.on('data', bytes => { run.stderr += bytes; });
+    run.closed = new Promise((resolve, reject) => {
+      child.on('error', reject);
+      child.on('close', status => { children.delete(child); resolve(status); });
+    });
+    return run;
+  }
+  const cancelling = start(cancelledPrompt, 'cancel'), surviving = start(survivorPrompt, 'survivor');
   const until = Date.now() + 20_000;
-  while (!lines(log).some(record => record.mode === 'cancel')) {
-    assert.ok(Date.now() < until && child.exitCode === null, 'Cancellation fixture never reached a pending prompt');
+  while (!['cancel', 'concurrent'].every(mode => lines(log).some(record => record.mode === mode))) {
+    assert.ok(Date.now() < until && cancelling.child.exitCode === null && surviving.child.exitCode === null,
+      'Both installed-plugin fixture turns must reach pending prompts concurrently');
     await delay(20);
   }
-  child.kill('SIGINT');
-  assert.notEqual(await closed, 0);
-  children.delete(child);
-  const cancelled = JSON.parse(stdout);
-  assert.equal(cancelled.state, 'CANCELLED', stdout + stderr);
+  const [cancelPeer, survivorPeer] = ['cancel', 'concurrent'].map(mode => lines(log).find(record => record.mode === mode));
+  assert.notEqual(cancelPeer.pid, survivorPeer.pid);
+  assert.notEqual(cancelPeer.parent, survivorPeer.parent);
+  assert.notEqual(cancelPeer.cwd, survivorPeer.cwd);
+  assert.equal(cancelPeer.prompt, cancelledPrompt); assert.equal(survivorPeer.prompt, survivorPrompt);
+  assert.ok(existsSync(cancelPeer.cwd) && existsSync(survivorPeer.cwd));
+  process.kill(cancelPeer.pid, 0); process.kill(survivorPeer.pid, 0);
+  cancelling.child.kill('SIGINT');
+  assert.notEqual(await cancelling.closed, 0);
+  const cancelled = JSON.parse(cancelling.stdout);
+  assert.equal(cancelled.state, 'CANCELLED', cancelling.stdout + cancelling.stderr);
   assert.equal(cancelled.cleanup.action, 'reclaimed');
-  t.diagnostic(JSON.stringify({ run_id: cancelled.run_id, state: cancelled.state, cancellation: 'SIGINT while session/prompt pending' }));
+  assert.equal(cancelled.workspace_path, cancelPeer.cwd);
+  assert.equal(existsSync(cancelPeer.cwd), false);
+  reaped(cancelPeer.pid);
+  assert.equal(surviving.child.exitCode, null, 'cancelling one host run stopped the other');
+  process.kill(survivorPeer.pid, 0);
+  assert.ok(existsSync(survivorPeer.cwd));
+  writeFileSync(`${log}.release`, 'release the independently owned surviving turn');
+  assert.equal(await surviving.closed, 0, surviving.stdout + surviving.stderr);
+  const survivor = evidence(surviving, null);
+  assert.notEqual(survivor.report.run_id, cancelled.run_id);
+  assert.equal(survivor.report.workspace_path, survivorPeer.cwd);
+  assert.deepEqual(survivor.events.filter(event => event.type === 'output'),
+    [{ type: 'output', stream: 'stdout', text: survivorPrompt }]);
+  assert.ok(survivor.contents.get('tracked_patch').includes('survivor-only'));
+  assert.equal(survivor.contents.get('tracked_patch').includes('cancel-only'), false);
+  assert.equal(existsSync(join(root, 'MUST_NOT_EXIST')), false);
+  assert.equal(readFileSync(join(repo, 'README.md'), 'utf8'), original);
+  reaped(survivorPeer.pid);
+  t.diagnostic(JSON.stringify({ cancelled_run: cancelled.run_id, survivor_run: survivor.report.run_id,
+    cancellation: 'SIGINT with both independent installed-plugin turns active', cleanup: 'both reclaimed' }));
   for (const record of lines(log).filter(record => record.pid)) {
     assert.equal(record.group, record.parentGroup, 'ACP child escaped bridge process group');
     assert.equal(record.home, home);
