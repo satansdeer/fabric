@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync, rmSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +25,7 @@ function reaped(pid) {
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `owned child ${pid} still alive`);
 }
 
-test('installed ACP package through the real Fabric host (no providers)', { timeout: 180_000 }, async t => {
+test('installed ACP package through the real Fabric host (no providers)', { timeout: 300_000 }, async t => {
   assert.ok(existsSync(host), 'Real Fabric host required; set FABRIC_ACP_TEST_HOST to an absolute built host. Never skipped.');
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'fabric-acp-')));
   const registry = join(root, 'registry'), home = join(root, 'native-home'), repo = join(root, 'repo');
@@ -111,15 +111,16 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   fabric(['project', 'prepare', 'fixture', '--recipe', recipe, '--json']);
   const runArgs = ['run', 'fixture', '--harness', 'acp', '--placement', 'local', '--profile', profile,
     '--prompt-file', promptFile, '--copy-limit-bytes', '67108864', '--timeout-seconds', '30', '--json'];
-  function evidence(result, expected) {
+  function evidence(result, expected, state = expected ? 'FAILED' : 'SUCCEEDED') {
     const report = JSON.parse(result.stdout);
-    assert.equal(report.state, expected ? 'FAILED' : 'SUCCEEDED', result.stdout + result.stderr);
-    assert.equal(report.capture.native_failure, expected);
+    assert.equal(report.state, state, result.stdout + result.stderr);
+    if (expected !== undefined) assert.equal(report.capture.native_failure, expected);
     assert.equal(report.cleanup.action, 'reclaimed');
     assert.equal(existsSync(report.workspace_path), false);
     const { artifacts } = JSON.parse(fabric(['runs', 'artifacts', report.run_id, '--json']).stdout);
     const contents = new Map();
     for (const artifact of artifacts) {
+      assert.equal(statSync(join(storage, artifact.relative_path)).mode & 0o777, 0o400);
       const bytes = readFileSync(join(storage, artifact.relative_path));
       assert.equal(bytes.length, artifact.size_bytes);
       assert.equal(sha256(bytes), artifact.sha256);
@@ -128,9 +129,26 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     const events = contents.get('events').trim().split('\n').map(line => JSON.parse(line)).filter(record => record.event).map(record => record.event);
     assert.equal(events.some(event => event.type === 'usage' || event.type === 'tool'), false);
     assert.doesNotMatch(contents.get('stdout') + contents.get('stderr') + contents.get('events'), /SECRET_|UNTRUSTED_/);
+    const extensions = contents.get('stderr').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    assert.ok(extensions.length <= 32);
+    assert.ok(Buffer.byteLength(contents.get('stderr')) <= 32_768);
+    for (const [index, record] of extensions.entries()) {
+      assert.equal(record.type, 'acp.extension');
+      assert.equal(record.source, 'untrusted_acp_peer');
+      assert.equal(record.phase, 'prompt');
+      assert.equal(record.sequence, index + 1);
+      assert.match(record.sha256, /^[a-f0-9]{64}$/);
+      assert.ok(Buffer.byteLength(JSON.stringify(record) + '\n') <= 4096);
+      const bytes = Buffer.from(record.json_base64, 'base64');
+      assert.ok(bytes.length <= 2048);
+      assert.equal(bytes.length, Math.min(record.notification_bytes, 2048));
+      assert.equal(record.truncated, record.notification_bytes > 2048);
+      if (!record.truncated) assert.equal(sha256(bytes), record.sha256);
+      assert.equal((result.stdout + result.stderr + contents.get('stdout') + contents.get('events')).includes(record.json_base64), false);
+    }
     t.diagnostic(JSON.stringify({ host, package_sha256: snapshot.hash, run_id: report.run_id, state: report.state,
       native_failure: report.capture.native_failure, events_sha256: sha256(contents.get('events')) }));
-    return { report, events, contents };
+    return { report, events, contents, extensions };
   }
   const prompt = `literal $(touch ${root}/MUST_NOT_EXIST); \"quoted\"\nUnicode: λ 😀`;
   writeFileSync(promptFile, prompt);
@@ -143,13 +161,52 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   const slow = evidence(fabric(runArgs), null);
   assert.deepEqual(slow.events.filter(event => event.type === 'output'),
     [{ type: 'output', stream: 'stdout', text: 'fixture:slow' }]);
+  for (const mode of ['extensions', 'large-extension', 'count-limit']) {
+    writeFileSync(promptFile, `fixture:${mode}`);
+    const proof = evidence(fabric(runArgs), null);
+    assert.deepEqual(proof.events.filter(event => event.type === 'output'),
+      [{ type: 'output', stream: 'stdout', text: `fixture:${mode}` }]);
+    assert.match(proof.contents.get('tracked_patch'), /ACP fixture worker/);
+    if (mode === 'extensions') {
+      const notifications = proof.extensions.map(record => JSON.parse(Buffer.from(record.json_base64, 'base64')));
+      assert.deepEqual(notifications.map(value => value.method), ['cursor/task', 'cursor/update_todos', 'cursor/generate_image']);
+      assert.ok(notifications.every(value => value.params.data === 'PRIVATE_EXTENSION_CANARY' &&
+        value.params.sessionId === 'untrusted-other-session'));
+      assert.doesNotMatch(proof.contents.get('stdout') + proof.contents.get('events') + JSON.stringify(proof.report), /PRIVATE_EXTENSION_CANARY/);
+    } else if (mode === 'large-extension') {
+      const bytes = Buffer.from(JSON.stringify({ jsonrpc: '2.0', method: `vendor/${'x'.repeat(3000)}`,
+        params: { sessionId: 'untrusted-other-session', data: '😀'.repeat(2000), marker: mode } }));
+      assert.equal(proof.extensions.length, 1);
+      assert.equal(proof.extensions[0].sha256, sha256(bytes));
+      assert.equal(proof.extensions[0].json_base64, bytes.subarray(0, 2048).toString('base64'));
+      assert.equal(proof.extensions[0].truncated, true);
+    } else assert.equal(proof.extensions.length, 32);
+  }
   const failures = { malformed: 'acp_invalid_update', mismatch: 'acp_invalid_update', tool: 'acp_unsupported_update',
     image: 'acp_invalid_update', request: 'acp_unsupported_request', failure: 'acp_remote_error',
-    stop: 'acp_invalid_stop', disconnect: 'acp_disconnected' };
+    stop: 'acp_invalid_stop', disconnect: 'acp_disconnected', late: 'acp_invalid_update',
+    'vendor-request': 'acp_unsupported_request', 'extension-request': 'acp_unsupported_request',
+    'core-session': 'acp_unsupported_update', 'core-fs': 'acp_unsupported_update',
+    'core-terminal': 'acp_unsupported_update', 'core-method': 'acp_unsupported_update',
+    'core-rpc': 'acp_unsupported_update',
+    'count-flood': 'acp_extension_overflow', 'byte-flood': 'acp_extension_overflow' };
   for (const [mode, code] of Object.entries(failures)) {
     writeFileSync(promptFile, `fixture:${mode}`);
     const proof = evidence(fabric(runArgs, { success: false }), code);
-    assert.deepEqual(proof.events.filter(event => event.type === 'failure'), [{ type: 'failure', code, message: code }]);
+    assert.deepEqual(proof.events.filter(event => event.type === 'failure'), [{ type: 'failure', code,
+      message: code === 'acp_unsupported_request' ? 'Unsupported blocking ACP peer request; no input or approval supplied.' : code }]);
+    if (code === 'acp_unsupported_request') {
+      assert.deepEqual(lines(log).filter(record => record.response).at(-1)?.response, {
+        jsonrpc: '2.0', id: mode === 'extension-request' ? 0 : 'peer-request',
+        error: { code: -32601, message: 'Method not found' },
+      });
+    }
+    if (mode === 'count-flood') assert.equal(proof.extensions.length, 32);
+    else if (mode === 'byte-flood') {
+      assert.ok(proof.extensions.length > 0 && proof.extensions.length < 32);
+      const next = { ...proof.extensions.at(-1), sequence: proof.extensions.length + 1 };
+      assert.ok(Buffer.byteLength(proof.contents.get('stderr')) + Buffer.byteLength(JSON.stringify(next) + '\n') > 32_768);
+    } else assert.deepEqual(proof.extensions, []);
   }
   const cancelledPrompt = `fixture:cancel\ncancel-only $(touch ${root}/MUST_NOT_EXIST); \"λ\"`;
   const survivorPrompt = `fixture:concurrent\nsurvivor-only $(touch ${root}/MUST_NOT_EXIST); \"😀\"`;
@@ -170,7 +227,7 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   }
   const cancelling = start(cancelledPrompt, 'cancel'), surviving = start(survivorPrompt, 'survivor');
   const until = Date.now() + 20_000;
-  while (!['cancel', 'concurrent'].every(mode => lines(log).some(record => record.mode === mode))) {
+  while (!['cancel', 'concurrent'].every(mode => lines(log).some(record => record.extensionsSent === mode))) {
     assert.ok(Date.now() < until && cancelling.child.exitCode === null && surviving.child.exitCode === null,
       'Both installed-plugin fixture turns must reach pending prompts concurrently');
     await delay(20);
@@ -190,6 +247,9 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   assert.equal(cancelled.workspace_path, cancelPeer.cwd);
   assert.equal(existsSync(cancelPeer.cwd), false);
   reaped(cancelPeer.pid);
+  const cancelledProof = evidence(cancelling, undefined, 'CANCELLED');
+  assert.equal(cancelledProof.extensions.length, 1);
+  assert.equal(JSON.parse(Buffer.from(cancelledProof.extensions[0].json_base64, 'base64')).params.marker, 'cancel');
   assert.equal(surviving.child.exitCode, null, 'cancelling one host run stopped the other');
   process.kill(survivorPeer.pid, 0);
   assert.ok(existsSync(survivorPeer.cwd));
@@ -202,6 +262,11 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     [{ type: 'output', stream: 'stdout', text: survivorPrompt }]);
   assert.ok(survivor.contents.get('tracked_patch').includes('survivor-only'));
   assert.equal(survivor.contents.get('tracked_patch').includes('cancel-only'), false);
+  assert.equal(survivor.extensions.length, 1);
+  assert.equal(JSON.parse(Buffer.from(survivor.extensions[0].json_base64, 'base64')).params.marker, 'concurrent');
+  assert.notEqual(survivor.extensions[0].json_base64, cancelledProof.extensions[0].json_base64);
+  assert.equal(survivor.contents.get('stderr').includes(cancelledProof.extensions[0].json_base64), false);
+  assert.equal(cancelledProof.contents.get('stderr').includes(survivor.extensions[0].json_base64), false);
   assert.equal(existsSync(join(root, 'MUST_NOT_EXIST')), false);
   assert.equal(readFileSync(join(repo, 'README.md'), 'utf8'), original);
   reaped(survivorPeer.pid);
@@ -216,6 +281,7 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     assert.notEqual(record.cwd, repo);
     assert.ok(record.cwd.startsWith(storage + '/'));
     reaped(record.pid);
+    assert.equal(lines(log).filter(value => value.mode === record.mode).length, 1, 'turn was replayed');
   }
   // Revalidates content identity before another launch, without ever running a replacement.
   const count = lines(log).filter(record => record.pid).length;

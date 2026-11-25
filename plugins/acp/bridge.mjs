@@ -16,7 +16,7 @@ const codes = new Set([
   'acp_callback_failed', 'acp_callback_overflow', 'acp_write_overflow', 'acp_deadline', 'acp_aborted',
   'acp_closed', 'acp_disconnected', 'acp_remote_error', 'acp_initialize_failed', 'acp_unsupported_request',
   'acp_invalid_session', 'acp_invalid_update', 'acp_unsupported_update', 'acp_invalid_stop',
-  'acp_turn_cancelled', 'acp_turn_incomplete', 'acp_output_overflow', 'acp_bridge_failed',
+  'acp_turn_cancelled', 'acp_turn_incomplete', 'acp_output_overflow', 'acp_extension_overflow', 'acp_bridge_failed',
 ]);
 const clean = text => text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 const all = ['headless.run', 'events.structured', 'model.override', 'session.resume', 'session.followup',
@@ -24,6 +24,11 @@ const all = ['headless.run', 'events.structured', 'model.override', 'session.res
   'tool.approval.noninteractive', 'workspace.external', 'filesystem.patch.capture'];
 const managed = ['execution.cancel', 'workspace.external', 'filesystem.patch.capture'];
 const native = ['headless.run', 'events.structured'];
+// Only namespaced extensions, never unknown core methods, enter private evidence.
+const extension = method => !method.startsWith('rpc.') &&
+  /^[A-Za-z_][A-Za-z0-9_.-]*\/[A-Za-z_][A-Za-z0-9_./-]*$/.test(method) &&
+  !['session', 'fs', 'terminal'].includes(method.split('/', 1)[0]);
+const extensionLimits = { prefixBytes: 2048, recordBytes: 4096, turnBytes: 32_768, turnCount: 32 };
 
 function plugin(config, configBytes) {
   const profile = {
@@ -83,7 +88,8 @@ function plugin(config, configBytes) {
         return { event: { type: 'output', stream: 'stdout', text: clean(event.text) } };
       }
       if (fields(event, ['type', 'code']) && event.type === 'acp.failure' && codes.has(event.code)) {
-        return { event: { type: 'failure', code: event.code, message: event.code } };
+        return { event: { type: 'failure', code: event.code, message: event.code === 'acp_unsupported_request'
+          ? 'Unsupported blocking ACP peer request; no input or approval supplied.' : event.code } };
       }
       if (fields(event, ['type', 'reason']) && event.type === 'acp.stop' && event.reason === 'end_turn') return { event: null };
       rejectNative('invalid_arguments');
@@ -93,11 +99,26 @@ function plugin(config, configBytes) {
 
 async function turn(config, prompt) {
   let connection, sessionId, pending = false, firstFailure;
+  let phase = 'initialize', extensionCount = 0, extensionBytes = 0;
   const controller = new AbortController();
   function emit(event) {
     const line = JSON.stringify(event) + '\n';
     if (process.stdout.writableLength + Buffer.byteLength(line) > 1_048_576) fail('acp_output_overflow');
     process.stdout.write(line);
+  }
+  function retainExtension(message) {
+    if (extensionCount >= extensionLimits.turnCount) fail('acp_extension_overflow');
+    const bytes = Buffer.from(JSON.stringify(message));
+    // Base64 encodes the bounded prefix; it does not redact private peer data.
+    const line = JSON.stringify({ type: 'acp.extension', source: 'untrusted_acp_peer', phase,
+      sequence: extensionCount + 1, notification_bytes: bytes.length, sha256: sha256(bytes),
+      truncated: bytes.length > extensionLimits.prefixBytes,
+      json_base64: bytes.subarray(0, extensionLimits.prefixBytes).toString('base64') }) + '\n';
+    const size = Buffer.byteLength(line);
+    if (size > extensionLimits.recordBytes || extensionBytes + size > extensionLimits.turnBytes) fail('acp_extension_overflow');
+    extensionCount++;
+    extensionBytes += size;
+    process.stderr.write(line);
   }
   function stop(code) {
     firstFailure ??= code;
@@ -111,6 +132,7 @@ async function turn(config, prompt) {
   const outputError = () => stop('acp_output_overflow');
   process.on('SIGTERM', abort); process.on('SIGINT', abort);
   process.stdout.on('error', outputError);
+  process.stderr.on('error', outputError);
   try {
     validate(config);
     if (realpathSync(process.execPath) !== config.runtime.path) fail('acp_bridge_failed');
@@ -119,11 +141,16 @@ async function turn(config, prompt) {
       executable: config.executable.path, args: config.args, cwd,
       env: { HOME: config.nativeHome, LC_ALL: 'C' }, failOnPeerRequest: true,
       requestTimeoutMs: config.requestTimeoutMs,
-      onNotification(message) {
+      onNotification(message, _signal, requestPendingAtReceipt) {
         try {
+          if (message.method !== 'session/update') {
+            if (!extension(message.method)) fail('acp_unsupported_update');
+            retainExtension(message);
+            return;
+          }
           const params = message.params;
-          if (message.method !== 'session/update' || !pending ||
-              !fields(params, ['sessionId', 'update', '_meta']) || params.sessionId !== sessionId) fail('acp_invalid_update');
+          if (!pending || !requestPendingAtReceipt || !fields(params, ['sessionId', 'update', '_meta']) ||
+              params.sessionId !== sessionId) fail('acp_invalid_update');
           const update = params.update;
           if (!object(update) || update.sessionUpdate !== 'agent_message_chunk') fail('acp_unsupported_update');
           if (!fields(update, ['sessionUpdate', 'content', '_meta']) ||
@@ -134,14 +161,17 @@ async function turn(config, prompt) {
       },
     });
     await connection.initialize(); // Metadata never grants consent, auth or model identity.
+    phase = 'session_new';
     const session = await connection.request('session/new', { cwd, mcpServers: [] });
     if (!fields(session, ['sessionId', 'modes', 'models', 'configOptions', '_meta']) ||
         typeof session.sessionId !== 'string' || !session.sessionId.length || Buffer.byteLength(session.sessionId) > 1024) fail('acp_invalid_session');
     sessionId = session.sessionId;
     pending = true;
+    phase = 'prompt';
     const result = await connection.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] },
       { signal: controller.signal, timeoutMs: null });
     pending = false;
+    phase = 'closing';
     // Drain notifications already queued behind the response before accepting it.
     await new Promise(resolve => setImmediate(resolve));
     if (firstFailure) fail(firstFailure);
@@ -160,6 +190,7 @@ async function turn(config, prompt) {
     await connection?.close();
     process.removeListener('SIGTERM', abort); process.removeListener('SIGINT', abort);
     process.stdout.removeListener('error', outputError);
+    process.stderr.removeListener('error', outputError);
   }
   if (firstFailure) process.exitCode = 1;
 }

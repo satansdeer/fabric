@@ -107,11 +107,14 @@ this module's protocol exchange, not a guarantee about arbitrary child behavior.
 - `notify(method, params = {})` sends a notification after initialization, with
   no fabricated response. A caller may explicitly send `session/cancel`; the
   module does not infer ACP sessions or prompt-turn cancellation semantics.
-- `onNotification(message, signal)` receives the full notification envelope,
-  including unknown methods. Delivery starts in wire order without awaiting
-  earlier callbacks; async completions may be unordered. Replies continue while
-  callbacks wait. Callback throws/rejections fail the connection. Consumers must
-  sanitize strings/URIs before display and never act on unknown methods as grants.
+- `onNotification(message, signal, requestPendingAtReceipt)` receives the full
+  notification envelope, including unknown methods. The third argument snapshots
+  whether any outbound RPC was pending at receipt, before deferred callbacks or
+  promise continuations; the single-prompt bridge uses it for phase validation.
+  Delivery starts in wire order without awaiting earlier callbacks; async
+  completions may be unordered. Replies continue while callbacks wait. Callback
+  throws/rejections fail the connection. Consumers must sanitize strings/URIs
+  before display and never act on unknown methods as grants.
 - All incoming agent **requests** receive JSON-RPC `-32601`, `Method not found`.
   There is no request handler/permission auto-approval. In particular
   `cursor/ask_question`, `cursor/create_plan`, `session/request_permission`, file
@@ -366,19 +369,56 @@ capabilities. All other optional capabilities remain unsupported.
 
 The bridge performs `initialize` → `session/new` (empty `mcpServers`) →
 `session/prompt` (one text block). IDs are connection-local; no session persistence,
-restart, replay or second turn. Only matching `session/update` notifications
-during the prompt, containing `agent_message_chunk` text, are supported.
+restart, replay or second turn. Core `session/update` notifications must match the
+exact session during the pending prompt and contain `agent_message_chunk` text.
 Each text chunk is at most 32,768 UTF-8 bytes; output buffering is at most 1 MiB.
-Control characters except tab/newline are removed before capture. Unknown updates,
-reasoning, tools, modalities and peer requests fail, rather than dropping data or
-auto-approving. Opaque `_meta` is never acted on.
+Control characters except tab/newline are removed before capture. Malformed,
+mismatched or out-of-phase core updates, unknown core methods, reasoning, tools
+and modalities still fail closed. Opaque `_meta` is never acted on.
+
+Unknown **notifications** may cross the shared extension boundary only with an
+ASCII namespaced method (`[A-Za-z_][A-Za-z0-9_.-]*/[A-Za-z_][A-Za-z0-9_./-]*`)
+outside the reserved `session/`, `fs/`, `terminal/` and JSON-RPC `rpc.*` namespaces.
+No vendor allowlist or extension semantics are implemented. Request-ID presence (including
+ID `0`), not the method name, makes a message blocking: the transport sends
+`-32601` and the turn fails with `acp_unsupported_request`. Its fixed diagnostic
+states that no input or approval was supplied; unsupported requests cannot
+become successful work.
+
+**Private evidence boundary:** extension records go only to Core's existing
+per-run `stderr.log` (mode `0600`) / sealed stderr artifact (mode `0400`), never normalized
+output, ordinary status/error messages or initialize-only inspection. Direct
+`--turn` execution exposes this sensitive stderr to its caller; use the installed
+host run/capture boundary. Records contain fixed `source: untrusted_acp_peer`,
+bridge phase and sequence labels, canonical notification JSON byte length and
+SHA-256, a truncation flag, and a base64 prefix of that JSON. Base64 is encoding,
+**not redaction**: private log/artifact readers can recover arbitrary peer data.
+Do not publish it or treat method, session, peer or body text as identity,
+instructions, approval, readiness, capabilities or successful work. The bridge
+does not inspect/copy native stores, credentials, environment or additional
+context into this evidence.
+
+Budgets apply across the entire connection/turn, not per method or session:
+2,048 retained JSON-prefix bytes per notification; 4,096 bytes per encoded
+evidence record including LF; at most 32 records and 32,768 encoded bytes total.
+Long notifications retain only the prefix plus the full canonical JSON hash;
+the transport's separate 1 MiB inbound record limit still applies. Count or
+encoded-byte exhaustion rejects the next record, retains earlier records and
+fails the turn with `acp_extension_overflow` (no silent drop or replay).
+Transport callback/write bounds may fail earlier for an excessive in-flight
+burst. Core's shared capture budget can additionally truncate raw artifacts,
+with its existing explicit truncation marker.
 
 Only a validated `end_turn` permits exit zero; cancelled/refused/limited turns and
 malformed/unknown stops fail. No done, usage, cost, model identity, native
 capability or provider-success record is invented. Normalization accepts only
-bridge text, fixed-code failure, and validated stop records. Core creates its own
-process lifecycle events. Native stdout/text is sensitive content, not universal
-secret-redacted output; peer stderr and remote error messages/data are discarded.
+bridge text, fixed-code failure, and validated stop records. Extension evidence
+has no normalized event and adds no usage/tool/support claim. Core creates its
+own process lifecycle events. Native stdout/text and retained extension evidence
+are sensitive content, not universal secret-redacted output; peer stderr and
+remote error messages/data are discarded. Initialize-only `--inspect` continues
+to discard all notification bodies; auth/model remain unverified and peer
+identity remains untrusted.
 
 Initialization has a 10-second deadline; `session/new` uses the package-bound
 1–300,000 ms setup timeout (default 60 seconds). **The prompt turn has no RPC
@@ -402,11 +442,15 @@ No SDK native-reference conformance helper is used.
 The check packages/installs into an isolated registry, uses real fixture children
 through Core probe/context/capabilities/plan/command/normalization and local target
 primitives, verifies text/patch/artifact hashes, malformed and mismatched events,
-tools/modalities/requests, remote failure, invalid stops and disconnect. It proves
-two independently active installed-plugin turns with distinct literal prompts,
-children and owned workspaces: SIGINT cancels one while the other remains alive,
-then the survivor produces only its own text/patch. Both workspaces are reclaimed
-and both children reaped; a fixture release file makes overlap deterministic.
+tools/modalities/requests, remote failure, invalid stops and disconnect. Extension
+checks cover interleaved exact-session text/patch success, private bounded
+evidence, truncation/hash integrity, count/byte floods and blocking vendor
+requests (including the same method as an accepted notification with ID `0`).
+Two independently active installed-plugin turns have distinct literal prompts,
+children, evidence and owned workspaces: SIGINT cancels one with a pending prompt
+after extension delivery while the other remains alive, then the survivor
+produces only its own evidence/text/patch. Both workspaces are reclaimed and both
+children reaped without replay; a fixture release file makes overlap deterministic.
 It also checks longer-than-setup-deadline turns, process-group inheritance and
 changed pins without executing replacements.
 It clones the local existing commit into a temporary fixture repo; no commit,
