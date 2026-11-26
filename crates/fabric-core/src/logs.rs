@@ -355,6 +355,11 @@ fn open_log(
             .workspace(&run.workspace_id)
             .map_err(|_| error("Log ownership unavailable"))?
             .ok_or_else(|| error("Missing owned workspace"))?;
+        // Ownership is committed before the backend creates the tree and marker.
+        // A pending fork has no readable logs; do not open its filesystem paths.
+        if run.state == RunState::Preparing && workspace.retention_reason.is_some() {
+            return Ok(None);
+        }
         let owned = super::workspace::validate_owned_workspace(root, run, &workspace)
             .map_err(|_| error("Unsafe or foreign run workspace"))?;
         let container = owned
