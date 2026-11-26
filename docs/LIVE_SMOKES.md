@@ -93,6 +93,14 @@ The launcher replaces the native child's environment with a fixture-only
 allowlist and dummy Anthropic Messages endpoint. Real native Read/Write results
 must reach the next request; Fabric's ACP JSONL is not a native SDK transcript.
 
+Claude's pinned SDK concurrently requests a session title. Its fixture matches
+one optional title call per scenario by exact prompt and output schema, with a
+private canary that must never enter public events. The large native Read also
+requires one exact `/v1/messages/count_tokens?beta=true` JSON call before the
+real Read/Write continuation. Every required call must occur once; duplicate,
+unknown, ambiguous and malformed requests still fail. Only this fixture opts
+into bounded unordered matching; other scripted providers remain ordered.
+
 CI downloads official architecture-specific releases with checked archive hashes;
 the runners never install/update host harnesses or import user authentication.
 Each reports its own retained proof/failure directory and exits nonzero on failure.

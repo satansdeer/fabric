@@ -7,7 +7,8 @@
 // ada7afbea165c20e5ec50a190653309bfba528ed9f74ef86a24f2734329ec59c.
 // Prefer its bundled Claude; localPlugin is the accepted release's native reference local target.
 // Endpoint overrides are NOT OS egress confinement. Run in the controller's isolated worker.
-// Known compatibility risk: v0.112.0 assistant messageId/core updates exceed the current bridge subset.
+// One optional title call per scenario; required main calls still prove exact tool history.
+// Title source: agentclientprotocol/claude-agent-acp v0.112.0 src/session-titles.ts.
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
@@ -61,6 +62,7 @@ const env = { HOME: home, TMPDIR: join(home, "tmp"), LC_ALL: "C", PATH: `${bin}:
 const model = "claude-sonnet-4-6", key = "fabric-fixture-only-not-a-secret";
 const target = "README.md", changed = "scripted native Claude write\n";
 const sentinel = "FABRIC_SCRIPTED_COMPLETE", held = "FABRIC_SCRIPTED_HELD", partial = "incomplete fixture";
+const titleCanary = "FABRIC_PRIVATE_TITLE_CANARY";
 const route = "/v1/messages?beta=true";
 const jsonl = text => text.split("\n").filter(line => line.trim()).map(line => JSON.parse(line));
 let commandNumber = 0, phase = "setup", prepared, original, nativeVersion, shimVersion, nodeVersion;
@@ -119,21 +121,39 @@ function toolWire(id, name, input) {
     frame("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: json.slice(0, middle) } }) +
     frame("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: json.slice(middle) } }) + finish("tool_use");
 }
+const countRoute = "/v1/messages/count_tokens?beta=true";
+function checkIsolation({ method, path, headers, body }, countTokens = false) {
+  assert.ok(method === "POST" && path === (countTokens ? countRoute : route), "Unexpected Anthropic route");
+  assert.ok(headers["x-api-key"] === key, "Only the dummy fixture API key is allowed");
+  for (const header of ["authorization", "cookie", "proxy-authorization", "api-key"]) assert.ok(!headers[header], "Unexpected credential header");
+  assert.ok(typeof headers["anthropic-version"] === "string", "Missing Anthropic protocol version");
+  assert.ok(body.model === model && body.stream === (countTokens ? undefined : true), "Wrong model or streaming mode");
+}
+function matchRequest(prompt, expectedTools = []) {
+  return ({ body }) => {
+    if (!Array.isArray(body?.messages) || !body.messages.some(message => message?.role === "user" &&
+      (message.content === prompt || (Array.isArray(message.content) && message.content.some(block => block?.type === "text" && block.text === prompt))))) return false;
+    const history = body.messages.flatMap(message => Array.isArray(message?.content) ?
+      message.content.map(block => ({ ...block, role: message.role })) : []).filter(block => ["tool_use", "tool_result"].includes(block.type));
+    return history.length === expectedTools.length * 2 && expectedTools.every((name, index) => {
+      const call = history[index * 2], result = history[index * 2 + 1];
+      const id = name === "Read" ? "fixture_read" : "fixture_write";
+      return call.role === "assistant" && call.type === "tool_use" && call.id === id && call.name === name &&
+        result.role === "user" && result.type === "tool_result" && result.tool_use_id === id;
+    });
+  };
+}
 function checkRequest(prompt, expectedTools = []) {
-  return ({ method, path, headers, body }) => {
-    assert.ok(method === "POST" && path === route, "Unexpected Anthropic route");
-    assert.ok(headers["x-api-key"] === key, "Only the dummy fixture API key is allowed");
-    for (const header of ["authorization", "cookie", "proxy-authorization", "api-key"]) assert.ok(!headers[header], "Unexpected credential header");
-    assert.ok(typeof headers["anthropic-version"] === "string", "Missing Anthropic protocol version");
-    assert.ok(body.model === model && body.stream === true, "Wrong model or non-streaming fallback");
-    assert.ok(Array.isArray(body.messages) && body.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes(prompt)), "Prompt missing");
+  return request => {
+    checkIsolation(request);
+    const { body } = request;
+    assert.ok(matchRequest(prompt, expectedTools)(request), "Wrong exact prompt or native tool history");
+    for (const name of ["Read", "Write"]) assert.ok(body.tools?.some(tool => tool.name === name), `Native ${name} unavailable`);
     const blocks = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : []);
     const calls = blocks.filter(block => block.type === "tool_use"), results = blocks.filter(block => block.type === "tool_result");
-    assert.equal(calls.length, expectedTools.length, "Unexpected/missing native tool call");
-    assert.equal(results.length, expectedTools.length, "Unexpected/missing actual tool result");
     for (const [index, name] of expectedTools.entries()) {
       const id = name === "Read" ? "fixture_read" : "fixture_write";
-      assert.ok(calls[index].id === id && calls[index].name === name && calls[index].input.file_path === target, "Native conversation changed tool input");
+      assert.equal(calls[index].input.file_path, target, "Native conversation changed tool input");
       if (name === "Write") assert.equal(calls[index].input.content, changed);
       const result = results.find(block => block.tool_use_id === id);
       const expected = name === "Write" ? target : original.split("\n").find(line => line.trim());
@@ -141,28 +161,72 @@ function checkRequest(prompt, expectedTools = []) {
     }
   };
 }
+const contentText = content => typeof content === "string" ? content : Array.isArray(content) ?
+  content.filter(block => block?.type === "text").map(block => block.text).join("\n") : "";
+function matchTitle(prompt) {
+  return ({ body }) => {
+    if (!/(?:^|\n)You are naming a coding session/.test(contentText(body?.system)) || !Array.isArray(body?.messages)) return false;
+    return body.messages.some(message => {
+      if (message?.role !== "user") return false;
+      const sessions = [...contentText(message.content).matchAll(/<session>([\s\S]*?)<\/session>/g)];
+      return sessions.length === 1 && sessions[0][1].trim() === prompt;
+    });
+  };
+}
+function titleStep(scenario) {
+  return { method: "POST", path: route, match: matchTitle(scenario.prompt), optional: true, headers,
+    chunks: split(textWire(JSON.stringify({ title: `${titleCanary}_${scenario.name}` }))),
+    check(request) {
+      checkIsolation(request);
+      assert.ok(matchTitle(scenario.prompt)(request), "Wrong title system text or prompt correlation");
+      assert.equal(request.body.messages.length, 1, "Unexpected title conversation");
+      const content = request.body.messages[0].content;
+      assert.ok(typeof content === "string" || (Array.isArray(content) &&
+        content.every(block => block?.type === "text" && typeof block.text === "string")), "Unexpected title content blocks");
+      assert.ok(request.body.tools === undefined || (Array.isArray(request.body.tools) && request.body.tools.length === 0), "Title request has tools");
+      assert.deepEqual(request.body.output_config?.format, { type: "json_schema", schema: {
+        type: "object", properties: { title: { type: "string" } }, required: ["title"], additionalProperties: false,
+      } }, "Unexpected title JSON schema");
+    } };
+}
 const headers = { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "close" };
-const step = (check, chunks, extra = {}) => ({ method: "POST", path: route, check, headers, chunks, ...extra });
+const step = (prompt, expectedTools, chunks, extra = {}) => ({ method: "POST", path: route,
+  match: matchRequest(prompt, expectedTools), check: checkRequest(prompt, expectedTools), headers, chunks, ...extra });
 let releaseDisconnect;
 const disconnectGate = new Promise(resolve => { releaseDisconnect = resolve; });
 const scenarios = [
   { name: "split-text", state: "SUCCEEDED", requests: 1, prompt: "Synthetic split-text fixture. Reply with the requested completion marker only.",
-    steps(prompt) { return [step(checkRequest(prompt), split(textWire(sentinel)))]; } },
-  { name: "native-write", state: "SUCCEEDED", requests: 3,
+    steps(prompt) { return [step(prompt, [], split(textWire(sentinel)))]; } },
+  { name: "native-write", state: "SUCCEEDED", requests: 4,
     prompt: `Synthetic write fixture. Read ${target}, then use native Write to replace it with ${JSON.stringify(changed)}, then report completion. No other tools or files.`,
-    steps(prompt) { return [step(request => { checkRequest(prompt)(request);
-      for (const name of ["Read", "Write"]) assert.ok(request.body.tools?.some(tool => tool.name === name), `Native ${name} unavailable`);
-    }, split(toolWire("fixture_read", "Read", { file_path: target }))),
-    step(checkRequest(prompt, ["Read"]), split(toolWire("fixture_write", "Write", { file_path: target, content: changed }))),
-    step(checkRequest(prompt, ["Read", "Write"]), split(textWire(sentinel)))]; } },
+    steps(prompt) { return [step(prompt, [], split(toolWire("fixture_read", "Read", { file_path: target }))),
+    // Native Read counts this large file before forwarding its real tool result.
+    { method: "POST", path: countRoute,
+      match: ({ path, body }) => path === countRoute && body?.messages?.length === 1 &&
+        body.messages[0].role === "user" && body.messages[0].content === original,
+      check(request) {
+        checkIsolation(request, true);
+        assert.deepEqual(request.body, { model, messages: [{ role: "user", content: original }], tools: [] },
+          "Unexpected native Read token-count request");
+      },
+      headers: { "content-type": "application/json" }, chunks: ['{"input_tokens":1000}'] },
+    step(prompt, ["Read"], split(toolWire("fixture_write", "Write", { file_path: target, content: changed }))),
+    step(prompt, ["Read", "Write"], split(textWire(sentinel)))]; } },
   { name: "api-error", state: "FAILED", requests: 1, prompt: "Synthetic non-retryable Anthropic API failure fixture.",
-    steps(prompt) { return [step(checkRequest(prompt), [JSON.stringify({ type: "error", error: { type: "authentication_error", message: "Synthetic fixture denial" } })],
+    steps(prompt) { return [step(prompt, [], [JSON.stringify({ type: "error", error: { type: "authentication_error", message: "Synthetic fixture denial" } })],
       { status: 401, headers: { "content-type": "application/json" } })]; } },
   { name: "incomplete-disconnect", state: "FAILED", requests: 1, prompt: "Synthetic interrupted Anthropic stream fixture.",
-    steps(prompt) { return [step(checkRequest(prompt), [textWire(partial, false), 'event: content_block_delta\ndata: {"type":'], { wait: disconnectGate, disconnect: true })]; } },
+    steps(prompt) { return [step(prompt, [], [textWire(partial, false), 'event: content_block_delta\ndata: {"type":'], { wait: disconnectGate, disconnect: true })]; } },
   { name: "cancel-held-stream", state: "CANCELLED", requests: 1, prompt: "Synthetic held Anthropic stream cancellation fixture.",
-    steps(prompt) { return [step(checkRequest(prompt), [textWire(held, false)], { wait: new Promise(() => {}) })]; } },
+    steps(prompt) { return [step(prompt, [], [textWire(held, false)], { wait: new Promise(() => {}) })]; } },
 ];
+function requestAccounting(scenario, before) {
+  const requests = server.requests.slice(before);
+  const counts = scenario.script.map(step => requests.filter(request => step.match(request)).length);
+  const optional = counts.pop(), required = counts.reduce((sum, count) => sum + count, 0);
+  return { required: scenario.requests, required_observed: required, required_step_counts: counts,
+    optional: 1, optional_observed: optional, unexpected: requests.length - required - optional };
+}
 async function sockets() {
   return (await run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(process.pid), `-iTCP:${new URL(server.baseUrl).port}`, "-FfT"]))
     .split("\n").filter(line => line.startsWith("TST=")).map(line => line.slice(4));
@@ -253,6 +317,12 @@ function checkOutcome({ task, report, contents }, scenario) {
   const raw = jsonl(contents.get("stdout").toString());
   const events = jsonl(contents.get("events").toString()).map(record => record.event).filter(Boolean);
   const output = events.filter(event => event.type === "output").map(event => event.text).join("");
+  const rawText = raw.filter(event => event.type === "acp.text").map(event => event.text).join("");
+  assert.ok(!output.includes(titleCanary) && !rawText.includes(titleCanary) &&
+    !JSON.stringify(events).includes(titleCanary) && !JSON.stringify(raw).includes(titleCanary),
+    "Private auxiliary title leaked into assistant output, tools or turn events");
+  if (scenario.name !== "native-write") assert.ok(!events.some(event => event.type === "tool") &&
+    !raw.some(event => event.type === "acp.tool"), "Auxiliary request produced unexpected tool events");
   if (["incomplete-disconnect", "cancel-held-stream"].includes(scenario.name)) {
     const expected = scenario.state === "CANCELLED" ? held : partial;
     assert.ok(output.includes(expected) && raw.filter(event => event.type === "acp.text").map(event => event.text).join("").includes(expected),
@@ -285,10 +355,13 @@ try {
   const tracked = (await run("/usr/bin/git", ["ls-files", "-z"], repo)).split("\0");
   assert.ok(!tracked.some(path => /(^|\/)\.claude(?:\/|\.json$)|(^|\/)\.mcp\.json$/.test(path)), "Source contains native config; review isolation before running");
   original = await readFile(join(repo, target), "utf8");
-  const steps = scenarios.flatMap(scenario => scenario.steps(scenario.prompt));
-  await writeFile(join(fixture, "provider-response-plan.json"), JSON.stringify(steps.map(({ method, path, status, headers, chunks, disconnect }) =>
-    ({ method, path, status, headers, chunks, disconnect })), null, 2));
-  server = await startScriptedProvider(steps);
+  const steps = scenarios.flatMap(scenario => {
+    scenario.script = [...scenario.steps(scenario.prompt), titleStep(scenario)];
+    return scenario.script;
+  });
+  await writeFile(join(fixture, "provider-response-plan.json"), JSON.stringify(steps.map(({ method, path, status, headers, chunks, disconnect, optional }) =>
+    ({ method, path, status, headers, chunks, disconnect, optional: optional === true })), null, 2));
+  server = await startScriptedProvider(steps, { unordered: true });
   assert.match(server.baseUrl, /^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/);
   const settingsPath = join(nativeHome, ".claude", "settings.json");
   await writeFile(settingsPath, JSON.stringify({ model, promptSuggestionEnabled: false, autoMemoryEnabled: false,
@@ -342,13 +415,15 @@ try {
       if (scenario.name === "incomplete-disconnect") { await observePartial(runId, partial); releaseDisconnect(); }
       if (scenario.state === "CANCELLED") {
         await observePartial(runId, held);
-        assert.equal(server.requests.length - before, 1, "Cancel preceded the provider request");
+        assert.equal(requestAccounting(scenario, before).required_observed, 1, "Cancel preceded the required provider request");
         assert.ok((await sockets()).includes("ESTABLISHED"), "No held provider socket");
         await cli(["cancel", batchId, "--json"]);
       }
       assert.equal((await cli(["wait", batchId, "--timeout-seconds", "90", "--json"])).terminal, true);
       settled = true; collected = await collect(batchId, runId); checkOutcome(collected, scenario);
-      assert.equal(server.requests.length - before, scenario.requests, "Unexpected retry/fallback/request count");
+      const accounting = requestAccounting(scenario, before);
+      assert.deepEqual(accounting.required_step_counts, Array(scenario.requests).fill(1), "Missing or repeated required main request");
+      assert.ok(accounting.optional_observed <= 1 && accounting.unexpected === 0, "Unexpected retry/fallback/auxiliary request count");
       if (scenario.name === "native-write") {
         const patch = collected.contents.get("tracked_patch");
         assert.ok(patch?.length && patch.toString().includes(target), "Missing captured native write patch");
@@ -379,9 +454,9 @@ try {
       }
       cleaning = false;
       proof.push({ scenario: scenario.name, outcome: scenarioErrors.length ? "FAIL" : "PASS", model_requests: server.requests.length - before,
-        batch_id: batchId, run_id: runId, ...collected?.summary });
+        request_accounting: requestAccounting(scenario, before), batch_id: batchId, run_id: runId, ...collected?.summary });
     }
-    // One exact ordered server: a failed turn cannot shift later scenarios into bogus passes.
+    // One bounded server: title requests cannot consume required main steps.
     if (scenarioErrors.length) throw new AggregateError(scenarioErrors, `Scenario ${scenario.name} failed`);
   }
 } catch (error) { errors.push(error); }

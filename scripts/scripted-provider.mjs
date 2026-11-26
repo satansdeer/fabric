@@ -7,12 +7,18 @@ const MAX_BODY = 1024 * 1024;
 const MAX_RESPONSE = 4 * 1024 * 1024;
 const CANCELLED = Symbol('cancelled');
 
-export async function startScriptedProvider(steps) {
+export async function startScriptedProvider(steps, options = {}) {
+  assert.ok(options && typeof options === 'object' && !Array.isArray(options) &&
+    Object.keys(options).every(key => key === 'unordered'), 'Invalid provider options');
+  assert.ok(options.unordered === undefined || typeof options.unordered === 'boolean', 'Invalid unordered option');
+  const unordered = options.unordered === true;
   assert.ok(Array.isArray(steps) && steps.length <= MAX_REQUESTS, 'Expected at most 128 steps');
   let responseBytes = 0;
   const script = steps.map(step => {
     assert.ok(step && typeof step === 'object' && !Array.isArray(step), 'Invalid step');
-    assert.ok(Object.keys(step).every(key => ['method', 'path', 'check', 'status', 'headers', 'chunks', 'disconnect', 'wait'].includes(key)), 'Unknown step option');
+    assert.ok(Object.keys(step).every(key => ['method', 'path', 'match', 'optional', 'check', 'status', 'headers', 'chunks', 'disconnect', 'wait'].includes(key)), 'Unknown step option');
+    assert.ok(unordered ? typeof step.match === 'function' : step.match === undefined, 'Selectors require unordered mode');
+    assert.ok(unordered ? step.optional === undefined || typeof step.optional === 'boolean' : step.optional === undefined, 'Optional steps require unordered mode');
     assert.equal(typeof step.method, 'string', 'Invalid method');
     validateHeaderName(step.method);
     assert.ok(typeof step.path === 'string' && /^\/[^\s#]*$/.test(step.path), 'Expected an exact origin-form path');
@@ -40,7 +46,7 @@ export async function startScriptedProvider(steps) {
       responseBytes += Buffer.byteLength(chunk);
       assert.ok(responseBytes <= MAX_RESPONSE, 'Declared responses exceed 4 MiB');
     }
-    return { ...step, status, headers, chunks };
+    return { ...step, status, headers, chunks, consumed: false };
   });
 
   let failure;
@@ -165,19 +171,43 @@ export async function startScriptedProvider(steps) {
       if (parsed === CANCELLED || closing) return;
       if (failure) { reject(res, 500, 'Fixture already failed'); return; }
       requests.push({ method: req.method, path: req.url, body: parsed.body });
-      const step = script[next];
+      const request = { method: req.method, path: req.url, headers: req.headers, body: parsed.body };
+      let index = next;
+      if (unordered) {
+        const matches = [];
+        try {
+          // Selectors must be pure synchronous booleans; checks never route requests.
+          for (let i = 0; i < script.length; i++) {
+            if (script[i].consumed) continue;
+            const matched = script[i].match(request);
+            if (matched && typeof matched.then === 'function') void Promise.resolve(matched).catch(() => {});
+            assert.equal(typeof matched, 'boolean');
+            if (matched) matches.push(i);
+          }
+        } catch {
+          reject(res, 400, 'Request selector failed');
+          return;
+        }
+        if (matches.length !== 1) {
+          reject(res, 400, matches.length ? 'Ambiguous request selectors' : 'Unexpected unmatched request');
+          return;
+        }
+        [index] = matches;
+      }
+      const step = script[index];
       if (!step || req.method !== step.method || req.url !== step.path) {
-        reject(res, 400, `Unexpected request at step ${next + 1}`);
+        reject(res, 400, `Unexpected request at step ${index + 1}`);
         return;
       }
       try {
-        const checked = step.check?.({ method: req.method, path: req.url, headers: req.headers, body: parsed.body });
+        const checked = step.check?.(request);
         if (await Promise.race([Promise.resolve(checked), stopped]) === CANCELLED || closing) return;
       } catch {
-        reject(res, 400, `Request check failed at step ${next + 1}`);
+        reject(res, 400, `Request check failed at step ${index + 1}`);
         return;
       }
       if (failure) { reject(res, 500, 'Fixture already failed'); return; }
+      step.consumed = true;
       next++;
       // Deliberately detached: a held stream must not block the next request.
       void respond(res, step);
@@ -215,7 +245,8 @@ export async function startScriptedProvider(steps) {
     requests,
     assertDone() {
       if (failure) throw failure;
-      assert.equal(next, script.length, `Unconsumed scripted steps: ${script.length - next}`);
+      const missing = script.filter(step => !step.consumed && !step.optional).length;
+      assert.equal(missing, 0, `Unconsumed scripted steps: ${missing}`);
       assert.equal(received, next, 'Pending or extra scripted requests');
     },
     close() {
