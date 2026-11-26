@@ -102,7 +102,7 @@ try {
   assert.equal(kit.installable, false);
   assert.equal(kit.fixture.path, 'plugins/acp/fixtures/turn-agent.mjs');
   for (const file of [
-    ...['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'README.md', 'fixtures/turn-agent.mjs'].map(file => `${kit.path}/${file}`),
+    ...['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'permission.mjs', 'permission-client.mjs', 'README.md', 'fixtures/turn-agent.mjs'].map(file => `${kit.path}/${file}`),
     ...['cli.mjs', 'package.mjs', 'protocol.mjs', 'index.mjs', 'webhook.mjs'].map(file => `${kit.sdk_path}/${file}`),
   ]) assert.match(manifest.files[file], /^[a-f0-9]{64}$/, `required pinned ACP kit/SDK payload: ${file}`);
   assert.equal(existsSync(join(installed, kit.path, 'launch.json')), false, 'kit must not bind a native profile');

@@ -116,13 +116,17 @@ this module's protocol exchange, not a guarantee about arbitrary child behavior.
   completions may be unordered. Replies continue while callbacks wait. Callback
   throws/rejections fail the connection. Consumers must sanitize strings/URIs
   before display and never act on unknown methods as grants.
-- All incoming agent **requests** receive JSON-RPC `-32601`, `Method not found`.
-  There is no request handler/permission auto-approval. In particular
-  `cursor/ask_question`, `cursor/create_plan`, `session/request_permission`, file
-  and terminal requests cannot block on or receive fake human answers.
-  Optional `failOnPeerRequest: true` also terminates with
+- Incoming agent requests default to JSON-RPC `-32601`, `Method not found`.
+  Optional `onPermissionRequest(message, signal)` handles **only**
+  `session/request_permission` during a live outgoing `session/prompt`.
+  Reading continues while the handler waits. Handler failure, duplicate/late IDs,
+  more than eight simultaneous or 64 lifetime permission requests fail closed.
+  Abort/close invalidates outstanding callbacks; no late result is sent.
+  Other methods (including file, terminal and vendor interaction) remain unsupported.
+  `failOnPeerRequest: true` also terminates unsupported requests with
   `acp_unsupported_request`; default `false` preserves transport-only behavior.
-  The bridge enables it, so denying a blocking request cannot become success.
+  The bridge enables this policy and supplies the handler only with explicit
+  packaged permission selection below.
 - `cancel()`, `close()`, request/initialization abort, or launch-signal abort
   terminate the connection. Await these methods or `closed` to wait for child
   reaping. `closed` always resolves `{ code }`, retaining the first terminal reason;
@@ -260,6 +264,79 @@ export PATH="$REGISTRY/packages/$HASH:/usr/bin:/bin"
 Changing executable, argv, native home, pins, setup timeout or runtime requires a
 new reviewed package/hash and explicit SDK upgrade; no launch field comes from
 peer metadata. Probe/version describe **this bridge**, not a native agent version.
+
+### Optional private allow-once / reject-once control
+
+Without `permission`, existing packages still reject every peer request.
+To opt in, add `"permission": {"directory": "/private/owner/acp"}` to the
+offline launch input. The directory must already exist, be canonical (no
+symlinks), owned by the current UID and have no group/world permission bits.
+Packaging pins its device/inode; replacing it requires repackaging. At turn
+start it must be outside the canonical execution workspace. The complete
+random socket path must fit 103 UTF-8 bytes (directory plus 33 bytes maximum),
+including on macOS. The bridge never creates or changes the selected directory.
+
+Each turn exclusively binds a fresh random `p-<24 hex>.sock`, mode `0600`;
+it never adopts or pre-unlinks an endpoint. Discover its pathname in the
+selected private directory, **not public run logs**. Use the packaged companion
+from a trusted owner terminal:
+
+```sh
+/private/package/fabric-acp-permission list /private/owner/acp/p-<24-hex>.sock
+# Review the entire bounded request, especially toolCall/rawInput and options.
+# Write a private decision.json with these exact reviewed values:
+# {"op":"decide","endpoint":"<socket>","nonce":"<list nonce>",
+#  "sessionId":"<pending sessionId>","requestId":"<pending requestId>",
+#  "digest":"<pending digest>","optionId":"<advertised once optionId>",
+#  "kind":"allow_once"}
+/private/package/fabric-acp-permission decide /private/owner/acp/p-<24-hex>.sock /private/decision.json
+```
+
+For rejection use `kind: "reject_once"` and the **actual advertised**
+`reject_once` option ID. No option is automatically selected; `allow_always`
+and `reject_always` can be inspected but never chosen. JSON output escapes
+terminal control characters; its contents remain untrusted peer data, not
+instructions. Keep inspection and decision files private; do not copy them
+into normalized events or public logs. The package-local API is
+`permissionControl(endpoint, {op: 'list'})` / `permissionControl(endpoint, decision)`
+from `permission.mjs`.
+
+A decision binds endpoint, random turn nonce, exact session/request and SHA-256
+of the reviewed request plus that identity. Unknown/stale/replayed/wrong-digest,
+cross-session/turn and wrong-kind/option decisions return `invalid_decision`
+without consuming the pending request. Missing clients leave permission pending
+until an explicit decision or owned cancellation, never a timed approval.
+Only `session/request_permission` is supported; tool-call fields use the v1
+update schema, options have unique IDs and advertised v1 kinds. Session,
+tool and option strings are bounded; permission request IDs/tool IDs cannot
+repeat within a turn. Malformed, late or overflowing peer requests fail the turn.
+Finishing a prompt with unresolved permissions also fails.
+
+Bounds: eight pending permissions, 64 total per turn, 128 UTF-8 bytes per ID,
+16 options, 1,024 bytes per option name, 32,768 bytes per permission payload,
+eight active control clients, 4,096 bytes per control message, and 300,000 bytes
+per response. One exchange per connection; idle clients close after five seconds
+(this is **not** a permission timeout). The companion checks canonical private
+directory and socket ownership/type/mode and bounds both directions.
+Public events retain only existing fixed tool correlations/failure codes;
+endpoints, nonces, digests and reviewed payloads stay in transient private memory.
+
+Core still owns cancellation: the bridge notifies only its session, invalidates
+pending permission handlers, reaps only its launched child, closes control
+clients/server and removes only its bound socket. It never discovers or kills
+a native Cline hub or sibling peer. This is **trusted same-UID local control,
+not an OS security boundary**: another process with the same UID can inspect or
+alter owner files/processes. Native launch grants, profile metadata and tool
+notifications are not model tool approval. No persistent allow policy, Core
+bidirectional RPC, multiplexing, native Cline parity or release promotion.
+
+Focused offline regression (packaged bridge/companion plus deterministic fake
+peers; no providers or Core host):
+
+```sh
+node --test plugins/acp/permission.test.mjs plugins/acp/transport.test.mjs plugins/acp/config.test.mjs
+```
+
 `agentInfo`, auth methods, modes/models and capability metadata are untrusted,
 never consent or readiness. No authenticate, install, login or model-selection RPC.
 
@@ -416,8 +493,9 @@ terminal references are shape-validated and discarded. Subagent session content
 is rejected: no `subagents` capability is advertised. Peer titles, names, IDs,
 commands, arguments, output, paths, content and `_meta` are never used as native
 names or diagnostics, retained as raw tool evidence, executed, opened or applied.
-Filesystem, terminal and permission requests remain unsupported even after a
-tool notification; the bridge advertises empty client capabilities.
+Filesystem and terminal requests remain unsupported even after a tool
+notification. Permission requests require the explicit private selection above;
+tool notifications never approve them. The bridge advertises empty client capabilities.
 
 At most 256 distinct tool IDs are correlated per turn using fixed-size hashes;
 the next distinct ID fails with `acp_tool_overflow`. No lifecycle history or raw
@@ -436,11 +514,11 @@ that an action ran. Correlation is discarded with the turn.
 Unknown **notifications** may cross the shared extension boundary only with an
 ASCII namespaced method (`[A-Za-z_][A-Za-z0-9_.-]*/[A-Za-z_][A-Za-z0-9_./-]*`)
 outside the reserved `session/`, `fs/`, `terminal/` and JSON-RPC `rpc.*` namespaces.
-No vendor allowlist or extension semantics are implemented. Request-ID presence (including
-ID `0`), not the method name, makes a message blocking: the transport sends
-`-32601` and the turn fails with `acp_unsupported_request`. Its fixed diagnostic
-states that no input or approval was supplied; unsupported requests cannot
-become successful work.
+No vendor allowlist or extension semantics are implemented. Except for explicitly
+selected `session/request_permission`, request-ID presence (including ID `0`)
+makes a message blocking: the transport sends `-32601` and the turn fails with
+`acp_unsupported_request`. Its fixed diagnostic states that no input or approval
+was supplied; unsupported requests cannot become successful work.
 
 **Private evidence boundary:** extension records go only to Core's existing
 per-run `stderr.log` (mode `0600`) / sealed stderr artifact (mode `0400`), never normalized
