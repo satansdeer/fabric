@@ -372,11 +372,29 @@ The bridge performs `initialize` → `session/new` (empty `mcpServers`) →
 `session/prompt` (one text block). IDs are connection-local; no session persistence,
 restart, replay or second turn. Core `session/update` notifications must match the
 exact session during the pending prompt, including the wire-receipt phase check.
-Supported variants are `agent_message_chunk` text, `tool_call` and
-`tool_call_update`. Each text chunk is at most 32,768 UTF-8 bytes; output buffering
-is at most 1 MiB. Control characters except tab/newline are removed from text.
-Malformed, mismatched or out-of-phase core updates, unknown core methods,
-reasoning and non-text agent messages still fail closed.
+Supported rendered variants are `agent_message_chunk` text, `tool_call` and
+`tool_call_update`. Each assistant text chunk is at most 32,768 UTF-8 bytes; output
+buffering is at most 1 MiB. Control characters except tab/newline are removed from text.
+Malformed, mismatched or out-of-phase core updates, unknown core methods and
+non-text assistant messages still fail closed.
+
+**Private reasoning and checklist subset (stable v1):** `agent_thought_chunk`
+accepts the existing standard content-block shapes and annotations, optional
+string/null `messageId`, and object/null `_meta`. Legacy `plan` requires an
+`entries` array; each entry requires string `content`, priority
+`high`/`medium`/`low`, and status `pending`/`in_progress`/`completed`, with optional
+object/null `_meta` on the entry and update. Empty checklists are valid.
+These notifications are validated and discarded, **not rendered or retained**:
+reasoning, IDs, plan content, annotations and metadata never become assistant
+output, tool labels, diagnostics or extension evidence. They do not imply
+execution, tool completion, billing or turn success; only the real prompt result
+determines completion. No reasoning history or plan accumulation is kept.
+Processing remains bounded by the existing 1 MiB transport frame and 64 in-flight
+notification callback limits, with no additional ceiling or capability.
+`plan_update`/`plan_removed` still fail closed: they require the client's `plan`
+capability, which the bridge does not advertise. Other standard session updates,
+auth/readiness/resume/permission semantics and native-provider support remain
+outside this subset under #95.
 
 **Tool lifecycle subset (stable v1):** initial calls require string `toolCallId`
 and `title`; omitted kind/status default to `other`/`pending`. Updates require
@@ -474,13 +492,18 @@ tool lifecycles/deltas/defaults, malformed tool shapes, unsupported modalities a
 requests, remote failure, invalid stops and disconnect. Tool checks include
 arbitrary JSON input/output, non-monotonic and orphan updates, terminal initial
 reports, private sentinel non-disclosure, inert content/diffs/paths/terminals,
-correlation overflow and initialize/session-new/post-response phase rejection. Extension
-checks cover interleaved exact-session text/patch success, private bounded
+correlation overflow and initialize/session-new/post-response phase rejection.
+Private-update checks cover thought/plan/text/tool receipt ordering in one write,
+nullable metadata, standard reasoning content, empty/replacement checklists,
+metadata-only turns without fabricated output, malformed required/optional
+fields, unsupported capability-dependent variants, wrong sessions, premature/late
+updates, oversized frames and repeated private updates without accumulation.
+Extension checks cover interleaved exact-session text/patch success, private bounded
 evidence, truncation/hash integrity, count/byte floods and blocking vendor
 requests (including the same method as an accepted notification with ID `0`).
 Two independently active installed-plugin turns have distinct literal prompts,
 children, evidence and owned workspaces: SIGINT cancels one with a pending prompt
-after extension/tool delivery while the other remains alive, then the survivor
+after private thought/plan and extension/tool delivery while the other remains alive, then the survivor
 produces only its own evidence/text/patch and terminal tool event. Cancelled tools
 receive no fabricated end. Both workspaces are reclaimed and both children reaped
 without replay; a fixture release file makes overlap deterministic.
@@ -500,4 +523,6 @@ Protocol references: [initialization](https://agentclientprotocol.com/protocol/v
 [stdio](https://agentclientprotocol.com/protocol/v1/transports.md),
 [schema](https://agentclientprotocol.com/protocol/v1/schema.md),
 [tool calls](https://agentclientprotocol.com/protocol/v1/tool-calls.md),
+[prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn.md),
+[agent plans](https://agentclientprotocol.com/protocol/v1/agent-plan.md),
 [security](https://agentclientprotocol.com/protocol/v1/security.md).
