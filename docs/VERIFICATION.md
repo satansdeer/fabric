@@ -1183,3 +1183,29 @@ Retained local controller proofs: `fabric-scripted-codex-tYS99w/proof.json` and
 Exact-head CI, successor package provenance and installed acceptance are tracked
 on #117. Official x64 pins are not local x64 evidence. Scripted API acceptance
 is not paid-provider authentication, full harness parity or OS egress confinement.
+
+## Issue #122 — owned generic ACP permission prerequisite
+
+Source changes add opt-in package-local Unix-socket permission control to the
+existing ACP bridge, not native Cline HTTP/provider fixtures. Offline input
+`permission.directory` pins a private canonical current-UID directory/device/inode.
+The packaged `fabric-acp-permission` companion lists bounded untrusted pending
+details and submits exact reviewed allow-once/reject-once decisions. Default
+unsupported requests and nonpermission methods retain fail-closed behavior.
+No Core grants, persistent approval, shared-hub lifecycle or credentials changed.
+
+Focused command for capture/review (no package installation or provider calls):
+
+```sh
+node --test plugins/acp/permission.test.mjs plugins/acp/transport.test.mjs plugins/acp/config.test.mjs
+```
+
+The permission regression uses the actual packaged bridge/companion and existing
+fake peer, checking inert pending state, explicit decisions, invalid binding and
+replay, abort/reaping/socket cleanup, independent turns, malformed/late/duplicate
+requests, bounded overload, default rejection and private directory pins.
+This is not the real Fabric-host integration or native Cline acceptance.
+LSP reports no `.mjs` server for this clone; consumer inspection uses source
+imports/call sites in ACP tests, inspect/bridge and release authoring/smoke scripts,
+not claims of graph index completeness. Exact run results belong in worker
+evidence; #121/#93/#96 and release/CI approval remain separate controller gates.

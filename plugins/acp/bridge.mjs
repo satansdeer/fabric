@@ -7,6 +7,7 @@ import { readBounded } from './sdk/protocol.mjs';
 import { launchAcp } from './transport.mjs';
 import { VERSION, validate, sha256, fail, fields, object } from './config.mjs';
 import { main as inspect } from './inspect.mjs';
+import { openPermissions } from './permission.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const codes = new Set([
@@ -16,6 +17,7 @@ const codes = new Set([
   'acp_callback_failed', 'acp_callback_overflow', 'acp_write_overflow', 'acp_deadline', 'acp_aborted',
   'acp_closed', 'acp_disconnected', 'acp_remote_error', 'acp_initialize_failed', 'acp_unsupported_request',
   'acp_invalid_session', 'acp_invalid_update', 'acp_unsupported_update', 'acp_invalid_stop',
+  'acp_invalid_permission',
   'acp_turn_cancelled', 'acp_turn_incomplete', 'acp_output_overflow', 'acp_extension_overflow', 'acp_tool_overflow', 'acp_bridge_failed',
 ]);
 const clean = text => text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
@@ -175,7 +177,7 @@ function plugin(config, configBytes) {
 }
 
 async function turn(config, prompt) {
-  let connection, sessionId, pending = false, firstFailure;
+  let connection, permissions, sessionId, pending = false, firstFailure;
   let phase = 'initialize', extensionCount = 0, extensionBytes = 0;
   const tools = new Map();
   const controller = new AbortController();
@@ -231,10 +233,20 @@ async function turn(config, prompt) {
     validate(config);
     if (realpathSync(process.execPath) !== config.runtime.path) fail('acp_bridge_failed');
     const cwd = realpathSync(process.cwd());
+    if (config.permission) permissions = await openPermissions(config.permission, cwd);
+    if (controller.signal.aborted) fail('acp_aborted');
     connection = launchAcp({
       executable: config.executable.path, args: config.args, cwd,
       env: { HOME: config.nativeHome, LC_ALL: 'C' }, failOnPeerRequest: true,
       requestTimeoutMs: config.requestTimeoutMs,
+      onPermissionRequest: permissions ? (message, signal) => {
+        try {
+          const tool = message.params?.toolCall;
+          if (!pending || !object(tool) || Object.hasOwn(tool, 'sessionUpdate') ||
+              !validTool({ ...tool, sessionUpdate: 'tool_call_update' })) fail('acp_invalid_permission');
+          return permissions.request(message, sessionId, signal);
+        } catch (error) { stop('acp_invalid_permission'); throw error; }
+      } : undefined,
       onNotification(message, _signal, requestPendingAtReceipt) {
         try {
           if (message.method !== 'session/update') {
@@ -306,6 +318,7 @@ async function turn(config, prompt) {
     // Drain notifications already queued behind the response before accepting it.
     await new Promise(resolve => setImmediate(resolve));
     if (firstFailure) fail(firstFailure);
+    if (permissions?.pendingCount) fail('acp_invalid_permission');
     if (!fields(result, ['stopReason', 'usage', '_meta']) || typeof result.stopReason !== 'string' ||
         !optional(result, 'usage', turnUsage)) fail('acp_invalid_stop');
     if (result.stopReason === 'cancelled') fail('acp_turn_cancelled');
@@ -320,6 +333,7 @@ async function turn(config, prompt) {
     try { emit({ type: 'acp.failure', code: firstFailure }); } catch { /* Broken capture cannot accept diagnostics. */ }
   } finally {
     await connection?.close();
+    await permissions?.close();
     process.removeListener('SIGTERM', abort); process.removeListener('SIGINT', abort);
     process.stdout.removeListener('error', outputError);
     process.stderr.removeListener('error', outputError);

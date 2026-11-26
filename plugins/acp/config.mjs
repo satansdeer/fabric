@@ -1,5 +1,5 @@
-import { constants, openSync, closeSync, fstatSync, readSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { constants, openSync, closeSync, fstatSync, readSync, realpathSync, statSync, lstatSync } from 'node:fs';
+import { isAbsolute, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 
 export const VERSION = 'fabric-acp-bridge/0.1.0';
@@ -37,13 +37,30 @@ function pin(value, executable = false) {
   if (executable && !(statSync(value.path).mode & 0o111)) fail('acp_unsafe_executable');
   if (fileHash(value.path) !== value.sha256) fail('acp_launch_changed');
 }
+export function permissionDirectory(path, workspace) {
+  absolute(path);
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
+      Buffer.byteLength(path) + 33 > 103) fail('acp_unsafe_permission_directory');
+  if (workspace) {
+    const child = relative(workspace, path);
+    if (!child || (!child.startsWith('../') && child !== '..' && !isAbsolute(child))) fail('acp_unsafe_permission_directory');
+  }
+  return { directory: path, dev: stat.dev, ino: stat.ino };
+}
 export function validate(config) {
-  if (!fields(config, ['executable', 'args', 'nativeHome', 'cwd', 'pins', 'requestTimeoutMs', 'runtime']) ||
+  if (!fields(config, ['executable', 'args', 'nativeHome', 'cwd', 'pins', 'requestTimeoutMs', 'runtime', 'permission']) ||
       !Array.isArray(config.args) || config.args.length > 120 || !config.args.every(literal) ||
       config.cwd !== 'fabric-workspace' || !Array.isArray(config.pins) || config.pins.length > 16 ||
       !Number.isSafeInteger(config.requestTimeoutMs) || config.requestTimeoutMs < 1 || config.requestTimeoutMs > 300_000) fail('acp_invalid_config');
   absolute(config.nativeHome);
   if (!statSync(config.nativeHome).isDirectory()) fail('acp_unsafe_path');
+  if (config.permission !== undefined) {
+    const p = config.permission;
+    if (!fields(p, ['directory', 'dev', 'ino'])) fail('acp_invalid_config');
+    const actual = permissionDirectory(p.directory);
+    if (p.dev !== actual.dev || p.ino !== actual.ino) fail('acp_unsafe_permission_directory');
+  }
   pin(config.executable, true);
   pin(config.runtime, true);
   for (const item of config.pins) pin(item);

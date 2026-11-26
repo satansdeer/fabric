@@ -90,7 +90,7 @@ try {
     purpose: 'offline-profile-authoring-only', installable: false,
     fixture: { path: 'plugins/acp/fixtures/turn-agent.mjs', purpose: 'deterministic fake ACP peer; no native provider support' },
   };
-  for (const file of ['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'README.md', 'fixtures/turn-agent.mjs']) {
+  for (const file of ['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'permission.mjs', 'permission-client.mjs', 'README.md', 'fixtures/turn-agent.mjs']) {
     copy(join(repo, 'plugins/acp', file), `${acpKit.path}/${file}`, false,
       text => text.replaceAll('../../sdk/typescript', '../../sdk').replaceAll('sdk/typescript/', 'sdk/'));
   }

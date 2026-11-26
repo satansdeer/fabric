@@ -8,6 +8,7 @@ const log = process.argv[2];
 const record = value => appendFileSync(log, JSON.stringify(value) + '\n');
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
 let initialized = false, session = false;
+let permissionTurn;
 const tool = { sessionUpdate: 'tool_call', toolCallId: 'SECRET_TOOL_ID_CANARY', title: 'SECRET_TOOL_TITLE_CANARY' };
 const delta = { sessionUpdate: 'tool_call_update', toolCallId: tool.toolCallId };
 const thought = { sessionUpdate: 'agent_thought_chunk', messageId: 'SECRET_MESSAGE_ID_CANARY',
@@ -24,7 +25,17 @@ process.on('SIGTERM', () => { record({ stopped: process.pid }); process.exit(0);
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
   record({ method: request.method });
-  if (!Object.hasOwn(request, 'method')) { record({ response: request }); continue; }
+  if (!Object.hasOwn(request, 'method')) {
+    record({ response: request });
+    if (permissionTurn && /^permission-[01]$/.test(request.id) && request.result?.outcome?.outcome === 'selected') {
+      if (request.result.outcome.optionId === 'once') appendFileSync(`${log}.executed`, 'executed\n');
+      if (--permissionTurn.remaining === 0) {
+        send({ id: permissionTurn.id, result: { stopReason: 'end_turn' } });
+        permissionTurn = undefined;
+      }
+    }
+    continue;
+  }
   if (request.method === 'initialize') {
     if (initialized || request.params.protocolVersion !== 1 || Object.keys(request.params.clientCapabilities).length) process.exit(21);
     initialized = true;
@@ -58,6 +69,41 @@ for await (const line of createInterface({ input: process.stdin })) {
     const extension = (method = 'cursor/task', data = 'PRIVATE_EXTENSION_CANARY') => send({
       method, params: { sessionId: 'untrusted-other-session', data, marker: mode },
     });
+    if (mode.startsWith('permission-')) {
+      permissionTurn = { id: request.id, remaining: mode === 'permission-two' ? 2 : 1 };
+      const params = {
+        sessionId: mode === 'permission-session' ? 'wrong-session' : 'connection-local',
+        toolCall: { toolCallId: 'PRIVATE_PERMISSION_TOOL', title: 'PRIVATE_PERMISSION_TITLE\u009b31m\u202e',
+          kind: 'execute', rawInput: { command: 'PRIVATE_PERMISSION_COMMAND' } },
+        options: [
+          { optionId: 'once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'no', name: 'Reject once', kind: 'reject_once' },
+          { optionId: 'always', name: 'Allow always', kind: 'allow_always' },
+        ],
+      };
+      if (mode === 'permission-malformed') params.options[1].optionId = 'once';
+      if (mode === 'permission-shape') params.toolCall.kind = 1;
+      if (mode === 'permission-oversize') params.toolCall.rawInput = 'x'.repeat(32_768);
+      if (mode === 'permission-options') params.options = [params.options[2]];
+      const permission = (index = 0) => ({ id: `permission-${index}`, method: 'session/request_permission',
+        params: { ...params, toolCall: { ...params.toolCall, toolCallId: `PRIVATE_PERMISSION_TOOL_${index}` } } });
+      if (mode === 'permission-late') {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n' +
+          JSON.stringify({ jsonrpc: '2.0', ...permission() }) + '\n');
+      } else if (mode === 'permission-early-stop') {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...permission() }) + '\n' +
+          JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n');
+      } else {
+        send(permission());
+        if (mode === 'permission-two') send(permission(1));
+        if (mode === 'permission-duplicate') send(permission());
+        if (mode === 'permission-tool-duplicate') send({ ...permission(), id: 'other-request' });
+        if (mode === 'permission-overflow') for (let i = 1; i < 9; i++) send(permission(i));
+        // Demonstrate the reader still handles nonpermission traffic while waiting.
+        update({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'PRIVATE_PERMISSION_THOUGHT' } });
+      }
+      continue;
+    }
     if (['cancel', 'concurrent'].includes(mode)) {
       update(plan); update(thought);
     }

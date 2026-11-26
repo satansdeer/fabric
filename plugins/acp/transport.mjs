@@ -82,6 +82,9 @@ class AcpConnection {
   #callbacks = 0;
   #callback;
   #failOnPeerRequest;
+  #permission;
+  #peerIds = new Set();
+  #peerActive = 0;
   #controller = new AbortController();
   #requestTimeout;
   #initializeTimeout;
@@ -99,6 +102,8 @@ class AcpConnection {
         typeof onNotification !== 'function' || !validSignal(signal)) throw error('acp_invalid_options');
     if (options.failOnPeerRequest !== undefined && !boolean(options.failOnPeerRequest)) throw error('acp_invalid_options');
     this.#failOnPeerRequest = options.failOnPeerRequest ?? false;
+    if (options.onPermissionRequest !== undefined && typeof options.onPermissionRequest !== 'function') throw error('acp_invalid_options');
+    this.#permission = options.onPermissionRequest;
     this.#maxRecord = bound(options.maxRecordBytes, 1_048_576, 256, 16_777_216);
     this.#maxPending = bound(options.maxPendingRequests, 64, 1, 1024);
     this.#maxCallbacks = bound(options.maxNotificationCallbacks, 64, 1, 1024);
@@ -189,7 +194,7 @@ class AcpConnection {
       const abort = () => this.#fail('acp_aborted');
       const timer = timeoutMs === null ? undefined : setTimeout(() => this.#fail('acp_deadline'), timeoutMs);
       const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
-      this.#pending.set(id, { resolve, reject, cleanup });
+      this.#pending.set(id, { resolve, reject, cleanup, method });
       signal?.addEventListener('abort', abort, { once: true });
       this.#send({ jsonrpc: '2.0', id, method, params });
     });
@@ -233,6 +238,35 @@ class AcpConnection {
           (own(value, 'params') && !object(value.params) && !Array.isArray(value.params)) ||
           (own(value, 'id') && !idValid(value.id))) { this.#fail('acp_invalid_envelope'); return; }
       if (own(value, 'id')) {
+        if (value.method === 'session/request_permission' && this.#permission) {
+          const prompt = [...this.#pending.entries()].find(([, call]) => call.method === 'session/prompt')?.[0];
+          if (prompt === undefined || !this.#initialized || this.#peerIds.has(value.id) ||
+              this.#peerIds.size >= 64 || this.#peerActive >= 8 ||
+              (text(value.id) && (!value.id.length || Buffer.byteLength(value.id) > 128))) {
+            this.#fail('acp_invalid_permission'); return;
+          }
+          this.#peerIds.add(value.id);
+          this.#peerActive++;
+          const signal = this.#controller.signal;
+          let abort;
+          const cancelled = new Promise((_, reject) => {
+            abort = () => reject(error('acp_aborted'));
+            signal.addEventListener('abort', abort, { once: true });
+          });
+          // Do not await a human in the reader; cancellation and RPC replies progress.
+          Promise.race([cancelled, Promise.resolve().then(() => {
+            if (signal.aborted) throw error('acp_aborted');
+            return this.#permission(value, signal);
+          })]).then(result => {
+            if (this.#failure) return;
+            if (!this.#pending.has(prompt)) { this.#fail('acp_invalid_permission'); return; }
+            this.#send({ jsonrpc: '2.0', id: value.id, result });
+          }).catch(() => this.#fail('acp_invalid_permission')).finally(() => {
+            signal.removeEventListener('abort', abort);
+            this.#peerActive--;
+          });
+          return;
+        }
         this.#send({ jsonrpc: '2.0', id: value.id, error: { code: -32601, message: 'Method not found' } });
         if (this.#failOnPeerRequest) this.#fail('acp_unsupported_request');
         return;
