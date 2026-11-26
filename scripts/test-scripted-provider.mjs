@@ -203,12 +203,26 @@ await fixture([step()], async provider => {
   assert.equal(provider.requests[0].body.length, 1024 * 1024 - 2);
   provider.assertDone();
 });
-for (const headers of [{ 'content-length': String(1024 * 1024 + 1) }, {}]) {
-  await fixture([step()], async provider => {
-    assert.equal((await send(provider, '"' + 'x'.repeat(1024 * 1024) + '"', { headers })).status, 413);
-    assert.throws(provider.assertDone, /exceeds 1 MiB/);
+await fixture([step()], async provider => {
+  const declared = open(provider, undefined, {
+    end: false, headers: { 'content-length': String(1024 * 1024 + 1), expect: '100-continue' },
   });
-}
+  declared.req.flushHeaders();
+  assert.equal((await read(declared.response)).status, 413);
+  assert.throws(provider.assertDone, /exceeds 1 MiB/);
+  assert.equal(provider.requests.length, 0);
+});
+await fixture([step()], async provider => {
+  // Closing an oversized upload may reset its still-writing socket before 413 arrives.
+  await send(provider, '"' + 'x'.repeat(1024 * 1024) + '"', {
+    headers: { 'transfer-encoding': 'chunked' },
+  }).then(
+    response => assert.equal(response.status, 413),
+    error => assert.ok(['ECONNRESET', 'EPIPE'].includes(error.code), error.message),
+  );
+  assert.throws(provider.assertDone, /exceeds 1 MiB/);
+  assert.equal(provider.requests.length, 0);
+});
 await fixture(Array.from({ length: 128 }, () => step()), async provider => {
   for (let i = 0; i < 128; i++) assert.equal((await send(provider)).status, 200);
   provider.assertDone();
