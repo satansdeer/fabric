@@ -1209,3 +1209,36 @@ LSP reports no `.mjs` server for this clone; consumer inspection uses source
 imports/call sites in ACP tests, inspect/bridge and release authoring/smoke scripts,
 not claims of graph index completeness. Exact run results belong in worker
 evidence; #121/#93/#96 and release/CI approval remain separate controller gates.
+
+## Issue #121 — native Cline scripted-provider acceptance (not accepted)
+
+The supervisor ran the permanent seven-scenario fixture with official native
+Cline 3.0.75, Node 22.23.2, Bun 1.3.5 and the extracted local Fabric
+`eaabfb59d399` package. The controller uses the Node permission client because
+Bun 1.3.5 cannot realpath macOS Unix sockets. Native inputs are hashed;
+configuration, hub, credentials and model endpoint are fixture-owned.
+
+Actual result: six PASS, one FAIL; the command exits nonzero. Exactly 13 local
+model requests, with no unexpected calls or fallback. Text, explicit allow-once
+(exact-once marker patch restored), reject-once (no write), held-stream
+cancellation, pending-permission cancellation and independent Fabric B passed.
+Both cancellations preserved a separate real native ACP B on the same owned
+hub; B completed its initial prompt and native follow-up. This is not Fabric
+`session.followup` support. Passed cases checked artifacts, terminal events,
+one attempt, process-group reaping and workspace reclaim. Invalid/replayed
+permission decisions did not grant access.
+
+Terminal HTTP 400 failed acceptance: native Cline returned empty `end_turn`,
+so Fabric reported SUCCEEDED instead of FAILED. The expected failure assertion
+is retained; issue #124 tracks the native error-propagation gap. An empty
+legitimate ACP turn is not itself proof of an API error. No native fork,
+fabricated failure signal or convenient replacement HTTP status is accepted.
+The fixture continues other terminal scenarios without converting this failure
+to success. Owned hub, manager, native state and permission-directory cleanup
+all passed.
+
+Retained private proof: `fabric-cline-0gRnhc/proof.json`, SHA256
+`8e53831e38218e521e0c52504007998aa81b07d7fd72056fc329c83c0c855ba0`.
+Detailed requests and permission payloads remain private. This does not satisfy
+#121/#93/#96 acceptance, paid-provider parity, OS egress confinement or #104's
+public-release gate.

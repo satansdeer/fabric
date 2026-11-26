@@ -104,6 +104,8 @@ try {
   for (const file of [
     ...['package.mjs', 'bridge.mjs', 'inspect.mjs', 'config.mjs', 'transport.mjs', 'permission.mjs', 'permission-client.mjs', 'README.md', 'fixtures/turn-agent.mjs'].map(file => `${kit.path}/${file}`),
     ...['cli.mjs', 'package.mjs', 'protocol.mjs', 'index.mjs', 'webhook.mjs'].map(file => `${kit.sdk_path}/${file}`),
+    'scripts/scripted-provider.mjs', 'docs/LIVE_SMOKES.md',
+    ...['claude', 'cline'].flatMap(native => ['fixture-launcher.mjs', 'scripted-provider-smoke.mjs'].map(file => `integrations/${native}/${file}`)),
   ]) assert.match(manifest.files[file], /^[a-f0-9]{64}$/, `required pinned ACP kit/SDK payload: ${file}`);
   assert.equal(existsSync(join(installed, kit.path, 'launch.json')), false, 'kit must not bind a native profile');
   assert.equal(existsSync(join(installed, kit.path, 'package.json')), false, 'kit is not an installable plugin');

@@ -75,7 +75,13 @@ try {
   for (const file of ['cli.mjs', 'package.mjs', 'protocol.mjs', 'conformance.mjs', 'index.mjs', 'index.d.mts', 'webhook.mjs']) copy(join(repo, 'sdk/typescript', file), `sdk/${file}`);
   for (const kind of ['connector', 'harness', 'target']) copy(join(repo, 'sdk/typescript/samples', `${kind}.ts`), `sdk/samples/${kind}.ts`);
   for (const file of ['fabric.ts', 'host-smoke.ts', 'up-smoke.ts']) copy(join(repo, 'integrations/omp', file), `integrations/omp/${file}`);
-  for (const file of ['smoke-release.mjs', 'fabric-webhook.mjs']) copy(join(repo, 'scripts', file), `scripts/${file}`);
+  for (const file of ['smoke-release.mjs', 'fabric-webhook.mjs', 'scripted-provider.mjs']) copy(join(repo, 'scripts', file), `scripts/${file}`);
+  for (const native of ['claude', 'cline']) {
+    for (const file of ['fixture-launcher.mjs', 'scripted-provider-smoke.mjs']) {
+      copy(join(repo, 'integrations', native, file), `integrations/${native}/${file}`, false,
+        text => text.replaceAll('../../sdk/typescript/', '../../sdk/'));
+    }
+  }
   for (const file of ['bridge.mjs', 'connector.mjs', 'plugin.mjs']) {
     copy(join(repo, 'integrations/github', file), `integrations/github/${file}`, file === 'bridge.mjs',
       text => text.replaceAll('../../sdk/typescript/', '../../sdk/'));
@@ -84,6 +90,8 @@ try {
   copy(join(repo, 'docs/GITHUB_CONNECTOR.md'), 'docs/GITHUB_CONNECTOR.md', false,
     text => text.replaceAll('sdk/typescript/', 'sdk/'));
   copy(join(repo, 'docs/CONTROL_SURFACES.md'), 'docs/CONTROL_SURFACES.md');
+  copy(join(repo, 'docs/LIVE_SMOKES.md'), 'docs/LIVE_SMOKES.md', false,
+    text => text.replaceAll('sdk/typescript/', 'sdk/'));
   // Authoring sources only: reuse the single release SDK, bind native paths offline later.
   const acpKit = {
     id: 'fabric-acp', version: '0.1.0', protocol: 1, path: 'plugins/acp', sdk_path: 'sdk',

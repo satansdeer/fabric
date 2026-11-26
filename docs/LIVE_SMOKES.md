@@ -107,6 +107,70 @@ Each reports its own retained proof/failure directory and exits nonzero on failu
 These are **native harness + scripted API** checks, not real-provider
 authentication/parity, generic ACP conformance or OS network/keychain isolation.
 
+### Native Cline Chat Completions and owned permission decisions
+
+```sh
+bun integrations/cline/scripted-provider-smoke.mjs /absolute/private-inputs.json
+```
+
+Requires official native Cline **3.0.75**, Node >=22.18, Bun and a built Fabric
+and local-target plugin. The owned `0600` JSON has `bun`, `fabric`, `node`,
+`cline`, `localPlugin`, `bootstrap`, each a canonical absolute `path` and
+`sha256`, plus `"clineVersion": "3.0.75"`. `bootstrap` is the adjacent
+`integrations/cline/fixture-launcher.mjs`; `cline` is the native binary, not
+the npm JavaScript entrypoint. In an extracted source-free kit use
+`bin/fabric`, `plugins/local/plugin` and the included fixture/launcher.
+Native executables are supplied separately, never bundled or installed by
+the runner. CI installs official `cline@3.0.75` with `--ignore-scripts` into
+a fixture-only directory and invokes this same runner.
+
+The configuration recipe is pinned to upstream commit
+`06f0ec711ea417430d552b98e7911fdac6f495a1` and its
+`@ai-sdk/openai-compatible` 3.0.67 integration. The input hashes bind the
+provided files; this runner checks the actual native version, not npm
+attestations. Provenance/attestation review remains the controller's job.
+
+The launcher uses an explicit environment, fresh HOME/USERPROFILE, temporary
+and Cline state paths, dedicated hub discovery and an exclusively fixture-owned
+loopback hub. The model endpoint is `providers.json`'s OpenAI Chat Completions
+`baseUrl`, **not** `CLINE_API_BASE_URL`. Dummy credentials only; telemetry,
+updates, compaction and tool auto-approval are disabled. These flags are not
+OS-level zero-egress, sandbox or keychain-isolation proof.
+
+Seven Fabric runs use the single generic ACP package and shared scripted
+provider: streamed text, approved command, rejected command, terminal API
+error, held-stream cancellation, pending-permission cancellation and an ordinary
+successful Fabric sibling. Exactly 13 model requests are required; unknown,
+duplicate, auxiliary and ambiguous requests fail closed. The actual advertised
+`run_commands` schema is checked before streaming a tool call. A matching
+`role=tool`/`tool_call_id` result must arrive before final text. Approval requires
+an explicit owner `allow_once` decision through `permissionControl`; pending
+and rejected commands cannot append the marker. Invalid endpoint/nonce/session/
+request/digest/option/kind bindings, cross-session replay and stale decisions cannot
+consume a pending request. The approved marker patch is restored and checked
+for exact-once execution.
+
+Each cancellation has a separate real native ACP peer B sharing the same owned
+hub. Its first response is held while Fabric A is cancelled; B then completes
+that prompt **and a native follow-up**, and the hub must remain alive. There is
+one ACP session per peer, no transport multiplexing. This is native-session
+follow-up evidence, **not Fabric `session.followup` support**; the generic
+Fabric bridge still supports one prompt per turn. The final ordinary Fabric B
+run independently proves successful Fabric capture/reclaim.
+
+Public JSON reports pins/versions, bounded request counts, hashed permission
+correlations, terminal states, artifact/capture/reclaim and child/hub cleanup,
+without permission payloads, socket names, hub tokens, model bodies or reasoning.
+Detailed requests, decisions, native notifications and command output stay in
+the retained private evidence directory. Only after all dependent peers and
+workers end does cleanup revalidate discovery PID/token/URL, stop that owned
+hub and remove native state and the private permission directory. Observation/
+command deadlines fail the check; they never approve tools. CI bounds the job,
+not an implementation-worker lifecycle timer.
+
+This fixture is an acceptance recipe, not a claim that native acceptance ran.
+It does not establish paid-provider parity, close #93/#96, or promote a release.
+
 ## 1. Prepare a disposable immutable source (no model invocation)
 
 Use Bash from the Fabric checkout. Choose `SMOKE_CASE` explicitly as `omp`, `codex` or `mixed`; repeat this procedure in a new directory for each case. Supply the prerequisite variables above before running:
