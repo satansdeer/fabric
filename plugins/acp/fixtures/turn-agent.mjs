@@ -10,6 +10,16 @@ const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...v
 let initialized = false, session = false;
 const tool = { sessionUpdate: 'tool_call', toolCallId: 'SECRET_TOOL_ID_CANARY', title: 'SECRET_TOOL_TITLE_CANARY' };
 const delta = { sessionUpdate: 'tool_call_update', toolCallId: tool.toolCallId };
+const thought = { sessionUpdate: 'agent_thought_chunk', messageId: 'SECRET_MESSAGE_ID_CANARY',
+  content: { type: 'text', text: 'SECRET_REASONING_CANARY', annotations: {
+    audience: ['assistant'], priority: 0.5, lastModified: 'SECRET_ANNOTATION_CANARY',
+    _meta: { private: 'SECRET_ANNOTATION_META_CANARY' } }, _meta: { private: 'SECRET_CONTENT_META_CANARY' } },
+  _meta: { private: 'SECRET_THOUGHT_META_CANARY' } };
+const plan = { sessionUpdate: 'plan', entries: ['high', 'medium', 'low'].map((priority, index) => ({
+  content: 'SECRET_PLAN_CANARY $(touch MUST_NOT_EXIST)', priority, status: ['pending', 'in_progress', 'completed'][index],
+  _meta: { private: 'SECRET_ENTRY_META_CANARY' },
+})), _meta: { private: 'SECRET_PLAN_META_CANARY' } };
+const privateUpdate = mode => mode.startsWith('thought-') ? thought : plan;
 process.on('SIGTERM', () => { record({ stopped: process.pid }); process.exit(0); });
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
@@ -18,6 +28,11 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (request.method === 'initialize') {
     if (initialized || request.params.protocolVersion !== 1 || Object.keys(request.params.clientCapabilities).length) process.exit(21);
     initialized = true;
+    if (/^(thought|plan)-early-/.test(process.argv[3] ?? '')) {
+      record({ early: process.argv[3], earlyPid: process.pid });
+      if (process.argv[3].endsWith('initialize')) send({ method: 'session/update',
+        params: { sessionId: 'connection-local', update: privateUpdate(process.argv[3]) } });
+    }
     if (process.argv[3]?.startsWith('tool-early-')) record({ early: process.argv[3], earlyPid: process.pid });
     if (process.argv[3] === 'tool-early-initialize') send({ method: 'session/update',
       params: { sessionId: 'connection-local', update: tool } });
@@ -26,6 +41,8 @@ for await (const line of createInterface({ input: process.stdin })) {
   } else if (request.method === 'session/new') {
     if (!initialized || session || request.params.cwd !== process.cwd() || request.params.mcpServers.length) process.exit(22);
     session = true;
+    if (/^(thought|plan)-early-session$/.test(process.argv[3] ?? '')) send({ method: 'session/update',
+      params: { sessionId: 'connection-local', update: privateUpdate(process.argv[3]) } });
     if (process.argv[3] === 'tool-early-session') send({ method: 'session/update',
       params: { sessionId: 'connection-local', update: delta } });
     send({ id: request.id, result: { sessionId: 'connection-local' } });
@@ -41,6 +58,58 @@ for await (const line of createInterface({ input: process.stdin })) {
     const extension = (method = 'cursor/task', data = 'PRIVATE_EXTENSION_CANARY') => send({
       method, params: { sessionId: 'untrusted-other-session', data, marker: mode },
     });
+    if (['cancel', 'concurrent'].includes(mode)) {
+      update(plan); update(thought);
+    }
+    if (mode === 'private') {
+      // One write: private updates before the response must survive deferred delivery.
+      const updates = [plan, thought, tool, { ...plan, entries: [] }, text,
+        { ...delta, status: 'completed' }, { ...thought, messageId: null, _meta: null },
+        { ...plan, entries: [{ content: '', priority: 'low', status: 'completed', _meta: null }], _meta: null }];
+      process.stdout.write(updates.map(update => JSON.stringify({ jsonrpc: '2.0', method: 'session/update',
+        params: { sessionId: 'connection-local', update, _meta: { private: 'SECRET_PARAMS_META_CANARY' } } }) + '\n').join('') +
+        JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n');
+      continue;
+    }
+    if (mode.startsWith('private-')) {
+      if (mode.startsWith('private-invalid-')) update(JSON.parse(prompt.slice(prompt.indexOf('\n') + 1)));
+      else {
+        update(plan); update(thought);
+        if (mode === 'private-many') {
+          for (let i = 0; i < 80; i++) {
+            update({ ...plan, entries: Array.from({ length: 100 }, () => plan.entries[i % 3]) });
+            update({ ...thought, content: { type: 'text', text: 'SECRET_LARGE_REASONING_CANARY'.repeat(3000) } });
+            await delay(5);
+          }
+          for (const content of [
+            { type: 'image', data: 'SECRET_IMAGE_CANARY', mimeType: 'image/png', uri: null },
+            { type: 'audio', data: 'SECRET_AUDIO_CANARY', mimeType: 'audio/wav' },
+            { type: 'resource_link', uri: 'SECRET_URI_CANARY', name: 'SECRET_NAME_CANARY', size: 0 },
+            { type: 'resource', resource: { uri: 'SECRET_URI_CANARY', text: 'SECRET_RESOURCE_CANARY' } },
+            { type: 'resource', resource: { uri: 'SECRET_URI_CANARY', blob: 'SECRET_BLOB_CANARY' } },
+          ]) update({ ...thought, content });
+        }
+      }
+      if (mode === 'private-failure') send({ id: request.id, error: { code: -32000, message: 'SECRET_ERROR_CANARY' } });
+      else send({ id: request.id, result: { stopReason: {
+        'private-cancelled': 'cancelled', 'private-incomplete': 'max_tokens', 'private-stop': 'invented-success',
+      }[mode] ?? 'end_turn' } });
+      continue;
+    }
+    if (/^(thought|plan)-(mismatch|late|oversize)$/.test(mode)) {
+      const value = privateUpdate(mode);
+      if (mode.endsWith('mismatch')) update(value, 'SECRET_OTHER_SESSION_CANARY');
+      else if (mode.endsWith('oversize')) update(mode.startsWith('thought-') ?
+        { ...thought, content: { type: 'text', text: 'x'.repeat(1_048_576) } } :
+        { ...plan, entries: [{ ...plan.entries[0], content: 'x'.repeat(1_048_576) }] });
+      else {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n' +
+          JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'connection-local', update: value } }) + '\n');
+        continue;
+      }
+      send({ id: request.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (['extensions', 'cancel', 'concurrent'].includes(mode)) extension();
     if (['cancel', 'concurrent'].includes(mode)) {
       update(tool); update({ ...delta, status: 'in_progress' });

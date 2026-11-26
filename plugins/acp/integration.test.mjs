@@ -25,7 +25,7 @@ function reaped(pid) {
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `owned child ${pid} still alive`);
 }
 
-test('installed ACP package through the real Fabric host (no providers)', { timeout: 360_000 }, async t => {
+test('installed ACP package through the real Fabric host (no providers)', { timeout: 600_000 }, async t => {
   assert.ok(existsSync(host), 'Real Fabric host required; set FABRIC_ACP_TEST_HOST to an absolute built host. Never skipped.');
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'fabric-acp-')));
   const registry = join(root, 'registry'), home = join(root, 'native-home'), repo = join(root, 'repo');
@@ -187,6 +187,21 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     } else assert.equal(proof.extensions.length, 32);
   }
   const toolEvent = (call, status, phase) => ({ type: 'tool', name: `acp.tool.${call}.${status}`, phase });
+  writeFileSync(promptFile, 'fixture:private');
+  const privateProof = evidence(fabric(runArgs), null);
+  assert.deepEqual(privateProof.events.filter(event => ['tool', 'output'].includes(event.type)), [
+    toolEvent(1, 'pending', 'start'), { type: 'output', stream: 'stdout', text: 'fixture:private' },
+    toolEvent(1, 'completed', 'end'),
+  ]);
+  assert.equal(privateProof.contents.get('tracked_patch'), '');
+  assert.equal(privateProof.contents.get('stderr'), '');
+  for (const mode of ['private-only', 'private-many']) {
+    writeFileSync(promptFile, `fixture:${mode}`);
+    const proof = evidence(fabric(runArgs), null);
+    assert.deepEqual(proof.events.filter(event => ['tool', 'output'].includes(event.type)), []);
+    assert.equal(proof.contents.get('stderr'), '');
+    assert.equal(proof.contents.get('tracked_patch'), '');
+  }
   writeFileSync(promptFile, 'fixture:tool');
   const toolProof = evidence(fabric(runArgs), null);
   assert.deepEqual(toolProof.events.filter(event => ['tool', 'output'].includes(event.type)), [
@@ -238,19 +253,66 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     'large-line': { ...delta, locations: [{ path: '', line: 4294967296 }] },
     'fractional-line': { ...delta, locations: [{ path: '', line: 1.5 }] },
   };
+  const thought = { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'SECRET_REASONING_CANARY' } };
+  const entry = { content: 'SECRET_PLAN_CANARY', priority: 'high', status: 'pending' };
+  const plan = { sessionUpdate: 'plan', entries: [entry] };
+  const malformedPrivate = {
+    'thought-missing-content': { sessionUpdate: 'agent_thought_chunk' },
+    'thought-null-content': { ...thought, content: null },
+    'thought-bad-text': { ...thought, content: { type: 'text', text: 1 } },
+    'thought-extra-field': { ...thought, unexpected: 'SECRET_EXTRA_CANARY' },
+    'thought-bad-id': { ...thought, messageId: 1 },
+    'thought-bad-meta': { ...thought, _meta: [] },
+    'thought-bad-content-meta': { ...thought, content: { ...thought.content, _meta: 'SECRET_META_CANARY' } },
+    'thought-bad-annotations': { ...thought, content: { ...thought.content, annotations: [] } },
+    'thought-bad-audience': { ...thought, content: { ...thought.content, annotations: { audience: ['SECRET_ROLE_CANARY'] } } },
+    'thought-bad-priority': { ...thought, content: { ...thought.content, annotations: { priority: 'SECRET_PRIORITY_CANARY' } } },
+    'thought-bad-date': { ...thought, content: { ...thought.content, annotations: { lastModified: 1 } } },
+    'thought-bad-annotation-meta': { ...thought, content: { ...thought.content, annotations: { _meta: [] } } },
+    'thought-bad-image': { ...thought, content: { type: 'image', data: '' } },
+    'thought-bad-resource': { ...thought, content: { type: 'resource', resource: { uri: '', text: 1 } } },
+    'thought-unknown-content': { ...thought, content: { type: 'SECRET_FUTURE_CANARY', text: '' } },
+    'plan-missing-entries': { sessionUpdate: 'plan' },
+    'plan-null-entries': { ...plan, entries: null },
+    'plan-object-entries': { ...plan, entries: {} },
+    'plan-null-entry': { ...plan, entries: [null] },
+    'plan-missing-content': { ...plan, entries: [{ priority: 'high', status: 'pending' }] },
+    'plan-null-content': { ...plan, entries: [{ ...entry, content: null }] },
+    'plan-object-content': { ...plan, entries: [{ ...entry, content: thought.content }] },
+    'plan-missing-priority': { ...plan, entries: [{ content: '', status: 'pending' }] },
+    'plan-null-priority': { ...plan, entries: [{ ...entry, priority: null }] },
+    'plan-bad-priority': { ...plan, entries: [{ ...entry, priority: 'SECRET_PRIORITY_CANARY' }] },
+    'plan-missing-status': { ...plan, entries: [{ content: '', priority: 'low' }] },
+    'plan-null-status': { ...plan, entries: [{ ...entry, status: null }] },
+    'plan-bad-status': { ...plan, entries: [{ ...entry, status: 'failed' }] },
+    'plan-extra-entry-field': { ...plan, entries: [{ ...entry, id: 'SECRET_ID_CANARY' }] },
+    'plan-bad-entry-meta': { ...plan, entries: [{ ...entry, _meta: [] }] },
+    'plan-bad-meta': { ...plan, _meta: 'SECRET_META_CANARY' },
+    'plan-extra-field': { ...plan, planId: 'SECRET_ID_CANARY' },
+    'unsupported-plan-update': { sessionUpdate: 'plan_update', plan: {
+      type: 'items', planId: 'SECRET_PLAN_ID_CANARY', entries: [entry] } },
+    'unsupported-plan-removed': { sessionUpdate: 'plan_removed', planId: 'SECRET_PLAN_ID_CANARY' },
+    'unsupported-subagent': { sessionUpdate: 'tool_call', toolCallId: '', title: '',
+      content: [{ type: 'session', sessionId: 'SECRET_SESSION_CANARY' }] },
+    'unsupported-core': { sessionUpdate: 'SECRET_UNKNOWN_CORE_CANARY' },
+  };
   const validationCwd = join(storage, 'tool-validation');
   mkdirSync(validationCwd);
-  for (const [name, update] of Object.entries(malformedTools)) {
-    const mode = `tool-invalid-${name}`;
+  for (const [mode, update, code] of [
+    ...Object.entries(malformedTools).map(([name, update]) => [`tool-invalid-${name}`, update, 'acp_invalid_update']),
+    ...Object.entries(malformedPrivate).map(([name, update]) => [`private-invalid-${name}`, update,
+      name.startsWith('unsupported-') && name !== 'unsupported-subagent' ? 'acp_unsupported_update' : 'acp_invalid_update']),
+  ]) {
     const result = spawnSync(join(bridgeDir, 'fabric-acp-bridge'), ['--turn', `fixture:${mode}\n${JSON.stringify(update)}`],
       { cwd: validationCwd, env: { HOME: root, LC_ALL: 'C' }, encoding: 'utf8', timeout: 15_000 });
     assert.ifError(result.error);
     assert.equal(result.status, 1, mode);
-    assert.deepEqual(JSON.parse(result.stdout), { type: 'acp.failure', code: 'acp_invalid_update' }, mode);
+    assert.deepEqual(JSON.parse(result.stdout), { type: 'acp.failure', code }, mode);
     assert.equal(result.stderr, '', mode);
     reaped(lines(log).find(record => record.mode === mode).pid);
   }
-  for (const mode of ['tool-early-initialize', 'tool-early-session']) {
+  for (const mode of ['tool-early-initialize', 'tool-early-session', 'thought-early-initialize',
+    'thought-early-session', 'plan-early-initialize', 'plan-early-session']) {
     const early = join(root, mode);
     prepare({ ...config, args: [agent, log, mode] }, early);
     const result = spawnSync(join(early, 'fabric-acp-bridge'), ['--turn', 'unused'],
@@ -271,12 +333,21 @@ test('installed ACP package through the real Fabric host (no providers)', { time
     'tool-mismatch': 'acp_invalid_update', 'tool-late': 'acp_invalid_update', 'tool-overflow': 'acp_tool_overflow',
     'tool-request': 'acp_unsupported_request', 'tool-fs-request': 'acp_unsupported_request',
     'tool-terminal-request': 'acp_unsupported_request',
+    'thought-mismatch': 'acp_invalid_update', 'plan-mismatch': 'acp_invalid_update',
+    'thought-late': 'acp_invalid_update', 'plan-late': 'acp_invalid_update',
+    'thought-oversize': 'acp_frame_too_large', 'plan-oversize': 'acp_frame_too_large',
+    'private-failure': 'acp_remote_error', 'private-cancelled': 'acp_turn_cancelled',
+    'private-incomplete': 'acp_turn_incomplete', 'private-stop': 'acp_invalid_stop',
     'count-flood': 'acp_extension_overflow', 'byte-flood': 'acp_extension_overflow' };
   for (const [mode, code] of Object.entries(failures)) {
     writeFileSync(promptFile, `fixture:${mode}`);
     const proof = evidence(fabric(runArgs, { success: false }), code);
     assert.deepEqual(proof.events.filter(event => event.type === 'failure'), [{ type: 'failure', code,
       message: code === 'acp_unsupported_request' ? 'Unsupported blocking ACP peer request; no input or approval supplied.' : code }]);
+    if (mode.startsWith('private-') || /^(thought|plan)-/.test(mode)) {
+      assert.deepEqual(proof.events.filter(event => ['tool', 'output'].includes(event.type)), []);
+      assert.equal(proof.contents.get('stderr'), '');
+    }
     if (code === 'acp_unsupported_request') {
       assert.deepEqual(lines(log).filter(record => record.response).at(-1)?.response, {
         jsonrpc: '2.0', id: mode === 'extension-request' ? 0 : 'peer-request',
@@ -345,6 +416,7 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   const cancelledProof = evidence(cancelling, undefined, 'CANCELLED');
   assert.deepEqual(cancelledProof.events.filter(event => event.type === 'tool'),
     [toolEvent(1, 'pending', 'start'), toolEvent(1, 'in_progress', 'update')]);
+  assert.deepEqual(cancelledProof.events.filter(event => event.type === 'output'), []);
   assert.equal(cancelledProof.extensions.length, 1);
   assert.equal(JSON.parse(Buffer.from(cancelledProof.extensions[0].json_base64, 'base64')).params.marker, 'cancel');
   assert.equal(surviving.child.exitCode, null, 'cancelling one host run stopped the other');

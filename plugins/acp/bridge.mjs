@@ -242,6 +242,19 @@ async function turn(config, prompt) {
               params.sessionId !== sessionId) fail('acp_invalid_update');
           const update = params.update;
           if (!object(update)) fail('acp_invalid_update');
+          // Private v1 metadata has no native event; validate without retaining it.
+          if (update.sessionUpdate === 'agent_thought_chunk') {
+            if (!dataFields(update, ['sessionUpdate', 'content', 'messageId']) ||
+                !optional(update, 'messageId', text) || !contentBlock(update.content)) fail('acp_invalid_update');
+            return;
+          }
+          if (update.sessionUpdate === 'plan') {
+            if (!dataFields(update, ['sessionUpdate', 'entries']) || !Array.isArray(update.entries) ||
+                !update.entries.every(entry => dataFields(entry, ['content', 'priority', 'status']) &&
+                  text(entry.content) && ['high', 'medium', 'low'].includes(entry.priority) &&
+                  ['pending', 'in_progress', 'completed'].includes(entry.status))) fail('acp_invalid_update');
+            return;
+          }
           if (['tool_call', 'tool_call_update'].includes(update.sessionUpdate)) {
             reportTool(update);
             return;
