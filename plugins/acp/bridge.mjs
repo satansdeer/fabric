@@ -37,6 +37,11 @@ const optional = (value, key, check) => value[key] == null || check(value[key]);
 const dataFields = (value, names) => fields(value, [...names, '_meta']) && optional(value, '_meta', object);
 const terminal = status => status === 'completed' || status === 'failed';
 const uint32 = value => Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff;
+const tokenCount = value => Number.isSafeInteger(value) && value >= 0;
+const usageFields = ['totalTokens', 'inputTokens', 'outputTokens', 'thoughtTokens', 'cachedReadTokens', 'cachedWriteTokens'];
+const turnUsage = value => dataFields(value, usageFields) &&
+  usageFields.slice(0, 3).every(key => tokenCount(value[key])) &&
+  usageFields.slice(3).every(key => optional(value, key, tokenCount));
 
 function contentBlock(value) {
   if (!object(value) || !optional(value, 'annotations', annotations =>
@@ -255,14 +260,33 @@ async function turn(config, prompt) {
                   ['pending', 'in_progress', 'completed'].includes(entry.status))) fail('acp_invalid_update');
             return;
           }
+          if (update.sessionUpdate === 'available_commands_update') {
+            if (!dataFields(update, ['sessionUpdate', 'availableCommands']) || !Array.isArray(update.availableCommands) ||
+                !update.availableCommands.every(command => dataFields(command, ['name', 'description', 'input']) &&
+                  text(command.name) && text(command.description) && optional(command, 'input', input =>
+                    dataFields(input, ['hint']) && text(input.hint)))) fail('acp_invalid_update');
+            return;
+          }
+          if (update.sessionUpdate === 'usage_update') {
+            if (!dataFields(update, ['sessionUpdate', 'used', 'size', 'cost']) ||
+                !tokenCount(update.used) || !tokenCount(update.size) || !optional(update, 'cost', cost =>
+                  dataFields(cost, ['amount', 'currency']) && Number.isFinite(cost.amount) &&
+                  text(cost.currency))) fail('acp_invalid_update');
+            return;
+          }
+          if (update.sessionUpdate === 'session_info_update') {
+            if (!dataFields(update, ['sessionUpdate', 'title', 'updatedAt']) ||
+                !optional(update, 'title', text) || !optional(update, 'updatedAt', text)) fail('acp_invalid_update');
+            return;
+          }
           if (['tool_call', 'tool_call_update'].includes(update.sessionUpdate)) {
             reportTool(update);
             return;
           }
           if (update.sessionUpdate !== 'agent_message_chunk') fail('acp_unsupported_update');
-          if (!fields(update, ['sessionUpdate', 'content', '_meta']) ||
-              !fields(update.content, ['type', 'text', '_meta']) || update.content.type !== 'text' ||
-              typeof update.content.text !== 'string' || Buffer.byteLength(update.content.text) > 32_768) fail('acp_invalid_update');
+          if (!dataFields(update, ['sessionUpdate', 'content', 'messageId']) ||
+              !optional(update, 'messageId', text) || !contentBlock(update.content) || update.content.type !== 'text' ||
+              Buffer.byteLength(update.content.text) > 32_768) fail('acp_invalid_update');
           emit({ type: 'acp.text', text: clean(update.content.text) });
         } catch (error) { stop(codes.has(error.code) ? error.code : 'acp_bridge_failed'); }
       },
@@ -282,7 +306,8 @@ async function turn(config, prompt) {
     // Drain notifications already queued behind the response before accepting it.
     await new Promise(resolve => setImmediate(resolve));
     if (firstFailure) fail(firstFailure);
-    if (!fields(result, ['stopReason', '_meta']) || typeof result.stopReason !== 'string') fail('acp_invalid_stop');
+    if (!fields(result, ['stopReason', 'usage', '_meta']) || typeof result.stopReason !== 'string' ||
+        !optional(result, 'usage', turnUsage)) fail('acp_invalid_stop');
     if (result.stopReason === 'cancelled') fail('acp_turn_cancelled');
     if (['max_tokens', 'max_turn_requests', 'refusal'].includes(result.stopReason)) fail('acp_turn_incomplete');
     if (result.stopReason !== 'end_turn') fail('acp_invalid_stop');

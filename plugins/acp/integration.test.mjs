@@ -257,6 +257,21 @@ test('installed ACP package through the real Fabric host (no providers)', { time
   const entry = { content: 'SECRET_PLAN_CANARY', priority: 'high', status: 'pending' };
   const plan = { sessionUpdate: 'plan', entries: [entry] };
   const malformedPrivate = {
+    'commands-not-array': { sessionUpdate: 'available_commands_update', availableCommands: {} },
+    'commands-bad-name': { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 1, description: '' }] },
+    'commands-bad-input': { sessionUpdate: 'available_commands_update', availableCommands: [{ name: '', description: '', input: { hint: 1 } }] },
+    'commands-extra-field': { sessionUpdate: 'available_commands_update', availableCommands: [{ name: '', description: '', execute: true }] },
+    'message-bad-id': { sessionUpdate: 'agent_message_chunk', messageId: 1, content: { type: 'text', text: '' } },
+    'usage-missing-count': { sessionUpdate: 'usage_update', used: 1 },
+    'usage-fraction': { sessionUpdate: 'usage_update', used: 1.5, size: 200000 },
+    'usage-negative': { sessionUpdate: 'usage_update', used: -1, size: 200000 },
+    'usage-unsafe-integer': { sessionUpdate: 'usage_update', used: Number.MAX_SAFE_INTEGER + 1, size: 200000 },
+    'usage-bad-cost': { sessionUpdate: 'usage_update', used: 1, size: 200000, cost: { amount: '1', currency: 'USD' } },
+    'usage-bad-currency': { sessionUpdate: 'usage_update', used: 1, size: 200000, cost: { amount: 1, currency: null } },
+    'usage-extra-field': { sessionUpdate: 'usage_update', used: 1, size: 200000, model: 'SECRET_MODEL_CANARY' },
+    'session-bad-title': { sessionUpdate: 'session_info_update', title: 1 },
+    'session-bad-date': { sessionUpdate: 'session_info_update', updatedAt: 1 },
+    'session-extra-field': { sessionUpdate: 'session_info_update', authorization: 'SECRET_SESSION_AUTH_CANARY' },
     'thought-missing-content': { sessionUpdate: 'agent_thought_chunk' },
     'thought-null-content': { ...thought, content: null },
     'thought-bad-text': { ...thought, content: { type: 'text', text: 1 } },
@@ -296,12 +311,24 @@ test('installed ACP package through the real Fabric host (no providers)', { time
       content: [{ type: 'session', sessionId: 'SECRET_SESSION_CANARY' }] },
     'unsupported-core': { sessionUpdate: 'SECRET_UNKNOWN_CORE_CANARY' },
   };
+  const validUsage = { totalTokens: 20, inputTokens: 10, outputTokens: 10 };
+  const malformedUsage = {
+    'not-object': [],
+    missing: { inputTokens: 10, outputTokens: 10 },
+    negative: { ...validUsage, inputTokens: -1 },
+    fraction: { ...validUsage, outputTokens: 0.5 },
+    unsafe: { ...validUsage, totalTokens: Number.MAX_SAFE_INTEGER + 1 },
+    'bad-optional': { ...validUsage, cachedReadTokens: '0' },
+    'bad-meta': { ...validUsage, _meta: [] },
+    extra: { ...validUsage, reasoning: 'SECRET_REASONING_CANARY' },
+  };
   const validationCwd = join(storage, 'tool-validation');
   mkdirSync(validationCwd);
   for (const [mode, update, code] of [
     ...Object.entries(malformedTools).map(([name, update]) => [`tool-invalid-${name}`, update, 'acp_invalid_update']),
     ...Object.entries(malformedPrivate).map(([name, update]) => [`private-invalid-${name}`, update,
       name.startsWith('unsupported-') && name !== 'unsupported-subagent' ? 'acp_unsupported_update' : 'acp_invalid_update']),
+    ...Object.entries(malformedUsage).map(([name, usage]) => [`usage-invalid-${name}`, usage, 'acp_invalid_stop']),
   ]) {
     const result = spawnSync(join(bridgeDir, 'fabric-acp-bridge'), ['--turn', `fixture:${mode}\n${JSON.stringify(update)}`],
       { cwd: validationCwd, env: { HOME: root, LC_ALL: 'C' }, encoding: 'utf8', timeout: 15_000 });

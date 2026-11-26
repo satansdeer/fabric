@@ -1,11 +1,12 @@
 // Bun/macOS only. Usage: bun integrations/codex/scripted-provider-smoke.mjs /absolute/FABRIC /absolute/CODEX /absolute/REFERENCE_PLUGIN
 // Supply the accepted Fabric CLI, its prebuilt reference plugin (no SDK source bootstrap), and private codex-cli 0.171.0.
-// Manager must verify official rust-v0.171.0 codex-aarch64-apple-darwin.tar.gz SHA256:
-// 9414c8c967f110b11e8324c0cfa2b20f012094ef890110a561c92ee535a2681a (archive, not executable).
+// Manager must checksum-verify the matching official rust-v0.171.0 macOS archive:
+// arm64: codex-aarch64-apple-darwin.tar.gz SHA256 9414c8c967f110b11e8324c0cfa2b20f012094ef890110a561c92ee535a2681a.
+// x64: codex-x86_64-apple-darwin.tar.gz with the manager's independent archive pin (not locally exercised).
 // Requires Bun, /usr/bin/git and /usr/sbin/lsof. Never installs/downloads or uses inherited auth/config.
 // Config/wire contract: https://github.com/openai/codex/tree/rust-v0.171.0/codex-rs
-// See core/config.schema.json, codex-api/src/sse/responses.rs, core/src/tools/handlers/apply_patch_spec.rs,
-// and exec/src/event_processor_with_jsonl_output.rs. Endpoint isolation is NOT OS egress confinement;
+// See models-manager/models.json, models-manager/src/model_info.rs, core/src/tools/spec_plan.rs,
+// core/src/tools/handlers/apply_patch_spec.rs, and features/src/lib.rs. Endpoint isolation is NOT OS egress confinement;
 // machine-managed Codex policy and native sandbox availability remain manager-run prerequisites.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -19,7 +20,7 @@ import { directory } from "../../sdk/typescript/package.mjs";
 
 assert.equal(process.argv.length, 5, "Usage: bun integrations/codex/scripted-provider-smoke.mjs /absolute/FABRIC /absolute/CODEX /absolute/REFERENCE_PLUGIN");
 assert.equal(process.platform, "darwin", "Native sandbox/socket proof requires macOS");
-assert.equal(process.arch, "arm64", "Pinned private release is macOS arm64");
+assert.ok(["arm64", "x64"].includes(process.arch), "Pinned private releases support macOS arm64 and x64");
 const [fabric, codex, referencePlugin] = await Promise.all(process.argv.slice(2).map(async path => {
   assert.ok(isAbsolute(path), "Binary arguments must be absolute paths");
   await access(path, constants.X_OK);
@@ -47,7 +48,9 @@ const env = {
   GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
   GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.invalid",
 };
-const model = "gpt-5.1-codex", providerName = "fabric-scripted", key = "fabric-fixture-only-not-a-secret";
+// rust-v0.171.0 bundles gpt-5.5 with freeform apply_patch and no forced code mode.
+// Unknown slugs fall back to metadata without apply_patch; the removed apply_patch_freeform flag cannot enable it.
+const model = "gpt-5.5", providerName = "fabric-scripted", key = "fabric-fixture-only-not-a-secret";
 const original = "original\n", changed = "scripted native write\n";
 const sentinel = "FABRIC_SCRIPTED_COMPLETE", held = "FABRIC_SCRIPTED_HELD", incomplete = "FABRIC_SCRIPTED_INCOMPLETE";
 const patchInput = "*** Begin Patch\n*** Update File: tracked.txt\n@@\n-original\n+scripted native write\n*** End Patch\n";
@@ -80,15 +83,17 @@ stream_idle_timeout_ms = 60000
 responses_websockets = false
 responses_websockets_v2 = false
 system_proxy_fallback = false
-remote_models = false
+api_key_model_discovery = false
+unbounded_connection_retries = false
+respect_system_proxy = false
 apps = false
 plugins = false
 code_mode = false
+code_mode_only = false
 multi_agent = false
 multi_agent_v2 = false
 shell_tool = false
 unified_exec = false
-apply_patch_freeform = true
 apply_patch_streaming_events = false
 [agents]
 enabled = false
@@ -349,7 +354,24 @@ try {
     phase = scenario.name;
     let releaseDisconnect;
     const disconnectGate = new Promise(resolve => { releaseDisconnect = resolve; });
-    const server = await startScriptedProvider(scenario.steps(checkRequest(scenario.prompt), checkRequest(scenario.prompt, true), disconnectGate));
+    const requestFailures = [];
+    const steps = scenario.steps(checkRequest(scenario.prompt), checkRequest(scenario.prompt, true), disconnectGate);
+    const server = await startScriptedProvider(steps.map((step, index) => ({ ...step, check: async request => {
+      try { await step.check?.(request); }
+      catch (error) {
+        // Only fixed assertion messages and structural counts/booleans; never headers, prompts, arguments or outputs.
+        const tools = Array.isArray(request.body.tools) ? request.body.tools : [];
+        requestFailures.push({ step: index + 1,
+          assertion: error instanceof assert.AssertionError ? error.message.slice(0, 512) : "Request check threw a non-assertion error",
+          model_matches: request.body.model === model, streaming: request.body.stream === true,
+          input_items: Array.isArray(request.body.input) ? request.body.input.length : null, tool_count: tools.length,
+          custom_tools: tools.filter(tool => tool.type === "custom").length,
+          function_tools: tools.filter(tool => tool.type === "function").length,
+          namespace_tools: tools.filter(tool => tool.type === "namespace").length,
+          apply_patch_advertised: tools.some(tool => tool.type === "custom" && tool.name === "apply_patch") });
+        throw error;
+      }
+    } })));
     let batchId, runId, collected, settled = false;
     const scenarioErrors = [];
     try {
@@ -432,8 +454,13 @@ try {
       }
       try { server.assertDone(); } catch (error) { scenarioErrors.push(error); }
       try { await server.close(); } catch (error) { scenarioErrors.push(error); }
+      if (requestFailures.length) {
+        try { await writeFile(join(fixture, `${scenario.name}-request-failures.json`), JSON.stringify(requestFailures, null, 2)); }
+        catch (error) { scenarioErrors.push(error); }
+      }
       proof.push({ scenario: scenario.name, outcome: scenarioErrors.length ? "FAIL" : "PASS", model_requests: server.requests.length,
-        batch_id: batchId, run_id: runId, ...collected?.summary });
+        batch_id: batchId, run_id: runId, ...collected?.summary,
+        ...(requestFailures.length ? { request_failure_evidence: `${scenario.name}-request-failures.json` } : {}) });
     }
     if (scenarioErrors.length) errors.push(new AggregateError(scenarioErrors, `Scenario ${scenario.name} failed`));
   }
@@ -451,6 +478,7 @@ finally {
   }
 }
 const result = { result: errors.length ? "FAIL" : "PASS", native_version: nativeVersion ?? null, evidence_root: fixture,
+  platform: process.platform, arch: process.arch, model,
   prepared_state_id: prepared?.state_id, source_commit_sha: prepared?.source_commit_sha, scenarios: proof,
   isolation_limit: "Private environment/config and loopback endpoint; not OS egress confinement or a bypass of machine-managed Codex policy.",
   ...(errors.length ? { failed_phase: proof.find(scenario => scenario.outcome === "FAIL")?.scenario ?? phase, failure_evidence: "failure.txt" } : {}) };

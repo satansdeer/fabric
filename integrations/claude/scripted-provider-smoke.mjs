@@ -2,8 +2,8 @@
 // Usage: /absolute/bun integrations/claude/scripted-provider-smoke.mjs /absolute/private-inputs.json
 // Inputs: {bun,fabric,node,shim,claude,localPlugin,bootstrap}: each {path,sha256};
 // plus claudeVersion (exact --version output). All paths canonical, absolute, content pinned.
-// bootstrap must select the adjacent fixture-launcher.mjs; Node >=22.18, native arm64 macOS binaries.
-// shim: manager-verified official v0.112.0 standalone release, ZIP SHA256
+// bootstrap must select the adjacent fixture-launcher.mjs; Node >=22.18, native arm64 or x64 macOS binaries.
+// shim: manager-verified official v0.112.0 standalone release; darwin-arm64 ZIP SHA256
 // ada7afbea165c20e5ec50a190653309bfba528ed9f74ef86a24f2734329ec59c.
 // Prefer its bundled Claude; localPlugin is the accepted release's native reference local target.
 // Endpoint overrides are NOT OS egress confinement. Run in the controller's isolated worker.
@@ -21,7 +21,7 @@ import { fileHash, sha256, VERSION } from "../../plugins/acp/config.mjs";
 
 assert.equal(process.argv.length, 3, "Usage: bun integrations/claude/scripted-provider-smoke.mjs /absolute/private-inputs.json");
 assert.equal(process.platform, "darwin", "Socket evidence requires macOS /usr/sbin/lsof");
-assert.equal(process.arch, "arm64", "Official pinned release is darwin-arm64");
+assert.ok(["arm64", "x64"].includes(process.arch), "Official macOS arm64 or x64 release required");
 const here = dirname(fileURLToPath(import.meta.url));
 const source = await realpath(join(here, "../.."));
 const inputPath = process.argv[2];
@@ -313,7 +313,8 @@ try {
   const configPath = join(fixture, "launch-input.json"), pkg = join(fixture, "acp-package");
   await writeFile(configPath, JSON.stringify(config));
   await run(inputs.node.path, [join(source, "plugins/acp/package.mjs"), configPath, pkg, join(fixture, "acp.tgz")]);
-  install(pkg, { registry, fabric: inputs.fabric.path, version: "0.1.0", sha256: directory(pkg).hash, trust: true });
+  const acp = install(pkg, { registry, fabric: inputs.fabric.path, version: "0.1.0", sha256: directory(pkg).hash, trust: true });
+  await symlink(join(registry, "packages", acp.sha256, "fabric-acp-bridge"), join(bin, "fabric-acp-bridge"));
   const local = reference("local", join(fixture, "local-package"), inputs.localPlugin.path);
   install(local, { registry, fabric: inputs.fabric.path, version: "0.1.0", sha256: directory(local).hash, trust: true });
   const recipe = join(fixture, "prepare.toml");

@@ -63,12 +63,27 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     if (mode === 'private') {
       // One write: private updates before the response must survive deferred delivery.
-      const updates = [plan, thought, tool, { ...plan, entries: [] }, text,
+      const updates = [{ sessionUpdate: 'available_commands_update', availableCommands: [
+        { name: 'SECRET_COMMAND_CANARY', description: 'SECRET_DESCRIPTION_CANARY', input: null },
+        { name: 'SECRET_COMMAND_CANARY', description: '', input: { hint: 'SECRET_HINT_CANARY' } },
+      ] }, { sessionUpdate: 'usage_update', used: 10, size: 200000, cost: null },
+      { sessionUpdate: 'usage_update', used: 20, size: 200000,
+        cost: { amount: 0.00036, currency: 'SECRET_CURRENCY_CANARY' }, _meta: { model: 'SECRET_MODEL_CANARY' } },
+      { sessionUpdate: 'session_info_update', title: 'SECRET_TITLE_CANARY', updatedAt: null,
+        _meta: { private: 'SECRET_SESSION_META_CANARY' } },
+      plan, thought, tool, { ...plan, entries: [] }, { ...text, messageId: 'SECRET_MESSAGE_ID_CANARY',
+        content: { ...text.content, annotations: { audience: ['assistant'], priority: 0, lastModified: '' } } },
         { ...delta, status: 'completed' }, { ...thought, messageId: null, _meta: null },
         { ...plan, entries: [{ content: '', priority: 'low', status: 'completed', _meta: null }], _meta: null }];
       process.stdout.write(updates.map(update => JSON.stringify({ jsonrpc: '2.0', method: 'session/update',
         params: { sessionId: 'connection-local', update, _meta: { private: 'SECRET_PARAMS_META_CANARY' } } }) + '\n').join('') +
-        JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n');
+        JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn',
+          usage: { totalTokens: 20, inputTokens: 10, outputTokens: 10, thoughtTokens: null,
+            cachedReadTokens: 0, cachedWriteTokens: 0, _meta: { private: 'SECRET_USAGE_META_CANARY' } } } }) + '\n');
+      continue;
+    }
+    if (mode.startsWith('usage-invalid-')) {
+      send({ id: request.id, result: { stopReason: 'end_turn', usage: JSON.parse(prompt.slice(prompt.indexOf('\n') + 1)) } });
       continue;
     }
     if (mode.startsWith('private-')) {

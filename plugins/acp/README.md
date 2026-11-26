@@ -92,8 +92,9 @@ this module's protocol exchange, not a guarantee about arbitrary child behavior.
   unsupported. Missing/null agent identity becomes `null`.
 - Known capability shapes, agent identity and agent auth methods are validated.
   Unknown capability/negotiation fields fail closed; extensions may be carried
-  in opaque object/null `_meta` fields. Nullable session/logout capability
-  objects are supported. Terminal auth is rejected because the client does not
+  in opaque object/null `_meta` fields. Nullable session/logout/status capability
+  objects, session fork/options/title metadata, provider metadata and MCP ACP
+  transport flags are supported. Terminal auth is rejected because the client does not
   advertise terminal authentication. No metadata, including `_meta`, grants
   local capabilities, establishes identity, or implies authentication readiness.
 - `request(method, params = {}, { signal, timeoutMs } = {})` returns a promise
@@ -375,7 +376,8 @@ The bridge performs `initialize` → `session/new` (empty `mcpServers`) →
 restart, replay or second turn. Core `session/update` notifications must match the
 exact session during the pending prompt, including the wire-receipt phase check.
 Supported rendered variants are `agent_message_chunk` text, `tool_call` and
-`tool_call_update`. Each assistant text chunk is at most 32,768 UTF-8 bytes; output
+`tool_call_update`. Text accepts standard annotations and optional string/null
+`messageId`, neither of which is rendered. Each assistant text chunk is at most 32,768 UTF-8 bytes; output
 buffering is at most 1 MiB. Control characters except tab/newline are removed from text.
 Malformed, mismatched or out-of-phase core updates, unknown core methods and
 non-text assistant messages still fail closed.
@@ -394,9 +396,16 @@ determines completion. No reasoning history or plan accumulation is kept.
 Processing remains bounded by the existing 1 MiB transport frame and 64 in-flight
 notification callback limits, with no additional ceiling or capability.
 `plan_update`/`plan_removed` still fail closed: they require the client's `plan`
-capability, which the bridge does not advertise. Other standard session updates,
-auth/readiness/resume/permission semantics and native-provider support remain
-outside this subset under #95.
+capability, which the bridge does not advertise. Auth/readiness/resume/permission
+semantics remain outside this subset under #95.
+
+**Private session metadata:** `available_commands_update`, `session_info_update`
+and `usage_update` are shape-validated and discarded, including commands, titles,
+context counts, costs and opaque metadata. Token counts must be nonnegative safe
+integers; costs must be finite numbers with a string currency/unit. Optional
+draft-v1 prompt-result `usage` is also validated and discarded, not projected as
+native billing or reasoning usage. None of this metadata enables client operations
+or changes the authoritative prompt `stopReason`.
 
 **Tool lifecycle subset (stable v1):** initial calls require string `toolCallId`
 and `title`; omitted kind/status default to `other`/`pending`. Updates require

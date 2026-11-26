@@ -10,7 +10,7 @@ permissions:
 jobs:
   acceptance:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       FABRIC_REFERENCE_PLUGIN_BINARY: ${{ github.workspace }}/target/release/fabric-reference-harnesses
       FABRIC_LOCAL_TARGET_BINARY: ${{ github.workspace }}/target/debug/fabric-local-target
@@ -131,3 +131,75 @@ jobs:
           "$GITHUB_WORKSPACE/target/debug/fabric"
           "$RUNNER_TEMP/omp-19.1.1"
           "$GITHUB_WORKSPACE/target/release/fabric-reference-harnesses"
+      - name: Real native Codex Responses with scripted local model API
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64)
+              platform=aarch64-apple-darwin
+              sha256=9414c8c967f110b11e8324c0cfa2b20f012094ef890110a561c92ee535a2681a
+              ;;
+            x86_64)
+              platform=x86_64-apple-darwin
+              sha256=6f9b1144ffaa64aa12bf30f312405b266b84c433bae9f070be10245762c7aa44
+              ;;
+            *) echo "Unsupported Codex architecture" >&2; exit 1 ;;
+          esac
+          native="$RUNNER_TEMP/fabric-scripted-codex-native"
+          mkdir -m 700 "$native"
+          curl --fail --location --max-time 180 \
+            "https://github.com/openai/codex/releases/download/rust-v0.171.0/codex-$platform.tar.gz" \
+            --output "$native/codex.tar.gz"
+          printf '%s  %s\n' "$sha256" "$native/codex.tar.gz" | shasum -a 256 --check
+          tar -xzf "$native/codex.tar.gz" -C "$native"
+          chmod 700 "$native/codex-$platform"
+          bun integrations/codex/scripted-provider-smoke.mjs \
+            "$GITHUB_WORKSPACE/target/debug/fabric" "$native/codex-$platform" \
+            "$GITHUB_WORKSPACE/target/release/fabric-reference-harnesses"
+      - name: Real native Claude Messages through generic ACP with scripted local model API
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64)
+              platform=arm64
+              sha256=ada7afbea165c20e5ec50a190653309bfba528ed9f74ef86a24f2734329ec59c
+              ;;
+            x86_64)
+              platform=x64
+              sha256=6be80ad3f2c7487829ff17c58d51b09043d19419c2b206657aad9a7affeb5ead
+              ;;
+            *) echo "Unsupported Claude ACP architecture" >&2; exit 1 ;;
+          esac
+          export CLAUDE_FIXTURE_NATIVE="$RUNNER_TEMP/fabric-scripted-claude-native"
+          mkdir -m 700 "$CLAUDE_FIXTURE_NATIVE"
+          curl --fail --location --max-time 180 \
+            "https://github.com/agentclientprotocol/claude-agent-acp/releases/download/v0.112.0/claude-agent-acp-darwin-$platform.zip" \
+            --output "$CLAUDE_FIXTURE_NATIVE/claude.zip"
+          printf '%s  %s\n' "$sha256" "$CLAUDE_FIXTURE_NATIVE/claude.zip" | shasum -a 256 --check
+          unzip -q "$CLAUDE_FIXTURE_NATIVE/claude.zip" -d "$CLAUDE_FIXTURE_NATIVE"
+          chmod 700 "$CLAUDE_FIXTURE_NATIVE/claude" "$CLAUDE_FIXTURE_NATIVE/claude-agent-acp"
+          export FIXTURE_BUN="$(command -v bun)" FIXTURE_NODE="$(command -v node)"
+          node --input-type=module <<'NODE'
+          import { realpathSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { fileHash } from './plugins/acp/config.mjs';
+          const root = process.env.GITHUB_WORKSPACE, native = process.env.CLAUDE_FIXTURE_NATIVE;
+          const paths = {
+            bun: process.env.FIXTURE_BUN, node: process.env.FIXTURE_NODE,
+            fabric: join(root, 'target/debug/fabric'),
+            localPlugin: join(root, 'target/debug/fabric-local-target'),
+            shim: join(native, 'claude-agent-acp'), claude: join(native, 'claude'),
+            bootstrap: join(root, 'integrations/claude/fixture-launcher.mjs'),
+          };
+          const inputs = Object.fromEntries(Object.entries(paths).map(([name, file]) => {
+            const path = realpathSync(file);
+            return [name, { path, sha256: fileHash(path) }];
+          }));
+          inputs.claudeVersion = '2.1.331 (Claude Code)';
+          writeFileSync(join(native, 'inputs.json'), JSON.stringify(inputs), { mode: 0o600, flag: 'wx' });
+          NODE
+          bun integrations/claude/scripted-provider-smoke.mjs "$CLAUDE_FIXTURE_NATIVE/inputs.json"
