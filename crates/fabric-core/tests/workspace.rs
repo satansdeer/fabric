@@ -113,6 +113,26 @@ impl WorkspaceBackend for ObservedBackend<'_> {
         );
         assert!(workspace.retention_reason.is_some());
         assert!(runner_workspace(&self.fixture.root, &run.run_id).is_err());
+        let pending = fabric_core::logs::read(
+            &self.fixture.root,
+            &run.run_id,
+            0,
+            1024,
+            Some(fabric_core::logs::RawStream::Stdout),
+        )
+        .unwrap();
+        assert_eq!(pending.raw.as_deref(), Some(""));
+        assert!(!pending.raw_eof);
+        assert!(
+            fabric_core::logs::read(
+                &self.fixture.root,
+                &run.run_id,
+                1,
+                1024,
+                Some(fabric_core::logs::RawStream::Stdout),
+            )
+            .is_err()
+        );
         if self.fail {
             let container = Path::new(&workspace.managed_path).parent().unwrap();
             fs::create_dir_all(container).unwrap();

@@ -15,6 +15,63 @@ For a live attempt, the operator must supply:
 
 Native-context consent and provider-spending authorization are **separate**. Native configuration, skills, extensions, plugins, MCP and commands are trusted local code and can access local credentials/services; this is not a sandbox. Do not place secrets in shell examples, profiles, prompts, recipes or published reports. Keep evidence private; logs may contain sensitive native output.
 
+## Scripted local model API (no external provider)
+
+Raw `runs logs --follow` may start during workspace preparation: a pending fork
+reports empty, non-EOF output until its tree and ownership marker are ready.
+It does not open pending workspace paths; ordinary ownership checks still apply
+once the fork completes.
+
+Run the actual Fabric OMP adapter and native OMP against the test-only
+`scripts/scripted-provider.mjs` HTTP server, not a fake harness:
+
+```sh
+bun integrations/omp/scripted-provider-smoke.mjs /absolute/path/to/fabric /absolute/path/to/omp /absolute/path/to/reference-plugin
+```
+
+Requires macOS, Bun, Git, `/usr/sbin/lsof`, Fabric, its reference adapter executable
+and native `omp/19.1.1`. For a release bundle, pass `plugins/omp/plugin` as the third
+binary; for a source build, pass `target/release/fabric-reference-harnesses`.
+The existing SDK installs and content-pins that adapter in a disposable registry.
+Missing dependencies or another OMP version fail; the runner never installs or
+updates a native harness, logs in or silently skips. CI uses its existing
+checksum-verified native OMP download.
+
+The runner creates a disposable Git repository, private HOME/XDG/native profiles
+and empty `agent.db`; child environments are literal allowlists. It never copies
+user credentials, native configuration, history, bridge, proxy or dotenv values.
+The sole custom model uses `openai-completions` at literal
+`http://127.0.0.1:<ephemeral-port>/v1` with a synthetic key. Every model request
+must match the expected route, authorization, model and conversation.
+
+Native acceptance requires split SSE text, a real `write` tool call and actual
+tool result in the next model request, a recoverable checksummed file patch,
+non-retryable HTTP failure, incomplete-stream failure, and cancellation after
+observing a real native partial-text event. It checks terminal states, one native
+attempt, process-group disappearance, socket closure, prepared-source provenance,
+artifact checksums and reclaimed workspaces. Watchdogs are failures, not success
+conditions; no elapsed-time worker restart is used.
+
+Configuration/discovery controls are reviewed against
+[OMP v19.1.1 source](https://github.com/can1357/oh-my-pi/tree/31ffee513f27a01bba7d4dfbe12bae239cdc646a):
+custom `models.yml`, default model role, all built-in/local provider IDs disabled,
+no retry/fallback/auxiliary model, update, marketplace, telemetry or LSP activity.
+`models.offline` alone does **not** stop registry discovery. Review the finite
+disabled-provider list and settings before accepting another native version.
+This test pin does not restrict Fabric's normal native-version discovery.
+
+Stdout and retained `proof.json` report the observed version, scenario outcomes,
+request counts, run IDs, artifact hashes and cleanup. A nonzero exit is failure;
+private diagnostics remain in the reported `/private/tmp/fabric-scripted-omp-*`
+directory. Share concise proof, not native transcripts, auth DBs or config files.
+The server is loopback-only with no forwarding and bounded requests/responses.
+Run its provider-free regression with `node scripts/test-scripted-provider.mjs`.
+
+This is **native OMP + scripted Chat Completions** evidence, not real-provider
+authentication/parity, fake ACP conformance or an OS network/keychain sandbox.
+Codex Responses, Claude Messages and other harness families need separate native
+wire/configuration/tool-loop/cancellation evidence; none is implied by this check.
+
 ## 1. Prepare a disposable immutable source (no model invocation)
 
 Use Bash from the Fabric checkout. Choose `SMOKE_CASE` explicitly as `omp`, `codex` or `mixed`; repeat this procedure in a new directory for each case. Supply the prerequisite variables above before running:
