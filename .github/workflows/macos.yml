@@ -203,3 +203,51 @@ jobs:
           writeFileSync(join(native, 'inputs.json'), JSON.stringify(inputs), { mode: 0o600, flag: 'wx' });
           NODE
           bun integrations/claude/scripted-provider-smoke.mjs "$CLAUDE_FIXTURE_NATIVE/inputs.json"
+      - name: Real native Cline Chat Completions and owned permission decisions
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$(uname -m)" in
+            arm64) platform=arm64 ;;
+            x86_64) platform=x64 ;;
+            *) echo "Unsupported Cline architecture" >&2; exit 1 ;;
+          esac
+          export CLINE_FIXTURE_NATIVE="$RUNNER_TEMP/fabric-scripted-cline-native"
+          mkdir -m 700 "$CLINE_FIXTURE_NATIVE"
+          mkdir -m 700 "$CLINE_FIXTURE_NATIVE/home" "$CLINE_FIXTURE_NATIVE/tmp" "$CLINE_FIXTURE_NATIVE/cache"
+          export FIXTURE_BUN="$(command -v bun)" FIXTURE_NODE="$(command -v node)"
+          : > "$CLINE_FIXTURE_NATIVE/user.npmrc"
+          : > "$CLINE_FIXTURE_NATIVE/global.npmrc"
+          (
+            cd "$CLINE_FIXTURE_NATIVE"
+            env -i PATH="$(dirname "$FIXTURE_NODE"):/usr/bin:/bin" \
+              HOME="$CLINE_FIXTURE_NATIVE/home" TMPDIR="$CLINE_FIXTURE_NATIVE/tmp" \
+              npm_config_userconfig="$CLINE_FIXTURE_NATIVE/user.npmrc" \
+              npm_config_globalconfig="$CLINE_FIXTURE_NATIVE/global.npmrc" \
+              npm_config_cache="$CLINE_FIXTURE_NATIVE/cache" \
+              "$(command -v npm)" install --ignore-scripts --no-audit --no-fund \
+              --prefix "$CLINE_FIXTURE_NATIVE" cline@3.0.75
+          )
+          export CLINE_FIXTURE_PLATFORM="$platform"
+          node --input-type=module <<'NODE'
+          import { realpathSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { fileHash } from './plugins/acp/config.mjs';
+          const root = process.env.GITHUB_WORKSPACE, native = process.env.CLINE_FIXTURE_NATIVE;
+          const paths = {
+            bun: process.env.FIXTURE_BUN, node: process.env.FIXTURE_NODE,
+            fabric: join(root, 'target/debug/fabric'),
+            localPlugin: join(root, 'target/debug/fabric-local-target'),
+            cline: join(native, 'node_modules', '@cline', `cli-darwin-${process.env.CLINE_FIXTURE_PLATFORM}`, 'bin/cline'),
+            bootstrap: join(root, 'integrations/cline/fixture-launcher.mjs'),
+          };
+          const inputs = Object.fromEntries(Object.entries(paths).map(([name, file]) => {
+            const path = realpathSync(file);
+            return [name, { path, sha256: fileHash(path) }];
+          }));
+          inputs.clineVersion = '3.0.75';
+          writeFileSync(join(native, 'inputs.json'), JSON.stringify(inputs), { mode: 0o600, flag: 'wx' });
+          NODE
+          bun integrations/cline/scripted-provider-smoke.mjs "$CLINE_FIXTURE_NATIVE/inputs.json"
