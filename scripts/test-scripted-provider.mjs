@@ -16,8 +16,8 @@ const deferred = () => {
 };
 const closeEvent = stream => new Promise(resolve => stream.once('close', resolve));
 
-async function fixture(steps, check) {
-  const provider = await startScriptedProvider(steps);
+async function fixture(steps, check, options) {
+  const provider = await startScriptedProvider(steps, options);
   let timer;
   try {
     await Promise.race([
@@ -196,6 +196,114 @@ await fixture([step()], async provider => {
   assert.throws(provider.assertDone, /Unconsumed/);
 });
 
+const matchedStep = (name, overrides = {}) => step({
+  match: ({ body }) => body?.request === name, chunks: [name], ...overrides,
+});
+const sendNamed = (provider, name, options) => send(provider, JSON.stringify({ request: name }), options);
+const unordered = { unordered: true };
+for (const order of [["main", "title"], ["title", "main"]]) {
+  await fixture([matchedStep("main"), matchedStep("title", { optional: true })], async provider => {
+    for (const name of order) assert.equal((await sendNamed(provider, name)).body, name);
+    provider.assertDone();
+    assert.deepEqual(provider.requests.map(request => request.body.request), order);
+  }, unordered);
+}
+await fixture([matchedStep("title", { optional: true }), matchedStep("main")], async provider => {
+  assert.equal((await sendNamed(provider, "main")).body, "main");
+  provider.assertDone(); // Only the explicitly optional title may be absent.
+}, unordered);
+await fixture([matchedStep("main"), matchedStep("title", { optional: true })], async provider => {
+  assert.equal((await sendNamed(provider, "title")).body, "title");
+  assert.throws(provider.assertDone, /Unconsumed scripted steps: 1/);
+}, unordered);
+
+for (const name of ["main", "title", "unknown"]) {
+  await fixture([matchedStep("main"), matchedStep("title", { optional: true })], async provider => {
+    if (name !== "unknown") assert.equal((await sendNamed(provider, name)).status, 200);
+    const rejected = await sendNamed(provider, name);
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body, "Scripted provider rejected request");
+    assert.throws(provider.assertDone, /Unexpected unmatched request/);
+    assert.equal((await sendNamed(provider, "main")).status, 500);
+    await provider.close();
+    assert.throws(provider.assertDone, /Unexpected unmatched request/);
+  }, unordered);
+}
+let ambiguousChecks = 0;
+await fixture([matchedStep("main", { check: () => ambiguousChecks++ }), matchedStep("main", { optional: true })], async provider => {
+  assert.equal((await sendNamed(provider, "main")).status, 400);
+  assert.equal(ambiguousChecks, 0, "Ambiguous selectors must not run checks");
+  assert.throws(provider.assertDone, /Ambiguous request selectors/);
+}, unordered);
+
+for (const match of [
+  () => { throw new Error("private selector diagnostic"); },
+  async () => { throw new Error("private async selector diagnostic"); },
+  () => 1,
+]) {
+  await fixture([step({ match })], async provider => {
+    assert.equal((await send(provider)).status, 400);
+    assert.throws(provider.assertDone, { message: "Request selector failed" });
+    assert.equal((await send(provider)).status, 500);
+    assert.throws(provider.assertDone, { message: "Request selector failed" });
+  }, unordered);
+}
+let otherChecks = 0;
+await fixture([
+  matchedStep("main", { check: () => { throw new Error("private check diagnostic"); } }),
+  matchedStep("title", { check: () => otherChecks++, optional: true }),
+], async provider => {
+  assert.equal((await sendNamed(provider, "main")).status, 400);
+  assert.equal(otherChecks, 0, "A failed check must not choose another step");
+  assert.throws(provider.assertDone, { message: "Request check failed at step 1" });
+  assert.equal((await sendNamed(provider, "title")).status, 500);
+  assert.equal(otherChecks, 0);
+}, unordered);
+
+for (const options of [
+  { method: "PUT", expected: /Unexpected request/ },
+  { path: "/wrong", expected: /Unexpected request/ },
+  { headers: { authorization: "wrong-private-header" }, expected: /check failed/ },
+  { body: "{", expected: /JSON/ },
+  { headers: { "content-type": "text/plain" }, expected: /application\/json/ },
+]) {
+  await fixture([matchedStep("main", { check: ({ headers }) => assert.equal(headers.authorization, undefined) })], async provider => {
+    const response = await send(provider, options.body ?? '{"request":"main"}', options);
+    assert.ok(response.status >= 400);
+    assert.throws(provider.assertDone, options.expected);
+    assert.ok(provider.requests.every(request => !Object.hasOwn(request, "headers")));
+  }, unordered);
+}
+
+// Optional requests may complete on either side of a held main response.
+for (const titleFirst of [false, true]) {
+  await fixture([
+    matchedStep("main", { wait: new Promise(() => {}) }),
+    matchedStep("title", { optional: true }),
+  ], async provider => {
+    if (titleFirst) assert.equal((await sendNamed(provider, "title")).body, "title");
+    const held = await open(provider, '{"request":"main"}').response;
+    const reader = held[Symbol.asyncIterator]();
+    assert.equal((await reader.next()).value.toString(), "main");
+    if (!titleFirst) assert.equal((await sendNamed(provider, "title")).body, "title");
+    provider.assertDone();
+    const closed = closeEvent(held);
+    held.destroy();
+    await closed;
+    await provider.close();
+    provider.assertDone();
+  }, unordered);
+}
+for (const [steps, options] of [
+  [[step({ match: () => true })], undefined],
+  [[step({ optional: true })], undefined],
+  [[step()], unordered],
+  [[step({ match: true })], unordered],
+  [[matchedStep("main", { optional: "yes" })], unordered],
+  [[], { unordered: "yes" }],
+  [[], { routing: true }],
+]) await assert.rejects(startScriptedProvider(steps, options));
+
 // Exact byte/count boundaries are usable; one byte/request over fails closed.
 const maxBody = '"' + 'x'.repeat(1024 * 1024 - 2) + '"';
 await fixture([step()], async provider => {
@@ -288,4 +396,4 @@ await fixture([step({ chunks: ['waiting'], wait: rejectedWait.promise })], async
   assert.throws(provider.assertDone, /wait rejected/);
 });
 
-console.log('PASS: scripted loopback SSE/tools, errors, cancellation, ordering, fail-closed validation and byte/count bounds');
+console.log('PASS: scripted loopback SSE/tools, errors, cancellation, strict ordering, bounded unordered/optional matching, fail-closed validation and byte/count bounds');

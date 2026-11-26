@@ -1138,3 +1138,48 @@ ACP integration check: a legitimate fixture `{ stopped: pid }` teardown record
 was projected to an extra `undefined` RPC method. The check now uses the same
 method-presence filter as initialize inspection tests and verifies every recorded
 stopped PID is reaped. No transport, timeout, cancellation or cleanup guard changed.
+
+## Issues #117–119 — native scripted Codex and Claude acceptance
+
+Two independent issue-owned OMP workers ran through the accepted local Fabric
+`5de89897e4cb70fc475e9f4b33213397688781a4` package. Manager review used captured
+patches, verified artifact sizes/SHA256 and reclaimed workspaces; worker exit
+status alone was not acceptance.
+
+Actual macOS arm64 checks:
+
+- Codex CLI 0.171.0, native Responses and `apply_patch`: five PASS scenarios,
+  with HTTP counts `1,2,1,1,1`, prepared state
+  `s-1795696843547282000-3005-0`, fixture commit
+  `2e121e5165e388dac3078a1116603b495f467856`.
+- Claude Code 2.1.331 and official `claude-agent-acp` 0.112.0 through generic
+  ACP: five PASS scenarios, HTTP counts `2,5,2,2,2`, prepared state
+  `s-1795698631516283000-8666-0`, bridge source
+  `46e3504e0d250adaba5c3f782ffc9de20980b8e6`. Each required call occurred once;
+  each scenario had one separately validated title call and no unknown calls.
+  Native Read required one additional nonstreaming token-count JSON call.
+- Both sequences proved streamed output, an actual native write and subsequent
+  tool result, nonretryable API error, incomplete disconnect, and cancellation
+  while a real HTTP stream remained open. Results checked immutable sources,
+  intended capture, reaped descendants and reclaimed workspaces.
+- The deterministic scripted-provider assertion runner passed strict ordered
+  behavior and bounded opt-in unordered/optional matching, including missing,
+  duplicate, ambiguous, unmatched and invalid selectors, cancellation and byte
+  ceilings. Current ACP transport tests passed 64/64; pin validation passed.
+- The installed generic ACP integration passed through the accepted host in
+  421 seconds; package SHA256
+  `b572c644bccb559662104bc31dd25288f435f1f84f2cc5bae9cb3712e733e797`.
+  Explicitly validated command, usage, session-info and message annotations
+  remain private. Invalid metadata, unsafe token counts, unknown core fields
+  and unsupported capabilities remain fail-closed.
+
+Real-native failures drove corrections: current ACP capabilities and metadata,
+concurrent title calls preceded by SDK system blocks, and native Read's
+token-count endpoint. No blanket unknown-update allowance, host harness update,
+private SDK transcript capture or production credential fallback was added.
+
+Retained local controller proofs: `fabric-scripted-codex-tYS99w/proof.json` and
+`fabric-scripted-claude-1yGzCK/proof.json` under the macOS temporary directory.
+Exact-head CI, successor package provenance and installed acceptance are tracked
+on #117. Official x64 pins are not local x64 evidence. Scripted API acceptance
+is not paid-provider authentication, full harness parity or OS egress confinement.

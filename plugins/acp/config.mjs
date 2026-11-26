@@ -8,6 +8,7 @@ export const fail = code => { throw Object.assign(new Error(code), { code }); };
 export const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 export const fields = (value, names) => object(value) && Object.keys(value).every(key => names.includes(key));
 const literal = value => typeof value === 'string' && value.length <= 4096 && !/[\0-\x1f\x7f]/.test(value);
+const MAX_PIN_BYTES = 512 * 1024 * 1024;
 export function absolute(path) {
   if (!literal(path) || !isAbsolute(path) || realpathSync(path) !== path) fail('acp_unsafe_path');
   return path;
@@ -17,12 +18,12 @@ export function fileHash(path) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = fstatSync(fd);
-    if (!before.isFile() || before.size > 268_435_456) fail('acp_unsafe_file');
+    if (!before.isFile() || before.size > MAX_PIN_BYTES) fail('acp_unsafe_file');
     const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(65_536);
     let count = 0, n;
     while ((n = readSync(fd, buffer))) {
       count += n;
-      if (count > 268_435_456) fail('acp_unsafe_file');
+      if (count > MAX_PIN_BYTES) fail('acp_unsafe_file');
       hash.update(buffer.subarray(0, n));
     }
     const after = fstatSync(fd);

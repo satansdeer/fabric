@@ -18,13 +18,14 @@ function shape(value, fields = {}) {
 }
 const empty = value => shape(value);
 const prompt = value => shape(value, { image: boolean, audio: boolean, embeddedContext: boolean });
-const mcp = value => shape(value, { http: boolean, sse: boolean });
+const mcp = value => shape(value, { http: boolean, sse: boolean, acp: boolean });
 const systemPrompt = value => shape(value, {
   mode: nullable(value => shape(value, { override: nullable(empty) })),
 });
 const sessions = value => shape(value, {
-  close: nullable(empty), delete: nullable(empty), list: nullable(empty),
-  resume: nullable(empty), additionalDirectories: nullable(empty),
+  close: nullable(empty), delete: nullable(empty), fork: nullable(empty), list: nullable(empty),
+  options: nullable(empty), resume: nullable(empty), status: nullable(empty), title: nullable(empty),
+  additionalDirectories: nullable(empty),
   systemPrompt: nullable(systemPrompt),
 });
 function negotiation(value) {
@@ -38,7 +39,8 @@ function negotiation(value) {
   }) || !shape(capabilities, {
     loadSession: boolean, promptCapabilities: prompt, mcpCapabilities: mcp,
     sessionCapabilities: sessions,
-    auth: value => shape(value, { logout: nullable(empty) }),
+    auth: value => shape(value, { logout: nullable(empty), status: nullable(empty) }),
+    providers: nullable(empty),
   })) throw error('acp_invalid_initialize');
   const ids = new Set();
   for (const method of authMethods) {

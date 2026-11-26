@@ -67,10 +67,45 @@ directory. Share concise proof, not native transcripts, auth DBs or config files
 The server is loopback-only with no forwarding and bounded requests/responses.
 Run its provider-free regression with `node scripts/test-scripted-provider.mjs`.
 
-This is **native OMP + scripted Chat Completions** evidence, not real-provider
-authentication/parity, fake ACP conformance or an OS network/keychain sandbox.
-Codex Responses, Claude Messages and other harness families need separate native
-wire/configuration/tool-loop/cancellation evidence; none is implied by this check.
+### Codex Responses and Claude Messages
+
+Separate native runners exercise the same five scenarios; an OMP result never
+substitutes for another harness's wire, tool-loop or cancellation evidence:
+
+```sh
+bun integrations/codex/scripted-provider-smoke.mjs /absolute/path/to/fabric /absolute/path/to/codex /absolute/path/to/reference-codex-plugin
+bun integrations/claude/scripted-provider-smoke.mjs /absolute/private-inputs.json
+```
+
+Codex requires `codex-cli 0.171.0`; release bundles supply `plugins/codex/plugin`.
+It uses the native Responses provider and actual `apply_patch`, not an ACP shim.
+`exec --json` exposes completed message items, not individual text deltas: held
+stream checks observe an actual message item before disconnect/cancel.
+
+Claude uses official `claude-agent-acp` 0.112.0 and its bundled Claude Code
+2.1.331 through the **generic** ACP bridge. Its private, owned `0600` inputs JSON
+contains `bun`, `fabric`, `node`, `shim`, `claude`, `localPlugin` and `bootstrap`,
+each `{ "path": "/canonical/absolute/file", "sha256": "<file-sha256>" }`,
+plus `"claudeVersion": "2.1.331 (Claude Code)"`. `bootstrap` selects the adjacent
+`integrations/claude/fixture-launcher.mjs`; use Node >=22.18, the actual Bun
+runner and `plugins/local/plugin` (or built `fabric-local-target`) for `localPlugin`.
+The launcher replaces the native child's environment with a fixture-only
+allowlist and dummy Anthropic Messages endpoint. Real native Read/Write results
+must reach the next request; Fabric's ACP JSONL is not a native SDK transcript.
+
+Claude's pinned SDK concurrently requests a session title. Its fixture matches
+one optional title call per scenario by exact prompt and output schema, with a
+private canary that must never enter public events. The large native Read also
+requires one exact `/v1/messages/count_tokens?beta=true` JSON call before the
+real Read/Write continuation. Every required call must occur once; duplicate,
+unknown, ambiguous and malformed requests still fail. Only this fixture opts
+into bounded unordered matching; other scripted providers remain ordered.
+
+CI downloads official architecture-specific releases with checked archive hashes;
+the runners never install/update host harnesses or import user authentication.
+Each reports its own retained proof/failure directory and exits nonzero on failure.
+These are **native harness + scripted API** checks, not real-provider
+authentication/parity, generic ACP conformance or OS network/keychain isolation.
 
 ## 1. Prepare a disposable immutable source (no model invocation)
 

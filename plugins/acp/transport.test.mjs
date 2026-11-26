@@ -115,6 +115,9 @@ const invalidNegotiations = [
     { agentCapabilities: { promptCapabilities: null } }, { agentCapabilities: { promptCapabilities: { image: 1 } } },
     { agentCapabilities: { mcpCapabilities: { http: [] } } }, { agentCapabilities: { sessionCapabilities: { list: true } } },
     { agentCapabilities: { auth: { logout: false } } },
+    { agentCapabilities: { mcpCapabilities: { acp: {} } } }, { agentCapabilities: { providers: true } },
+    { agentCapabilities: { auth: { status: [] } } },
+    ...['fork', 'options', 'status', 'title'].map(key => ({ agentCapabilities: { sessionCapabilities: { [key]: true } } })),
     { agentCapabilities: { sessionCapabilities: { systemPrompt: { mode: { override: false } } } } },
     { agentCapabilities: { unknown: true } }, { agentCapabilities: { _meta: [] } },
     { authMethods: null }, { authMethods: {} }, { authMethods: [null] }, { authMethods: [{ id: 'x' }] },
@@ -139,6 +142,16 @@ test('omitted fields mean no optional support; valid nullable and extension meta
     protocolVersion: 1,
     agentCapabilities: { auth: { logout: {} }, sessionCapabilities: { close: null, systemPrompt: { mode: { override: {} } } }, _meta: { terminal: true } },
     authMethods: [{ id: 'x', name: 'Untrusted', type: 'agent' }], agentInfo: null,
+  }, {
+    protocolVersion: 1,
+    agentCapabilities: {
+      loadSession: true, promptCapabilities: { image: true, embeddedContext: true },
+      mcpCapabilities: { http: true, sse: true, acp: true },
+      auth: { logout: {}, status: {} }, providers: {},
+      sessionCapabilities: { additionalDirectories: {}, close: {}, delete: {}, fork: {}, list: {},
+        options: {}, resume: {}, status: {}, systemPrompt: { mode: { override: {} } }, title: {} },
+      _meta: { claudeCode: { promptQueueing: true }, authStatus: {} },
+    },
   }]) {
     const { connection } = await launch(t, 'init-value', {}, value);
     const metadata = await connection.initialize();
