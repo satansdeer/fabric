@@ -220,6 +220,8 @@ from independently approved files, not agent metadata. Example nonsecret
 All paths must already exist, be absolute and canonical. Executable/runtime
 files are SHA-256 checked during packaging, probe/context/plan/command and again
 before the child launches. Explicit additional `pins` bind script/resource files.
+Each pinned executable/resource is limited to 512 MiB and hashed in bounded chunks;
+the limit accommodates standalone native CLIs without loading them into memory.
 Shebang ACP entrypoints are rejected: select an approved absolute runtime and
 literal absolute script argument instead, pinning that script. When that runtime
 is the bridge's Node, its first argument must be a pinned script (no loader flags).
