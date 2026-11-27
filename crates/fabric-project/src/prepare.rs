@@ -67,7 +67,7 @@ pub fn prepare_with_admission(
         .ok_or_else(|| project_not_found(name))?;
     let source = Path::new(&project.source_path);
     let directory_source = is_directory_source(&project.default_ref);
-    if directory_source != !has_git_metadata(source)? {
+    if directory_source == has_git_metadata(source)? {
         return Err(source_error(
             "Registered source changed between Git and directory kinds.",
         ));

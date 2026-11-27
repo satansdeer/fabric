@@ -188,8 +188,7 @@ fn scan(
     let mut entries = BTreeMap::new();
     visit(
         &directory,
-        Path::new(""),
-        destination,
+        (Path::new(""), destination),
         deadline,
         &mut hash,
         &mut links,
@@ -208,14 +207,14 @@ fn scan(
 
 fn visit(
     file: &File,
-    relative: &Path,
-    destination: Option<&Path>,
+    paths: (&Path, Option<&Path>),
     deadline: Instant,
     hash: &mut Sha256,
     links: &mut BTreeMap<PathBuf, PathBuf>,
     entries: &mut BTreeMap<PathBuf, bool>,
     buffer: &mut [u8; 64 * 1024],
 ) -> Result<(), FabricError> {
+    let (relative, destination) = paths;
     crate::prepare::check_deadline(deadline)?;
     let before = file.metadata().map_err(storage_error)?;
     field(hash, relative.as_os_str().as_bytes());
@@ -310,13 +309,12 @@ fn visit(
             {
                 let child = open_at(file, &name, stat.st_mode & libc::S_IFMT == libc::S_IFDIR)?;
                 let opened = child.metadata().map_err(storage_error)?;
-                if opened.dev() != stat.st_dev as u64 || opened.ino() != stat.st_ino as u64 {
+                if opened.dev() != stat.st_dev as u64 || opened.ino() != stat.st_ino {
                     return Err(source_error("Directory entry changed before snapshotting."));
                 }
                 visit(
                     &child,
-                    &relative,
-                    target.as_deref(),
+                    (&relative, target.as_deref()),
                     deadline,
                     hash,
                     links,
