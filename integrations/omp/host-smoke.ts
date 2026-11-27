@@ -200,6 +200,7 @@ export default function proof(pi:ExtensionAPI) {
 	assert.equal((await first.invoke("fabric_spawn", { project: "demo", tasks: [{ task_id: "x", harness_id: "fake-a", prompt: "literal", unexpected: true }] }, true)).valid, false, "native task schema accepts unknown intent");
 	for (const [fields, valid] of [
 		[{ execution_context: { kind: "native" }, source_ref: { kind: "current-head" } }, true],
+		[{ execution_context: { kind: "native" }, source_ref: { kind: "current-directory" } }, true],
 		[{ execution_context: { kind: "explicit", harness_version: "fixture", native_config_refs: [{ kind: "config", path: "literal" }], connection_refs: [{ kind: "profile", name: "local" }] }, source_ref: { kind: "commit", sha: "abc" }, limits: { max_cost_usd: 0 } }, true],
 		[{ execution_context: { kind: "native", harness_version: "unexpected" } }, false],
 		[{ execution_context: { kind: "explicit" } }, false],

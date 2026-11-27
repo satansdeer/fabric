@@ -221,3 +221,38 @@ fn up_requires_consent_before_probes_and_reuses_the_exact_ready() {
             .contains("workers spawn")
     );
 }
+
+#[test]
+fn up_accepts_an_empty_directory_without_git_or_a_recipe() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source");
+    fs::remove_dir_all(source.join(".git")).unwrap();
+    fs::remove_file(source.join("Cargo.toml")).unwrap();
+    fs::write(fixture.0.join("native/auth.json"), "opaque fixture auth").unwrap();
+    let args = ["up", "--harness", "codex", "--yes", "--json"];
+    let first = fixture.cli(&args);
+    assert!(first.status.success(), "{first:?}");
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(
+        first["source_commit_sha"]
+            .as_str()
+            .unwrap()
+            .starts_with("directory-sha256:")
+    );
+    assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+    let second = fixture.cli(&args);
+    assert!(second.status.success(), "{second:?}");
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(first["prepared_state_id"], second["prepared_state_id"]);
+    fs::write(source.join("notes.txt"), "include current files").unwrap();
+    let changed = fixture.cli(&args);
+    assert!(changed.status.success(), "{changed:?}");
+    let changed: serde_json::Value = serde_json::from_slice(&changed.stdout).unwrap();
+    assert_ne!(first["prepared_state_id"], changed["prepared_state_id"]);
+    assert_ne!(first["source_commit_sha"], changed["source_commit_sha"]);
+    assert!(!source.join(".git").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("notes.txt")).unwrap(),
+        "include current files"
+    );
+}

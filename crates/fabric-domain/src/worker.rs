@@ -38,6 +38,7 @@ pub enum ExecutionContext {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SourceRef {
     CurrentHead {},
+    CurrentDirectory {},
     Prepared { state_id: String },
     Commit { sha: String },
 }

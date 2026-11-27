@@ -119,7 +119,7 @@ fn write_init(report: &InitReport, json: bool) -> Result<(), FabricError> {
         return super::write_inspection(report, true);
     }
     let mut out = io::stdout().lock();
-    writeln!(out, "Project: {}\nSource: {}\nCommit: {}\nDirty: {} (only committed HEAD is prepared)\nREADY: {}\nConnected: {}\nNative authentication available: {}",
+    writeln!(out, "Project: {}\nSource: {}\nSnapshot: {}\nDirty Git checkout: {}\nREADY: {}\nConnected: {}\nNative authentication available: {}",
         report.project_name, report.source, report.source_commit_sha, report.dirty, report.ready, report.connected, report.credential_available).map_err(super::output_error)?;
     if let Some(context) = &report.native_context {
         writeln!(
@@ -175,11 +175,12 @@ pub fn init(
     let root = root.map_or_else(fabric_project::default_root, Ok)?;
     let cwd = std::env::current_dir().map_err(super::output_error)?;
     let source = fabric_project::resolve_source(&cwd)?;
+    fabric_project::validate_source_root(&root, &source)?;
     let path = Path::new(&source.path);
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| invalid("Git source needs a UTF-8 project name."))?
+        .ok_or_else(|| invalid("Source directory needs a UTF-8 project name."))?
         .to_owned();
     let mut errors = Vec::new();
     let context = if let Some(id) = id {
@@ -234,16 +235,39 @@ pub fn init(
             "npm lockfile: npm ci",
             "version = 1\n[[steps]]\nargv = [\"npm\", \"ci\"]\n",
         ))
+    } else if fabric_project::is_directory_source(&source.commit_sha) {
+        Some((
+            "Directory snapshot: no dependency installation",
+            "version = 1\n[[steps]]\nargv = [\"/usr/bin/true\"]\n",
+        ))
     } else {
         None
     };
     let mut report = InitReport {
-        source: source.path.clone(), source_commit_sha: source.commit_sha.clone(), project_name: name.clone(), dirty: source.dirty,
-        harness_id: context.as_ref().map(|c| c.profile.harness_id.clone()), version: context.as_ref().map(|c| c.profile.harness_version.clone()),
-        credential_available: context.as_ref().is_some_and(|c| c.credential_available), connected, ready,
-        native_context: context, discovery_errors: errors,
-        likely_recipe: existing.as_ref().map(|p| p.display().to_string()).or_else(|| suggestion.map(|s| s.0.to_owned())),
-        actions: vec!["Connect a native context explicitly; authentication remains owned by the harness.".into(), "Review a recipe before explicitly approving preparation; only committed HEAD is prepared.".into()],
+        source: source.path.clone(),
+        source_commit_sha: source.commit_sha.clone(),
+        project_name: name.clone(),
+        dirty: source.dirty,
+        harness_id: context.as_ref().map(|c| c.profile.harness_id.clone()),
+        version: context.as_ref().map(|c| c.profile.harness_version.clone()),
+        credential_available: context.as_ref().is_some_and(|c| c.credential_available),
+        connected,
+        ready,
+        native_context: context,
+        discovery_errors: errors,
+        likely_recipe: existing
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or_else(|| suggestion.map(|s| s.0.to_owned())),
+        actions: vec![
+            "Connect a native context explicitly; authentication remains owned by the harness."
+                .into(),
+            if fabric_project::is_directory_source(&source.commit_sha) {
+                "Review a recipe before explicitly approving preparation; all current directory contents are snapshotted.".into()
+            } else {
+                "Review a recipe before explicitly approving preparation; only committed HEAD is prepared.".into()
+            },
+        ],
     };
     if check || json || !io::stdin().is_terminal() {
         return write_init(&report, json);
@@ -255,7 +279,7 @@ pub fn init(
         report.connected = true;
     }
     if registered.is_none() {
-        if !approve("Register this committed Git source with Fabric?")? {
+        if !approve("Register this source directory with Fabric?")? {
             return Ok(());
         }
         fabric_project::register(&root, &name, path)?;

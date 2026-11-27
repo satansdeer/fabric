@@ -34,7 +34,7 @@ pub struct UpArgs {
     /// Reviewed preparation recipe; otherwise use the repo recipe or a detected lockfile.
     #[arg(long, conflicts_with = "source_only")]
     recipe: Option<PathBuf>,
-    /// Explicitly prepare committed source without installing dependencies.
+    /// Prepare source without installing dependencies (default for plain directories without a recipe/lockfile).
     #[arg(long)]
     source_only: bool,
     /// Explicit trust/execute/auth/preparation consent for unattended setup.
@@ -183,11 +183,12 @@ pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
     };
     let source =
         fabric_project::resolve_source(&std::env::current_dir().map_err(super::output_error)?)?;
+    fabric_project::validate_source_root(&root, &source)?;
     let path = Path::new(&source.path);
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| invalid("Git source needs a UTF-8 project name."))?;
+        .ok_or_else(|| invalid("Source directory needs a UTF-8 project name."))?;
     if args.controller && args.harness.as_ref().is_some_and(|id| id.as_str() != "omp") {
         return Err(invalid(
             "--controller requires a compatible native OMP adapter.",
@@ -212,8 +213,9 @@ pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
     let registry = std::env::var_os("FABRIC_PLUGIN_REGISTRY")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("up-registry"));
+    let directory = fabric_project::is_directory_source(&source.commit_sha);
     eprintln!(
-        "Source: {}\nCommit: {}\nDirty: {} (only committed HEAD is prepared)\nStorage: {}\nRegistry: {}",
+        "Source: {}\nSnapshot: {}\nDirty Git checkout: {}\nStorage: {}\nRegistry: {}",
         source.path,
         source.commit_sha,
         source.dirty,
@@ -325,6 +327,8 @@ pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
         "version = 1\nenvironment = [\"PATH\"]\n[[steps]]\nargv = [\"cargo\", \"build\", \"--locked\"]\n".to_owned()
     } else if path.join("package-lock.json").is_file() {
         "version = 1\nenvironment = [\"PATH\"]\n[[steps]]\nargv = [\"npm\", \"ci\"]\n".to_owned()
+    } else if directory {
+        "version = 1\n[[steps]]\nargv = [\"/usr/bin/true\"]\n".to_owned()
     } else {
         return Err(invalid(
             "No preparation requirements inferred. Use --source-only for a source-only tree, --recipe <reviewed-path>, or a repository fabric.recipe.toml. No dependency installation was attempted.",
@@ -337,8 +341,13 @@ pub fn up(root: Option<PathBuf>, args: UpArgs) -> Result<(), FabricError> {
         .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
         .collect();
     let fingerprint = parsed.fingerprint(&source.commit_sha, &environment)?;
+    let scope = if directory {
+        "all current directory contents"
+    } else {
+        "committed HEAD only"
+    };
     eprintln!(
-        "Preparation (committed HEAD only; commands may access network/auth through the selected recipe):\n{recipe}"
+        "Preparation ({scope}; commands may access network/auth through the selected recipe):\n{recipe}"
     );
     consent(
         args.yes,

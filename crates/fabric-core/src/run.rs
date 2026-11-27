@@ -217,9 +217,13 @@ fn select_prepared(
             }
             store.ready_state_for_commit(&project.project_id, &sha.to_ascii_lowercase()).map_err(error)?
         }
-        SourceRef::CurrentHead {} => {
+        SourceRef::CurrentHead {} | SourceRef::CurrentDirectory {} => {
             let source = fabric_project::resolve_source(Path::new(&project.source_path))?;
-            checkout_dirty = Some(source.dirty);
+            let directory = fabric_project::is_directory_source(&source.commit_sha);
+            if matches!(selection, SourceRef::CurrentDirectory {}) && !directory {
+                return Err(source_error("Current-directory selection requires a non-Git source directory."));
+            }
+            checkout_dirty = (!directory).then_some(source.dirty);
             if source.dirty {
                 eprintln!("warning: dirty Git checkout; only committed HEAD is used; uncommitted changes are not imported.");
             }
@@ -237,12 +241,17 @@ fn select_prepared(
         kind: ErrorKind::Source,
         message: failure.message,
     })?;
+    let directory = fabric_project::is_directory_source(&state.source_commit_sha);
     let provenance = SourceProvenance {
-        source_ref: selection.clone(),
+        source_ref: if directory && matches!(selection, SourceRef::CurrentHead {}) {
+            SourceRef::CurrentDirectory {}
+        } else {
+            selection.clone()
+        },
         prepared_state_id: state.state_id.clone(),
         base_commit_sha: state.source_commit_sha.clone(),
         checkout_dirty,
-        dirty_changes_excluded: true,
+        dirty_changes_excluded: !directory,
     };
     Ok((root, state, provenance))
 }

@@ -59,6 +59,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_source(true)
+    }
+
+    fn with_source(git: bool) -> Self {
         let path = std::env::temp_dir().join(format!(
             "fabric-workers-{}-{}-{}",
             std::process::id(),
@@ -80,11 +84,13 @@ impl Fixture {
             submitted: false,
         };
         fs::create_dir(&fixture.repo).unwrap();
-        fixture.git(&["init", "--quiet"]);
-        fs::write(fixture.repo.join("tracked"), "original").unwrap();
-        fs::write(fixture.repo.join(".gitignore"), ".deps/\n").unwrap();
-        fixture.git(&["add", "."]);
-        fixture.git(&["commit", "--quiet", "-m", "initial"]);
+        if git {
+            fixture.git(&["init", "--quiet"]);
+            fs::write(fixture.repo.join("tracked"), "original").unwrap();
+            fs::write(fixture.repo.join(".gitignore"), ".deps/\n").unwrap();
+            fixture.git(&["add", "."]);
+            fixture.git(&["commit", "--quiet", "-m", "initial"]);
+        }
         let mut add = fixture.cli();
         add.args(["project", "add", "--name", "test", "--path"])
             .arg(&fixture.repo);
@@ -341,6 +347,80 @@ fn eventually(mut predicate: impl FnMut() -> bool) {
         assert!(start.elapsed() < DEADLINE, "fixture condition timed out");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn empty_directory_workers_are_isolated_and_capture_without_git() {
+    let mut fixture = Fixture::with_source(false);
+    assert_eq!(fs::read_dir(&fixture.repo).unwrap().count(), 0);
+    let mut second = fixture.task("second", "fake-b");
+    second["source_ref"] = json!({"kind":"current-directory"});
+    let accepted = fixture.accept(&json!({
+        "project":"test","max_concurrency":2,
+        "tasks":[fixture.task("first", "fake-a"), second]
+    }));
+    fs::write(fixture.path.join("release-all"), "").unwrap();
+    let batch = accepted["batch_id"].as_str().unwrap();
+    fixture.terminal(batch);
+    let results = fixture.query("results", batch);
+    assert_eq!(results["succeeded"], true, "{results}");
+    for (index, task) in results["tasks"].as_array().unwrap().iter().enumerate() {
+        let run = &task["result"];
+        assert_eq!(run["source"]["source_ref"]["kind"], "current-directory");
+        assert_eq!(run["source"]["checkout_dirty"], Value::Null);
+        assert_eq!(run["source"]["dirty_changes_excluded"], false);
+        assert_eq!(run["base_commit_sha"], fixture.base["source_commit_sha"]);
+        let artifacts = fixture
+            .path
+            .join("storage/artifacts")
+            .join(run["artifact_manifest_id"].as_str().unwrap());
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(artifacts.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["source_scope"], "directory_full_tree");
+        let extracted = fixture.path.join(format!("extracted-{index}"));
+        fs::create_dir(&extracted).unwrap();
+        checked(
+            &Command::new("/usr/bin/tar")
+                .arg("-xf")
+                .arg(artifacts.join("untracked.tar"))
+                .arg("-C")
+                .arg(&extracted)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            fs::read_to_string(extracted.join("new-source")).unwrap(),
+            format!("new-{}", ["first", "second"][index])
+        );
+        assert_eq!(
+            fs::read_to_string(extracted.join("tracked")).unwrap(),
+            format!(
+                "{} ; $(touch INJECTED) 'quoted'\nsecond line",
+                ["first", "second"][index]
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(extracted.join(".deps/ready")).unwrap(),
+            "ready"
+        );
+        assert!(!extracted.join(".git").exists());
+        let shown = parsed(&fixture.run({
+            let mut show = fixture.cli();
+            show.args(["runs", "show", task["run_id"].as_str().unwrap(), "--json"]);
+            show
+        }));
+        assert_eq!(shown["workspace"]["state"], "RECLAIMED");
+        assert!(!Path::new(shown["workspace"]["managed_path"].as_str().unwrap()).exists());
+    }
+    assert_ne!(
+        results["tasks"][0]["result"]["workspace_id"],
+        results["tasks"][1]["result"]["workspace_id"]
+    );
+    assert_eq!(fs::read_dir(&fixture.repo).unwrap().count(), 0);
+    let prepared = Path::new(fixture.base["prepared_path"].as_str().unwrap());
+    assert!(!prepared.join(".git").exists());
+    assert!(!prepared.join("tracked").exists());
+    assert!(!prepared.join("new-source").exists());
 }
 
 #[test]

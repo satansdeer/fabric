@@ -156,6 +156,7 @@ export default function fabricExtension(pi: ExtensionAPI) {
 		]).optional(),
 		source_ref: z.union([
 			z.object({ kind: z.literal("current-head") }).strict(),
+			z.object({ kind: z.literal("current-directory") }).strict(),
 			z.object({ kind: z.literal("prepared"), state_id: z.string().min(1) }).strict(),
 			z.object({ kind: z.literal("commit"), sha: z.string().min(1) }).strict(),
 		]).optional(),
