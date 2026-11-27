@@ -142,11 +142,12 @@ impl Recipe {
         commit_sha: &str,
         environment: &BTreeMap<String, String>,
     ) -> Result<PreparationFingerprint, FabricError> {
-        if ![40, 64].contains(&commit_sha.len())
-            || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        if !crate::is_directory_source(commit_sha)
+            && (![40, 64].contains(&commit_sha.len())
+                || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
         {
             return Err(invalid_recipe(
-                "Preparation requires a full 40- or 64-digit commit SHA, not a ref.",
+                "Preparation requires a full Git commit SHA or a tagged directory-sha256 identity, not a ref.",
             ));
         }
         // Serialize a sorted name/value map directly into SHA-256; do not buffer secrets.

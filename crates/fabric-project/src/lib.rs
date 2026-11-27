@@ -1,6 +1,7 @@
-//! Local-only Git registration and preparation. Registration keeps its original
-//! committed SHA; each preparation request separately resolves current committed HEAD.
+//! Local-only Git and directory registration and isolated preparation.
+//! Registration keeps its original source identity; preparation resolves current content.
 
+mod directory;
 pub mod prepare;
 pub mod recipe;
 
@@ -8,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fabric_domain::{ErrorKind, FabricError, ProjectId};
 use fabric_store::{Project, Store};
@@ -27,24 +28,34 @@ pub struct Registration {
     pub dirty: bool,
 }
 
-/// Inspect only local Git metadata. Never fetch, copy files, or refresh the index.
+/// Inspect a local Git checkout or hash every entry of a non-Git directory.
 pub fn resolve_source(path: &Path) -> Result<Source, FabricError> {
     let path = path.canonicalize().map_err(|error| {
         source_error(format!(
-            "Cannot open Git working tree {}: {error}. Use --path with an existing local Git working tree.",
+            "Cannot open local source {}: {error}. Use --path with an accessible local directory.",
             path.display()
         ))
     })?;
     if !path.is_dir() {
         return Err(source_error(format!(
-            "{} is not a Git working tree directory; use --path with a local repository.",
+            "{} is not a source directory.",
             path.display()
         )));
+    }
+    if !has_git_metadata(&path)? {
+        return Ok(Source {
+            path: path
+                .to_str()
+                .ok_or_else(|| source_error("Source paths must be valid UTF-8."))?
+                .to_owned(),
+            commit_sha: directory::identity(&path, Instant::now() + Duration::from_secs(1200))?,
+            dirty: false,
+        });
     }
     let top = local_git(&path, &["rev-parse", "--show-toplevel"])?;
     if !top.status.success() {
         return Err(source_error(format!(
-            "{} is not an accessible Git working tree; use --path with a local clone (not a bare repository), or run git init and commit your source first.",
+            "{} has inaccessible, broken, or bare Git metadata; restore a working checkout before registering.",
             path.display()
         )));
     }
@@ -89,6 +100,59 @@ pub fn resolve_source(path: &Path) -> Result<Source, FabricError> {
         commit_sha: sha.to_owned(),
         dirty: !status.stdout.is_empty(),
     })
+}
+
+/// Directory identities are tagged, canonical SHA-256 values, never Git commit IDs.
+pub fn is_directory_source(identity: &str) -> bool {
+    identity
+        .strip_prefix(directory::PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Reject recursive directory snapshots before creating any managed storage.
+/// Git sources retain their committed-only checkout behavior.
+pub fn validate_source_root(root: &Path, source: &Source) -> Result<(), FabricError> {
+    if is_directory_source(&source.commit_sha) {
+        directory::outside_source(root, Path::new(&source.path))?;
+    }
+    Ok(())
+}
+
+fn has_git_metadata(path: &Path) -> Result<bool, FabricError> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(source_error(format!(
+                    "Cannot inspect local Git metadata: {error}"
+                )));
+            }
+        }
+        // Recognize bare (including damaged bare) layouts without mistaking a
+        // project's ordinary `objects` or `config` entry for repository metadata.
+        let mut bare_markers = 0;
+        for name in ["HEAD", "objects", "refs", "config"] {
+            match fs::symlink_metadata(ancestor.join(name)) {
+                Ok(_) => bare_markers += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(source_error(format!(
+                        "Cannot inspect local Git metadata: {error}"
+                    )));
+                }
+            }
+        }
+        if bare_markers >= 3 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn local_git(path: &Path, args: &[&str]) -> Result<Output, FabricError> {
@@ -141,6 +205,7 @@ pub fn register(root: &Path, name: &str, path: &Path) -> Result<Registration, Fa
     }
     // Validate source before creating any Fabric storage.
     let source = resolve_source(path)?;
+    validate_source_root(root, &source)?;
     let store = open_store(root, true)?;
     if store
         .project_by_name(name)

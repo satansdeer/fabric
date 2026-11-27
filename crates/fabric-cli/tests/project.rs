@@ -206,7 +206,9 @@ fn invalid_sources_and_unknown_projects_have_actionable_json_errors() {
     let fixture = Fixture::new();
     let plain = fixture.0.join("plain");
     fs::create_dir(&plain).unwrap();
-    for path in [&plain, &fixture.0.join("missing")] {
+    let file = fixture.0.join("file");
+    fs::write(&file, "not a directory").unwrap();
+    for path in [&file, &fixture.0.join("missing")] {
         let output = fixture
             .cli()
             .args(["project", "add", "--name", "bad", "--json", "--path"])
@@ -217,23 +219,19 @@ fn invalid_sources_and_unknown_projects_have_actionable_json_errors() {
         assert!(output.stdout.is_empty());
         let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
         assert_eq!(error["error"]["kind"], "source");
-        assert!(
-            error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Git working tree")
-        );
     }
     let bare = fixture.0.join("bare.git");
     fs::create_dir(&bare).unwrap();
     git(&bare, &["init", "--bare", "--quiet"]);
-    let bare_result = fixture.add(&bare);
+    let bare_result = fixture
+        .cli()
+        .args(["project", "add", "--name", "bare", "--json", "--path"])
+        .arg(&bare)
+        .output()
+        .unwrap();
     assert!(!bare_result.status.success());
-    assert!(
-        String::from_utf8(bare_result.stderr)
-            .unwrap()
-            .contains("working tree")
-    );
+    let error: serde_json::Value = serde_json::from_slice(&bare_result.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "source");
     assert!(!fixture.0.join("storage").exists());
     git(&plain, &["init", "--quiet"]);
     let unborn = fixture.add(&plain);

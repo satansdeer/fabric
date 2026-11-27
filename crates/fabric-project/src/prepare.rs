@@ -1,4 +1,4 @@
-//! Private, committed-only staging. Only the final durable DB transition publishes READY.
+//! Private source staging. Only the final durable DB transition publishes READY.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +17,10 @@ use fabric_store::PreparedState;
 use sha2::{Digest, Sha256};
 
 use crate::recipe::Recipe;
-use crate::{NEXT_ID, git_text, open_store, project_not_found, source_error, storage_error};
+use crate::{
+    NEXT_ID, directory, git_text, has_git_metadata, is_directory_source, open_store,
+    project_not_found, source_error, storage_error,
+};
 
 const SAFE_PATH: &str = "/usr/bin:/bin";
 const METADATA_CAP: usize = 64 * 1024;
@@ -63,34 +66,52 @@ pub fn prepare_with_admission(
         .map_err(storage_error)?
         .ok_or_else(|| project_not_found(name))?;
     let source = Path::new(&project.source_path);
-    let top = git_output(source, &["rev-parse", "--show-toplevel"], deadline)?;
-    if Path::new(git_text(&top)?)
-        .canonicalize()
-        .map_err(storage_error)?
-        != source
-    {
+    let directory_source = is_directory_source(&project.default_ref);
+    if directory_source != !has_git_metadata(source)? {
         return Err(source_error(
-            "Registered source is no longer the same Git working tree.",
+            "Registered source changed between Git and directory kinds.",
         ));
     }
-    let head = git_output(
-        source,
-        &["rev-parse", "--verify", "HEAD^{commit}"],
-        deadline,
-    )?;
-    let fingerprint = recipe.fingerprint(git_text(&head)?, &environment)?;
-    let dirty = !git_output(
-        source,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=normal",
-            "--ignore-submodules=none",
-        ],
-        deadline,
-    )?
-    .is_empty();
+    let source_identity = if directory_source {
+        directory::outside_source(&root, source)?;
+        if source.canonicalize().map_err(storage_error)? != source {
+            return Err(source_error(
+                "Registered directory source path has changed.",
+            ));
+        }
+        directory::identity(source, deadline)?
+    } else {
+        let top = git_output(source, &["rev-parse", "--show-toplevel"], deadline)?;
+        if Path::new(git_text(&top)?)
+            .canonicalize()
+            .map_err(storage_error)?
+            != source
+        {
+            return Err(source_error(
+                "Registered source is no longer the same Git working tree.",
+            ));
+        }
+        let head = git_output(
+            source,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            deadline,
+        )?;
+        git_text(&head)?.to_owned()
+    };
+    let fingerprint = recipe.fingerprint(&source_identity, &environment)?;
+    let dirty = !directory_source
+        && !git_output(
+            source,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
+            deadline,
+        )?
+        .is_empty();
     if dirty {
         // Warn before execution, including when preparation later fails.
         eprintln!(
@@ -183,36 +204,47 @@ pub fn prepare_with_admission(
         File::open(&prepared)
             .and_then(|dir| dir.sync_all())
             .map_err(storage_error)?;
-        let mut clone = git_command(source);
-        clone
-            .args([
-                "-c",
-                "protocol.file.allow=always",
-                "clone",
-                "--no-local",
-                "--no-hardlinks",
-                "--no-checkout",
-                "--template=",
-                "--",
-            ])
-            .arg(source)
-            .arg(&tree);
-        run(clone, deadline, false)?;
-        git_output(
-            &tree,
-            &["checkout", "--quiet", "--detach", &state.source_commit_sha],
-            deadline,
-        )?;
-        // Local config is private, and no developer/global/template hooks are imported.
-        git_output(&tree, &["config", "core.hooksPath", "/dev/null"], deadline)?;
-        // Pin the fresh committed checkout before any declared recipe can modify it.
+        if directory_source {
+            directory::snapshot(source, &tree, &state.source_commit_sha, deadline)?;
+            if has_git_metadata(source)? {
+                return Err(source_error(
+                    "Directory source acquired Git metadata during snapshotting.",
+                ));
+            }
+        } else {
+            let mut clone = git_command(source);
+            clone
+                .args([
+                    "-c",
+                    "protocol.file.allow=always",
+                    "clone",
+                    "--no-local",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    "--template=",
+                    "--",
+                ])
+                .arg(source)
+                .arg(&tree);
+            run(clone, deadline, false)?;
+            git_output(
+                &tree,
+                &["checkout", "--quiet", "--detach", &state.source_commit_sha],
+                deadline,
+            )?;
+            // Local config is private; developer/global/template hooks are not imported.
+            git_output(&tree, &["config", "core.hooksPath", "/dev/null"], deadline)?;
+        }
+        // Pin the fresh source snapshot before any declared recipe can modify it.
         // Never manufacture this baseline from a reused READY tree.
         store
             .pin_checkout(&state.state_id, &content_digest(&tree, deadline)?)
             .map_err(storage_error)?;
         for step in recipe.steps() {
             validate_container(&container, &state.state_id)?;
-            private_git(&tree)?;
+            if !directory_source {
+                private_git(&tree)?;
+            }
             let argv = step.argv();
             let mut command = Command::new(&argv[0]);
             command
@@ -227,12 +259,15 @@ pub fn prepare_with_admission(
             run(command, deadline, false)?;
         }
         validate_container(&container, &state.state_id)?;
-        private_git(&tree)?;
-        let final_head = git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
-        if git_text(&final_head)? != state.source_commit_sha {
-            return Err(source_error(
-                "Preparation changed the pinned Git HEAD; refusing READY.",
-            ));
+        if !directory_source {
+            private_git(&tree)?;
+            let final_head =
+                git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
+            if git_text(&final_head)? != state.source_commit_sha {
+                return Err(source_error(
+                    "Preparation changed the pinned Git HEAD; refusing READY.",
+                ));
+            }
         }
         let size = verify_tree(&tree, &tree, deadline, true)?;
         store
@@ -372,12 +407,14 @@ fn verify_ready(root: &Path, state: &PreparedState, deadline: Instant) -> Result
             "Cached READY tree size does not match its record.",
         ));
     }
-    private_git(&tree)?;
-    let head = git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
-    if git_text(&head)? != state.source_commit_sha {
-        return Err(source_error(
-            "Cached READY HEAD does not match its recorded source.",
-        ));
+    if !is_directory_source(&state.source_commit_sha) {
+        private_git(&tree)?;
+        let head = git_output(&tree, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
+        if git_text(&head)? != state.source_commit_sha {
+            return Err(source_error(
+                "Cached READY HEAD does not match its recorded source.",
+            ));
+        }
     }
     let evidence = crate::open_store(root, false)?
         .source_evidence(&state.state_id)
@@ -575,7 +612,7 @@ fn run(mut command: Command, deadline: Instant, capture: bool) -> Result<Vec<u8>
     }
 }
 
-fn check_deadline(deadline: Instant) -> Result<(), FabricError> {
+pub(crate) fn check_deadline(deadline: Instant) -> Result<(), FabricError> {
     if Instant::now() >= deadline {
         Err(source_error(
             "Preparation total wall-clock timeout exceeded; process group killed.",
@@ -660,44 +697,96 @@ fn private_git(tree: &Path) -> Result<(), FabricError> {
     Ok(())
 }
 
-fn validate_symlink(root: &Path, path: &Path, deadline: Instant) -> Result<(), FabricError> {
+/// Validate relative symlinks (including chains and `..`) against a real tree root.
+/// Both paths must be rooted in the same already-validated, private tree.
+pub fn validate_symlink(root: &Path, path: &Path, deadline: Instant) -> Result<(), FabricError> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root)
+        .map_err(storage_error)?;
+    validate_symlink_at(
+        &directory,
+        path.strip_prefix(root).map_err(storage_error)?,
+        deadline,
+    )
+}
+
+/// Resolve a relative link beneath an already-open tree without following raced ancestors.
+pub fn validate_symlink_at(root: &File, path: &Path, deadline: Instant) -> Result<(), FabricError> {
+    if !root.metadata().map_err(storage_error)?.is_dir() {
+        return Err(storage_error(
+            "Symlink validation requires a real tree directory.",
+        ));
+    }
     let mut pending: VecDeque<_> = path
-        .strip_prefix(root)
-        .map_err(storage_error)?
         .components()
         .map(|component| component.as_os_str().to_owned())
         .collect();
-    let mut resolved = root.to_path_buf();
+    let mut directories = vec![root.try_clone().map_err(storage_error)?];
     let mut links = 0;
     while let Some(component) = pending.pop_front() {
         check_deadline(deadline)?;
         match Path::new(&component).components().next() {
             Some(Component::CurDir) => {}
-            Some(Component::ParentDir) if resolved != root => {
-                resolved.pop();
+            Some(Component::ParentDir) if directories.len() > 1 => {
+                directories.pop();
             }
             Some(Component::Normal(_)) => {
-                resolved.push(&component);
-                let meta = fs::symlink_metadata(&resolved).map_err(storage_error)?;
-                if meta.file_type().is_symlink() {
+                let parent = directories.last().expect("root remains open");
+                let name = std::ffi::CString::new(component.as_bytes()).map_err(storage_error)?;
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: parent and name remain valid; stat is initialized on success.
+                if unsafe {
+                    libc::fstatat(
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return Err(storage_error(std::io::Error::last_os_error()));
+                }
+                let stat = unsafe { stat.assume_init() };
+                if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
                     links += 1;
                     if links > 40 {
                         return Err(storage_error(
                             "Prepared symlink cycle or excessive link depth.",
                         ));
                     }
-                    let target = fs::read_link(&resolved).map_err(storage_error)?;
+                    let mut buffer = [0u8; 64 * 1024];
+                    // SAFETY: parent/name and the writable buffer are valid for this call.
+                    let count = unsafe {
+                        libc::readlinkat(
+                            parent.as_raw_fd(),
+                            name.as_ptr(),
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                        )
+                    };
+                    if count < 0 {
+                        return Err(storage_error(std::io::Error::last_os_error()));
+                    }
+                    if count as usize == buffer.len() {
+                        return Err(storage_error("Symlink target exceeds safety limit."));
+                    }
+                    let target = Path::new(std::ffi::OsStr::from_bytes(&buffer[..count as usize]));
                     if target.is_absolute() {
                         return Err(storage_error(
                             "Absolute prepared symlink target is forbidden.",
                         ));
                     }
-                    resolved.pop();
                     for part in target.components().rev() {
                         pending.push_front(part.as_os_str().to_owned());
                     }
-                } else if !pending.is_empty() && !meta.is_dir() {
-                    return Err(storage_error("Prepared symlink traverses a non-directory."));
+                } else if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    directories.push(directory::open_at(parent, &name, true)?);
+                } else if !pending.is_empty() || stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    return Err(storage_error(
+                        "Prepared symlink traverses a non-directory or special file.",
+                    ));
                 }
             }
             _ => return Err(storage_error("Prepared symlink escapes its private tree.")),

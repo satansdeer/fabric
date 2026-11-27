@@ -98,7 +98,7 @@ enum Commands {
         #[command(subcommand)]
         command: HarnessesCommands,
     },
-    /// Register or inspect a local Git source.
+    /// Register or inspect a local source directory.
     Project {
         #[arg(long, global = true)]
         json: bool,
@@ -450,7 +450,7 @@ struct HarnessDoctorReport {
 
 #[derive(Subcommand)]
 enum ProjectCommands {
-    /// Pin the current committed HEAD without importing local edits.
+    /// Pin Git HEAD or the content identity of a non-Git directory.
     Add {
         #[arg(long)]
         name: String,
@@ -459,7 +459,7 @@ enum ProjectCommands {
     },
     /// Report the persisted source identity.
     Status { name: String },
-    /// Prepare current committed HEAD in a private managed snapshot.
+    /// Prepare the current source in a private managed snapshot.
     Prepare {
         name: String,
         #[arg(long)]
@@ -1035,7 +1035,7 @@ fn write_project(
         } else {
             writeln!(
                 stdout,
-                "Prepared: {}\nStatus: READY\nSource SHA: {}\nPath: {}\nSize: {} bytes",
+                "Prepared: {}\nStatus: READY\nSource identity: {}\nPath: {}\nSize: {} bytes",
                 report.state_id, report.source_commit_sha, report.prepared_path, report.size_bytes
             )
             .map_err(output_error)?;
@@ -1074,7 +1074,7 @@ fn write_project(
     } else {
         writeln!(
             stdout,
-            "Project: {}\nSource: {}\nSource SHA: {}",
+            "Project: {}\nSource: {}\nSource identity: {}",
             report.name, report.source_path, report.source_commit_sha
         )
         .map_err(output_error)?;

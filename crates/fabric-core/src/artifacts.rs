@@ -1,4 +1,4 @@
-//! Complete non-ignored source recovery evidence; deletion requires separate GC checks.
+//! Complete source recovery evidence; deletion requires separate GC checks.
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fabric_domain::{
     ArtifactManifestId, CaptureMetadata, CapturedFile, ErrorKind, FabricError, ProfileEvidence,
@@ -19,6 +19,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::workspace::{capture_workspace, private_directory, private_file};
+
+// Directory captures use the same inventory, but only the archive contains source evidence.
+const DIRECTORY_EMPTY_FILES: [(&str, &str); 8] = [
+    ("tracked.patch", "tracked_patch"),
+    ("git.stderr", "capture_diagnostic"),
+    ("ignored.paths", "ignored_paths"),
+    ("ignored.stderr", "ignored_stderr"),
+    ("untracked.paths", "untracked_paths"),
+    ("untracked.stderr", "untracked_stderr"),
+    ("verified.paths", "verified_untracked_paths"),
+    ("verified.stderr", "verified_untracked_stderr"),
+];
 
 #[derive(Serialize)]
 struct Manifest<'a> {
@@ -236,8 +248,14 @@ fn verify_files(
         .capture
         .as_ref()
         .ok_or_else(|| error("Missing capture metadata"))?;
+    let directory_source = fabric_project::is_directory_source(&prepared.source_commit_sha);
+    let source_scope = if directory_source {
+        "directory_full_tree"
+    } else {
+        "tracked_and_nonignored_untracked"
+    };
     if manifest.format_version != 2
-        || manifest.source_scope != "tracked_and_nonignored_untracked"
+        || manifest.source_scope != source_scope
         || manifest.manifest_id != expected_id
         || manifest.run_id != run.run_id.as_str()
         || manifest.workspace_id != run.workspace_id.as_str()
@@ -275,6 +293,15 @@ fn verify_files(
         || manifest.files.len() != files.len() - 1
     {
         return Err(error("Manifest metadata does not match registered run"));
+    }
+    if directory_source
+        && DIRECTORY_EMPTY_FILES.iter().any(|(_, kind)| {
+            files
+                .iter()
+                .any(|file| file.kind == *kind && file.size_bytes != 0)
+        })
+    {
+        return Err(error("Directory capture contains Git-only evidence"));
     }
     let mut seen = HashSet::new();
     for entry in &manifest.files {
@@ -446,11 +473,13 @@ pub(super) fn recover_capture(
             "Recovery prompt differs from durable admission digest",
         ));
     }
-    validate_git(&workspace.path().join(".git"))?;
     let prepared = store
         .prepared_state(&run.prepared_state_id)
         .map_err(error)?
         .ok_or_else(|| error("Missing pinned prepared state"))?;
+    if !fabric_project::is_directory_source(&prepared.source_commit_sha) {
+        validate_git(&workspace.path().join(".git"))?;
+    }
     if !apply {
         return Ok(None);
     }
@@ -541,187 +570,218 @@ fn capture_in_workspace(
     }
     files.push(record(&manifest, "prompt.input", "prompt", prompt));
 
-    validate_git(&workspace.path().join(".git"))?;
-    for name in [
-        ".git/commondir",
-        ".git/objects/info/alternates",
-        ".git/objects/info/http-alternates",
-    ] {
-        match fs::symlink_metadata(workspace.path().join(name)) {
-            Ok(_) => return Err(error("Shared Git object storage is not capture-safe")),
-            Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {}
-            Err(failure) => return Err(error(failure)),
-        }
+    let directory_source = fabric_project::is_directory_source(&prepared.source_commit_sha);
+    if directory_source != fabric_project::is_directory_source(&run.base_commit_sha) {
+        return Err(error("Source kind differs from the pinned run"));
     }
-    // Reuse the owned, bounded process/drain path rather than buffering a binary patch.
-    // Compare to the pinned launch HEAD, not a potentially worker-moved branch tip.
-    // Even with optional locks disabled, Git diff can refresh the index.
-    // Capture must preserve the returned tree's immutable installation digest.
-    let mut command = CommandSpec {
-        program: "/usr/bin/git".into(),
-        args: [
-            "--git-dir=.git",
-            "--work-tree=.",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "diff.autoRefreshIndex=false",
-            "-c",
-            "protocol.allow=never",
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--no-renames",
-            "--ignore-submodules=none",
-            &run.base_commit_sha,
-            "--",
-        ]
-        .into_iter()
-        .map(Into::into)
-        .collect(),
-        environment: [
-            ("PATH", "/usr/bin:/bin"),
-            ("LC_ALL", "C"),
-            ("GIT_CONFIG_NOSYSTEM", "1"),
-            ("GIT_CONFIG_GLOBAL", "/dev/null"),
-            ("GIT_TERMINAL_PROMPT", "0"),
-            ("GIT_NO_LAZY_FETCH", "1"),
-            ("GIT_NO_REPLACE_OBJECTS", "1"),
-            ("GIT_OPTIONAL_LOCKS", "0"),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.into(), value.into()))
-        .collect(),
-    };
-    let patch = capture_git(
-        &command,
-        workspace.path(),
-        &stage,
-        "tracked.patch",
-        "git.stderr",
-        &mut remaining,
-    )?;
-    files.push(record(
-        &manifest,
-        "tracked.patch",
-        "tracked_patch",
-        patch.stdout,
-    ));
-    files.push(record(
-        &manifest,
-        "git.stderr",
-        "capture_diagnostic",
-        patch.stderr,
-    ));
-    command.args.truncate(10);
-    command.args.extend(
-        ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+    if directory_source {
+        let empty_sha256 = format!("{:x}", Sha256::digest([]));
+        for (name, kind) in DIRECTORY_EMPTY_FILES {
+            create(&stage.join(name))?.sync_all().map_err(error)?;
+            files.push(record(
+                &manifest,
+                name,
+                kind,
+                CapturedFile {
+                    size_bytes: 0,
+                    sha256: empty_sha256.clone(),
+                },
+            ));
+        }
+        let archive = archive_source(
+            workspace.path(),
+            None,
+            &stage.join("untracked.tar"),
+            &mut remaining,
+        )?;
+        files.push(record(
+            &manifest,
+            "untracked.tar",
+            "untracked_archive",
+            archive,
+        ));
+    } else {
+        validate_git(&workspace.path().join(".git"))?;
+        for name in [
+            ".git/commondir",
+            ".git/objects/info/alternates",
+            ".git/objects/info/http-alternates",
+        ] {
+            match fs::symlink_metadata(workspace.path().join(name)) {
+                Ok(_) => return Err(error("Shared Git object storage is not capture-safe")),
+                Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {}
+                Err(failure) => return Err(error(failure)),
+            }
+        }
+        // Reuse the owned, bounded process/drain path rather than buffering a binary patch.
+        // Compare to the pinned launch HEAD, not a potentially worker-moved branch tip.
+        // Even with optional locks disabled, Git diff can refresh the index.
+        // Capture must preserve the returned tree's immutable installation digest.
+        let mut command = CommandSpec {
+            program: "/usr/bin/git".into(),
+            args: [
+                "--git-dir=.git",
+                "--work-tree=.",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "diff.autoRefreshIndex=false",
+                "-c",
+                "protocol.allow=never",
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                "--ignore-submodules=none",
+                &run.base_commit_sha,
+                "--",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            environment: [
+                ("PATH", "/usr/bin:/bin"),
+                ("LC_ALL", "C"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_NO_LAZY_FETCH", "1"),
+                ("GIT_NO_REPLACE_OBJECTS", "1"),
+                ("GIT_OPTIONAL_LOCKS", "0"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        };
+        let patch = capture_git(
+            &command,
+            workspace.path(),
+            &stage,
+            "tracked.patch",
+            "git.stderr",
+            &mut remaining,
+        )?;
+        files.push(record(
+            &manifest,
+            "tracked.patch",
+            "tracked_patch",
+            patch.stdout,
+        ));
+        files.push(record(
+            &manifest,
+            "git.stderr",
+            "capture_diagnostic",
+            patch.stderr,
+        ));
+        command.args.truncate(10);
+        command.args.extend(
+            ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+                .into_iter()
+                .map(Into::into),
+        );
+        let listing = capture_git(
+            &command,
+            workspace.path(),
+            &stage,
+            "untracked.paths",
+            "untracked.stderr",
+            &mut remaining,
+        )?;
+        command.args.truncate(10);
+        command.args.extend(
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+                "--",
+            ]
             .into_iter()
             .map(Into::into),
-    );
-    let listing = capture_git(
-        &command,
-        workspace.path(),
-        &stage,
-        "untracked.paths",
-        "untracked.stderr",
-        &mut remaining,
-    )?;
-    command.args.truncate(10);
-    command.args.extend(
-        [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-            "--",
-        ]
-        .into_iter()
-        .map(Into::into),
-    );
-    let ignored = capture_git(
-        &command,
-        workspace.path(),
-        &stage,
-        "ignored.paths",
-        "ignored.stderr",
-        &mut remaining,
-    )?;
-    let archive = archive_untracked(
-        workspace.path(),
-        &stage.join("untracked.paths"),
-        &stage.join("ignored.paths"),
-        &stage.join("untracked.tar"),
-        &mut remaining,
-    )?;
-    files.push(record(
-        &manifest,
-        "ignored.paths",
-        "ignored_paths",
-        ignored.stdout,
-    ));
-    files.push(record(
-        &manifest,
-        "ignored.stderr",
-        "ignored_stderr",
-        ignored.stderr,
-    ));
-    command.args.truncate(10);
-    command.args.extend(
-        ["ls-files", "--others", "--exclude-standard", "-z", "--"]
-            .into_iter()
-            .map(Into::into),
-    );
-    files.push(record(
-        &manifest,
-        "untracked.tar",
-        "untracked_archive",
-        archive,
-    ));
-    let verified = capture_git(
-        &command,
-        workspace.path(),
-        &stage,
-        "verified.paths",
-        "verified.stderr",
-        &mut remaining,
-    )?;
-    if listing.stdout != verified.stdout {
-        return Err(error(
-            "Untracked paths changed during capture; recovery required",
+        );
+        let ignored = capture_git(
+            &command,
+            workspace.path(),
+            &stage,
+            "ignored.paths",
+            "ignored.stderr",
+            &mut remaining,
+        )?;
+        let archive = archive_source(
+            workspace.path(),
+            Some((&stage.join("untracked.paths"), &stage.join("ignored.paths"))),
+            &stage.join("untracked.tar"),
+            &mut remaining,
+        )?;
+        files.push(record(
+            &manifest,
+            "ignored.paths",
+            "ignored_paths",
+            ignored.stdout,
+        ));
+        files.push(record(
+            &manifest,
+            "ignored.stderr",
+            "ignored_stderr",
+            ignored.stderr,
+        ));
+        command.args.truncate(10);
+        command.args.extend(
+            ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+                .into_iter()
+                .map(Into::into),
+        );
+        files.push(record(
+            &manifest,
+            "untracked.tar",
+            "untracked_archive",
+            archive,
+        ));
+        let verified = capture_git(
+            &command,
+            workspace.path(),
+            &stage,
+            "verified.paths",
+            "verified.stderr",
+            &mut remaining,
+        )?;
+        if listing.stdout != verified.stdout {
+            return Err(error(
+                "Untracked paths changed during capture; recovery required",
+            ));
+        }
+        files.push(record(
+            &manifest,
+            "untracked.paths",
+            "untracked_paths",
+            listing.stdout,
+        ));
+        files.push(record(
+            &manifest,
+            "untracked.stderr",
+            "untracked_stderr",
+            listing.stderr,
+        ));
+        files.push(record(
+            &manifest,
+            "verified.paths",
+            "verified_untracked_paths",
+            verified.stdout,
+        ));
+        files.push(record(
+            &manifest,
+            "verified.stderr",
+            "verified_untracked_stderr",
+            verified.stderr,
         ));
     }
-    files.push(record(
-        &manifest,
-        "untracked.paths",
-        "untracked_paths",
-        listing.stdout,
-    ));
-    files.push(record(
-        &manifest,
-        "untracked.stderr",
-        "untracked_stderr",
-        listing.stderr,
-    ));
-    files.push(record(
-        &manifest,
-        "verified.paths",
-        "verified_untracked_paths",
-        verified.stdout,
-    ));
-    files.push(record(
-        &manifest,
-        "verified.stderr",
-        "verified_untracked_stderr",
-        verified.stderr,
-    ));
     let metadata = Manifest {
         format_version: 2,
         manifest_id: manifest.as_str(),
@@ -742,7 +802,11 @@ fn capture_in_workspace(
             .filter(|reason| matches!(*reason, "timeout" | "cancelled" | "native_failure")),
         capture: output,
         artifact_limit_bytes: limit,
-        source_scope: "tracked_and_nonignored_untracked",
+        source_scope: if directory_source {
+            "directory_full_tree"
+        } else {
+            "tracked_and_nonignored_untracked"
+        },
         files: &files,
     };
     let bytes = serde_json::to_vec_pretty(&metadata).map_err(error)?;
@@ -862,10 +926,9 @@ impl Write for ArchiveWriter<'_> {
     }
 }
 
-fn archive_untracked(
+fn archive_source(
     workspace: &Path,
-    listing: &Path,
-    ignored_listing: &Path,
+    listing: Option<(&Path, &Path)>,
     destination: &Path,
     remaining: &mut u64,
 ) -> Result<CapturedFile, FabricError> {
@@ -874,22 +937,25 @@ fn archive_untracked(
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(workspace)
         .map_err(error)?;
-    // Git omits FIFOs and sockets from ls-files entirely. Inspect nonignored directories
-    // as well, so that their omission can never grant cleanup authority.
+    // Git omits special files from ls-files. Directory mode inspects every entry,
+    // including hidden files and empty directories, without Git ignore semantics.
+    let full_tree = listing.is_none();
     let mut ignored = HashSet::new();
-    for path in fs::read(ignored_listing)
-        .map_err(error)?
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let path = path.strip_suffix(b"/").unwrap_or(path);
-        if !safe_path(path) {
-            return Err(error("Unsafe ignored Git path"));
+    if let Some((_, ignored_listing)) = listing {
+        for path in fs::read(ignored_listing)
+            .map_err(error)?
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = path.strip_suffix(b"/").unwrap_or(path);
+            if !safe_path(path) {
+                return Err(error("Unsafe ignored Git path"));
+            }
+            ignored.insert(PathBuf::from(OsStr::from_bytes(path)));
         }
-        ignored.insert(PathBuf::from(OsStr::from_bytes(path)));
     }
     let mut inspected = Vec::new();
-    inspect_directory(&root, Path::new(""), &ignored, &mut inspected)?;
+    inspect_directory(&root, Path::new(""), &ignored, full_tree, &mut inspected)?;
     let writer = ArchiveWriter {
         file: create(destination)?,
         remaining,
@@ -899,17 +965,28 @@ fn archive_untracked(
     let mut archive = tar::Builder::new(writer);
     let mut directories = HashSet::new();
     let mut captured = Vec::new();
-    let mut input = BufReader::new(open(listing)?);
+    let mut input = listing
+        .map(|(listing, _)| open(listing).map(BufReader::new))
+        .transpose()?;
+    let mut full_paths = inspected
+        .iter()
+        .filter(|(path, _)| !path.as_os_str().is_empty());
     let mut bytes = Vec::new();
     loop {
-        bytes.clear();
-        if input.read_until(0, &mut bytes).map_err(error)? == 0 {
+        let path = if let Some(input) = &mut input {
+            bytes.clear();
+            if input.read_until(0, &mut bytes).map_err(error)? == 0 {
+                break;
+            }
+            if bytes.pop() != Some(0) || !safe_path(&bytes) {
+                return Err(error("Unsafe or unterminated untracked Git path"));
+            }
+            Path::new(OsStr::from_bytes(&bytes))
+        } else if let Some((path, _)) = full_paths.next() {
+            path.as_path()
+        } else {
             break;
-        }
-        if bytes.pop() != Some(0) || !safe_path(&bytes) {
-            return Err(error("Unsafe or unterminated untracked Git path"));
-        }
-        let path = Path::new(OsStr::from_bytes(&bytes));
+        };
         let mut prefix = PathBuf::new();
         for component in path.parent().unwrap().components() {
             prefix.push(component);
@@ -929,9 +1006,19 @@ fn archive_untracked(
         let (parent, name, metadata) = entry(&root, path)?;
         let kind = metadata.st_mode & libc::S_IFMT;
         if metadata.st_uid != unsafe { libc::geteuid() } {
-            return Err(error("Untracked input is not owned by the current user"));
+            return Err(error("Archive input is not owned by the current user"));
         }
-        if kind == libc::S_IFREG && metadata.st_nlink == 1 {
+        if full_tree && kind == libc::S_IFDIR {
+            if directories.insert(path.to_owned()) {
+                append_header(
+                    &mut archive,
+                    path,
+                    &metadata,
+                    tar::EntryType::Directory,
+                    std::io::empty(),
+                )?;
+            }
+        } else if kind == libc::S_IFREG && metadata.st_nlink == 1 {
             let mut source = open_at(&parent, &name, libc::O_NONBLOCK)?;
             unchanged(&metadata, &stat(&source)?)?;
             append_header(
@@ -957,7 +1044,7 @@ fn archive_untracked(
                 return Err(error(std::io::Error::last_os_error()));
             }
             let length = length as usize;
-            if length == target.len() || !safe_link(&root, path, &target[..length])? {
+            if length == target.len() || !safe_link(&root, path, &target[..length], full_tree)? {
                 return Err(error("Unsafe untracked symlink target; recovery required"));
             }
             let mut header = header(&metadata, tar::EntryType::Symlink)?;
@@ -987,6 +1074,14 @@ fn archive_untracked(
             unchanged(&metadata, &entry(&root, &path)?.2)?;
         }
     }
+    if full_tree {
+        let current_root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(workspace)
+            .map_err(error)?;
+        unchanged(&stat(&root)?, &stat(&current_root)?)?;
+    }
     let writer = archive.into_inner().map_err(error)?;
     writer.file.sync_all().map_err(error)?;
     Ok(CapturedFile {
@@ -1002,9 +1097,18 @@ fn safe_path(bytes: &[u8]) -> bool {
             .all(|part| !part.is_empty() && part != b"." && part != b".." && part != b".git")
 }
 
-fn safe_link(root: &File, path: &Path, bytes: &[u8]) -> Result<bool, FabricError> {
+fn safe_link(root: &File, path: &Path, bytes: &[u8], full_tree: bool) -> Result<bool, FabricError> {
     if bytes.is_empty() {
         return Ok(false);
+    }
+    if full_tree {
+        fabric_project::prepare::validate_symlink_at(
+            root,
+            path,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .map_err(error)?;
+        return Ok(true);
     }
     let mut target = path.parent().unwrap().to_owned();
     // Do not normalize "..": an earlier component might be a symlink.
@@ -1026,9 +1130,14 @@ fn inspect_directory(
     directory: &File,
     prefix: &Path,
     ignored: &HashSet<PathBuf>,
+    full_tree: bool,
     inspected: &mut Vec<(PathBuf, libc::stat)>,
 ) -> Result<(), FabricError> {
-    inspected.push((prefix.to_owned(), stat(directory)?));
+    let metadata = stat(directory)?;
+    if full_tree && metadata.st_uid != unsafe { libc::geteuid() } {
+        return Err(error("Archive directory is not owned by the current user"));
+    }
+    inspected.push((prefix.to_owned(), metadata));
     // fdopendir owns this duplicate, leaving our anchored descriptor alive.
     // SAFETY: directory is a live descriptor.
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -1075,7 +1184,9 @@ fn inspect_directory(
         }
         // SAFETY: readdir's name is NUL-terminated and valid until the next call.
         let name = unsafe { CStr::from_ptr((*item).d_name.as_ptr()) };
-        if [b".".as_slice(), b"..", b".git"].contains(&name.to_bytes()) {
+        if [b".".as_slice(), b".."].contains(&name.to_bytes())
+            || (!full_tree && name.to_bytes() == b".git")
+        {
             continue;
         }
         let path = prefix.join(OsStr::from_bytes(name.to_bytes()));
@@ -1087,10 +1198,14 @@ fn inspect_directory(
             libc::S_IFDIR => {
                 let child = open_at(directory, name, libc::O_DIRECTORY)?;
                 unchanged(&metadata, &stat(&child)?)?;
-                inspect_directory(&child, &path, ignored, inspected)?;
+                inspect_directory(&child, &path, ignored, full_tree, inspected)?;
                 unchanged(&metadata, &stat_at(directory, name)?)?;
             }
-            libc::S_IFREG | libc::S_IFLNK => (),
+            libc::S_IFREG | libc::S_IFLNK => {
+                if full_tree {
+                    inspected.push((path, metadata));
+                }
+            }
             _ => {
                 return Err(error(
                     "Nonignored special file cannot be safely archived; recovery required",
@@ -1407,7 +1522,7 @@ mod tests {
         let root = File::open(&tree).unwrap();
         fs::write(tree.join("inside"), b"lexical bait").unwrap();
         symlink(temp.path(), tree.join("hop")).unwrap();
-        assert!(!safe_link(&root, Path::new("link"), b"hop/../inside").unwrap());
+        assert!(!safe_link(&root, Path::new("link"), b"hop/../inside", false).unwrap());
         let before = entry(&root, Path::new("dir/file")).unwrap().2;
         fs::remove_file(tree.join("dir/file")).unwrap();
         symlink("../../outside", tree.join("dir/file")).unwrap();
@@ -1426,10 +1541,9 @@ mod tests {
         fs::write(&ignored, []).unwrap();
         let mut remaining = 65536;
         assert!(
-            archive_untracked(
+            archive_source(
                 &tree,
-                &listing,
-                &ignored,
+                Some((&listing, &ignored)),
                 &temp.path().join("archive.tar"),
                 &mut remaining
             )
@@ -1439,5 +1553,307 @@ mod tests {
             fs::read(temp.path().join("outside")).unwrap(),
             b"outside sentinel"
         );
+    }
+
+    #[test]
+    fn directory_archive_round_trips_the_complete_final_tree_without_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        let empty_archive = temp.path().join("empty.tar");
+        let mut remaining = 65536;
+        let empty = archive_source(&tree, None, &empty_archive, &mut remaining).unwrap();
+        assert_eq!(empty.size_bytes, 1024);
+        assert_eq!(
+            tar::Archive::new(File::open(empty_archive).unwrap())
+                .entries()
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::write(tree.join("deleted"), b"old source").unwrap();
+        fs::remove_file(tree.join("deleted")).unwrap();
+        fs::write(tree.join("binary"), b"\0\xff\n\x80").unwrap();
+        fs::set_permissions(tree.join("binary"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(tree.join("new"), b"worker output").unwrap();
+        fs::write(tree.join(".gitignore"), b".hidden\n").unwrap();
+        fs::write(tree.join(".hidden"), b"not ignored in directory mode").unwrap();
+        fs::create_dir_all(tree.join("nested/empty")).unwrap();
+        fs::create_dir(tree.join(".git")).unwrap();
+        fs::write(tree.join(".git/ordinary"), b"worker-created ordinary data").unwrap();
+        // APFS requires UTF-8 names; Unix filesystems without that restriction also cover raw bytes.
+        #[cfg(target_os = "macos")]
+        let unusual = OsStr::new("literal\n字");
+        #[cfg(not(target_os = "macos"))]
+        let unusual = OsStr::from_bytes(b"literal\n\xff");
+        fs::write(tree.join(unusual), b"unusual filename").unwrap();
+        symlink("binary", tree.join("link")).unwrap();
+        symlink(".git/ordinary", tree.join("metadata-link")).unwrap();
+        symlink("../binary", tree.join("nested/parent-link")).unwrap();
+        symlink("link", tree.join("chain")).unwrap();
+
+        let destination = temp.path().join("tree.tar");
+        let budget = remaining;
+        let captured = archive_source(&tree, None, &destination, &mut remaining).unwrap();
+        assert_eq!(budget - remaining, captured.size_bytes);
+        assert_eq!(checksum(&destination).unwrap(), captured);
+        let mut archive = tar::Archive::new(File::open(&destination).unwrap());
+        let paths = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect::<HashSet<_>>();
+        let expected = [
+            "binary",
+            "new",
+            ".gitignore",
+            ".hidden",
+            "nested",
+            "nested/empty",
+            ".git",
+            ".git/ordinary",
+            "link",
+            "metadata-link",
+            "nested/parent-link",
+            "chain",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .chain([PathBuf::from(unusual)])
+        .collect::<HashSet<_>>();
+        assert_eq!(paths, expected);
+        let restored = temp.path().join("restored");
+        let mut archive = tar::Archive::new(File::open(&destination).unwrap());
+        archive.set_preserve_permissions(true);
+        archive.unpack(&restored).unwrap();
+        for name in ["binary", "new", ".gitignore", ".hidden", ".git/ordinary"] {
+            assert_eq!(
+                fs::read(restored.join(name)).unwrap(),
+                fs::read(tree.join(name)).unwrap()
+            );
+        }
+        assert_eq!(
+            fs::read(restored.join(unusual)).unwrap(),
+            b"unusual filename"
+        );
+        assert_eq!(
+            fs::metadata(restored.join("binary")).unwrap().mode() & 0o777,
+            0o751
+        );
+        assert!(restored.join("nested/empty").is_dir());
+        assert!(!restored.join("deleted").exists());
+        assert_eq!(
+            fs::read_link(restored.join("link")).unwrap(),
+            Path::new("binary")
+        );
+        assert_eq!(
+            fs::read_link(restored.join("metadata-link")).unwrap(),
+            Path::new(".git/ordinary")
+        );
+        assert_eq!(
+            fs::read_link(restored.join("nested/parent-link")).unwrap(),
+            Path::new("../binary")
+        );
+        assert_eq!(
+            fs::read_link(restored.join("chain")).unwrap(),
+            Path::new("link")
+        );
+        assert_eq!(
+            fs::read(restored.join("nested/parent-link")).unwrap(),
+            b"\0\xff\n\x80"
+        );
+        assert_eq!(fs::read(restored.join("chain")).unwrap(), b"\0\xff\n\x80");
+    }
+
+    #[test]
+    fn directory_archive_failures_preserve_the_source_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("source"), b"retained").unwrap();
+        let mut remaining = 1;
+        assert!(
+            archive_source(
+                &tree,
+                None,
+                &temp.path().join("over-budget.tar"),
+                &mut remaining
+            )
+            .is_err()
+        );
+        symlink(temp.path(), tree.join("escape")).unwrap();
+        remaining = 65536;
+        assert!(
+            archive_source(
+                &tree,
+                None,
+                &temp.path().join("unsafe-link.tar"),
+                &mut remaining
+            )
+            .is_err()
+        );
+        fs::remove_file(tree.join("escape")).unwrap();
+        fs::hard_link(tree.join("source"), tree.join("alias")).unwrap();
+        remaining = 65536;
+        assert!(
+            archive_source(
+                &tree,
+                None,
+                &temp.path().join("hardlink.tar"),
+                &mut remaining
+            )
+            .is_err()
+        );
+        fs::remove_file(tree.join("alias")).unwrap();
+        symlink("cycle-b", tree.join("cycle-a")).unwrap();
+        symlink("cycle-a", tree.join("cycle-b")).unwrap();
+        remaining = 65536;
+        assert!(
+            archive_source(&tree, None, &temp.path().join("cycle.tar"), &mut remaining).is_err()
+        );
+        fs::remove_file(tree.join("cycle-a")).unwrap();
+        fs::remove_file(tree.join("cycle-b")).unwrap();
+        let socket = std::os::unix::net::UnixListener::bind(tree.join("socket")).unwrap();
+        remaining = 65536;
+        assert!(
+            archive_source(
+                &tree,
+                None,
+                &temp.path().join("special.tar"),
+                &mut remaining
+            )
+            .is_err()
+        );
+        drop(socket);
+        assert_eq!(fs::read(tree.join("source")).unwrap(), b"retained");
+        assert!(tree.join("socket").exists());
+    }
+
+    #[test]
+    fn directory_recovery_recaptures_without_git_and_reclaims_verified_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("gone"), b"original").unwrap();
+        let root = temp.path().join("storage");
+        fabric_project::register(&root, "directory-recovery", &source).unwrap();
+        let root = root.canonicalize().unwrap();
+        let recipe = temp.path().join("recipe.toml");
+        fs::write(&recipe, "version=1\n[[steps]]\nargv=['/usr/bin/true']\n").unwrap();
+        fabric_project::prepare::prepare(&root, "directory-recovery", &recipe).unwrap();
+        let fake = temp.path().join("fake");
+        fs::write(&fake, "#!/bin/sh\numask 077\nif [ \"$1\" = '--version' ]; then printf 'fabric-fake-harness 1\\n'; exit 0; fi\nrm gone\nprintf '\\000\\377\\012' > binary\nprintf recovered > .hidden\nmkdir -p nested/empty\nprintf 'worker log\\n'\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER test_lease AFTER UPDATE OF state ON workspaces
+             WHEN NEW.state='CLEANUP_PENDING' BEGIN
+             UPDATE workspaces SET lease_expires_at=9223372036854775807
+             WHERE workspace_id=NEW.workspace_id; END;
+             CREATE TRIGGER test_association BEFORE UPDATE OF artifact_manifest_id ON runs
+             WHEN NEW.artifact_manifest_id IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'injected directory capture interruption'); END;",
+        )
+        .unwrap();
+        drop(db);
+        let prompt = temp.path().join("prompt");
+        fs::write(&prompt, b"prompt").unwrap();
+        let pin = crate::target::reference_pin();
+        let result = crate::run::foreground(
+            &root,
+            "directory-recovery",
+            &prompt,
+            &fabric_runner::FakeHarness::new(fake).unwrap(),
+            &crate::run::RunOptions {
+                copy_limit_bytes: 1024 * 1024,
+                harness_request: fabric_domain::HarnessRequest {
+                    placement: pin.placement.clone(),
+                    ..fabric_domain::HarnessRequest::default()
+                },
+                target_pin: Some(pin),
+                ..crate::run::RunOptions::default()
+            },
+        );
+        let failure = result.err().expect("artifact association must fail");
+        assert!(
+            failure
+                .to_string()
+                .contains("injected directory capture interruption")
+        );
+        let (_, store) = crate::workspace::open_store(&root).unwrap();
+        let ids = store.workspace_ids().unwrap();
+        assert_eq!(ids.len(), 1);
+        let workspace = store.workspace(&ids[0]).unwrap().unwrap();
+        let before = store.run(&workspace.run_id).unwrap().unwrap();
+        assert!(fabric_project::is_directory_source(&before.base_commit_sha));
+        assert!(before.capture.is_some());
+        assert!(before.artifact_manifest_id.is_none());
+        let tree = Path::new(&workspace.managed_path);
+        assert!(!tree.join(".git").exists());
+        assert_eq!(fs::read(tree.join("binary")).unwrap(), b"\0\xff\n");
+        let destination = root.join("artifacts").join(format!("a-{}", before.run_id));
+        let stage = root
+            .join("artifact-staging")
+            .join(format!("a-{}", before.run_id));
+        // Recreate the durable boundary before capture started: output/completion
+        // are recorded, but neither a partial stage nor promoted evidence exists.
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        assert!(!destination.exists());
+        assert!(!stage.exists());
+        let db = rusqlite::Connection::open(root.join("fabric.db")).unwrap();
+        db.execute_batch(
+            "DROP TRIGGER test_lease; DROP TRIGGER test_association;
+             UPDATE workspaces SET lease_expires_at=NULL;",
+        )
+        .unwrap();
+        drop(db);
+        let inspection = crate::workspace::recover(&root, &before.run_id, false).unwrap();
+        assert_eq!(inspection.action, "would_recover", "{inspection:?}");
+        assert!(!destination.exists());
+        assert!(!stage.exists());
+        assert_eq!(store.run(&before.run_id).unwrap().unwrap(), before);
+        drop(store);
+
+        let recovery = crate::workspace::recover(&root, &before.run_id, true).unwrap();
+        assert_eq!(recovery.action, "reclaimed", "{recovery:?}");
+        let (_, store) = crate::workspace::open_store(&root).unwrap();
+        let recovered = store.run(&before.run_id).unwrap().unwrap();
+        assert_eq!(
+            verify_registered(&root, &store, &recovered).unwrap().len(),
+            14
+        );
+        assert_eq!(
+            store.workspace(&ids[0]).unwrap().unwrap().state,
+            fabric_domain::WorkspaceState::Reclaimed
+        );
+        assert!(!tree.parent().unwrap().exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(destination.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["source_scope"], "directory_full_tree");
+        for (name, _) in DIRECTORY_EMPTY_FILES {
+            assert_eq!(fs::metadata(destination.join(name)).unwrap().len(), 0);
+        }
+        let restored = temp.path().join("restored");
+        tar::Archive::new(File::open(destination.join("untracked.tar")).unwrap())
+            .unpack(&restored)
+            .unwrap();
+        assert_eq!(fs::read(restored.join("binary")).unwrap(), b"\0\xff\n");
+        assert_eq!(fs::read(restored.join(".hidden")).unwrap(), b"recovered");
+        assert!(restored.join("nested/empty").is_dir());
+        assert!(!restored.join("gone").exists());
+        assert!(!source.join(".git").exists());
+        assert_eq!(fs::read(source.join("gone")).unwrap(), b"original");
+        drop(store);
+
+        fn writable(path: &Path) {
+            if fs::symlink_metadata(path).unwrap().is_dir() {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                for entry in fs::read_dir(path).unwrap() {
+                    writable(&entry.unwrap().path());
+                }
+            }
+        }
+        writable(temp.path());
     }
 }
